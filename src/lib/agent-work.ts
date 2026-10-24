@@ -444,43 +444,47 @@ export async function releaseStaleWork(client: AgentWorkClient, maxAgeMs: number
  * (reassigned to another agent) is left to its new owner instead of being
  * deleted out from under it.
  *
-   * #1390: a lease taken between the scan and the delete (the agent resumes
-   * its work, or a force-claim takes the issue) keeps its row, through three
-   * layers:
-   *
-   * 1. SCAN exclusion (`agentName: { notIn: activeAgentNames }`) — leases
-   *    committed before the scan.
-   * 2. IN-TRANSACTION RE-READ + per-candidate DECLINE — the protecting-lease
-   *    set is re-derived inside the cleanup `$transaction` with the same
-   *    predicate as the scan; a candidate whose agent holds a protecting lease
-   *    at re-read time is not deleted, the count stays as-is, and no audit row
-   *    claims the deletion. Declines are logged so they are not invisible.
-   * 3. POST-CONSUME VERIFICATION + ROLLBACK — after the deletes, before the
-   *    audit, the protecting-lease set is read a third time (fresh READ
-   *    COMMITTED snapshot, so it observes every lease commit up to that
-   *    statement). If any agent whose row WAS consumed now holds a protecting
-   *    lease, the whole transaction throws and rolls back: the delete lands
-   *    nowhere, no audit row is written, and the caller fails — the row is
-   *    back exactly where it started.
-   *
-   * The remaining window between the verification read and the COMMIT is
-   * closed by SYNCHRONIZATION, not by snapshot timing: every lease-granting
-   * writer holds the per-issue mutation guard ACROSS its lease commit —
-   * `upsertLease` renews/creates under the guard (`lease.ts`; the claim route
-   * passes `mutationGuardHeld` because it already holds it) and the ownership
-   * renew/disposition paths run under `withOwnershipGuard` →
-   * `withIssueMutationGuard`. The claim route — this cleanup's only production
-   * caller — holds that same guard for the whole guarded region containing
-   * this cleanup, so a guard-respecting lease acquisition cannot COMMIT inside
-   * any window of the cleanup: it is `busy` before it ever writes, and a
-   * renewal racing the guard fails as `mutation_busy`. The only residual is
-   * the maintainer force-claim OVERRIDE of a guard whose holder has gone silent
-   * past `GUARD_OVERRIDE_MIN_AGE_MS` (a live claim holder stamps every
-   * `GUARD_HEARTBEAT_MS`, so this never hits an in-flight cleanup of a healthy
-   * process) — the repo-wide accepted cost of the deliberate override,
-   * documented in `issue-mutation-guard.ts`. The #1350 delete-fence conjuncts
-   * above stay the last line of defense for non-lease shape changes, same as
-   * before.
+ * #1390: a lease taken between the scan and the delete (the agent resumes
+ * its work, or a force-claim takes the issue) keeps its row, through three
+ * layers:
+ *
+ * 1. SCAN exclusion (`agentName: { notIn: activeAgentNames }`) — leases
+ *    committed before the scan.
+ * 2. IN-TRANSACTION RE-READ + per-candidate DECLINE — the protecting-lease
+ *    set is re-derived inside the cleanup `$transaction` with the same
+ *    predicate as the scan; a candidate whose agent holds a protecting lease
+ *    at re-read time is not deleted, the count stays as-is, and no audit row
+ *    claims the deletion. Declines are logged so they are not invisible.
+ * 3. POST-CONSUME VERIFICATION + ROLLBACK — after the deletes, before the
+ *    audit, the protecting-lease set is read a third time (fresh READ
+ *    COMMITTED snapshot, so it observes every lease commit up to that
+ *    statement). If any agent whose row WAS consumed now holds a protecting
+ * lease, the whole transaction throws and rolls back: the delete lands
+ * nowhere, no audit row is written, and the row is back exactly where it
+ * started. The claim route (the only production caller) converts this
+ * rejection into a retryable 503 INSIDE its guarded callback — an escaping
+ * throw would demote the claim guard to `executing: false` and wedge every
+ * other writer on the issue, the #1361/#1367 class — so a decline never
+ * strands the anchor.
+ *
+ * The remaining window between the verification read and the COMMIT is
+ * closed by SYNCHRONIZATION, not by snapshot timing: every lease-granting
+ * writer holds the per-issue mutation guard ACROSS its lease commit —
+ * `upsertLease` renews/creates under the guard (`lease.ts`; the claim route
+ * passes `mutationGuardHeld` because it already holds it) and the ownership
+ * renew/disposition paths run under `withOwnershipGuard` →
+ * `withIssueMutationGuard`. The claim route — this cleanup's only production
+ * caller — holds that same guard for the whole guarded region containing
+ * this cleanup, so a guard-respecting lease acquisition cannot COMMIT inside
+ * any window of the cleanup: it is `busy` before it ever writes, and a
+ * renewal racing the guard fails as `mutation_busy`. The only residual is
+ * the maintainer force-claim OVERRIDE of a guard whose holder has gone silent
+ * past `GUARD_OVERRIDE_MIN_AGE_MS` (a live claim holder stamps every
+ * `GUARD_HEARTBEAT_MS`, so this never hits an in-flight cleanup of a healthy
+ * process) — the repo-wide accepted cost of the deliberate override,
+ * documented in `issue-mutation-guard.ts`. The #1350 delete-fence conjuncts
+ * above stay the last line of defense for non-lease shape changes, same as
+ * before.
  *
  * Returns the count of deleted records.
  */

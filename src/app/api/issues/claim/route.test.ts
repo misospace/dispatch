@@ -1221,6 +1221,34 @@ describe("POST /api/issues/claim — parked claims (#1316, #1334)", () => {
     expect(mocks.createAuditLog.mock.calls.filter((call: any) => (call[0] as any).data.action === "stale_agentwork_cleanup")).toHaveLength(0);
   });
 
+  it("a failing stale-work cleanup returns a retryable 503 without starting the claim (#1390)", async () => {
+    // The cleanup throws when its post-consume verification sees a protecting
+    // lease for a row it consumed (the transaction rolled back). The route
+    // must convert that failure INSIDE the guarded callback into a retryable
+    // 5xx: a throw escaping the callback demotes the claim guard to
+    // `executing: false`, which wedges every other-agent claim, force-claim
+    // (the override only clears `executing` guards), and lease/ownership
+    // writer on the issue — the #1361/#1367 wedge class. With the callback
+    // returning normally (remoteStarted still false → complete), the guard is
+    // released and the claimer can retry.
+    mocks.agentWorkFindMany.mockRejectedValue(new Error("cleanup exploded"));
+
+    const res = await POST(makeRequest());
+
+    expect(res.status).toBe(503);
+    const body = await res.json();
+    expect(body.error).toContain("Stale-work cleanup failed");
+    // No claim effect was started: no lease intent, no remote label write.
+    expect(mocks.leaseCreate).not.toHaveBeenCalled();
+    expect(mocks.leaseUpdate).not.toHaveBeenCalled();
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    // The failure is audited as the cleanup, not as a deletion.
+    const failureAudit = mocks.createAuditLog.mock
+      .calls.map((call: any) => (call[0] as any).data)
+      .find((data: any) => data.success === false);
+    expect(failureAudit?.errorMessage).toContain("Stale AgentWork cleanup failed");
+  });
+
   it("a running park with a live ownership TTL 409s a normal claim outright (#1334)", async () => {
     // Before the TTL elapses the park is simply an active lease: no cleanup
     // runs, no write happens, and the claim is refused without force.
