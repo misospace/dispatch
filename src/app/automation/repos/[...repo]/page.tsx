@@ -84,6 +84,8 @@ export default function RepoDetailPage({ params }: { params: Promise<{ repo: str
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
+  const [rerunningRunId, setRerunningRunId] = useState<number | null>(null);
+  const [rerunError, setRerunError] = useState<string | null>(null);
 
   async function handleSync(fullName: string) {
     setSyncing(true);
@@ -103,6 +105,25 @@ export default function RepoDetailPage({ params }: { params: Promise<{ repo: str
       setSyncError(error instanceof Error ? error.message : "Failed to sync repository");
     } finally {
       setSyncing(false);
+    }
+  }
+
+  async function handleRerun(runId: number, fullName: string) {
+    setRerunningRunId(runId);
+    setRerunError(null);
+    try {
+      const res = await authedFetch(`/api/automation/runs/${runId}?repo=${fullName}&action=rerun`, {
+        method: "POST",
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        throw new Error(data?.error || `Failed to rerun (HTTP ${res.status})`);
+      }
+      window.location.reload();
+    } catch (error) {
+      setRerunError(error instanceof Error ? error.message : "Failed to rerun workflow run");
+    } finally {
+      setRerunningRunId(null);
     }
   }
 
@@ -246,6 +267,12 @@ export default function RepoDetailPage({ params }: { params: Promise<{ repo: str
           <CardTitle>Workflows</CardTitle>
         </CardHeader>
         <CardContent>
+          {rerunError && (
+            <div className="flex items-center gap-2 text-sm text-destructive mb-4">
+              <AlertTriangle className="h-4 w-4 shrink-0" />
+              <span>{rerunError}</span>
+            </div>
+          )}
           {repo.workflows.length === 0 ? (
             <p className="text-muted-foreground text-sm">No workflows found</p>
           ) : (
@@ -297,12 +324,10 @@ export default function RepoDetailPage({ params }: { params: Promise<{ repo: str
                                   <Button
                                     variant="ghost"
                                     size="sm"
-                                    onClick={() => {
-                                      authedFetch(`/api/automation/runs/${run.runId}?repo=${repo.fullName}&action=rerun`, { method: "POST" })
-                                        .then(() => window.location.reload());
-                                    }}
+                                    onClick={() => handleRerun(run.runId, repo.fullName)}
+                                    disabled={rerunningRunId !== null}
                                   >
-                                    <RefreshCw className="h-3 w-3" />
+                                    <RefreshCw className={`h-3 w-3 ${rerunningRunId === run.runId ? "animate-spin" : ""}`} />
                                   </Button>
                                 )}
                               </div>
