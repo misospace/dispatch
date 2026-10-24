@@ -949,6 +949,172 @@ describe("POST /api/agent-work", () => {
     });
   });
 
+  // #1406: the operator reassign path read its identifiers verbatim, so a
+  // padded workId answered 404 instead of reassigning the row, and a padded
+  // newAgentName was written verbatim onto AgentWork.agentName — a row no
+  // later name-keyed lookup could find.
+  describe("reassign action — operator identifier normalization (#1406)", () => {
+    beforeEach(() => {
+      vi.clearAllMocks();
+      auditLog.create.mockResolvedValue({ id: "audit-1" });
+    });
+
+    function mockReassignTransaction(capture: {
+      updatedWhere: Array<Record<string, unknown>>;
+      claimedData: Array<Record<string, unknown>>;
+      historyCreates: Array<Record<string, unknown>>;
+      findManyAgentNames: string[];
+    }) {
+      transaction.mockImplementation(async (fn: (tx: any) => Promise<any>) => {
+        const txAgentWorkUpdate = vi.fn(async (args: any) => {
+          capture.updatedWhere.push(args.where);
+          if (args.data?.state === "CLAIMED") {
+            capture.claimedData.push(args.data);
+          }
+          return {
+            id: "work-1",
+            agentName: args.data?.agentName ?? "new-agent",
+            issueId: "issue-1",
+            state: args.data?.state ?? "CLAIMED",
+            leaseExpiresAt: new Date(),
+            summary: null,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            blockerReason: null,
+            runId: null,
+            checkpoint: "CLAIMED",
+            branch: null,
+            prUrl: null,
+            lastHeartbeatAt: new Date(),
+            issue: { number: 10, repository: { fullName: "org/repo" } },
+          };
+        });
+        const txAgentWorkFindMany = vi.fn(async (args: any) => {
+          capture.findManyAgentNames.push(String(args.where.agentName));
+          return [];
+        });
+        const txAgentWorkHistoryCreate = vi.fn(async (args: any) => {
+          capture.historyCreates.push(args.data);
+          return { id: "hist-1" };
+        });
+
+        return fn({
+          agentWork: {
+            update: txAgentWorkUpdate,
+            findMany: txAgentWorkFindMany,
+          },
+          agentWorkHistory: {
+            create: txAgentWorkHistoryCreate,
+          },
+        });
+      });
+    }
+
+    it("reassigns the stored row when the padded workId matches it", async () => {
+      agentWork.findUnique.mockResolvedValueOnce({
+        id: "work-1",
+        agentName: "old-agent",
+        issueId: "issue-1",
+        state: "IN_PROGRESS",
+        issue: { number: 10, repository: { fullName: "org/repo" } },
+      });
+      const capture = {
+        updatedWhere: [] as Array<Record<string, unknown>>,
+        claimedData: [] as Array<Record<string, unknown>>,
+        historyCreates: [] as Array<Record<string, unknown>>,
+        findManyAgentNames: [] as string[],
+      };
+      mockReassignTransaction(capture);
+
+      const res = await makePostRequest({
+        action: "reassign",
+        workId: "  work-1  ",
+        newAgentName: "new-agent",
+      });
+
+      expect(res.status).toBe(200);
+      // The lookup, both release/rewrite updates and the history row all
+      // name the stored row, not the padded request value.
+      expect(agentWork.findUnique).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: "work-1" } })
+      );
+      expect(capture.updatedWhere).toEqual([{ id: "work-1" }, { id: "work-1" }]);
+      expect(capture.historyCreates).toEqual([
+        expect.objectContaining({ workId: "work-1", action: "reassigned" }),
+      ]);
+    });
+
+    it("writes the canonical agent name onto the row when newAgentName is padded", async () => {
+      agentWork.findUnique.mockResolvedValueOnce({
+        id: "work-1",
+        agentName: "old-agent",
+        issueId: "issue-1",
+        state: "IN_PROGRESS",
+        issue: { number: 10, repository: { fullName: "org/repo" } },
+      });
+      const capture = {
+        updatedWhere: [] as Array<Record<string, unknown>>,
+        claimedData: [] as Array<Record<string, unknown>>,
+        historyCreates: [] as Array<Record<string, unknown>>,
+        findManyAgentNames: [] as string[],
+      };
+      mockReassignTransaction(capture);
+
+      const res = await makePostRequest({
+        action: "reassign",
+        workId: "work-1",
+        newAgentName: "  new-agent  ",
+      });
+
+      expect(res.status).toBe(200);
+      // The CLAIMED rewrite must store the canonical name — a padded value
+      // would strand the row outside every later name-keyed lookup — and
+      // both the history summary and the audit note must name it too.
+      expect(capture.claimedData).toHaveLength(1);
+      expect(capture.claimedData[0]).toEqual(
+        expect.objectContaining({ agentName: "new-agent", state: "CLAIMED" })
+      );
+      expect(capture.findManyAgentNames).toEqual(["new-agent"]);
+      expect(capture.historyCreates).toEqual([
+        expect.objectContaining({ summary: expect.stringContaining("-> new-agent") }),
+      ]);
+      expect(auditLog.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            action: "agent_work_reassigned",
+            notes: expect.stringContaining("Reassigned work from old-agent to new-agent"),
+          }),
+        })
+      );
+    });
+
+    it("treats a whitespace-only workId as absent instead of answering 404", async () => {
+      const res = await makePostRequest({
+        action: "reassign",
+        workId: "   ",
+        newAgentName: "new-agent",
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toBe("Missing workId");
+      expect(agentWork.findUnique).not.toHaveBeenCalled();
+    });
+
+    it("treats a whitespace-only newAgentName as absent", async () => {
+      const res = await makePostRequest({
+        action: "reassign",
+        workId: "work-1",
+        newAgentName: "   ",
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toBe("Missing newAgentName");
+      expect(agentWork.findUnique).not.toHaveBeenCalled();
+    });
+  });
+
   describe("release by agentName + issueId", () => {
     beforeEach(() => {
       vi.clearAllMocks();

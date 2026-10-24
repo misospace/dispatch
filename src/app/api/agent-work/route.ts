@@ -173,7 +173,8 @@ export async function POST(request: Request) {
 }
 
 /**
- * Normalize an operator-supplied identifier for the release path (#1402).
+ * Normalize an operator-supplied identifier for the release and reassign
+ * paths (#1402, #1406).
  *
  * `AgentWork.agentName`, `Lease.agentName` and the work/lease row ids are
  * stored in their canonical form, so the request side is the side that can
@@ -394,8 +395,16 @@ async function releaseAgentWork(body: Record<string, unknown>) {
 }
 
 async function reassignAgentWork(body: Record<string, unknown>) {
-  const workId = typeof body.workId === "string" ? body.workId : null;
-  const newAgentName = typeof body.newAgentName === "string" ? body.newAgentName : null;
+  // #1406: normalize the operator-supplied identifiers so a padded value
+  // matches the value stored on the row. `AgentWork.agentName` is stored as
+  // the agent's canonical name, so a padded `workId` answered 404 instead of
+  // reassigning, and a padded `newAgentName` was written verbatim onto the
+  // row — leaving every later lookup keyed on the agent name
+  // (`releaseLeaseByAgentAndIssue`, `releaseAllLeasesByAgent`,
+  // `releaseAgentWorkByAgentAndIssue`, the agent-work queue) unable to find
+  // the handover.
+  const workId = normalizeOperatorIdentifier(body.workId);
+  const newAgentName = normalizeOperatorIdentifier(body.newAgentName);
   const reason = typeof body.reason === "string" ? body.reason : "Reassigned by operator";
 
   if (!workId) {
