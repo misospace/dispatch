@@ -395,6 +395,32 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
   });
 
+  it("defers a REBASE hand-out when the gate read fails inside the admission (fail closed, #1327 review)", async () => {
+    // One level deeper than the transaction-failure case: the transaction
+    // runs and the advisory lock is taken, but the gate read itself throws
+    // inside the serialized window. The failure must propagate to the same
+    // fail-closed deferral — never a dispatch without the gate (the removed
+    // fallback's behavior) and no hand-out write of any kind.
+    const row = { ...prFixRow(24), type: "REBASE", reason: "Mechanical rebase: PR dirty against base (#1327)" };
+    mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) => {
+      if (where?.OR) throw new Error("gate read unavailable");
+      return [row];
+    });
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+      (where.id === row.id ? { ...row } : null));
+
+    const response = await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    });
+    // The poll stays healthy (no 500); the candidate is deferred.
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.shouldRun).toBe(false);
+    expect(body.prFixItem).toBeUndefined();
+    expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+    expect(row.agentHandouts).toEqual([]);
+  });
+
   it("still dispatches ordinary fix work when the rebase admission fails (#1327 review)", async () => {
     // The fail-closed deferral is REBASE-only: ordinary fix work never takes
     // the lane lock, so a failing REBASE admission must not strand it.
