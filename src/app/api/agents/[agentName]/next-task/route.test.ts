@@ -396,6 +396,10 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       expect(body.type).toBe("followup-pr");
       expect(body.prFixItem.fixType).toBe("REBASE");
       expect(body.prFixItem.id).toBe(row.id);
+      // The config gate precedes, not replaces, the serialized admission:
+      // the hand-out still runs inside the advisory-lock transaction.
+      expect(mocks.prFixTxSurfaces).toContain("findMany");
+      expect(mocks.prFixTxSurfaces).toContain("updateMany");
     });
 
     it("still dispatches ordinary fix work for an agent outside the pool", async () => {
@@ -2919,6 +2923,43 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(contract).toContain("MECHANICALLY ONLY");
     expect(contract).toContain("--force-with-lease");
     expect(contract).toContain("human_decision");
+  });
+
+  it("defers a materialized conflicted linked PR for an agent outside the rebase pool (#1327)", async () => {
+    // The linked-PR materialization loop is a second dispatchPrFixCandidate
+    // caller: the pool gate must hold there too — the row is still
+    // materialized (an eligible poller consumes it next poll), but this
+    // ineligible agent receives no hand-out and never enters the lane
+    // admission.
+    process.env.DISPATCH_REBASE_AGENTS = "local-coder";
+    try {
+      mocks.issueFindMany.mockResolvedValue([
+        linkedIssue(42, 15, {
+          linkedPrMergeState: "dirty",
+          linkedPrFollowupReasons: ["merge_conflict"],
+        }),
+      ]);
+
+      const res = await GET(
+        request("/api/agents/example-agent/next-task?lane=local"),
+        { params: Promise.resolve({ agentName: "example-agent" }) },
+      );
+
+      const body = await res.json();
+      expect(body.shouldRun).toBe(false);
+      expect(body.prFixItem).toBeUndefined();
+      // The row is materialized QUEUED (not dropped), but no hand-out was
+      // stamped and the admission transaction was never entered.
+      expect(mocks.prFixCreate).toHaveBeenCalledTimes(1);
+      expect(mocks.prFixCreate.mock.calls[0][0].data.type).toBe("REBASE");
+      expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+      // The only transaction surface is the materialization create itself
+      // (createLinkedPrFixItem writes in its own $transaction); the rebase
+      // lane admission — gate read + hand-out stamp — was never entered.
+      expect(mocks.prFixTxSurfaces).toEqual(["create"]);
+    } finally {
+      delete process.env.DISPATCH_REBASE_AGENTS;
+    }
   });
 
   it("materializes a linked PR without a merge conflict as an ordinary fix item (#1327)", async () => {
