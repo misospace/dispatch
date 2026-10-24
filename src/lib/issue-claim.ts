@@ -37,6 +37,21 @@ export interface ReleaseIssueClaimOptions {
    * repair keeps its own key and the real release stays unkeyed.
    */
   releaseKey?: string;
+  /**
+   * Release THIS agent's label even when ANOTHER agent's label is also on the
+   * issue.
+   *
+   * A claim MOVE (A→B) needs it: the old owner's label must go even when the
+   * new owner's label is ALREADY there — a retry of the same handover, or a
+   * half-applied one. The skip below protects a NEWER agent's claim from a
+   * stale release and therefore stays in force for every other caller.
+   *
+   * The caller owns the PROOF that the other label belongs to the intended new
+   * owner: the reassign route reads the LIVE label set under the per-issue
+   * mutation anchor and refuses a third agent's claim before it reaches the
+   * release.
+   */
+  allowOtherAgentPresent?: boolean;
 }
 
 export interface ReleaseIssueClaimResult {
@@ -201,7 +216,15 @@ export async function releaseIssueClaim(params: {
 
   // Never remove a newer agent's claim while an old AgentWork row is being
   // recovered. The stale-work caller can still retire the old local row.
-  if (currentAgent && currentAgent !== agentLabel) {
+  //
+  // A claim MOVE opts out (`allowOtherAgentPresent`): it removes the OLD
+  // owner's label while the NEW owner's label is already on the issue — a
+  // retry of the same handover, or a half-applied one. Without the opt-in the
+  // skip would refuse that release and the move would leave BOTH labels on
+  // the issue, which breaks the one-claim-per-issue invariant. The order of
+  // the label set decides which agent the skip reads (`getAgentFromLabels`
+  // takes the FIRST `agent/*` label), so the refusal is not a rare corner.
+  if (currentAgent && currentAgent !== agentLabel && !options.allowOtherAgentPresent) {
     return {
       released: false,
       labels: issue.labels,
@@ -211,7 +234,11 @@ export async function releaseIssueClaim(params: {
     };
   }
 
-  if (!currentAgent) {
+  // The label being released is ABSENT: the claim is already released. The
+  // test is on the TARGET label — not on "some other agent owns the issue" —
+  // so a move whose old label is already gone records the already-released
+  // evidence instead of skipping the release.
+  if (!issue.labels.includes(agentLabel)) {
     if (!options.allowMissingAgent) {
       throw new Error(`Issue is not assigned to ${agentName}`);
     }
@@ -222,7 +249,14 @@ export async function releaseIssueClaim(params: {
     const latestIssue = prisma.issue.findUnique
       ? await prisma.issue.findUnique({ where: { id: issue.id }, select: { labels: true } })
       : null;
-    const cacheLabels = latestIssue?.labels ?? issue.labels;
+    // The mirror must not RE-PERSIST the label this release just proved
+    // absent on GitHub: the re-read can still carry it (the cache row is
+    // behind GitHub), and a stale owner label in the cache keeps the board
+    // listing the issue under the released owner. The sibling
+    // ownership-only branch filters the same label out of its mirror.
+    const cacheLabels = (latestIssue?.labels ?? issue.labels).filter(
+      (label: string) => label !== agentLabel,
+    );
     // A sweep that dies between the GitHub release and the final AgentWork
     // update repeats this repair, so the release event carries an identity:
     // the same already-released repair cannot be recorded twice.
