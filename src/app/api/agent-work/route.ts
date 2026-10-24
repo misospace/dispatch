@@ -38,6 +38,24 @@ interface AgentWorkItem {
   repoFullName: string | null;
 }
 
+/**
+ * Normalize an operator-supplied issue id (#1399).
+ *
+ * `AgentWork.issueId`, `Lease.issueId`, `AuditLog.issueId` and
+ * `OwnershipReleaseIntent.issueId` are foreign keys to `Issue.id`, so a row
+ * only ever carries the normalized id. The operator path keyed every lookup
+ * on the raw request value, so a padded id matched no row: the release freed
+ * nothing, and the reconciler's release intent was looked up on an id no row
+ * carries. Normalizing the input makes it agree with the stored id, like the
+ * worker paths do for their own `issueId` (#1328 checkpoint, #1331 finish).
+ * A whitespace-only value is absent, matching those paths.
+ */
+function normalizeIssueId(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
 function toItem(w: any): AgentWorkItem {
   return {
     id: w.id,
@@ -184,7 +202,7 @@ async function releaseAgentWork(body: Record<string, unknown>) {
   const workId = typeof body.workId === "string" ? body.workId : null;
   const leaseId = typeof body.leaseId === "string" ? body.leaseId : null;
   const agentName = typeof body.agentName === "string" ? body.agentName : null;
-  const issueId = typeof body.issueId === "string" ? body.issueId : null;
+  // #1399: normalize the operator-supplied issue id so a padded value\n  // matches the normalized id stored on the row.\n  const issueId = normalizeIssueId(body.issueId);
   const releaseAll = body.releaseAll === true;
   const reason = typeof body.reason === "string" ? body.reason : "Released by operator";
 
