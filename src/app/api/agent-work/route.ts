@@ -202,7 +202,9 @@ async function releaseAgentWork(body: Record<string, unknown>) {
   const workId = typeof body.workId === "string" ? body.workId : null;
   const leaseId = typeof body.leaseId === "string" ? body.leaseId : null;
   const agentName = typeof body.agentName === "string" ? body.agentName : null;
-  // #1399: normalize the operator-supplied issue id so a padded value\n  // matches the normalized id stored on the row.\n  const issueId = normalizeIssueId(body.issueId);
+  // #1399: normalize the operator-supplied issue id so a padded value
+  // matches the normalized id stored on the row.
+  const issueId = normalizeIssueId(body.issueId);
   const releaseAll = body.releaseAll === true;
   const reason = typeof body.reason === "string" ? body.reason : "Released by operator";
 
