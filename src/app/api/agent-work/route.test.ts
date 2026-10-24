@@ -76,7 +76,8 @@ vi.mock("@/lib/prisma", () => ({
 
 vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock("test-token"));
 
-vi.mock("@/lib/agent-work", () => ({
+vi.mock("@/lib/agent-work", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/agent-work")>()),
   releaseStaleWork: vi.fn(async () => []),
 }));
 
@@ -93,6 +94,7 @@ vi.mock("@/lib/lease", () => ({
 
 import { prisma } from "@/lib/prisma";
 import * as leaseModule from "@/lib/lease";
+import { AGENT_WORK_LEASE_DURATION_MS } from "@/lib/agent-work";
 import { authorizeRequest } from "@/lib/auth";
 import { GET, POST } from "./route";
 
@@ -647,6 +649,7 @@ describe("POST /api/agent-work", () => {
       // Capture the rewrite-to-CLAIMED update: the second of the two updates
       // on work-1 inside the reassign transaction (the first sets RELEASED).
       const claimedUpdates: Array<Record<string, unknown>> = [];
+      const before = Date.now();
       transaction.mockImplementation(async (fn: (tx: any) => Promise<any>) => {
         const txAgentWorkUpdate = vi.fn(async (args: any) => {
           if (args.where.id === "work-1" && args.data.state === "CLAIMED") {
@@ -697,6 +700,21 @@ describe("POST /api/agent-work", () => {
           state: "CLAIMED",
           staleClaimReleasePending: false,
         })
+      );
+
+      // PR #1393 review: the same write must hand the new owner a LIVE
+      // lease. The preceding RELEASED update stamps `leaseExpiresAt` with
+      // "now", so a rewrite that left the field alone would carry an
+      // already-expired lease into the `CLAIMED` shape. The handover is a
+      // fresh claim, so it carries the claim path's horizon — asserted
+      // against the write's own heartbeat so the check is clock-independent.
+      const claimedLease = claimedUpdates[0].leaseExpiresAt as Date | undefined;
+      const claimedHeartbeat = claimedUpdates[0].lastHeartbeatAt as Date | undefined;
+      expect(claimedLease).toBeInstanceOf(Date);
+      expect(claimedHeartbeat).toBeInstanceOf(Date);
+      expect(claimedLease!.getTime()).toBeGreaterThan(before);
+      expect(claimedLease!.getTime() - claimedHeartbeat!.getTime()).toBe(
+        AGENT_WORK_LEASE_DURATION_MS
       );
     });
   });

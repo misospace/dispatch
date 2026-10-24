@@ -4,6 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { enforceWorkerAgentScope, enforceWorkerBound } from "@/lib/worker-identity";
 import { releaseLeaseByAgentAndIssue, releaseAllLeasesByAgent, releaseAgentWorkByAgentAndIssue } from "@/lib/lease";
+import { AGENT_WORK_LEASE_DURATION_MS } from "@/lib/agent-work";
 import { supersedeOwnershipReleaseIntent } from "@/lib/ownership-reconciliation";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
@@ -393,11 +394,16 @@ async function reassignAgentWork(body: Record<string, unknown>) {
       return errorResponse("Work item not found", 404);
     }
 
+    // One instant for the whole handover: the old owner's lease expires now,
+    // and the new owner's claim starts from the same instant.
+    const now = new Date();
+    const leaseExpiresAt = new Date(now.getTime() + AGENT_WORK_LEASE_DURATION_MS);
+
     const work = await prisma.$transaction(async (tx) => {
       // Release old agent's work
       await tx.agentWork.update({
         where: { id: workId },
-        data: { state: "RELEASED", leaseExpiresAt: new Date() },
+        data: { state: "RELEASED", leaseExpiresAt: now },
       });
       await tx.agentWorkHistory.create({
         data: { workId, action: "reassigned", summary: `${reason} -> ${newAgentName}` },
@@ -410,7 +416,7 @@ async function reassignAgentWork(body: Record<string, unknown>) {
       for (const active of newAgentActive) {
         await tx.agentWork.update({
           where: { id: active.id },
-          data: { state: "RELEASED", leaseExpiresAt: new Date() },
+          data: { state: "RELEASED", leaseExpiresAt: now },
         });
         await tx.agentWorkHistory.create({
           data: { workId: active.id, action: "released_by_reassignment" },
@@ -429,10 +435,27 @@ async function reassignAgentWork(body: Record<string, unknown>) {
         // component could advance it. The operator's reassignment supersedes the sweep's
         // decision on the row, so the rewrite settles it here; the sweep
         // stays the single owner of retiring an owed release elsewhere.
+        //
+        // PR #1393 review: the rewrite must also leave the row with a LIVE
+        // lease. The RELEASED write above stamps `leaseExpiresAt` with `now`,
+        // so a rewrite that left the field alone would carry an expiry that
+        // is already in the past into the `CLAIMED` shape — a shape no claim
+        // path produces. The sweep's reclaim arm
+        // (`src/lib/stale-work.ts:161`) fires on
+        // `lastHeartbeatAt < cutoff OR leaseExpiresAt < cutoff`, so an expiry
+        // that is not ahead of the heartbeat lets the EXPIRY arm fire at the
+        // same instant as the heartbeat arm instead of strictly after it.
+        // The handover is a fresh claim, so it carries the claim path's lease
+        // horizon (`AGENT_WORK_LEASE_DURATION_MS`, the same value
+        // `startAgentWork`/`checkpointAgentWork` stamp): the expiry stays
+        // ahead of the heartbeat, the reclaim stays governed by the heartbeat
+        // window — exactly like a row from `startAgentWork` — and the field
+        // never shrinks under the new owner.
         data: {
           agentName: newAgentName,
           state: "CLAIMED",
-          lastHeartbeatAt: new Date(),
+          lastHeartbeatAt: now,
+          leaseExpiresAt,
           staleClaimReleasePending: false,
         },
         include: { issue: { select: { number: true, repository: { select: { fullName: true } } } } },

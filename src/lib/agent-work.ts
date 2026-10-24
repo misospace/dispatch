@@ -2,6 +2,20 @@ import { normalizeAgentWorkState, normalizeAgentWorkCheckpoint, AgentWorkState, 
 import { nonEmpty } from "./pr-fix-queue";
 import { findCurrentClaimWork } from "./worker-ownership";
 
+/**
+ * The lease horizon the CLAIM PATH stamps on an active AgentWork row: how
+ * long the claim stays live without a heartbeat. `startAgentWork` stamps it
+ * on every start and `checkpointAgentWork` on every checkpoint, so the
+ * field's horizon is stable across a claim's writes. Writers outside the
+ * claim path use their own horizons on purpose (the ownership renewal writes
+ * its configurable renew TTL, a `blocked` disposition writes the park
+ * deadline), so this constant names the claim path's horizon only — a writer
+ * that stamped a different expiry would shrink the lease under the worker,
+ * and one that left the field at a past timestamp would hand the sweep an
+ * already-expired claim.
+ */
+export const AGENT_WORK_LEASE_DURATION_MS = 5 * 60 * 1000;
+
 export type AgentWorkClient = {
   agentWork: {
     findUnique: (args: any) => Promise<any>;
@@ -191,8 +205,7 @@ export function parseFinishAgentWorkInput(body: unknown): FinishAgentWorkInput |
 
 export async function startAgentWork(client: AgentWorkClient, input: StartAgentWorkInput) {
   const now = new Date();
-  const leaseDuration = 5 * 60 * 1000; // 5 minutes
-  const leaseExpiresAt = new Date(now.getTime() + leaseDuration);
+  const leaseExpiresAt = new Date(now.getTime() + AGENT_WORK_LEASE_DURATION_MS);
 
   return client.$transaction(async (tx) => {
     // Release all existing active work for this agent (single work per agent)
@@ -232,7 +245,6 @@ export async function startAgentWork(client: AgentWorkClient, input: StartAgentW
 
 export async function checkpointAgentWork(client: AgentWorkClient, input: CheckpointAgentWorkInput) {
   const now = new Date();
-  const leaseDuration = 5 * 60 * 1000;
 
   return client.$transaction(async (tx) => {
     // #1328: select the current claim's work through the shared deterministic
@@ -249,7 +261,7 @@ export async function checkpointAgentWork(client: AgentWorkClient, input: Checkp
     }
 
     // Extend lease on heartbeat
-    const leaseExpiresAt = new Date(now.getTime() + leaseDuration);
+    const leaseExpiresAt = new Date(now.getTime() + AGENT_WORK_LEASE_DURATION_MS);
 
     const updateData: Record<string, unknown> = {
       lastHeartbeatAt: now,
