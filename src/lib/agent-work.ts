@@ -414,6 +414,11 @@ export async function releaseStaleWork(client: AgentWorkClient, maxAgeMs: number
  * pairs it with the STALE mark), so the boundary is defence in depth on top
  * of the state filter.
  *
+ * The delete is fenced on the same conjuncts the scan matched, ownership
+ * included: a row whose owner changed between the scan and the delete
+ * (reassigned to another agent) is left to its new owner instead of being
+ * deleted out from under it.
+ *
  * Returns the count of deleted records.
  */
 export async function findAndReleaseStaleAgentWorkForIssue(
@@ -455,20 +460,24 @@ export async function findAndReleaseStaleAgentWorkForIssue(
 
   // Delete + audit atomically so a deletion is never left without its audit
   // row. Each delete is fenced on the SAME conjuncts the scan matched (#1350):
-  // the executing state family and the pending-release boundary, mirroring the
-  // sweep's own CAS practice. A row that changed shape between the scan and
-  // the delete — a writer outside the per-issue mutation guard, e.g. the
-  // self-heal agent-work routes — is left for whoever now owns that shape, and
-  // the audit (and the returned count) report exactly the rows the fence
-  // actually consumed. The claim route runs this cleanup inside that guard, so
-  // a fenced miss does not happen there; preserving the row is the safe
-  // direction in every case.
+  // the executing state family, the pending-release boundary, and the scanned
+  // ownership fields (`issueId`, `agentName`), mirroring the sweep's own CAS
+  // practice. A row that changed shape between the scan and the delete — a
+  // writer outside the per-issue mutation guard, e.g. the operator
+  // agent-work routes (release / release-all / reassign) and the self-heal
+  // routes — is left for whoever now owns that shape, and the audit (and the
+  // returned count) report exactly the rows the fence actually consumed. The
+  // claim route runs this cleanup inside that guard, but the other callers do
+  // not, so the fence (not the guard) is the load-bearing protection here;
+  // preserving the row is the safe direction in every case.
   const deletedIds: string[] = [];
   await prisma.$transaction(async (tx: any) => {
     for (const work of staleWorks) {
       const deleted = await tx.agentWork.deleteMany({
         where: {
           id: work.id,
+          issueId,
+          agentName: work.agentName,
           state: { in: ["CLAIMED", "IN_PROGRESS"] },
           staleClaimReleasePending: false,
         },
