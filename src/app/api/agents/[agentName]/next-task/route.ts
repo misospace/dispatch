@@ -465,7 +465,10 @@ export async function GET(
        // ordinary-dispatched row that merely looks dirty now is settled as
        // its stamped lane, so the rebase gate is not its bound. Deferral is
        // transient: the next poll retries it. Non-rebase fix work is
-       // unaffected.
+       // unaffected. `attemptType` is trustworthy as the current attempt's
+       // lane because `freshAttemptGeneration` clears it on every generation
+       // bump: non-null here means THIS generation was handed out as that
+       // lane; a fresh attempt falls back to the queue type.
        const dispatchedLane = candidate.attemptType ?? candidate.fixType;
        if (dispatchedLane === "REBASE") {
          try {

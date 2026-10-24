@@ -5669,3 +5669,41 @@ describe("withRebaseLaneAdmission (#1327 review)", () => {
     await expect(withRebaseLaneAdmission(client, async () => "admitted")).rejects.toThrow("lock_timeout");
   });
 });
+
+describe("fresh attempts drop the previous attempt's dispatched lane (#1327 review)", () => {
+  it("requeue clears attemptType with the generation bump", async () => {
+    const client = makeClient();
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 410, lane: "NORMAL", type: "REBASE", reason: "r", feedback: "f", evidenceKey: "k410" });
+    // The REBASE attempt was handed out (lane stamped) and parked blocked.
+    client.items[0].attemptType = "REBASE";
+    client.items[0].agentHandouts = ["worker-a@1"];
+    client.items[0].status = "BLOCKED";
+
+    const requeued = await requeuePrFixItem(client, { repo: "org/repo", pr: 410, note: "fresh episode" });
+    expect(requeued?.generation, "requeue is a fresh work identity").toBe(2);
+    expect(requeued?.attemptType, "a fresh attempt carries no dispatched lane").toBeNull();
+  });
+
+  it("a reopen after a settled REBASE does not inherit the rebase lane", async () => {
+    // The reviewed bypass: a REBASE episode settles, the PR later re-observes
+    // as ordinary work, and the reopened row's STALE attemptType made
+    // next-task treat the fresh attempt as the dead lane — skipping the
+    // rebase serialization for what is a fresh REBASE by type, or gating
+    // ordinary work behind the rebase lane. The lane resets with the
+    // generation, so the row's lane is its queue type again.
+    const client = makeClient();
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 411, lane: "NORMAL", type: "REBASE", reason: "r", feedback: "f", evidenceKey: "merge_state:org/repo#411" });
+    client.items[0].attemptType = "REBASE";
+    await markPrFixItem(client, { repo: "org/repo", pr: 411, status: "FIXED", note: "rebased" });
+
+    const reopened = await enqueuePrFixItem(client, { repo: "org/repo", pr: 411, lane: "NORMAL", type: "CI_FAILURE", reason: "r2", feedback: "f2", evidenceKey: "checks_failed:org/repo#411" });
+    expect(reopened.status).toBe("QUEUED");
+    expect(reopened.attemptType, "the reopen is a fresh attempt, not the old REBASE dispatch").toBeNull();
+
+    // With a live hand-out, the gate reads the row by its current lane
+    // (CI_FAILURE): the ordinary attempt must not occupy the rebase lane.
+    reopened.agentHandouts = ["worker-a@2"];
+    reopened.dispatchedAt = new Date();
+    expect(await hasInFlightRebaseHandout(client)).toBe(false);
+  });
+});

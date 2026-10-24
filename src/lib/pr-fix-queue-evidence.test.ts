@@ -653,7 +653,9 @@ describe("legacy fallback and snapshot lifecycle (#1249)", () => {
   });
 
   it("freshAttemptGeneration resets the watermark everywhere a fresh attempt is minted", () => {
-    expect(freshAttemptGeneration()).toEqual({ generation: { increment: 1 }, attemptEvidenceWatermark: null });
+    // #1327 review: the DISPATCHED lane resets with the attempt too, so a
+    // reopened row never masquerades as the previous attempt's lane.
+    expect(freshAttemptGeneration()).toEqual({ generation: { increment: 1 }, attemptEvidenceWatermark: null, attemptType: null });
   });
 });
 

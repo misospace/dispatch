@@ -87,7 +87,14 @@ export async function withRebaseLaneAdmission<T>(
   return client.$transaction(async (tx) => {
     if (typeof tx.$executeRaw === "function") {
       // `SET` accepts no bind parameters, so the interval is a literal.
-      await tx.$executeRaw(Prisma.raw("SET LOCAL lock_timeout = '5s'"));
+      // 3s is deliberately BELOW Prisma's interactive-transaction timeout
+      // (default 5s): the lock wait must end on the PG side — statement
+      // cancelled, transaction aborted, caller fails open — before Prisma
+      // gives up on a connection still blocked inside the lock function,
+      // where its rollback cannot land and the abandoned transaction would
+      // transiently re-acquire and hold the lock the fail-open path just
+      // raced past.
+      await tx.$executeRaw(Prisma.raw("SET LOCAL lock_timeout = '3s'"));
       await tx.$executeRaw(Prisma.sql`SELECT pg_advisory_xact_lock(${REBASE_LANE_ADVISORY_LOCK_KEY})`);
     }
     return run(tx);
@@ -3427,13 +3434,22 @@ export async function reconcileArchivedRepoPrFixItems(
 export function freshAttemptGeneration(): {
   generation: { increment: number };
   attemptEvidenceWatermark: null;
+  attemptType: null;
 } {
   // A fresh attempt has no hand-out yet, so it has no evidence snapshot: the
   // watermark resets alongside the post-dispatch list and dies only with the
   // generation it bounded (#1249). The durable ledger COUNTER is not reset —
   // ledger positions are per-item history, and a stale-low watermark must
   // never survive into a new attempt to make known evidence read as new.
-  return { generation: { increment: 1 }, attemptEvidenceWatermark: null };
+  //
+  // #1327 review: the DISPATCHED lane resets with the attempt too. A
+  // non-null `attemptType` means "this generation was handed out as that
+  // lane"; letting it survive a generation bump would make next-task's
+  // concurrency gate read a dead attempt as the live lane — masking a fresh
+  // REBASE attempt (bypassing the gate and its serialization, a fan-out
+  // door) or gating an ordinary fresh attempt behind the rebase lane. The
+  // lane is stamped by the hand-out itself; a fresh attempt has none.
+  return { generation: { increment: 1 }, attemptEvidenceWatermark: null, attemptType: null };
 }
 
 /**
