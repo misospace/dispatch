@@ -406,6 +406,32 @@ export async function releaseStaleWork(client: AgentWorkClient, maxAgeMs: number
  * History entries are automatically cascaded via onDelete: Cascade.
  * An AuditLog entry is created for traceability.
  *
+ * #1350: a row still owed a claim release (`staleClaimReleasePending`) is
+ * never consumed here — neither the scan nor the delete takes one. This
+ * cleanup is the repository's only `agentWork.deleteMany` (the sweep only
+ * MARKS rows STALE), so leaving a pending row out of it is what keeps the
+ * release the previous sweep decided on from being dropped. The sweep's own
+ * boundary (`activeStateFamilies` in `stale-work.ts` is the canon) is
+ * `staleClaimReleasePending: false`, mirrored here.
+ *
+ * The marker conjunct is LOAD-BEARING, not redundant with the state filter:
+ * the operator reassign route rewrites a row to `state: "CLAIMED"` without
+ * clearing the marker, so a sweep-marked `STALE` row can arrive here as an
+ * ACTIVE-SHAPED row that still owes its release, and the state filter alone
+ * would not keep it. Who retires it differs by shape: the sweep's retry arm
+ * (`state: "STALE"`, `staleClaimReleasePending: true`) retires the owed
+ * release of a STALE row, but an ACTIVE-SHAPED pending row belongs to NO
+ * sweep arm — its reclaim arms require `staleClaimReleasePending: false` and
+ * its retry arm requires `state: "STALE"` — so the sweep cannot retire it
+ * either. This boundary is what keeps such a row, and the owed release it
+ * carries, alive instead of dropping it; the stranded-release side of that
+ * shape is tracked in #1391.
+ *
+ * The delete is fenced on the same conjuncts the scan matched, ownership
+ * included: a row whose owner changed between the scan and the delete
+ * (reassigned to another agent) is left to its new owner instead of being
+ * deleted out from under it.
+ *
  * Returns the count of deleted records.
  */
 export async function findAndReleaseStaleAgentWorkForIssue(
@@ -425,11 +451,19 @@ export async function findAndReleaseStaleAgentWorkForIssue(
 
   const activeAgentNames = Array.from(new Set(activeLeases.map((l: any) => l.agentName)));
 
-  // Find active AgentWork records for this issue whose agent has no active lease
+  // Find active AgentWork records for this issue whose agent has no active lease.
+  //
+  // #1350: the pending-release boundary is shared with the stale-work sweep
+  // (`activeStateFamilies` in `stale-work.ts` is the canon) — a row still owed
+  // a claim release is never this cleanup's to take. The state filter already
+  // keeps a marked STALE row out; this conjunct additionally refuses an
+  // active-shaped row that still owes its release, so a claim attempt cannot
+  // hard-delete the release a previous sweep decided on.
   const staleWorks = await prisma.agentWork.findMany({
     where: {
       issueId,
       state: { in: ["CLAIMED", "IN_PROGRESS"] },
+      staleClaimReleasePending: false,
       agentName: { notIn: activeAgentNames },
     },
     select: { id: true, agentName: true },
@@ -437,13 +471,50 @@ export async function findAndReleaseStaleAgentWorkForIssue(
 
   if (staleWorks.length === 0) return 0;
 
-  const staleIds = staleWorks.map((w: any) => w.id);
-
-  // Delete + audit atomically so a deletion is never left without its audit row.
+  // Delete + audit atomically so a deletion is never left without its audit
+  // row. Each delete is fenced on the SAME conjuncts the scan matched (#1350):
+  // the executing state family, the pending-release boundary, and the scanned
+  // ownership fields (`issueId`, `agentName`), mirroring the sweep's own CAS
+  // practice. A row that changed shape between the scan and the delete is
+  // left for whoever now owns that shape, and the audit (and the returned
+  // count) report exactly the rows the fence actually consumed.
+  //
+  // The claim route (this function's only production caller) runs this cleanup
+  // inside the per-issue mutation guard, but the writers it races with do NOT
+  // take that guard: the operator agent-work routes (release / release-all /
+  // reassign — `src/app/api/agent-work/route.ts`), the operator unclaim path
+  // (`releaseAgentWorkByAgentAndIssue` — `src/lib/lease.ts`, called from
+  // `src/app/api/issues/unclaim/route.ts` AFTER its guarded block) and the
+  // worker agent-work start / checkpoint / finish paths (`src/lib/agent-work.ts`).
+  // The fence (not the guard) is therefore the load-bearing protection here;
+  // preserving the row is the safe direction in every case. The stale-work
+  // sweep — the only writer that SETS the pending marker — does take the
+  // guard, so it normally cannot interleave with the claim path (a maintainer
+  // force-claim may override that guard); either way the fence's pending
+  // conjunct refuses a row that became pending after the scan, so the
+  // reachable pending shape is one that ARRIVES pending (the operator
+  // reassign route's leftover marker).
+  // One CAS delete per candidate row (N = the issue's leftover rows), all
+  // inside the transaction: a failure rolls the whole cleanup back, so a
+  // partial delete without its audit row is not reachable.
+  const deletedIds: string[] = [];
   await prisma.$transaction(async (tx: any) => {
-    await tx.agentWork.deleteMany({
-      where: { id: { in: staleIds } },
-    });
+    for (const work of staleWorks) {
+      const deleted = await tx.agentWork.deleteMany({
+        where: {
+          id: work.id,
+          issueId,
+          agentName: work.agentName,
+          state: { in: ["CLAIMED", "IN_PROGRESS"] },
+          staleClaimReleasePending: false,
+        },
+      });
+      if ((deleted?.count ?? 0) === 1) {
+        deletedIds.push(work.id);
+      }
+    }
+
+    if (deletedIds.length === 0) return;
 
     await tx.auditLog.create({
       data: {
@@ -452,10 +523,10 @@ export async function findAndReleaseStaleAgentWorkForIssue(
         repoFullName,
         issueId: issueId,
         success: true,
-        notes: `Deleted ${staleWorks.length} stale AgentWork record(s) with no matching active Lease (agentWorkIds=[${staleIds.join(", ")}])`,
+        notes: `Deleted ${deletedIds.length} stale AgentWork record(s) with no matching active Lease (agentWorkIds=[${deletedIds.join(", ")}])`,
       },
     });
   });
 
-  return staleWorks.length;
+  return deletedIds.length;
 }

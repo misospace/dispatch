@@ -172,8 +172,10 @@ every 5 min when the in-process scheduler is enabled
   `skipped`, and `leasesReleased` — the number of lease rows the CAS-fenced
   delete actually consumed, so operators can see when a reclaim ran without a
   lease and when a retention deleted nothing (#1317 accounting).
-- `findAndReleaseStaleAgentWorkForIssue` (`src/lib/agent-work.ts:350`) deletes
-  `AgentWork` rows with no matching active lease during a claim.
+- `findAndReleaseStaleAgentWorkForIssue` (`src/lib/agent-work.ts:437`) deletes
+  `AgentWork` rows with no matching active lease during a claim, skipping any row
+  still owed a claim release (`staleClaimReleasePending`) and fencing each delete
+  on the scanned row's state, owner and issue (#1350).
 
 **Gap:** the sweep's liveness inputs are still heartbeat and lease-expiry age
 only. A worker whose model call or test run exceeds the heartbeat window, or
