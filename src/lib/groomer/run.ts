@@ -1375,6 +1375,12 @@ async function executeGroomerRun(
     // #1362: release only a row THIS run minted. A renewal of an existing
     // lease (e.g. one this agent's earlier run or a live attempt still owns)
     // must leave the row intact for its minting attempt's own lifecycle.
+    // A leftover renewed row is TTL-bounded, not stranded: the renewal
+    // pushed `expiredAt` forward by GROOMER_LEASE_TTL_MS, after which the
+    // row is no longer an active lease (findActiveLeasesForIssue filters on
+    // expiry) and the claim route's expired-lease recovery purges it. A
+    // non-force worker claim can therefore see this agent's renewed lease as
+    // an active conflict for at most that window.
     if (lease && leaseMintedByThisRun) await deps.releaseLease(lease.id);
   }
 }
