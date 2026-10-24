@@ -32,6 +32,31 @@ describe("parseStartAgentWorkInput", () => {
     expect(parseStartAgentWorkInput([])).toEqual({ error: "Invalid JSON body: expected an object" });
     expect(parseStartAgentWorkInput("string")).toEqual({ error: "Invalid JSON body: expected an object" });
   });
+
+  it("trims a padded issueId", () => {
+    const result = parseStartAgentWorkInput({ agentName: "test-agent", issueId: " issue-1 " });
+    expect(result).toEqual(expect.objectContaining({ issueId: "issue-1" }));
+  });
+
+  it("treats a non-string issueId as absent", () => {
+    const result = parseStartAgentWorkInput({ agentName: "test-agent", issueId: 42 });
+    expect(result).toEqual(expect.objectContaining({ issueId: null }));
+  });
+
+  it("treats an empty-string issueId as absent", () => {
+    const result = parseStartAgentWorkInput({ agentName: "test-agent", issueId: "" });
+    expect(result).toEqual(expect.objectContaining({ issueId: null }));
+  });
+
+  it("treats a whitespace-only issueId as absent", () => {
+    const result = parseStartAgentWorkInput({ agentName: "test-agent", issueId: " " });
+    expect(result).toEqual(expect.objectContaining({ issueId: null }));
+  });
+
+  it("treats an absent issueId as absent", () => {
+    const result = parseStartAgentWorkInput({ agentName: "test-agent" });
+    expect(result).toEqual(expect.objectContaining({ issueId: null }));
+  });
 });
 
 describe("parseCheckpointAgentWorkInput", () => {
@@ -269,6 +294,20 @@ describe("startAgentWork", () => {
 
     expect(tx.agentWork.update).toHaveBeenCalledWith(
       expect.objectContaining({ where: expect.objectContaining({ id: "old-work-other" }), data: expect.objectContaining({ state: "RELEASED" }) })
+    );
+  });
+
+  // #1355: the write is the FK write that a padded id used to fail, so the
+  // created row must carry the normalized id, not the raw request text.
+  it("persists the normalized issueId on the created row", async () => {
+    const tx = createMockTransaction();
+    const parsed = parseStartAgentWorkInput({ agentName: "agent-1", issueId: " issue-1 " });
+    if ("error" in parsed) throw new Error(`unexpected parse error: ${parsed.error}`);
+
+    await startAgentWork(tx, parsed);
+
+    expect(tx.agentWork.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ issueId: "issue-1" }) })
     );
   });
 });

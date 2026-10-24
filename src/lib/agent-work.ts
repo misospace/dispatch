@@ -44,6 +44,15 @@ export type AgentWorkClient = {
  */
 export interface StartAgentWorkInput {
   agentName: string;
+  /**
+   * Optional GitHub issue ID identifying the start's issue.
+   *
+   * Normalized by the parser, like the checkpoint (#1328) and finish (#1331)
+   * parsers: a non-string or whitespace-only value is absent, and any other
+   * value is trimmed. `AgentWork.issueId` and `AuditLog.issueId` are foreign
+   * keys to `Issue.id`, so a padded value used to fail the write instead of
+   * normalizing like the other two endpoints.
+   */
   issueId?: string | null;
   runId?: string | null;
   branch?: string | null;
@@ -135,7 +144,7 @@ export function parseStartAgentWorkInput(body: unknown): StartAgentWorkInput | {
 
   return {
     agentName: input.agentName.trim(),
-    issueId: typeof input.issueId === "string" ? input.issueId : null,
+    issueId: typeof input.issueId === "string" && nonEmpty(input.issueId.trim()) ? input.issueId.trim() : null,
     runId: typeof input.runId === "string" ? input.runId : null,
     branch: typeof input.branch === "string" ? input.branch : null,
   };
