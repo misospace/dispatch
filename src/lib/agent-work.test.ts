@@ -1076,6 +1076,68 @@ describe("findAndReleaseStaleAgentWorkForIssue", () => {
     expect(row.issueId).toBe("issue-2");
   });
 
+  it("a lease taken between the scan and the delete protects the row (#1390)", async () => {
+    // The scan's lease exclusion is evaluated at scan time; a lease taken
+    // after it (the agent resumes its work, or a force-claim takes the issue)
+    // is invisible to the delete's own conjuncts (id/issueId/agentName/state/
+    // marker). The cleanup must re-read the protecting-lease set inside the
+    // transaction and decline the candidate: consume nothing, return 0, and
+    // write no audit row claiming a deletion that did not happen.
+    const { findAndReleaseStaleAgentWorkForIssue } = await import("./agent-work");
+    // Scan sees no protecting lease; the in-transaction re-read sees the one
+    // taken mid-flight for the scanned agent.
+    mockPrisma.lease.findMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([{ agentName: "resumed-agent" }]);
+    (mockPrisma.agentWork as any)._mockData = [
+      { id: "resumed-1", issueId: "issue-1", state: "IN_PROGRESS", agentName: "resumed-agent", staleClaimReleasePending: false },
+    ];
+
+    const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1", "org/repo");
+    expect(result).toBe(0);
+    expect(mockPrisma.agentWork.deleteMany).not.toHaveBeenCalled();
+    expect(mockPrisma.auditLog.create).not.toHaveBeenCalled();
+    const row = ((mockPrisma.agentWork as any)._mockData as any[])[0];
+    expect(row.id).toBe("resumed-1");
+  });
+
+  it("a mid-flight lease declines only its own agent; other candidates are still consumed (#1390)", async () => {
+    // The re-read decline is per-candidate: an agent that took a lease
+    // mid-flight keeps its row, while a genuinely lease-less leftover row is
+    // still deleted, and the audit / returned count report ONLY the consumed
+    // row — never the declined one.
+    const { findAndReleaseStaleAgentWorkForIssue } = await import("./agent-work");
+    mockPrisma.lease.findMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([{ agentName: "resumed-agent" }]);
+    (mockPrisma.agentWork as any)._mockData = [
+      { id: "resumed-1", issueId: "issue-1", state: "IN_PROGRESS", agentName: "resumed-agent", staleClaimReleasePending: false },
+      { id: "leftover-1", issueId: "issue-1", state: "CLAIMED", agentName: "crashed-agent", staleClaimReleasePending: false },
+    ];
+    mockPrisma.agentWork.deleteMany.mockImplementation(({ where }: any) => {
+      const rows = (mockPrisma.agentWork as any)._mockData as any[];
+      const row = rows.find((r: any) => r.id === where.id);
+      if (row && fencedWhereMatches(where, row)) {
+        rows.splice(rows.indexOf(row), 1);
+        return Promise.resolve({ count: 1 });
+      }
+      return Promise.resolve({ count: 0 });
+    });
+
+    const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1", "org/repo");
+    expect(result).toBe(1);
+    expect(mockPrisma.agentWork.deleteMany).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.agentWork.deleteMany).toHaveBeenCalledWith({
+      where: expect.objectContaining({ id: "leftover-1", agentName: "crashed-agent" }),
+    });
+    const notes = mockPrisma.auditLog.create.mock.calls[0][0].data.notes as string;
+    expect(notes).toContain("Deleted 1 stale AgentWork record");
+    expect(notes).toContain("leftover-1");
+    expect(notes).not.toContain("resumed-1");
+    const survivor = ((mockPrisma.agentWork as any)._mockData as any[])[0];
+    expect(survivor.id).toBe("resumed-1");
+  });
+
   it("deletes and audits in one transaction, and surfaces an audit failure (#1350)", async () => {
     // "A deletion is never left without its audit row" is a transaction-level
     // invariant: the deletes and the audit row must go through the SAME
@@ -1091,8 +1153,13 @@ describe("findAndReleaseStaleAgentWorkForIssue", () => {
     const outerDelete = vi.fn();
     const outerAudit = vi.fn();
     const txDelete = vi.fn().mockResolvedValue({ count: 1 });
+    const txLeaseFindMany = vi.fn().mockResolvedValue([]);
     const txAudit = vi.fn().mockResolvedValue({ id: "log-1" });
-    const tx = { agentWork: { deleteMany: txDelete }, auditLog: { create: txAudit } };
+    const tx = {
+      lease: { findMany: txLeaseFindMany },
+      agentWork: { deleteMany: txDelete },
+      auditLog: { create: txAudit },
+    };
     const scopedPrisma: any = {
       lease: { findMany: vi.fn().mockResolvedValue([]) },
       agentWork: {
@@ -1111,6 +1178,9 @@ describe("findAndReleaseStaleAgentWorkForIssue", () => {
     const result = await findAndReleaseStaleAgentWorkForIssue(scopedPrisma, "issue-1", "org/repo");
     expect(result).toBe(1);
     expect(scopedPrisma.$transaction).toHaveBeenCalledTimes(1);
+    // The #1390 lease re-read goes through the TRANSACTION client, not the
+    // outer one: the protection must observe the state the delete will see.
+    expect(txLeaseFindMany).toHaveBeenCalledTimes(1);
     // The delete and the audit row both went through the TRANSACTION client.
     expect(txDelete).toHaveBeenCalledTimes(1);
     expect(txAudit).toHaveBeenCalledTimes(1);

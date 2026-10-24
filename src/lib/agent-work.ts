@@ -444,6 +444,19 @@ export async function releaseStaleWork(client: AgentWorkClient, maxAgeMs: number
  * (reassigned to another agent) is left to its new owner instead of being
  * deleted out from under it.
  *
+ * #1390: the lease-derived exclusion is re-derived INSIDE the cleanup
+ * transaction, not carried over from the pre-transaction scan. A lease taken
+ * between the scan and the delete (the agent resumes its work, or a
+ * force-claim takes the issue) keeps its row: the delete would otherwise
+ * match on `id`/`issueId`/`agentName`/state/marker — none of which observes
+ * the newly taken lease — and drop live work. A candidate whose agent holds
+ * a protecting lease at re-read time is DECLINED, not deleted: the fence
+ * consumes nothing, the count stays as-is, and no audit row claims the
+ * deletion. Declines are logged so they are not invisible to operators.
+ * The re-read narrows the race to the window between it and the delete
+ * statement (READ COMMITTED cannot close it fully); the delete-fence conjuncts
+ * above stay the last line of defense, same as before.
+ *
  * Returns the count of deleted records.
  */
 export async function findAndReleaseStaleAgentWorkForIssue(
@@ -510,8 +523,28 @@ export async function findAndReleaseStaleAgentWorkForIssue(
   // inside the transaction: a failure rolls the whole cleanup back, so a
   // partial delete without its audit row is not reachable.
   const deletedIds: string[] = [];
+  const declinedAgentNames: string[] = [];
   await prisma.$transaction(async (tx: any) => {
+    // #1390: re-read the protecting-lease set inside the transaction. The
+    // scan's exclusion was evaluated at scan time; a lease taken after it
+    // (agent resume, force-claim) must protect its row, and the fenced
+    // delete's own conjuncts cannot observe it. Same predicate as the scan's
+    // lease read: non-expired, or a running park.
+    const txNow = new Date();
+    const liveLeases = await tx.lease.findMany({
+      where: {
+        issueId,
+        OR: [{ expiredAt: { gt: txNow } }, { retryAfter: { gt: txNow } }],
+      },
+      select: { agentName: true },
+    });
+    const liveAgentNames = new Set<string>(liveLeases.map((l: any) => l.agentName));
+
     for (const work of staleWorks) {
+      if (liveAgentNames.has(work.agentName)) {
+        declinedAgentNames.push(work.agentName);
+        continue;
+      }
       const deleted = await tx.agentWork.deleteMany({
         where: {
           id: work.id,
@@ -539,6 +572,12 @@ export async function findAndReleaseStaleAgentWorkForIssue(
       },
     });
   });
+
+  if (declinedAgentNames.length > 0) {
+    console.info(
+      `[agent-work] stale cleanup declined ${declinedAgentNames.length} candidate(s) after a lease was taken mid-flight on issue ${issueId} (agents=[${declinedAgentNames.join(", ")}])`,
+    );
+  }
 
   return deletedIds.length;
 }
