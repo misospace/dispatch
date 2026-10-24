@@ -210,7 +210,11 @@ function makeClient(): PrFixQueueClient & {
           (i) =>
             (where.id === undefined || i.id === where.id) &&
             (where.generation === undefined || i.generation === where.generation) &&
-            (where.status === undefined || i.status === where.status) &&
+            (where.status === undefined
+              ? true
+              : typeof where.status === "string"
+                ? i.status === where.status
+                : where.status.in !== undefined && where.status.in.includes(i.status)) &&
             (where.dispatchedGeneration === undefined || i.dispatchedGeneration === where.dispatchedGeneration) &&
             (where.retryAt === undefined || (where.retryAt.lte && i.retryAt != null && new Date(i.retryAt).getTime() <= new Date(where.retryAt.lte).getTime()) || i.retryAt === where.retryAt) &&
             (where.postDispatchEvidenceKeys === undefined ||
@@ -5033,7 +5037,12 @@ describe("PR-fix outcome separation (#1218)", () => {
       expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
     });
 
-    it("a sequential worker mark PARKED -> BLOCKED at unchanged generation no-ops", async () => {
+    // #1340: the one direction the sticky pin relaxes — a worker-tier BLOCKED
+    // mark may escalate a same-generation PARKED row into a genuine human
+    // decision (a run that parks for bounded no-progress and later ends
+    // NeedsHuman reports `blocked`). A recorded BLOCKED stays sticky against
+    // every other mark; only this one transition is allowed.
+    it("a sequential worker mark PARKED -> BLOCKED at unchanged generation escalates (#1340)", async () => {
       await enqueuePrFixItem(client, {
         repo: "org/repo", pr: 319, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k319",
       });
@@ -5047,19 +5056,120 @@ describe("PR-fix outcome separation (#1218)", () => {
       surfacingMocks.surfacePrFixParked.mockClear();
       surfacingMocks.surfacePrFixBlocked.mockClear();
 
-      // Worker tries to escalate back to BLOCKED at the same generation —
-      // the sticky state pin must refuse, since PARKED was a real cap and
-      // only operator reclassification or requeue should release it.
+      // The same worker run later ends NeedsHuman and reports blocked at the
+      // same generation. The escalation lands: the row becomes BLOCKED with
+      // the decision payload, the needs-human surface fires, and the parked
+      // surface does not fire again.
+      const decision = { question: "Why is CI red?" };
+      const escalation = await markPrFixItem(client, {
+        repo: "org/repo", pr: 319, status: "BLOCKED", decision, expectedGeneration: 1,
+      });
+
+      expect(escalation.mutated).toBe(true);
+      expect(client.items[0].status).toBe("BLOCKED");
+      expect(client.items[0].lane).toBe("NEEDS_HUMAN");
+      expect(client.items[0].outcome).toBe("human_decision");
+      expect(client.items[0].decisionDetail).toEqual(decision);
+      expect(client.history.length).toBe(historyAfterParked + 1);
+      expect(surfacingMocks.surfacePrFixBlocked).toHaveBeenCalledTimes(1);
+      expect(surfacingMocks.surfacePrFixParked).not.toHaveBeenCalled();
+    });
+
+    // #1340: a BLOCKED mark that carries no structured decision still records
+    // a decision context — the needs-human surface and the operator need a
+    // question and evidence to act on, so both are synthesized from the
+    // mark's diagnostic.
+    it("a worker BLOCKED mark without a decision on a PARKED row escalates with a synthesized decision context (#1340)", async () => {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 319, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k319",
+      });
+      const parked = await markPrFixItem(client, {
+        repo: "org/repo", pr: 319, status: "PARKED", outcome: "no_progress", expectedGeneration: 1,
+      });
+      expect(mutatedItem(parked).status).toBe("PARKED");
+
+      const escalation = await markPrFixItem(client, {
+        repo: "org/repo", pr: 319, status: "BLOCKED", note: "the spec is ambiguous about retry semantics", expectedGeneration: 1,
+      });
+
+      expect(escalation.mutated).toBe(true);
+      expect(client.items[0].status).toBe("BLOCKED");
+      expect(client.items[0].lane).toBe("NEEDS_HUMAN");
+      expect(client.items[0].outcome).toBe("human_decision");
+      const synthetic = client.items[0].decisionDetail;
+      expect(typeof synthetic.question).toBe("string");
+      expect(synthetic.question.trim().length).toBeGreaterThan(0);
+      expect(synthetic.evidence).toBe("the spec is ambiguous about retry semantics");
+    });
+
+    // #1340 + #1253: the escalation also lands when the parked row carries
+    // fresh post-dispatch evidence. The sticky PARKED row never re-arms on
+    // new evidence (#1218), but the record sits on its post-dispatch cache;
+    // the BLOCKED settlement must absorb it (keys-pinned write clears the
+    // cache) instead of being blocked by it or reopening the row.
+    it("a worker BLOCKED mark escalates a PARKED row with fresh post-dispatch evidence and clears it (#1340, #1253)", async () => {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 324, lane: "NORMAL", reason: "r", feedback: "f1",
+        evidenceKey: "review:1", headSha: "H1",
+      });
+      const parked = await markPrFixItem(client, {
+        repo: "org/repo", pr: 324, status: "PARKED", outcome: "no_progress", expectedGeneration: 1,
+      });
+      expect(mutatedItem(parked).status).toBe("PARKED");
+
+      // A fresh automated review lands after the park (a new evidence key),
+      // and sits on the row's post-dispatch cache (#1253 "fresh evidence
+      // while parked").
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 324, lane: "NORMAL", reason: "r", feedback: "f2",
+        evidenceKey: "review:2", headSha: "H2",
+      });
+      client.items[0].postDispatchEvidenceKeys = ["review:2@H2"];
+      expect(client.items[0].status).toBe("PARKED");
+      expect(client.items[0].generation).toBe(1);
+      surfacingMocks.surfacePrFixParked.mockClear();
+      surfacingMocks.surfacePrFixBlocked.mockClear();
+      surfacingMocks.surfacePrFixUnblocked.mockClear();
+
+      const escalation = await markPrFixItem(client, {
+        repo: "org/repo", pr: 324, status: "BLOCKED", note: "the spec is ambiguous about retry semantics", expectedGeneration: 1,
+      });
+
+      expect(escalation.mutated).toBe(true);
+      expect(client.items[0].status).toBe("BLOCKED");
+      expect(client.items[0].lane).toBe("NEEDS_HUMAN");
+      expect(client.items[0].outcome).toBe("human_decision");
+      // The settlement absorbed the fresh-evidence cache rather than
+      // reopening the row or leaving the entries behind.
+      expect(client.items[0].postDispatchEvidenceKeys).toEqual([]);
+      expect(client.items[0].generation).toBe(1);
+      expect(surfacingMocks.surfacePrFixBlocked).toHaveBeenCalledTimes(1);
+      expect(surfacingMocks.surfacePrFixParked).not.toHaveBeenCalled();
+      expect(surfacingMocks.surfacePrFixUnblocked).not.toHaveBeenCalled();
+    });
+
+    // #1340: the relaxation is BLOCKED-only — a recorded STALE settlement
+    // (a closed PR is gone, no human decision pending) stays sticky against
+    // worker BLOCKED marks exactly like a recorded BLOCKED.
+    it("a sequential worker mark STALE -> BLOCKED at unchanged generation no-ops", async () => {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 319, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k319",
+      });
+      const stale = await markPrFixItem(client, {
+        repo: "org/repo", pr: 319, status: "STALE", note: "pr closed", expectedGeneration: 1,
+      });
+      expect(mutatedItem(stale).status).toBe("STALE");
+      const historyAfterStale = client.history.length;
+      surfacingMocks.surfacePrFixParked.mockClear();
+      surfacingMocks.surfacePrFixBlocked.mockClear();
+
       const escalation = await markPrFixItem(client, {
         repo: "org/repo", pr: 319, status: "BLOCKED", decision: { question: "?" }, expectedGeneration: 1,
       });
 
       expect(escalation).toEqual({ mutated: false, reason: "generation-mismatch" });
-      expect(client.items[0].status).toBe("PARKED");
-      expect(client.items[0].lane).toBe("NORMAL");
-      expect(client.items[0].outcome).toBe("no_progress");
-      expect(client.items[0].decisionDetail).toBeNull();
-      expect(client.history.length).toBe(historyAfterParked);
+      expect(client.items[0].status).toBe("STALE");
+      expect(client.history.length).toBe(historyAfterStale);
       expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
     });
 

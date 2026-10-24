@@ -55,6 +55,8 @@ function matches(row: any, where: any): boolean {
       for (const [op, operand] of Object.entries(ops)) {
         if (op === "equals") {
           if (!sameValue(value, operand)) return false;
+        } else if (op === "in") {
+          if (!Array.isArray(operand) || !(operand as unknown[]).some((o) => sameValue(value, o))) return false;
         } else if (op === "has") {
           if (!(Array.isArray(value) && value.includes(operand))) return false;
         } else if (op === "not") {

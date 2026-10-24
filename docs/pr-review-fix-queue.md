@@ -93,7 +93,7 @@ Items in the `NEEDS_HUMAN` lane receive `BLOCKED` status and are excluded from t
 
 ### Mark item status
 
-`POST /api/pr-fix-queue/mark` — Marks an item `FIXED`, `BLOCKED`, `PARKED`, `STALE`, `IGNORED`, or `WAITING_EXTERNAL` and records a history event. Requires auth. The body may include an `outcome` (`human_decision`, `no_progress`, `infra_failure`, or `security_failure`) and a `decision` object (`question`, `options`, and `evidence`) when recording a human decision.
+`POST /api/pr-fix-queue/mark` — Marks an item `FIXED`, `BLOCKED`, `PARKED`, `STALE`, `IGNORED`, or `WAITING_EXTERNAL` and records a history event. Requires auth. The body may include an `outcome` (`human_decision`, `no_progress`, `infra_failure`, or `security_failure`) and a `decision` object (`question`, `options`, and `evidence`) when recording a human decision; a `BLOCKED` mark without a `decision` gets a synthesized `decisionDetail` built from the note (#1340). A worker-tier `BLOCKED` mark may escalate a same-generation `PARKED` item (#1340); every other overwrite of a recorded `BLOCKED`/`PARKED` stays refused without operator `allowStickyReclassify`.
 
 **Request body:**
 ```json
@@ -231,6 +231,7 @@ until a health reconcile observes the PR closed.
 QUEUED → FIXED (completed)
 QUEUED → BLOCKED (genuine human decision)
 QUEUED → PARKED (bounded exhaustion, infrastructure/auth failure, or security failure)
+PARKED → BLOCKED (worker escalation: a parked attempt that turns out to need a human decision, #1340)
 QUEUED → STALE (no longer relevant)
 QUEUED → IGNORED (deliberately skipped)
 ```
