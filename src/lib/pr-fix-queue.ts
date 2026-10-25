@@ -310,6 +310,20 @@ export interface MarkPrFixInput {
    * settles QUEUED → BLOCKED/PARKED.
    */
   allowStickyReclassify?: boolean;
+  /**
+   * Hand-out binding for worker-tier settlements (#1428). When set, the mark
+   * is authorized ONLY for rows whose `agentHandouts` carry this agent's
+   * marker at the settled generation (the same `<agentName>@<generation>`
+   * envelope `agentAlreadyHanded`/`ackPrFixHandout` match): a bound worker
+   * credential may settle only the attempt it was handed, never another
+   * agent's. A row without the marker returns `not-handed` — a refusal
+   * distinct from the row's outcome vocabulary, with no mutation. The route
+   * handler is the only trusted source of this value (the bound token's
+   * agent identity); `parseMarkPrFixInput` never accepts it from a body.
+   * Unset (maintainer/operator paths and internal report settlement) keeps
+   * the existing unconstrained behavior.
+   */
+  handoutScopedAgent?: string;
 }
 
 export interface RequeuePrFixInput {
@@ -2530,11 +2544,16 @@ export async function assertPrHeadMovedForFix(
  * (`mutated: true`, with the fresh row) or was skipped without any write
  * (`mutated: false`): `not-found` when no item matches, `generation-mismatch`
  * when an `expectedGeneration` was supplied and the row's generation no
- * longer matches (the attempt was re-issued between read and write).
+ * longer matches (the attempt was re-issued between read and write), and
+ * `not-handed` when a `handoutScopedAgent` was supplied and the row's
+ * `agentHandouts` do not carry that agent's marker at the settled generation
+ * (#1428) — a caller-binding refusal, deliberately distinct from the row's
+ * outcome vocabulary so a worker can tell "you may not settle this" from
+ * "the settlement was refused".
  */
 export type MarkPrFixResult =
   | { mutated: true; item: any }
-  | { mutated: false; reason: "generation-mismatch" | "not-found" };
+  | { mutated: false; reason: "generation-mismatch" | "not-found" | "not-handed" };
 
 export async function markPrFixItem(
   client: PrFixQueueClient,
@@ -2560,6 +2579,38 @@ export async function markPrFixItem(
   const existing = await client.prFixQueueItem.findUnique({ where: { repo_pr: { repo: input.repo, pr: input.pr } } });
   if (!existing) return { mutated: false, reason: "not-found" };
 
+  // Idempotent WAITING_EXTERNAL duplicate for the same generation: never
+  // extend the cooldown, never overwrite the recorded contract or note
+  // (#1231). Checked BEFORE the #1428 hand-out binding below on purpose: the
+  // wait itself cleared `agentHandouts`, so the binding cannot re-authorize a
+  // replay of a wait that was legitimately started (and consumed) already.
+  if (nextStatus === "WAITING_EXTERNAL" && existing.status === "WAITING_EXTERNAL" && existing.generation === expectedGeneration) {
+    return { mutated: true, item: existing };
+  }
+
+  // Hand-out binding (#1428): a worker-tier settlement (the route supplies the
+  // bound token's agent as `handoutScopedAgent`) may settle only the attempt
+  // it was actually handed — the row's `agentHandouts` must carry this agent's
+  // `<agentName>@<generation>` marker at the settled generation, the same
+  // envelope `ackPrFixHandout` pins on. Without it the caller is crossing the
+  // agent boundary on the queue (any bound credential could tombstone another
+  // agent's attempt as FIXED/BLOCKED/...), so refuse with `not-handed` — no
+  // mutation, no history row, and a code outside the outcome vocabulary.
+  // Entries from other generations are inert (fail toward `not-handed`, never
+  // toward settling a spent hand-out). Maintainer/operator paths and the
+  // internal report settlement never set this field and stay unconstrained.
+  if (input.handoutScopedAgent) {
+    const handouts: string[] = Array.isArray(existing.agentHandouts) ? existing.agentHandouts : [];
+    const scopedGeneration = expectedGeneration ?? existing.generation;
+    const handedThisAgent = handouts.some((entry) => {
+      const parsed = parseAgentHandoutToken(entry);
+      return parsed !== null && parsed.agentName === input.handoutScopedAgent && parsed.generation === scopedGeneration;
+    });
+    if (!handedThisAgent) {
+      return { mutated: false, reason: "not-handed" };
+    }
+  }
+
   // BLOCKED is reserved for a genuine human decision (#1218): lane NEEDS_HUMAN,
   // outcome human_decision, surfaced with the needs-human label + marker. PARKED
   // is bounded exhaustion or an operational failure: lane NORMAL, no
@@ -2573,11 +2624,8 @@ export async function markPrFixItem(
   // src/lib/pr-fix-evidence-requirements.test.ts, which fails if any other
   // production module assigns this status directly.
   if (nextStatus === "WAITING_EXTERNAL") {
-    // Idempotent duplicate for the same generation: never extend the
-    // cooldown, never overwrite the recorded contract or note (#1231).
-    if (existing.status === "WAITING_EXTERNAL" && existing.generation === expectedGeneration) {
-      return { mutated: true, item: existing };
-    }
+    // The same-generation idempotent duplicate (#1231) was already answered
+    // above, before the #1428 hand-out binding.
     if (existing.status !== "QUEUED") return { mutated: false, reason: "generation-mismatch" };
 
     // #1250: a NEW wait must name a concrete, independently verifiable

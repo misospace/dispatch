@@ -5779,3 +5779,126 @@ describe("rebase worker pool eligibility (DISPATCH_REBASE_AGENTS, #1327)", () =>
     expect(isRebaseLaneAgent("local-coder")).toBe(false);
   });
 });
+
+describe("mark hand-out binding for worker settlements (#1428)", () => {
+  let client: ReturnType<typeof makeClient>;
+
+  beforeEach(() => {
+    client = makeClient();
+  });
+
+  it("lets a scoped agent holding the marker at the settled generation settle", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 500, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k500" });
+    client.items[0].agentHandouts = ["alpha@1"];
+
+    const result = await markPrFixItem(client, { repo: "org/repo", pr: 500, status: "FIXED", expectedGeneration: 1, handoutScopedAgent: "alpha" });
+
+    expect(mutatedItem(result).status).toBe("FIXED");
+    expect(client.history.at(-1)).toMatchObject({ action: "mark", status: "FIXED" });
+  });
+
+  it("refuses a scoped agent with no hand-out record: not-handed, zero writes", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 501, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k501" });
+
+    const result = await markPrFixItem(client, { repo: "org/repo", pr: 501, status: "FIXED", expectedGeneration: 1, handoutScopedAgent: "alpha" });
+
+    expect(result).toEqual({ mutated: false, reason: "not-handed" });
+    expect(client.items[0].status).toBe("QUEUED");
+    expect(client.history.filter((h) => h.action === "mark")).toHaveLength(0);
+  });
+
+  it("refuses a scoped agent whose marker belongs to another agent", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 502, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k502" });
+    client.items[0].agentHandouts = ["bravo@1"];
+
+    const result = await markPrFixItem(client, { repo: "org/repo", pr: 502, status: "BLOCKED", expectedGeneration: 1, handoutScopedAgent: "alpha" });
+
+    expect(result).toEqual({ mutated: false, reason: "not-handed" });
+    expect(client.items[0].status).toBe("QUEUED");
+    expect(client.history.filter((h) => h.action === "mark")).toHaveLength(0);
+  });
+
+  it("refuses a scoped agent whose marker belongs to another generation (fail-closed)", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 503, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k503" });
+    // A spent hand-out from a previous generation must not authorize the
+    // current attempt's settlement.
+    client.items[0].generation = 2;
+    client.items[0].agentHandouts = ["alpha@1"];
+
+    const result = await markPrFixItem(client, { repo: "org/repo", pr: 503, status: "FIXED", expectedGeneration: 2, handoutScopedAgent: "alpha" });
+
+    expect(result).toEqual({ mutated: false, reason: "not-handed" });
+    expect(client.items[0].status).toBe("QUEUED");
+    expect(client.history.filter((h) => h.action === "mark")).toHaveLength(0);
+  });
+
+  it("treats malformed hand-out entries as inert (never authorizes)", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 504, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k504" });
+    client.items[0].agentHandouts = ["alpha", "alpha@0", "alpha@x"];
+
+    const result = await markPrFixItem(client, { repo: "org/repo", pr: 504, status: "PARKED", expectedGeneration: 1, handoutScopedAgent: "alpha" });
+
+    expect(result).toEqual({ mutated: false, reason: "not-handed" });
+  });
+
+  it("an agent name containing @ keeps its marker matching (last-@ split)", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 505, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k505" });
+    client.items[0].agentHandouts = ["bot@corp@1"];
+
+    const result = await markPrFixItem(client, { repo: "org/repo", pr: 505, status: "STALE", expectedGeneration: 1, handoutScopedAgent: "bot@corp" });
+
+    expect(mutatedItem(result).status).toBe("STALE");
+  });
+
+  it("an unscoped mark (maintainer/internal path) stays unconstrained", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 506, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k506" });
+
+    const result = await markPrFixItem(client, { repo: "org/repo", pr: 506, status: "FIXED", expectedGeneration: 1, actorTier: "maintainer" });
+
+    expect(mutatedItem(result).status).toBe("FIXED");
+  });
+
+  it("refuses a scoped WAITING_EXTERNAL on a row without the agent's hand-out", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 507, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k507" });
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 507, status: "WAITING_EXTERNAL", expectedGeneration: 1, handoutScopedAgent: "alpha",
+      externalWait: { kind: "upstream_pr", ref: "org/deps#7", evidence: "upstream PR open", trigger: { kind: "merged" } },
+    });
+
+    expect(result).toEqual({ mutated: false, reason: "not-handed" });
+    expect(client.items[0].status).toBe("QUEUED");
+    expect(client.history.filter((h) => h.action === "mark")).toHaveLength(0);
+  });
+
+  it("keeps the #1231 idempotent WAITING_EXTERNAL replay authorized after the wait cleared the hand-outs", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 508, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k508" });
+    const wait = { kind: "upstream_pr", ref: "org/deps#7", evidence: "upstream PR open", trigger: { kind: "merged" } };
+    client.items[0].agentHandouts = ["alpha@1"];
+
+    const first = await markPrFixItem(client, { repo: "org/repo", pr: 508, status: "WAITING_EXTERNAL", expectedGeneration: 1, handoutScopedAgent: "alpha", externalWait: wait });
+    expect(mutatedItem(first).status).toBe("WAITING_EXTERNAL");
+    expect(client.items[0].agentHandouts).toEqual([]);
+
+    // A retry after a lost response: the wait consumed (and cleared) the
+    // hand-out records, so the binding must not turn the idempotent replay
+    // into a 403 — the duplicate answers before the binding runs.
+    const retry = await markPrFixItem(client, { repo: "org/repo", pr: 508, status: "WAITING_EXTERNAL", expectedGeneration: 1, handoutScopedAgent: "alpha", externalWait: wait });
+    expect(retry.mutated).toBe(true);
+    expect(mutatedItem(retry).status).toBe("WAITING_EXTERNAL");
+    expect(client.history.filter((h) => h.status === "WAITING_EXTERNAL")).toHaveLength(1);
+  });
+
+  it("only the agent holding the marker at the settled generation authorizes", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 509, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k509" });
+    client.items[0].generation = 2;
+    client.items[0].agentHandouts = ["alpha@1", "bravo@2"];
+
+    const result = await markPrFixItem(client, { repo: "org/repo", pr: 509, status: "BLOCKED", expectedGeneration: 2, handoutScopedAgent: "alpha" });
+
+    expect(result).toEqual({ mutated: false, reason: "not-handed" });
+    // bravo holds the live hand-out and can still settle it.
+    const other = await markPrFixItem(client, { repo: "org/repo", pr: 509, status: "BLOCKED", expectedGeneration: 2, handoutScopedAgent: "bravo" });
+    expect(mutatedItem(other).status).toBe("BLOCKED");
+  });
+});
