@@ -36,9 +36,21 @@ to whatever backend it chose.
 - **Explicit unknown.** Absent baselines are `null`, never coerced to zero:
   no ever-completed sync (`pipeline.sync.lastSuccessTimestampSeconds: null`
   plus `everSucceeded: false`), admission state in `off` mode
-  (`admission.notAdmitted: null`), scheduler-not-evaluable
-  (`observations.eligibleWorkNotHandedOut: null`), assignment age without
-  persisted evidence.
+  (`admission.notAdmitted: null`), a sync pipeline that is not armed (opted
+  out, unknown, or the sync job disabled —
+  `observations.eligibleWorkNotHandedOut: null`; otherwise the observation is
+  decidable), assignment age without persisted evidence.
+- **The sync-pipeline arm state is explicit too.** `config.syncPipeline` is
+  the operator's **raw declaration** (`DISPATCH_SYNC_PIPELINE`: `auto`,
+  `external`, or `off` — the value as declared, never inferred), and
+  `pipeline.syncPipelineState` is the **derived** arm state the alerts gate on:
+  `armed` (the pipeline is expected to run), `off` (the operator opted out),
+  or `unknown` (it cannot be told). The derivation reads the declaration plus
+  in-process facts only (is the in-process scheduler ticking? is a sync
+  interval configured?) — **sync history is never evidence**: a one-off
+  manual sync is not a pipeline, and inferring "armed" from history would
+  arm a false CRITICAL A2 in the default deployment. An `unknown` state is
+  neither healthy nor stale, so the dependent observations stay `null`.
 
 ## Sections
 
@@ -50,7 +62,7 @@ to whatever backend it chose.
 | `prFix` | §4.5 hand-out/ack/reclaim, §4.6 settlement | `PARKED` (operational exhaustion, by outcome) is reported separately from `BLOCKED` (`human_decision`) and never inflates it; overdue is **age-tied** to `dispatchedAt` vs `PR_FIX_HANDOUT_TIMEOUT_MS` |
 | `admission` | §4.7 | reuses the canonical rule in `src/lib/queue-admission.ts`; withheld reason codes are the 12-code allowlist |
 | `grooming` | §4.8 | persisted columns only; absent fingerprint is `unknown`, never `fresh` |
-| `pipeline` | §4.9 | real `IssueSyncRun` statuses (`completed`/`failed`); the last-success series is absent (null) until the first completion |
+| `pipeline` | §4.9 | real `IssueSyncRun` statuses (`completed`/`failed`); the last-success series is absent (null) until the first completion; the arm state (`pipeline.syncPipelineState`) is derived from the raw declaration (`config.syncPipeline`) plus in-process facts — never from sync history |
 | `failures` | §4.10 `dispatch_audit_failures_in_window` | per-action sparse maps per window |
 | `observations` | §6 predicate helpers | derived states: A4 conjunction (with the fresh-sync and scheduler guards), A5, age-tied A7, aged-assignment evidence, A2 absent-series, discovery failing, scheduler overdue, admission withholding |
 

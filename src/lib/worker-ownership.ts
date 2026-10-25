@@ -247,13 +247,15 @@ export function findCurrentClaimWork<T extends { agentWork: { findFirst: (args: 
 /**
  * Refresh the matching active `AgentWork` row of an ownership operation.
  *
- * The row carries the *execution* lease the sweeper reads: `sweepStaleWork`
- * reclaims an active row whose `lastHeartbeatAt` OR whose `leaseExpiresAt`
- * fell past its cutoff. Moving only the heartbeat therefore leaves a renewed
- * long-running worker reclaimable — the old `leaseExpiresAt` (5 minutes, set
- * by `startAgentWork`/`checkpointAgentWork`) passes the cutoff and the sweeper
- * marks the freshly renewed worker STALE and deletes its lease. So the expiry
- * is propagated here too, and both values are the operation's own clock and
+ * The row carries the *execution* lease the sweeper reads: since #1418,
+ * `sweepStaleWork` reclaims an active row only when its `lastHeartbeatAt`
+ * fell past the cutoff AND its `leaseExpiresAt` is not live — heartbeat
+ * silence alone is not abandonment while a renewed lease stands. Moving only
+ * the heartbeat would therefore leave a renewed long-running worker's row
+ * carrying the stale short expiry written by start/checkpoint, and the
+ * sweep would reclaim it the moment the 5-minute execution lease lapsed —
+ * mid-renewal-cycle, while the worker is still renewing. So the expiry is
+ * propagated here too, and both values are the operation's own clock and
  * expiry — the very ones written to the `Lease` row — never a second
  * `new Date()` that could drift from them.
  *

@@ -16,6 +16,15 @@ configuration are part of this design.
   docs/observability-snapshot.md. This document remains the design source of
   truth; a `/metrics` scrape exporter, OTel push, and executable alert
   assets remain deferred decisions (§10).
+- **Implementation status (#1255):** the catalogue is packaged for operation:
+  an opt-in Prometheus text exposition at `GET /api/metrics`
+  (`DISPATCH_METRICS_ENABLED`, default off), the portable alert definitions
+  and evaluator in src/lib/observability-alerts.ts with a replayable fixture
+  matrix, and optional Prometheus/VictoriaMetrics rules plus a Grafana
+  dashboard under observability/. The metric contract and installation
+  guidance live in docs/observability-packaging.md, kept separate from these
+  semantics. OTel push and deployment-owned notification routing remain
+  deferred (§10).
 
 ---
 
@@ -85,13 +94,16 @@ dependency choices require a later decision (see [§10](#10-open-questions-and-d
 
 ## 3. Current instrumentation inventory
 
-Dispatch today has **no metrics endpoint, no `/metrics`, no OpenTelemetry, and
-no structured counters/timers**. Observability is limited to a health endpoint,
-in-process scheduler liveness, and append-only database tables. (Confirmed by
-searching the repository: no Prometheus/OTel/metrics integration exists.
-Update #1252: a bounded read-only snapshot endpoint of this catalogue now
-exists at `GET /api/observability`, see docs/observability-snapshot.md; a
-scrape `/metrics` exporter, OTel, and in-process counters remain absent.)
+Dispatch today has **no OpenTelemetry and no structured counters/timers**;
+every exported signal is recomputed from its persisted rows at read time.
+Observability is a health endpoint, in-process scheduler liveness, and
+append-only database tables. (Update #1252: a bounded read-only snapshot
+endpoint of this catalogue exists at `GET /api/observability`, see
+docs/observability-snapshot.md. Update #1255: an opt-in scrape exporter of
+this catalogue now exists at `GET /api/metrics`
+(`DISPATCH_METRICS_ENABLED`, default off) — still no OTel, no in-process
+counters, and no push transport; every series is recomputed from the cache
+at scrape time.)
 
 | Source | Location | What it exposes | Limitation |
 |---|---|---|---|
@@ -135,7 +147,7 @@ freshness, or settlement outcomes as signals. This document specifies them.
   older failure expired and a new one arrived, giving `delta == 0` and missing
   the failure entirely. Therefore: "did anything happen in the last N" evaluates
   the as-of-scrape gauge **directly** (e.g.
-  `dispatch_<...>_in_window{window="900s"} > 0`), never via `increase()`,
+  `dispatch_<...>_in_window{window="900"} > 0`), never via `increase()`,
   `rate()`, or `delta()`. The `_total` suffix that remains on some rows of this
   catalogue is historical; those rows are windowed counts under this same rule,
   not monotonic counters, and must not fire alerts through rate-style
@@ -313,13 +325,56 @@ must be allowlisted with an `unknown` bucket.
 | `dispatch_sync_last_success_timestamp_seconds` | gauge | unix seconds | newest `IssueSyncRun.completedAt` with `status = "completed"` | `type` | Supply-pipeline freshness. Emitted **only when a completed run exists** — on a fresh deployment with no sync yet there is no series, and absence must be evaluated as stale, not silent (see A2) |
 | `dispatch_sync_failures_total` | gauge (windowed) | count | `IssueSyncRun.status = "failed"` | `type` | Failed syncs |
 | `dispatch_repo_stale_sync_seconds` | gauge | seconds | `now - AutomationRepo.lastSyncedAt` | — | Per-repo cache staleness (aggregate max) |
-| `dispatch_health_up` | gauge | 0/1 | `GET /api/health` ok | — | Process + DB liveness |
+| `dispatch_repo_stale_sync_threshold_seconds` | gauge | seconds | derived config: 2× `DISPATCH_SYNC_INTERVAL_MS`, 3600 fallback when the sync job is disabled | — | A13 threshold as a scrapeable series, so packaged rules track the configured interval instead of hard-coding it (same helper as the evaluator default) |
+| `dispatch_health_up` | gauge | 0/1 | `GET /api/health` ok | — | Process + DB liveness. The #1255 exporter renders it as `1` whenever the exposition itself is served (the collector needs the database to answer); the down case is observed as a **failed scrape** (`up == 0`), which is how A3 is wired in the packaged rules — a missing series is never coerced to healthy |
 | `dispatch_scheduler_healthy` | gauge | 0/1 | derived: `dispatch_scheduler_up == 1` **and** no `dispatch_scheduler_job_overdue == 1` | — | Scheduler armed and every job ticking on time |
+| `dispatch_sync_pipeline_state` | gauge | 0/1 per state | operator declaration `DISPATCH_SYNC_PIPELINE` (`auto`/`external`/`off`) + in-process facts (scheduler enabled, sync interval) — **never** sync history | `state` (`armed`,`off`,`unknown`) | Arm state of the issue-sync pipeline under the **declared-topology** model: `armed` = the pipeline is expected to run (freshness IS evaluable; `external` declared, or `auto` with the in-process scheduler ticking), `off` = the operator opted out (`off` declared, or `auto` with the sync interval at `0` — never a fault), `unknown` = it cannot be told (`auto` with no in-process scheduler — never healthy, never stale). Sync history is never evidence: one manual sync is not a pipeline. Exactly one state is 1; the other two are 0 |
 
 Job names (`src/lib/scheduler.ts:88-140`): `sync, groomer, pr-followup,
 ci-failures, prune-closed, reconcile, stale-work, pr-fix-sweep`. `overdue`
 means no run in more than two intervals; `lastRunAt` is in-process and resets on
 restart, so a freshly started process reports `null` until the first tick.
+
+**Sync-pipeline arm state.** `dispatch_sync_pipeline_state` is a *declared +
+derived* fact, not a scheduler inference. The in-process scheduler is **off by
+default** while external cron/CronJob drivers are a supported topology, so
+"is the scheduler armed?" is not the same question as "should the sync
+pipeline run?" — inferring the latter from the former suppressed every
+sync-freshness alert in exactly the deployments where the pipeline genuinely
+runs. The arm state is therefore the operator's **declared topology**
+(`DISPATCH_SYNC_PIPELINE`) plus **in-process facts** (is the in-process
+scheduler ticking? is a sync interval configured?), and it resolves to one of
+three values (`src/lib/sync-pipeline.ts:99`):
+
+- `armed` — the pipeline is expected to run: the operator declared
+  `external`, or `auto` with the in-process scheduler ticking. Freshness IS
+  evaluable; A2/A4 are armed.
+- `off` — the operator opted out (`DISPATCH_SYNC_PIPELINE=off`, or `auto`
+  with the sync job disabled, i.e. the interval at `0`). An opt-out is never a
+  fault.
+- `unknown` — it cannot be told: `auto` with no in-process scheduler running.
+  Never healthy and never stale — the freshness judgement is simply
+  unavailable.
+
+`auto` (the default) means **"the in-process scheduler decides"**: Dispatch
+answers for the topology it can observe. It does **not** mean "guess from what
+happened" — sync history is deliberately **not** part of the arm state. A
+single one-off manual sync is not a pipeline, and history cannot tell a broken
+external driver from a deployment that syncs rarely by design: inferring
+"armed" from history turned the default deployment (in-process scheduler off,
+`auto`, default 15m interval) into a false CRITICAL A2 thirty minutes after
+any manual `POST /api/sync`. The trade-off is explicit — an external driver
+that is not declared `external` is reported as `unknown` (never healthy, never
+stale) and therefore never pages. An operator running an external driver MUST
+declare `external`, and MUST set `DISPATCH_SYNC_INTERVAL_MS` to their own
+cadence: the interval defines the freshness window A2/A4 judge (and the A13
+threshold), so a driver slower than the interval pages falsely.
+
+The sync-staleness gauge is emitted **only** for an armed pipeline that has
+completed at least one sync and has a configured interval — it reads `0` while
+the last sync is fresh and `1` once it is older than two intervals. In every
+other case (not armed, never synced, no configured interval) the series is
+**absent**: no judgement at all, never a coerced `0`.
 
 `IssueSyncRun.status` is a free string whose only persisted values are
 `running` (created at lock acquisition, `src/lib/sync-lock.ts:160`),
@@ -337,11 +392,11 @@ the backstop for them.
 
 | Signal | Kind | Unit | Source | Dimensions | Semantics |
 |---|---|---|---|---|---|
-| `dispatch_audit_failures_in_window` | gauge (as-of-scrape) | count | `AuditLog.success = false` **and** `createdAt >= now() - window` | `action` (allowlisted), `window` (allowlisted: `900s`, `3600s`) | Failed mutations in the previous N seconds, recomputed at scrape time. Evaluated **directly** (e.g. `{window="900s"} > 0` for A12) — never via `increase()`, `rate()`, or `delta()` (§4.1). Replaces the earlier `dispatch_audit_failures_total` windowed gauge, which A12 misused through `delta()` |
+| `dispatch_audit_failures_in_window` | gauge (as-of-scrape) | count | `AuditLog.success = false` **and** `createdAt >= now() - window` | `action` (allowlisted), `window` (allowlisted: `900`, `3600`) | Failed mutations in the previous N seconds, recomputed at scrape time. Evaluated **directly** (e.g. `{window="900"} > 0` for A12) — never via `increase()`, `rate()`, or `delta()` (§4.1). Replaces the earlier `dispatch_audit_failures_total` windowed gauge, which A12 misused through `delta()` |
 | `dispatch_agent_runs_total` | gauge (windowed) | count | `AgentRun.runType`, `status` | `run_type`, `status` | Outcome distribution across `AgentRun` rows. **Windowed count only**: the rows are append-only and the window is the reset, so the exporter recomputes the count over the chosen window at each scrape. It is **not** process-monotonic and **must not** be evaluated with `increase()`-style rate functions (§4.1) |
-| `dispatch_agent_runs_started_in_window` | gauge (as-of-scrape) | count | `AgentRun.startedAt >= now() - window` | `run_type` (allowlisted), `window` (allowlisted: `1800s`, `3600s`) | Number of runs whose **reported start time** falls in the previous N seconds, computed at scrape time. Used directly (e.g. `== 0`) — never via `increase()`. Survives process restarts because it is derived from the row timestamp. **Blind spot:** `AgentRun` rows are inserted by `tasks/report` when work *finishes* (`src/app/api/agents/[agentName]/tasks/report/route.ts:571`), and `startedAt` is a retrospective optional field defaulting to report time. A worker still mid-task (running longer than the window) is invisible to this gauge until it reports. It measures *reported starts*, not real-time pickups — do not use it alone to detect "nothing being handed out"; use `dispatch_work_pickups_in_window` / `dispatch_agent_runs_reported_in_window` for that |
-| `dispatch_work_pickups_in_window` | gauge (as-of-scrape) | count | new `AgentWork` rows (`AgentWork.createdAt >= now() - window`) **or** newly created `Lease` rows (`Lease.createdAt >= now() - window`), worker identities only (system-emitter exclusion, §4.3) | `window` (allowlisted: `1800s`, `3600s`) | Work **picked up** in the previous N seconds, recorded at pickup time: `AgentWork` rows are created by `POST /api/agent-work/start` (`src/lib/agent-work.ts:186`) and `Lease` rows by claim via `upsertLease` (`src/lib/lease.ts:69`, `createdAt = DB now()`). Lease *renewals* do not count (they reuse the original `createdAt`) |
-| `dispatch_agent_runs_reported_in_window` | gauge (as-of-scrape) | count | task `AgentRun` rows (`AgentRun.createdAt >= now() - window`, `runType` allowlisted to the task types `implement`/`followup-pr` — heartbeat/groom/legacy rows excluded, §4.3) | `run_type` (allowlisted), `window` (allowlisted: `1800s`, `3600s`) | Completed tasks **reported** in the previous N seconds. Throughput evidence for the canonical loop (next-task → execute → report), which — unlike claim/agent-work — writes no pickup row, so pickups alone under-count a fleet that delivers without materializing a lease. A row lands only at finish, so this gauge cannot see a single task still in flight; that is what `dispatch_execution_active` covers |
+| `dispatch_agent_runs_started_in_window` | gauge (as-of-scrape) | count | `AgentRun.startedAt >= now() - window` | `run_type` (allowlisted), `window` (allowlisted: `1800`, `3600`) | Number of runs whose **reported start time** falls in the previous N seconds, computed at scrape time. Used directly (e.g. `== 0`) — never via `increase()`. Survives process restarts because it is derived from the row timestamp. **Blind spot:** `AgentRun` rows are inserted by `tasks/report` when work *finishes* (`src/app/api/agents/[agentName]/tasks/report/route.ts:571`), and `startedAt` is a retrospective optional field defaulting to report time. A worker still mid-task (running longer than the window) is invisible to this gauge until it reports. It measures *reported starts*, not real-time pickups — do not use it alone to detect "nothing being handed out"; use `dispatch_work_pickups_in_window` / `dispatch_agent_runs_reported_in_window` for that |
+| `dispatch_work_pickups_in_window` | gauge (as-of-scrape) | count | new `AgentWork` rows (`AgentWork.createdAt >= now() - window`) **or** newly created `Lease` rows (`Lease.createdAt >= now() - window`), worker identities only (system-emitter exclusion, §4.3) | `window` (allowlisted: `1800`, `3600`) | Work **picked up** in the previous N seconds, recorded at pickup time: `AgentWork` rows are created by `POST /api/agent-work/start` (`src/lib/agent-work.ts:186`) and `Lease` rows by claim via `upsertLease` (`src/lib/lease.ts:69`, `createdAt = DB now()`). Lease *renewals* do not count (they reuse the original `createdAt`) |
+| `dispatch_agent_runs_reported_in_window` | gauge (as-of-scrape) | count | task `AgentRun` rows (`AgentRun.createdAt >= now() - window`, `runType` allowlisted to the task types `implement`/`followup-pr` — heartbeat/groom/legacy rows excluded, §4.3) | `run_type` (allowlisted), `window` (allowlisted: `1800`, `3600`) | Completed tasks **reported** in the previous N seconds. Throughput evidence for the canonical loop (next-task → execute → report), which — unlike claim/agent-work — writes no pickup row, so pickups alone under-count a fleet that delivers without materializing a lease. A row lands only at finish, so this gauge cannot see a single task still in flight; that is what `dispatch_execution_active` covers |
 | `dispatch_agent_run_failures_total` | gauge (windowed) | count | `AgentRun.status = failed` | `run_type` | Hard run failures |
 | `dispatch_scheduler_job_errors_total` | gauge (windowed) | count | job HTTP non-2xx/409 (logs today) | `job` | Requires a future counter; **unknown** today |
 
@@ -349,8 +404,8 @@ the backstop for them.
 Allowlist the observed values and bucket the rest as `unknown`; never label by
 `errorMessage`. The default `window` allowlists shared by
 `dispatch_agent_runs_started_in_window`, `dispatch_work_pickups_in_window`,
-`dispatch_agent_runs_reported_in_window` (`1800s`, `3600s`) and
-`dispatch_audit_failures_in_window` (`900s`, `3600s`) cover the alerting needs
+`dispatch_agent_runs_reported_in_window` (`1800`, `3600`) and
+`dispatch_audit_failures_in_window` (`900`, `3600`) cover the alerting needs
 in [§6](#6-alert-catalogue); consumers may add other windows but must keep
 cardinality bounded.
 
@@ -373,7 +428,7 @@ layout is rows of related signals.
 | **7. Human decisions** | `dispatch_pr_fix_human_decisions`; `dispatch_pr_fix_oldest_human_decision_seconds`; `dispatch_queue_withheld` by `reason` | What genuinely needs a human, and how long has it waited? |
 | **8. Pipeline freshness** | `dispatch_scheduler_job_overdue`; `dispatch_scheduler_job_last_success_timestamp_seconds`; `dispatch_sync_last_success_timestamp_seconds`; `dispatch_repo_stale_sync_seconds`; `dispatch_health_up` | Did the supply pipeline stop? |
 | **9. Grooming** | `dispatch_grooming_freshness`; `dispatch_grooming_stale_reasons`; `dispatch_grooming_backoff` | Is the admission gate starved by stale/unknown grooming? |
-| **10. Failures** | `dispatch_audit_failures_in_window{window="900s"}`; `dispatch_agent_run_failures_total` | Are mutations/runs failing? |
+| **10. Failures** | `dispatch_audit_failures_in_window{window="900"}`; `dispatch_agent_run_failures_total` | Are mutations/runs failing? |
 
 **Separation requirement.** The dashboard must keep these distinct, because
 collapsing them produces wrong operator conclusions:
@@ -405,18 +460,18 @@ recommendation; the consumer maps it.
 | # | Alert | Condition (predicate) | Enabled | Severity | `for` | Why actionable | Recovery / operator action |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | A1 | Scheduler job overdue | `dispatch_scheduler_job_overdue{job=...} == 1` | yes | critical | 10m | Every queue is fed by these jobs; a stopped timer starves the loop silently | Inspect logs; restart/verify `DISPATCH_SCHEDULER_ENABLED`; supervisor re-arms, but a persistent stop is a real fault |
-| A2 | No successful sync | `dispatch_sync_last_success_timestamp_seconds` series **absent** (no `IssueSyncRun` has ever completed — the never-successful first sync must not be silent) **or** `time() - dispatch_sync_last_success_timestamp_seconds > 2× sync interval` | yes | critical | 5m | Supply is stale, or has never flowed; issues will not enter the queue. Consumers must evaluate the absent-series case as firing (e.g. `absent(...) == 1` in Prometheus), because `time() - <no data> > x` yields no data, not true | Check `IssueSyncRun` errors and GitHub reachability |
-| A3 | Health/DB down | `dispatch_health_up == 0` | yes | critical | 2m | The service cannot serve work | Check DB connectivity; `/api/health` returns 503 |
-| A4 | Eligible work not handed out | `dispatch_issues_open_claimable > 0` **and** `dispatch_execution_active == 0` **and** `dispatch_work_pickups_in_window{window="1800s"} == 0` **and** `dispatch_agent_runs_reported_in_window{window="1800s"} == 0` **and** `dispatch_scheduler_healthy == 1` **and** `(time() - dispatch_sync_last_success_timestamp_seconds) <= 2 × sync interval` | yes | warning | 30m | Work exists **and** nothing is executing **and** nothing has been picked up or reported in 30 minutes **and** every scheduled job is ticking **and** the last sync is fresh enough that A2 would be silent — an idle fleet while work waits, i.e. supply is not reaching workers. Three suppressors cover both delivery modes: a task in flight keeps `dispatch_execution_active` at 1 for its full duration (claim/agent-work workers — see §8.6); a fresh claim/start raises the pickup gauge; and any finished task's report lands in the reported gauge even for the canonical loop (next-task → execute → report), which writes no pickup row. Both gauges exclude the non-task system rows (groomer, heartbeat, legacy ingestion) per the §4.3 filter, so a busy groomer or a merely polling fleet cannot mask an idle fleet — nor disarm A4 the other way. Residual blind spot (documented, not solvable from the DB): a worker that materializes no claim/agent-work and runs a *single* task longer than the window without reporting is invisible while mid-task, and A4 fires; that firing is a truthful "Dispatch cannot observe this fleet" warning, and materializing a claim or agent-work start removes the ambiguity. A *hung* claimed task is caught by A5 and the AgentWork heartbeat-age signal instead. The fresh-sync guard is the explicit spelling of A2-suppresses-A4: a scheduler that ticks on time while sync is failing (or has never completed, so the sync series is absent and the guard cannot pass) no longer satisfies A4, and is routed to A2/A13 instead | Check worker availability/credentials; confirm `next-task` returns `implement`; confirm workers materialize a claim or agent-work start |
+| A2 | No successful sync | `dispatch_sync_last_success_timestamp_seconds` series **absent** (no `IssueSyncRun` has ever completed — the never-successful first sync must not be silent) **or** `time() - dispatch_sync_last_success_timestamp_seconds > 2× sync interval` — **and** the sync pipeline is armed (`dispatch_sync_pipeline_state{state="armed"} == 1`: the pipeline is expected to run — declared via `DISPATCH_SYNC_PIPELINE` (`external`), or `auto` with the in-process scheduler ticking; an opted-out (`off`) or indeterminate (`unknown`) pipeline is not a fault and is not evaluable) **and** the observation is live (the scrape is succeeding, so a dead instance routes to A3 instead) | yes | critical | 5m | Supply is stale, or has never flowed; issues will not enter the queue. Consumers must evaluate the absent-series case as firing (e.g. `absent(...) == 1` in Prometheus), because `time() - <no data> > x` yields no data, not true | Check `IssueSyncRun` errors and GitHub reachability |
+| A3 | Health/DB down | the Dispatch scrape is failing (`up{job="dispatch"} == 0` in the packaged rules; `dispatch_health_up` is rendered by the #1255 exporter as 1-when-served — see §4.9 — so a missing series is the down signal, never an exported 0) | yes | critical | 2m | The service cannot serve work | Check DB connectivity; `/api/health` returns 503 |
+| A4 | Eligible work not handed out | `dispatch_issues_open_claimable > 0` **and** `dispatch_execution_active == 0` **and** `dispatch_work_pickups_in_window{window="1800"} == 0` **and** `dispatch_agent_runs_reported_in_window{window="1800"} == 0` **and** `dispatch_sync_pipeline_state{state="armed"} == 1` **and** `(time() - dispatch_sync_last_success_timestamp_seconds) <= 2 × sync interval` **and** the in-process scheduler is either not running (`dispatch_scheduler_up == 0` — an external driver owns the pipeline and has no in-process job that can be overdue) or every scheduled job is ticking (`dispatch_scheduler_healthy == 1`) | yes | warning | 30m | Work exists **and** nothing is executing **and** nothing has been picked up or reported in 30 minutes **and** the in-process scheduler is either not running or every scheduled job is ticking **and** the last sync is fresh enough that A2 would be silent — an idle fleet while work waits, i.e. supply is not reaching workers. Three suppressors cover both delivery modes: a task in flight keeps `dispatch_execution_active` at 1 for its full duration (claim/agent-work workers — see §8.6); a fresh claim/start raises the pickup gauge; and any finished task's report lands in the reported gauge even for the canonical loop (next-task → execute → report), which writes no pickup row. Both gauges exclude the non-task system rows (groomer, heartbeat, legacy ingestion) per the §4.3 filter, so a busy groomer or a merely polling fleet cannot mask an idle fleet — nor disarm A4 the other way. Residual blind spot (documented, not solvable from the DB): a worker that materializes no claim/agent-work and runs a *single* task longer than the window without reporting is invisible while mid-task, and A4 fires; that firing is a truthful "Dispatch cannot observe this fleet" warning, and materializing a claim or agent-work start removes the ambiguity. A *hung* claimed task is caught by A5 and the AgentWork heartbeat-age signal instead. The fresh-sync guard is the explicit spelling of A2-suppresses-A4: a pipeline that ticks on time while sync is failing (or has never completed, so the sync series is absent and the guard cannot pass) no longer satisfies A4, and is routed to A2/A13 instead | Check worker availability/credentials; confirm `next-task` returns `implement`; confirm workers materialize a claim or agent-work start |
 | A5 | Stale ownership | `dispatch_leases_expired > 0` or `dispatch_agent_work{state="STALE"} > 0` | yes | warning | 15m | Ownership is lost; the issue may be stuck in-progress | Stale sweep releases it; if it persists, inspect the sweep job (A1) |
 | A6 | Assigned without execution | **Future gap — must NOT fire on the aggregate.** Intended predicate: an individual **open, eligible** issue (not `done`/`blocked`) has carried `agent/*` with no active lease/`AgentWork` for longer than a threshold T. Per-item waiting age is not derivable from persisted columns today — label assignment carries no timestamp (`Issue` has no `assignedAt`; `updatedAt`/`lastSyncedAt` refresh on unrelated changes), and only actions-route assignments produce `assign_agent` audit rows (`src/app/api/issues/actions/route.ts:14`; claims audit as `claim_issue` but materialize a lease, so they fall outside this predicate), so a GitHub-side assignment has no age source at all. Firing `dispatch_assigned_without_execution > 0` sustained would misreport healthy churn as failure (§8.7), so this row stays pinned — an exporter that ships an age source promotes it to a real alert (§10) | no — pinned future gap | info (pinned; not firing) | — (T applies only when promoted) | Assigned but never picked up; invisible in a queue-depth-only view. Until the age gap closes, execution-loss detection is owned by A5 (expired leases / STALE work) and pickup starvation by A4/A10 | Verify the worker polls its lane; check admission withholding |
 | A7 | Unacknowledged hand-outs (overdue) | `dispatch_pr_fix_overdue_unacked > 0` sustained | yes | warning | 35m | A worker may have died before materializing its run; item is stranded past the configured hand-out timeout. The predicate is age-tied to `dispatchedAt` (per-row `now − dispatchedAt > PR_FIX_HANDOUT_TIMEOUT_MS`), not the aggregate unacked count, so steady churn does not fire | Reclaim sweep (`pr-fix-sweep`, default-disabled) or operator requeue |
 | A8 | PR-fix head-of-line | `dispatch_pr_fix_oldest_queued_seconds > threshold` | yes | warning | 30m | Work is queued but not draining | Check worker concurrency, lane routing, and `fixAttempts` saturation |
-| A9 | Human decisions piling up | `dispatch_pr_fix_human_decisions > 0` **and** oldest age > threshold | yes | info/warning | 1h | A person must decide; PARKED is excluded so this is real | Review the BLOCKED item's decision context and act |
+| A9 | Human decisions piling up | `dispatch_pr_fix_human_decisions > 0` **and** oldest age > threshold | yes | info | 1h | A person must decide; PARKED is excluded so this is real | Review the BLOCKED item's decision context and act |
 | A10 | Admission withholding | `dispatch_queue_withheld{reason="grooming_unknown"}` or `{reason="grooming_stale"}` sustained | yes | warning | 1h | The admission gate is starving the queue on missing/stale grooming | Fix grooming pipeline; or operator admission override for a specific issue |
 | A11 | Grooming backoff | `dispatch_grooming_backoff > 0` sustained | yes | warning | 30m | Upstream GitHub reads are failing; issues cannot be groomed | Check GitHub reachability/rate limits |
-| A12 | Audit failures | `dispatch_audit_failures_in_window{window="900s"} > 0` | yes | warning | 5m | Mutations are failing (labels/claims). The predicate evaluates the as-of-scrape 15-minute gauge **directly**, so a new failure fires even when an older one expires from the window at the same moment — a `delta()` over a rolling windowed count could read zero there (§4.1) | Inspect `AuditLog.errorMessage` for the action; **do not** label by error string |
-| A13 | Upstream evidence unavailable | `dispatch_repo_stale_sync_seconds > 2× sync interval` **or** `dispatch_grooming_backoff > 0` | yes | warning | 15m | Admission/settlement decisions lack current evidence; the forge could not be read | Check GitHub reachability/rate limits; treat `unknown` as unknown, never healthy |
+| A12 | Audit failures | `dispatch_audit_failures_in_window{window="900"} > 0` | yes | warning | 5m | Mutations are failing (labels/claims). The predicate evaluates the as-of-scrape 15-minute gauge **directly**, so a new failure fires even when an older one expires from the window at the same moment — a `delta()` over a rolling windowed count could read zero there (§4.1) | Inspect `AuditLog.errorMessage` for the action; **do not** label by error string |
+| A13 | Upstream evidence unavailable | `dispatch_repo_stale_sync_seconds > 2× sync interval` (3600 fallback when the sync job is disabled; packaged rules compare against the exported `dispatch_repo_stale_sync_threshold_seconds`) **or** `dispatch_grooming_backoff > 0` | yes | warning | 15m | Admission/settlement decisions lack current evidence; the forge could not be read | Check GitHub reachability/rate limits; treat `unknown` as unknown, never healthy |
 
 The `Enabled` column is the wiring contract: `yes` means a consumer **may**
 evaluate the predicate and map it to a rule; `no` means the row documents a known
@@ -445,6 +500,16 @@ exists.
   `grooming_unknown`): **no alert**. Never-groomed backlog is not a fault.
 - `lastRunAt == null` immediately after process start: **no alert** until at
   least one interval has elapsed.
+- A sync pipeline that is opted out or indeterminate (arm state `off` or
+  `unknown`): **no alert** — an operator opt-out is not a fault, and "cannot be
+  told" is never healthy. `off` is an explicit `DISPATCH_SYNC_PIPELINE=off`,
+  or `auto` with the sync job disabled (the interval at `0`); `unknown` is
+  `auto` with no in-process scheduler running. A1/A2 (and A4's fresh-sync
+  guard) are not evaluable while the pipeline is not armed; the packaged rules
+  gate on `dispatch_sync_pipeline_state{state="armed"}` for the same reason.
+  A **disabled in-process scheduler alone is not an opt-out**: external
+  cron/CronJob drivers are a supported topology, so such a deployment declares
+  `DISPATCH_SYNC_PIPELINE=external`.
 - Workers mid-task **with the work materialized** (live lease or active
   `AgentWork` row): **no alert** for A4 — in-flight work keeps
   `dispatch_execution_active == 1` for the whole task, independent of when — or
@@ -493,6 +558,7 @@ Values are illustrative.
 ```
 dispatch_health_up                                  1
 dispatch_scheduler_up                               1
+dispatch_sync_pipeline_state{state="armed"}        1
 dispatch_scheduler_job_overdue{job="sync"}          0
 dispatch_sync_last_success_timestamp_seconds        (2m ago)
 dispatch_issues{status="ready",state="open"}        12
@@ -513,6 +579,7 @@ decision has aged past the threshold. This is the expected steady state.
 ```
 dispatch_health_up                                  1
 dispatch_scheduler_up                               1
+dispatch_sync_pipeline_state{state="armed"}        1
 dispatch_scheduler_job_overdue{job="sync"}          0
 dispatch_issues_open_claimable                      0
 dispatch_agent_work{state="IN_PROGRESS"}            0
@@ -528,11 +595,12 @@ that most often produces false alarms if inactivity is treated as failure.
 ```
 dispatch_health_up                                  1
 dispatch_scheduler_up                               1
+dispatch_sync_pipeline_state{state="armed"}        1
 dispatch_scheduler_job_overdue{job="sync"}          1     # last tick 45m ago, interval 15m
 dispatch_sync_last_success_timestamp_seconds        (45m ago)
 dispatch_issues_open_claimable                      20
 dispatch_execution_active                                   0     # nothing executing
-dispatch_work_pickups_in_window{window="1800s"}             0     # nothing picked up
+dispatch_work_pickups_in_window{window="1800"}             0     # nothing picked up
 dispatch_leases_expired                             2
 dispatch_agent_work{state="STALE"}                  2
 dispatch_queue_withheld{reason="grooming_unknown"}  6
@@ -584,6 +652,7 @@ unacked aggregate is correctly surfaced on the dashboard only.
 ```
 dispatch_health_up                                  1
 dispatch_scheduler_up                               1
+dispatch_sync_pipeline_state{state="armed"}        1
 dispatch_scheduler_job_overdue{job="sync"}          0
 dispatch_sync_last_success_timestamp_seconds        (6m ago)
 dispatch_issues_open_claimable                      7     # backlog exists
@@ -591,8 +660,8 @@ dispatch_execution_active                           1     # AgentWork IN_PROGRES
 dispatch_leases_active                              1     # kept live by the worker's re-claim renewal (src/lib/lease.ts:55-57)
 dispatch_agent_work{state="IN_PROGRESS"}            1
 dispatch_agent_work_heartbeat_age_seconds           40    # seconds — checkpoint heartbeat extends lastHeartbeatAt (src/lib/agent-work.ts:220-227)
-dispatch_work_pickups_in_window{window="1800s"}     0     # the pickup was 45m ago
-dispatch_agent_runs_reported_in_window{window="1800s"}  0 # nothing finished/reported yet
+dispatch_work_pickups_in_window{window="1800"}     0     # the pickup was 45m ago
+dispatch_agent_runs_reported_in_window{window="1800"}  0 # nothing finished/reported yet
 dispatch_agent_runs_started_in_window{run_type="implement", window="1800s"}  0  # no report row exists at all
 ```
 **Read:** one worker picked up an implement task 45 minutes ago and is still
@@ -615,14 +684,15 @@ see the blind spot stated in A4.)
 ```
 dispatch_health_up                                  1
 dispatch_scheduler_up                               1
+dispatch_sync_pipeline_state{state="armed"}        1
 dispatch_sync_last_success_timestamp_seconds        (3m ago)
 dispatch_issues{status="ready",state="open"}        5
 dispatch_issue_assigned                             3     # label-assigned supply
 dispatch_assigned_without_execution                 1     # just assigned; gains a lease <60s later
 dispatch_leases_active                              2
 dispatch_execution_active                           1
-dispatch_work_pickups_in_window{window="1800s"}     4
-dispatch_agent_runs_reported_in_window{window="1800s"} 3
+dispatch_work_pickups_in_window{window="1800"}     4
+dispatch_agent_runs_reported_in_window{window="1800"} 3
 ```
 **Read:** workers label-assign, then pick up within seconds, so the
 `dispatch_assigned_without_execution` aggregate is nonzero at most scrapes —
@@ -727,5 +797,9 @@ executable check at `docs/observability.test.ts`, run as part of `npm run test`
 This verifies **structure and source drift only**. It does not exercise alert
 runtime behavior: the snapshot exporter (#1252) is tested against this
 catalogue by the unit suites for `src/lib/observability-signals.ts` and
-`src/lib/observability-snapshot.ts`, but no scrape exporter or alert
-evaluator exists yet ([§10](#10-open-questions-and-deferred-decisions)).
+`src/lib/observability-snapshot.ts`. Since #1255, the opt-in scrape exporter
+(`src/lib/observability-export.ts`), the portable alert evaluator
+(`src/lib/observability-alerts.ts`, with the replayable acceptance fixtures),
+and the optional-asset drift contract (`src/lib/observability-assets.test.ts`)
+have their own suites; OTel transport and notification routing remain
+deferred ([§10](#10-open-questions-and-deferred-decisions)).

@@ -195,9 +195,13 @@ function makeQueueStore() {
 
 /**
  * Mirrors the route's first-hand-out-only stamp `where` against a stateful
- * fake row: match id + generation, and (dispatchedGeneration IS NULL OR
- * != the stamped generation). Lets updateMany genuinely no-op on re-hand-outs
- * of an already-stamped generation.
+ * fake row: match id + generation, then every composed AND group of the pin —
+ * (dispatchedGeneration IS NULL OR != the stamped generation) and (ciParkState
+ * IS NULL OR != "active", #495). Both inequality forms are evaluated, so a
+ * predicate rejected by an advanced counter misses while the `gte` lower bound
+ * applies. The hand-out flow's other writes (the evidence watermark stamp,
+ * the per-agent hand-out record) defer to `matchesFirstHandOut` / their own
+ * mocks.
  */
 /**
  * Evaluate the OR clause of a pr-fix queue updateMany against a fake row.
@@ -226,8 +230,35 @@ function matchesOrConditions(row: any, or: any[]): boolean {
 
 function matchesFirstHandOut(row: any, where: any): boolean {
   if (row.id !== where.id || row.generation !== where.generation) return false;
+  // #495: the composed AND groups — the first-hand-out pin and the CI park
+  // deferral guard — each carry OR alternatives, and every group must have
+  // at least one arm that the row satisfies.
+  for (const group of where.AND ?? []) {
+    if (Array.isArray(group.OR) && !group.OR.some((cond: any) => matchesNullableColumnCondition(row, cond))) return false;
+  }
+  // #1327: the issuance pin — the top-level OR arms anchor the lane being
+  // issued (`type` / `attemptType`).
   if (!where.OR) return true;
   return matchesOrConditions(row, where.OR);
+}
+
+/**
+ * One column condition of a composed Prisma pin, with the nullable-column
+ * semantics the #495 guard leans on: `{ col: null }` matches NULL/absent rows
+ * while `{ col: { not: x } }` does NOT (SQL `<>` excludes NULL). Everything
+ * else in the mirrored shape must be enumerated here — an unknown condition
+ * fails closed.
+ */
+function matchesNullableColumnCondition(row: any, cond: any): boolean {
+  if ("dispatchedGeneration" in cond) {
+    if (cond.dispatchedGeneration === null) return row.dispatchedGeneration == null;
+    return row.dispatchedGeneration != null && row.dispatchedGeneration !== cond.dispatchedGeneration.not;
+  }
+  if ("ciParkState" in cond) {
+    if (cond.ciParkState === null) return row.ciParkState == null;
+    return row.ciParkState != null && row.ciParkState !== cond.ciParkState.not;
+  }
+  return false;
 }
 
 /**
@@ -1394,9 +1425,16 @@ describe("GET /api/agents/[agentName]/next-task", () => {
         id: "prfix-1",
         generation: 2,
         status: "QUEUED",
-        OR: [
-          { dispatchedGeneration: null },
-          { dispatchedGeneration: { not: 2 } },
+        // #495: the first-hand-out pin and the CI-park guard compose as
+        // AND-of-OR groups (the explicit null arm matches rows whose
+        // deferral column never recorded a lifecycle).
+        AND: [
+          {
+            OR: [{ dispatchedGeneration: null }, { dispatchedGeneration: { not: 2 } }],
+          },
+          {
+            OR: [{ ciParkState: null }, { ciParkState: { not: "active" } }],
+          },
         ],
       },
       data: expect.objectContaining({
@@ -1879,10 +1917,15 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     let stampCount = 0;
     const stamps: any[] = [];
     mocks.prFixUpdateMany.mockImplementation(async ({ where, data }: any) => {
-      // Stamps carry the first-hand-out OR arms; the per-agent hand-out
-      // record push (#1133) carries the issuance pin (#1327) or no OR.
-      const isStamp = Array.isArray(where.OR) &&
-        where.OR.some((cond: any) => "dispatchedGeneration" in cond);
+      // Stamps carry the first-hand-out arms inside an AND group (#495 moved
+      // them off the top-level OR so the CI park guard can AND with them); the
+      // per-agent hand-out record push (#1133) carries the issuance pin
+      // (#1327) and a NOT, never a dispatchedGeneration arm.
+      const isStamp =
+        Array.isArray(where.AND) &&
+        where.AND.some((group: any) =>
+          Array.isArray(group.OR) && group.OR.some((cond: any) => "dispatchedGeneration" in cond),
+        );
       if (!isStamp) {
         const recorded = matchesFirstHandOut(row, where);
         if (recorded) applyUpdate(row, data);
@@ -3722,5 +3765,138 @@ describe("GET /api/agents/[agentName]/next-task — capacity-scoped handoff cool
     const body = await res.json();
     expect(body.type).toBe("implement");
     expect(body.issue.number).toBe(101);
+  });
+});
+
+describe("GET /api/agents/[agentName]/next-task — CI park deferral suppression (#495)", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+    mocks.prFixFindMany.mockResolvedValue([]);
+    mocks.issueFindMany.mockResolvedValue([]);
+    mocks.findLeasedIssueIds.mockResolvedValue([]);
+    mocks.prFixUpdateMany.mockResolvedValue({ count: 1 });
+    mocks.prFixFindUnique.mockResolvedValue(null);
+    mocks.prFixFindUniqueByRepo.mockResolvedValue(null);
+    mocks.capacityHandoffFindMany.mockResolvedValue([]);
+    mocks.capacityHandoffDeleteMany.mockResolvedValue({ count: 0 });
+  });
+
+  /** A QUEUED pr-fix row whose CI park deferral column is configurable. */
+  function ciParkRow(ciParkState?: string | null): any {
+    return {
+      id: "prfix-77", repo: "org/repo", pr: 77, issue: null,
+      url: "https://github.com/org/repo/pull/77", lane: "NORMAL",
+      status: "QUEUED", reason: "checks failing", feedback: [],
+      evidenceKeys: [], author: "bot", generation: 2, agentHandouts: [],
+      ...(ciParkState !== undefined ? { ciParkState } : {}),
+    };
+  }
+
+  const url = "/api/agents/example-agent/next-task?lane=local";
+
+  it("suppresses the hand-out while the deferral is active, for ANY polling agent", async () => {
+    // Suppression is PER-ITEM and GLOBAL: the notice's agentName is transport
+    // identity only, so a different polling agent is held back too.
+    mocks.prFixFindMany.mockResolvedValue([ciParkRow("active")]);
+    const response = await GET(request(url), { params: Promise.resolve({ agentName: "example-agent" }) });
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.type).toBe("idle");
+    // No stamp, no claim: the item is never written while suppression holds.
+    expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it("emits the [next-task-pr-fix] diagnostic whose reason names the active deferral", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    try {
+      mocks.prFixFindMany.mockResolvedValue([ciParkRow("active")]);
+      await GET(request(url), { params: Promise.resolve({ agentName: "example-agent" }) });
+      expect(info).toHaveBeenCalledWith(
+        "[next-task-pr-fix]",
+        expect.objectContaining({
+          repoFullName: "org/repo",
+          pullRequestNumber: 77,
+          generation: 2,
+          reason: "ci-park-active",
+        }),
+      );
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  it.each([
+    ["a lifecycle-never-recorded row (absent column)", ciParkRow()],
+    ["an explicit null ciParkState", ciParkRow(null)],
+    ["a released deferral", ciParkRow("released")],
+    ["a settled deferral", ciParkRow("settled")],
+  ])("%s dispatches normally", async (_name, row) => {
+    mocks.prFixFindMany.mockResolvedValue([row]);
+    const response = await GET(request(url), { params: Promise.resolve({ agentName: "example-agent" }) });
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem.id).toBe(row.id);
+  });
+
+  it("pins the composed guards: both the stamp and the claim where exclude ONLY active deferrals", async () => {
+    mocks.prFixFindMany.mockResolvedValue([ciParkRow()]);
+    mocks.issueFindMany.mockResolvedValue([]);
+    await GET(request(url), { params: Promise.resolve({ agentName: "example-agent" }) });
+
+    // Two item writes per successful hand-out: the stamp (#1119) and the
+    // claim (#1133). Both carry the #495 guard as an AND group whose OR
+    // alternatives are spelled NULL-inclusively (Prisma `{ not: "active" }`
+    // does not match NULL rows — the explicit null arm is the pin).
+    const calls = mocks.prFixUpdateMany.mock.calls as Array<[{ where: any }, any]>;
+    expect(calls).toHaveLength(2);
+    for (const [{ where }] of calls) {
+      const group = (where.AND ?? []).find((g: any) => Array.isArray(g.OR) && g.OR.some((cond: any) => "ciParkState" in cond));
+      expect(group).toBeDefined();
+      expect(group.OR).toEqual([{ ciParkState: null }, { ciParkState: { not: "active" } }]);
+    }
+    // The stamp's first-hand-out pin survives the composition intact.
+    const stampWhere = calls[0][0].where;
+    const stampedOr = stampWhere.AND.find((g: any) => Array.isArray(g.OR) && g.OR.some((cond: any) => "dispatchedGeneration" in cond));
+    expect(stampedOr.OR).toEqual([{ dispatchedGeneration: null }, { dispatchedGeneration: { not: 2 } }]);
+  });
+
+  it("a deferral that activates between the queue read and the hand-out stops both the stamp and the claim", async () => {
+    // Race-hardening: the listing carried the pre-deferral row, but a
+    // concurrent cipark commit lands before the stamp evaluates — the
+    // simulator flips the row exactly there. NULL and inactive states keep
+    // passing both pins; the active one fails them (count 0).
+    const row = ciParkRow();
+    mocks.prFixFindMany.mockResolvedValue([row]);
+    mocks.prFixFindUnique.mockImplementation(async () => row);
+    mocks.prFixUpdateMany.mockImplementation(async ({ where, data }: any) => {
+      row.ciParkState = "active";
+      if (where.NOT) {
+        // The claim: id/generation/status, the per-agent NOT append pin, and
+        // the #495 AND group.
+        if (row.id !== where.id || row.generation !== where.generation || row.status !== where.status) return { count: 0 };
+        if (Array.isArray(row.agentHandouts) && row.agentHandouts.includes(where.NOT.agentHandouts?.has)) return { count: 0 };
+        for (const group of where.AND ?? []) {
+          if (Array.isArray(group.OR) && !group.OR.some((cond: any) => matchesNullableColumnCondition(row, cond))) return { count: 0 };
+        }
+        applyUpdate(row, data);
+        return { count: 1 };
+      }
+      if (!matchesFirstHandOut(row, where)) return { count: 0 };
+      applyUpdate(row, data);
+      return { count: 1 };
+    });
+
+    const response = await GET(request(url), { params: Promise.resolve({ agentName: "example-agent" }) });
+    const body = await response.json();
+    // The stamp missed (row active) and the claim's guard refused: no
+    // hand-out record materialized and the item stays queue-owned.
+    expect(body.type).toBe("idle");
+    expect(row.agentHandouts).toEqual([]);
+    expect(row.dispatchedGeneration ?? null).toBeNull();
   });
 });
