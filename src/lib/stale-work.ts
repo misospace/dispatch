@@ -7,10 +7,14 @@ export const DEFAULT_STALE_WORK_MAX_AGE_MS = 5 * 60 * 1000;
 export const DEFAULT_STALE_WORK_BATCH_SIZE = 50;
 
 /**
- * Active `AgentWork` states whose staleness is HEARTBEAT-GATED: a row is
- * reclaimable when its `lastHeartbeatAt` OR its `leaseExpiresAt` fell past
- * the cutoff. These are executing rows — silence is the failure the sweep
- * exists to catch.
+ * Active `AgentWork` states whose staleness is gated on SILENCE-WITHOUT-A-LIVE-LEASE:
+ * a row is reclaimable when its `lastHeartbeatAt` fell past the cutoff AND its
+ * execution lease is not live (#1418). These are executing rows — silence used
+ * to be the failure the sweep existed to catch, but a renewal-extended lease is
+ * positive liveness: `heartbeatMatchingAgentWork` writes the heartbeat and the
+ * renewed expiry together, so between renewals the heartbeat can age past the
+ * cutoff while the lease the worker is still renewing stands. Silence alone is
+ * no longer abandonment while that lease is live.
  */
 const HEARTBEAT_GATED_STATES = ["CLAIMED", "IN_PROGRESS"] as const;
 
@@ -22,33 +26,22 @@ function lt(field: string, cutoff: Date): WhereClause {
 }
 
 /**
- * The SQL three-valued complement of `lt(field, cutoff)` over a NULLABLE
- * column: TRUE exactly when the `lt` comparison is NOT TRUE — the column IS
- * NULL, or its value is at/after the cutoff. This is the one place the
- * NULL-polarity rule is spelled; the heartbeat-gated family's live arm is
- * derived from it.
- */
-function notLt(field: string, cutoff: Date): WhereClause {
-  return { OR: [{ [field]: null }, { [field]: { gte: cutoff } }] };
-}
-
-/**
  * The SQL three-valued complement of the "IS NULL OR lt" reclaim shape over a
  * NULLABLE column: TRUE exactly when the column IS NOT NULL AND its value is
- * at/after the cutoff.
+ * at/after the boundary.
  *
- * `notLt` cannot express it: `notLt` is TRUE on a NULL column, while this arm
- * must never be TRUE there — a NULL deadline means NO park, and such a row
- * must not shield a claim. The bare `{ gte }` comparison already excludes
- * NULL rows (SQL's `NULL >= cutoff` is UNKNOWN, never TRUE), so this builder
- * spells the `IS NOT NULL` conjunct out instead of leaning on that side
- * effect: the NULL polarity of the rule lives in the builder, not in a
- * comparison's behaviour. The blocked-park family's live arm is derived from
- * THIS builder; the two builders are the two polarities of the same rule,
- * side by side.
+ * The bare `{ gte }` comparison already excludes NULL rows (SQL's
+ * `NULL >= boundary` is UNKNOWN, never TRUE), so this builder spells the
+ * `IS NOT NULL` conjunct out instead of leaning on that side effect: the NULL
+ * polarity of the rule lives in the builder, not in a comparison's behaviour.
+ * Both families' live arms derive their lease-liveness conjunct from THIS
+ * builder — the heartbeat-gated lease arm (`leaseExpiresAt IS NOT NULL AND
+ * leaseExpiresAt >= now`, #1418) and the blocked-park deadline arm — so a
+ * NULL column is never TRUE for either live arm and can never shield a claim
+ * on its own.
  */
-function notNullNotLt(field: string, cutoff: Date): WhereClause {
-  return { AND: [{ [field]: { not: null } }, { [field]: { gte: cutoff } }] };
+function notNullNotLt(field: string, boundary: Date): WhereClause {
+  return { AND: [{ [field]: { not: null } }, { [field]: { gte: boundary } }] };
 }
 
 /**
@@ -114,14 +107,25 @@ export interface ActiveStateFamilyPredicates {
 /**
  * The two active families and their reclaim/live predicates.
  *
- * - `CLAIMED`/`IN_PROGRESS` (heartbeat-gated): reclaimable on silence (stale
- *   heartbeat) OR an elapsed lease expiry — executing rows, silence is the
- *   failure the sweep exists to catch. Live is the De Morgan complement
- *   `notLt(lastHeartbeatAt) AND notLt(leaseExpiresAt)`; `lastHeartbeatAt` is
- *   NOT NULL in the schema, so its complement collapses to the `{ gte }` arm,
- *   while the nullable `leaseExpiresAt` keeps both arms of `notLt` — a
- *   fresh-heartbeat row with a NULL expiry is NOT stale under the sweeper's
- *   own clause (SQL `NULL < cutoff` is UNKNOWN) and must count as live.
+ * - `CLAIMED`/`IN_PROGRESS` (silence-without-a-live-lease, #1418): reclaimable
+ *   only on heartbeat silence AND no live lease — `lastHeartbeatAt < cutoff
+ *   AND (leaseExpiresAt IS NULL OR leaseExpiresAt < now)`. Heartbeat silence
+ *   alone is NOT abandonment while the execution lease stands: every active-row
+ *   writer pairs the two writes (`startAgentWork`/`checkpointAgentWork` at
+ *   +5m, an ownership renewal through `heartbeatMatchingAgentWork` at the
+ *   renewed TTL), so a non-renewing worker's lease crosses at the same silence
+ *   moment as before and only a renewal-extended row gains the shield —
+ *   bounded by `DISPATCH_OWNERSHIP_RENEW_TTL_MS`, exactly the window the
+ *   lease still blocks duplicate pickup for. This aligns the sweep with the
+ *   derived ownership read model (`lease_still_live` → CLAIMED_LONG_RUNNING,
+ *   never release). A NULL expiry keeps reclaim-on-silence: no lease clock, no
+ *   liveness to trust. Live is the exact 3VL complement, De Morgan over the
+ *   conjunction: `lastHeartbeatAt >= cutoff OR (leaseExpiresAt IS NOT NULL AND
+ *   leaseExpiresAt >= now)` — a fresh heartbeat is liveness on its own (the
+ *   worker just checkpointed), and a live lease is liveness on its own (the
+ *   renewal clock). The `IS NOT NULL` conjunct comes from `notNullNotLt`, so a
+ *   NULL-expiry sibling is FALSE (never TRUE) for the lease arm and can only
+ *   be live through its heartbeat.
  * - `BLOCKED` (park-gated, #1316): a blocked worker is silent BY DESIGN, and
  *   a `blocked` ownership disposition parks the row as an external wait by
  *   moving its `leaseExpiresAt` to the park deadline (`retryAfter`). So it is
@@ -132,10 +136,15 @@ export interface ActiveStateFamilyPredicates {
  *   park-shaped hold it had no deadline for). Reclaiming on the heartbeat instead would destroy
  *   the parked claim while the park is still running, deleting the lease the
  *   `blocked` disposition was recorded on. Live is the 3VL complement of
- *   `IS NULL OR lt` — `NOT IS NULL AND notLt` — derived through the sibling
+ *   `IS NULL OR lt` — `NOT IS NULL AND gte` — derived through the sibling
  *   builder `notNullNotLt`, which spells the `IS NOT NULL` conjunct out: a
  *   NULL-deadline BLOCKED sibling is therefore FALSE (never TRUE) for the
  *   live arm and can never keep a claim alive forever.
+ *
+ * `now` is the sweep's own instant and must satisfy `now >= cutoff` (the sweep
+ * derives `cutoff = now - maxAgeMs`); the lease-liveness boundary is plain
+ * expiry at `now`, not at the cutoff — an expired lease is reclaimable the
+ * moment it lapses, and the heartbeat cutoff stays the silence threshold.
  *
  * Both arms of both families share the pending boundary
  * `staleClaimReleasePending: false`. A row that still owes a claim release
@@ -151,20 +160,22 @@ export interface ActiveStateFamilyPredicates {
  * full truth grid so the coupling is pinned behaviorally, not just by
  * construction.
  */
-export function activeStateFamilies(cutoff: Date): ActiveStateFamilyPredicates[] {
+export function activeStateFamilies(cutoff: Date, now: Date): ActiveStateFamilyPredicates[] {
   return [
     {
       name: "heartbeat-gated",
       reclaim: {
         state: { in: [...HEARTBEAT_GATED_STATES] },
         staleClaimReleasePending: false,
-        OR: [lt("lastHeartbeatAt", cutoff), lt("leaseExpiresAt", cutoff)],
+        AND: [
+          lt("lastHeartbeatAt", cutoff),
+          { OR: [{ leaseExpiresAt: null }, lt("leaseExpiresAt", now)] },
+        ],
       },
       live: {
         state: { in: [...HEARTBEAT_GATED_STATES] },
         staleClaimReleasePending: false,
-        lastHeartbeatAt: { gte: cutoff },
-        ...notLt("leaseExpiresAt", cutoff),
+        OR: [{ lastHeartbeatAt: { gte: cutoff } }, notNullNotLt("leaseExpiresAt", now)],
       },
     },
     {
@@ -320,17 +331,17 @@ interface StaleWorkOutcome {
  * Find a live sibling `AgentWork` row for the same (agent, issue) pair — a row
  * that still keeps the claim alive.
  *
- * The predicate is `OR` over `activeStateFamilies(cutoff)`'s `live` clauses —
- * the SAME family definitions the candidate query and the mark CAS consume for
- * their `reclaim` clauses. A sibling is live exactly when the sweeper's own
- * staleness test would NOT reclaim it for that state family, per state, in
- * SQL three-valued logic, and it does not owe a claim release (both arms
- * carry `staleClaimReleasePending: false`, so a pending active-shaped row is
- * never mistaken for a live shield — see `activeStateFamilies` / `notLt` for how each
- * family's live arm is derived as the 3VL complement of its reclaim arm and
- * why the NULL polarity differs per family). The structural coupling is the
- * point: one definition site, both consumers, so the two predicates cannot
- * drift apart.
+ * The predicate is `OR` over `activeStateFamilies(cutoff, now)`'s `live`
+ * clauses — the SAME family definitions the candidate query and the mark CAS
+ * consume for their `reclaim` clauses. A sibling is live exactly when the
+ * sweeper's own staleness test would NOT reclaim it for that state family,
+ * per state, in SQL three-valued logic, and it does not owe a claim release
+ * (both arms carry `staleClaimReleasePending: false`, so a pending
+ * active-shaped row is never mistaken for a live shield — see
+ * `activeStateFamilies` / `notNullNotLt` for how each family's live arm is
+ * derived as the 3VL complement of its reclaim arm and why the NULL polarity
+ * differs per family). The structural coupling is the point: one definition
+ * site, both consumers, so the two predicates cannot drift apart.
  *
  * The row being processed is excluded (`id: { not: work.id }`). That exclusion
  * is defence in depth, not the load-bearing part: the live arms are the exact
@@ -342,13 +353,14 @@ async function findLiveSiblingWork(
   tx: StaleWorkTransactionClient,
   work: { id: string; agentName: string; issueId: string | null },
   cutoff: Date,
+  now: Date,
 ): Promise<{ id: string } | null> {
   return tx.agentWork.findFirst({
     where: {
       agentName: work.agentName,
       issueId: work.issueId,
       id: { not: work.id },
-      OR: activeStateFamilies(cutoff).map((family) => family.live),
+      OR: activeStateFamilies(cutoff, now).map((family) => family.live),
     },
     select: { id: true },
   });
@@ -419,7 +431,7 @@ export async function sweepStaleWork(
   const parkedClaims = await findParkedClaims(client, now);
   const reclaimClause = {
     OR: [
-      ...activeStateFamilies(cutoff).map((family) => family.reclaim),
+      ...activeStateFamilies(cutoff, now).map((family) => family.reclaim),
       { state: "STALE", staleClaimReleasePending: true },
     ],
   };
@@ -550,7 +562,7 @@ export async function sweepStaleWork(
       // it. A row without an issue owns no claim at all (no lease, no
       // label), so there is nothing a sibling could be keeping alive.
       const liveSibling = work.issueId
-        ? await findLiveSiblingWork(tx, work, cutoff)
+        ? await findLiveSiblingWork(tx, work, cutoff, now)
         : null;
 
       if (work.state === "STALE") {
@@ -569,7 +581,7 @@ export async function sweepStaleWork(
           where: {
             id: work.id,
             staleClaimReleasePending: false,
-            OR: activeStateFamilies(cutoff).map((family) => family.reclaim),
+            OR: activeStateFamilies(cutoff, now).map((family) => family.reclaim),
           },
           // A live sibling owns the claim, so no release is owed for this
           // row: the marker stays down and the retry loop stops.
