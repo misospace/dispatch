@@ -313,11 +313,45 @@ model PrFixQueueItem {
   // freshness or satisfaction predicate; NULL = never considered.
   triggerEvaluatedAt       DateTime?
   author                   String?
+  // CI park-and-resume deferral (misospace/courier#495): server-side state
+  // for Courier's "park while CI runs, reserve one repair opportunity, settle
+  // the outcome" lifecycle over the PR-fix queue. Null `ciParkState` = no
+  // lifecycle ever recorded for this row.
+  //
+  // `ciParkState`: "active" (a park notice is in force — the queued hand-out
+  // stays quiet for ANY polling agent until settlement), "released" (a
+  // fence-less unsupported outcome handed stewardship back), or "settled"
+  // (a fenced exhausted/unsupported outcome handed stewardship back).
+  // The notice's agentName is transport identity only — suppression is
+  // per-item, never per-agent.
+  //
+  // `ciParkHead`: the parked CI head (head-superseded fences reservations).
+  // `ciParkKey`: the idempotencyKey of the park notice that produced the
+  // current state. `ciParkFence`: the live reservation fence (one repair
+  // opportunity per deferral) or null. `ciParkAt`: when the current state
+  // was committed.
+  //
+  // Passive on non-QUEUED dispositions: a BLOCKED/PARKED/STALE row is not in
+  // the QUEUED hand-out listing, so a stale `ciParkState` there is inert; the
+  // row's next requeue/reactivation goes through `freshAttemptGeneration`,
+  // which bumps the generation and clears all five columns in the same write
+  // (the "leash": a deferral can never strand the item — no TTL or new env
+  // var). Unwritten columns stay null for every pre-feature row.
+  ciParkState              String?
+  ciParkHead               String?
+  ciParkKey                String?
+  ciParkFence              String?
+  ciParkAt                 DateTime?
   history                  PrFixHistory[]
   evidence                 PrFixEvidence[]
   // #1183: worker executions durably associated to this item's fix rounds
   // (AgentRun.prFixQueueItemId). SetNull on item deletion keeps run evidence.
   agentRuns                AgentRun[]
+  // Exactly-once replay ledger for the CI park lifecycle routes (#495): one
+  // row per (item, kind, idempotencyKey) transition. The composite unique
+  // index is the commitment record — a retried notice whose create races
+  // into a P2002 replays instead of re-applying.
+  ciParkLedger             PrFixCIParkLedger[]
 
   @@unique([repo, pr])
   @@index([status])
@@ -391,6 +425,31 @@ model PrFixEvidence {
   @@unique([itemId, identity])
   @@index([itemId, sequence])
   @@index([itemId, contentSignature])
+}
+
+// Exactly-once replay ledger for the CI park-and-resume lifecycle routes
+// (misospace/courier#495): every accepted transition of /cipark, /cireserve,
+// /cirepair commits exactly one row keyed (item, kind, idempotencyKey). The
+// composite unique index doubles as the commitment record: a retried call
+// whose ledger create hits the unique violation replays its original
+// acceptance without touching state. `kind` is "park" | "reserve" |
+// "outcome" | "release"; fence/result/head/agent carry the transition's
+// payload for replay responses and audit.
+model PrFixCIParkLedger {
+  id        String         @id @default(cuid())
+  itemId    String
+  item      PrFixQueueItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  // "park" | "reserve" | "outcome" | "release"
+  kind      String
+  // Caller-presented idempotency key — the replay identity with the kind.
+  key       String
+  fence     String?
+  result    String?
+  head      String?
+  agent     String?
+  createdAt DateTime       @default(now())
+
+  @@unique([itemId, kind, key])
 }
 
 model AgentRun {
