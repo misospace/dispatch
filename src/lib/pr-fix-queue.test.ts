@@ -5902,3 +5902,393 @@ describe("mark hand-out binding for worker settlements (#1428)", () => {
     expect(mutatedItem(other).status).toBe("BLOCKED");
   });
 });
+
+describe("hand-out-scoped external waits (#1430)", () => {
+  let client: ReturnType<typeof makeClient>;
+
+  const wait = {
+    kind: "upstream_pr",
+    ref: "org/deps#7",
+    evidence: "upstream PR open",
+    trigger: { kind: "merged" },
+  } as const;
+
+  beforeEach(() => {
+    client = makeClient();
+    surfacingMocks.surfacePrFixBlocked.mockReset();
+    surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    surfacingMocks.surfacePrFixParked.mockReset();
+    surfacingMocks.surfacePrFixParked.mockResolvedValue({ commentPosted: true, commentUpdated: false, skippedTerminal: false, errors: [] });
+  });
+
+  async function seedQueued(pr: number) {
+    const item = await enqueuePrFixItem(client, { repo: "org/repo", pr, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: `k${pr}` });
+    // #1431 composes with #1430: a bound worker may start WAITING_EXTERNAL
+    // only from a generation it was actually handed. Seed both live worker
+    // markers so these tests exercise waiter-replay ownership, not the
+    // earlier route-wide hand-out authorization gate.
+    const row = client.items.find((i) => i.id === item.id)!;
+    row.agentHandouts = [`alpha@${row.generation}`, `bravo@${row.generation}`];
+    return item;
+  }
+
+  function rowOf(item: any) {
+    return client.items.find((i) => i.id === item.id)!;
+  }
+
+  it("records the bound waiter when a scoped worker starts the wait", async () => {
+    const item = await seedQueued(90);
+    const result = await markPrFixItem(client, {
+      repo: item.repo,
+      pr: item.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: item.generation,
+      externalWait: wait,
+      handoutScopedAgent: "alpha",
+    });
+
+    expect(result.mutated).toBe(true);
+    const row = mutatedItem(result);
+    expect(row.status).toBe("WAITING_EXTERNAL");
+    expect(row.externalWaitBy).toBe("alpha");
+    expect(client.history.at(-1)).toMatchObject({ action: "mark", status: "WAITING_EXTERNAL" });
+  });
+
+  it("records a null waiter when an unscoped caller starts the wait", async () => {
+    const item = await seedQueued(91);
+    const result = await markPrFixItem(client, {
+      repo: item.repo,
+      pr: item.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: item.generation,
+      externalWait: wait,
+    });
+
+    expect(result.mutated).toBe(true);
+    expect(mutatedItem(result).externalWaitBy).toBe(null);
+  });
+
+  it("grants its own same-generation replay idempotently without extending the wait (#1231, #1430)", async () => {
+    const item = await seedQueued(92);
+    const first = await markPrFixItem(client, {
+      repo: item.repo,
+      pr: item.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: item.generation,
+      note: "original note",
+      externalWait: wait,
+      handoutScopedAgent: "alpha",
+    });
+    expect(first.mutated).toBe(true);
+
+    const row = rowOf(item);
+    const retryAtBefore = row.retryAt;
+    const waitBefore = row.externalWait;
+    const historyLengthBefore = client.history.length;
+
+    const replay = await markPrFixItem(client, {
+      repo: row.repo,
+      pr: row.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: row.generation,
+      note: "replay note",
+      externalWait: wait,
+      handoutScopedAgent: "alpha",
+    });
+
+    expect(replay.mutated).toBe(true);
+    expect(mutatedItem(replay)).toBe(row);
+    // No new history row: the replay is the #1231 duplicate answer, not a new mark.
+    expect(client.history).toHaveLength(historyLengthBefore);
+    // The cooldown is never re-armed by the replay.
+    expect(row.retryAt).toBe(retryAtBefore);
+    expect(row.externalWait).toEqual(waitBefore);
+    expect(row.externalWaitBy).toBe("alpha");
+    expect(client.history.at(-1)).toMatchObject({ note: "original note" });
+  });
+
+  it("refuses a same-generation replay from a different bound worker (not-handed)", async () => {
+    const item = await seedQueued(93);
+    const first = await markPrFixItem(client, {
+      repo: item.repo,
+      pr: item.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: item.generation,
+      externalWait: wait,
+      handoutScopedAgent: "alpha",
+    });
+    expect(first.mutated).toBe(true);
+
+    const row = rowOf(item);
+    const retryAtBefore = row.retryAt;
+    const historyLengthBefore = client.history.length;
+
+    const refused = await markPrFixItem(client, {
+      repo: row.repo,
+      pr: row.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: row.generation,
+      externalWait: wait,
+      handoutScopedAgent: "bravo",
+    });
+
+    expect(refused).toEqual({ mutated: false, reason: "not-handed" });
+    // The refusal is a caller-binding denial: no write, no history row.
+    expect(row.status).toBe("WAITING_EXTERNAL");
+    expect(row.externalWaitBy).toBe("alpha");
+    expect(row.retryAt).toBe(retryAtBefore);
+    expect(client.history).toHaveLength(historyLengthBefore);
+  });
+
+  it("refuses a scoped replay of a wait started by an unscoped caller (no recorded waiter)", async () => {
+    const item = await seedQueued(94);
+    const first = await markPrFixItem(client, {
+      repo: item.repo,
+      pr: item.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: item.generation,
+      externalWait: wait,
+    });
+    expect(first.mutated).toBe(true);
+    const row = rowOf(item);
+    expect(row.externalWaitBy).toBe(null);
+
+    const refused = await markPrFixItem(client, {
+      repo: row.repo,
+      pr: row.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: row.generation,
+      externalWait: wait,
+      handoutScopedAgent: "alpha",
+    });
+
+    expect(refused).toEqual({ mutated: false, reason: "not-handed" });
+    expect(row.externalWaitBy).toBe(null);
+  });
+
+  it("keeps the unscoped same-generation replay unchanged for a scoped wait (#1231)", async () => {
+    const item = await seedQueued(95);
+    const first = await markPrFixItem(client, {
+      repo: item.repo,
+      pr: item.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: item.generation,
+      externalWait: wait,
+      handoutScopedAgent: "alpha",
+    });
+    expect(first.mutated).toBe(true);
+
+    const row = rowOf(item);
+    const replay = await markPrFixItem(client, {
+      repo: row.repo,
+      pr: row.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: row.generation,
+      externalWait: wait,
+    });
+
+    expect(replay.mutated).toBe(true);
+    expect(mutatedItem(replay)).toBe(row);
+    expect(row.externalWaitBy).toBe("alpha");
+  });
+
+  it("resets the recorded waiter when the wait is released into a fresh attempt", async () => {
+    const item = await seedQueued(96);
+    const first = await markPrFixItem(client, {
+      repo: item.repo,
+      pr: item.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: item.generation,
+      externalWait: wait,
+      handoutScopedAgent: "alpha",
+    });
+    expect(first.mutated).toBe(true);
+
+    const row = rowOf(item);
+    expect(row.externalWaitBy).toBe("alpha");
+    const generationBefore = row.generation;
+
+    // Operator release: a mark back to QUEUED is a fresh attempt and must not
+    // inherit the dead attempt's recorded waiter or hand-out records.
+    const released = await markPrFixItem(client, {
+      repo: row.repo,
+      pr: row.pr,
+      status: "QUEUED",
+      expectedGeneration: row.generation,
+      actorTier: "maintainer",
+      note: "operator release",
+    });
+
+    expect(released.mutated).toBe(true);
+    const fresh = mutatedItem(released);
+    expect(fresh.status).toBe("QUEUED");
+    expect(fresh.generation).toBe(generationBefore + 1);
+    expect(fresh.externalWaitBy).toBe(null);
+    expect(fresh.agentHandouts).toEqual([]);
+  });
+
+  // Post-write conflict fallback race (#1430): the scoped caller reads the row
+  // as QUEUED, a CONCURRENT mark at the same generation wins the
+  // QUEUED→WAITING_EXTERNAL transition before the caller's generation-pinned
+  // write runs (status where-pin misses, count 0), and the fallback re-read
+  // must apply the same scoped-replay gate as the pre-read duplicate. Each of
+  // the two fallback paths (normal wait write, fail-closed downgrade) runs
+  // exactly one updateMany — the pinned write itself — so the one-shot
+  // `beforeUpdateMany` hook lands the concurrent winner right before it.
+  describe("concurrent same-generation wait races (post-write fallback)", () => {
+    const ALPHA_RETRY_AT = new Date(Date.UTC(2026, 5, 15, 12, 30));
+    const ALPHA_NOTE = "alpha is waiting on the upstream PR";
+
+    function installConcurrentAlphaWait(item: { id: string }) {
+      client.hooks.beforeUpdateMany = () => {
+        const row = client.items.find((i) => i.id === item.id)!;
+        // Alpha's winning wait write: distinct note (history) and retryAt
+        // from anything the losing caller would have recorded; generation
+        // unchanged (same-generation race).
+        Object.assign(row, {
+          status: "WAITING_EXTERNAL",
+          retryAt: ALPHA_RETRY_AT,
+          externalWait: wait,
+          outcome: null,
+          decisionDetail: null,
+          postDispatchEvidenceKeys: [],
+          disposedAt: new Date(Date.UTC(2026, 5, 16, 0, 0)),
+          disposedEvidence: null,
+          attemptEvidenceWatermark: null,
+          dispatchedGeneration: null,
+          dispatchedAt: null,
+          agentHandouts: [],
+          handoutReceipts: [],
+          handoutAcks: [],
+          externalWaitBy: "alpha",
+          updatedAt: new Date(Date.UTC(2026, 5, 17, 0, 0)),
+        });
+        client.history.push({
+          id: `history-${client.history.length + 1}`,
+          at: new Date(),
+          itemId: row.id,
+          action: "mark",
+          status: "WAITING_EXTERNAL",
+          lane: row.lane,
+          note: ALPHA_NOTE,
+        });
+      };
+    }
+
+    it("a scoped caller losing the QUEUED→WAITING_EXTERNAL write to a concurrent wait by another agent gets not-handed (post-write fallback, #1430)", async () => {
+      const item = await seedQueued(97);
+      installConcurrentAlphaWait(item);
+      const historyLengthBefore = client.history.length;
+
+      const lost = await markPrFixItem(client, {
+        repo: item.repo,
+        pr: item.pr,
+        status: "WAITING_EXTERNAL",
+        expectedGeneration: item.generation,
+        note: "bravo wait note",
+        externalWait: wait,
+        handoutScopedAgent: "bravo",
+      });
+
+      expect(lost).toEqual({ mutated: false, reason: "not-handed" });
+      const row = rowOf(item);
+      // The row keeps the concurrent winner's wait, not bravo's: alpha is the
+      // recorded waiter with alpha's cooldown, and bravo's attempt left no
+      // history row (its pinned write missed before the history create).
+      expect(row.status).toBe("WAITING_EXTERNAL");
+      expect(row.externalWaitBy).toBe("alpha");
+      expect(row.retryAt).toBe(ALPHA_RETRY_AT);
+      expect(client.history).toHaveLength(historyLengthBefore + 1);
+      expect(client.history.at(-1)).toMatchObject({ action: "mark", status: "WAITING_EXTERNAL", note: ALPHA_NOTE });
+      expect(client.history.some((h) => h.note === "bravo wait note")).toBe(false);
+    });
+
+    it("a scoped caller losing the write to its own concurrent wait keeps the idempotent answer (post-write fallback double submit, #1430)", async () => {
+      const item = await seedQueued(98);
+      installConcurrentAlphaWait(item);
+      const historyLengthBefore = client.history.length;
+
+      const replay = await markPrFixItem(client, {
+        repo: item.repo,
+        pr: item.pr,
+        status: "WAITING_EXTERNAL",
+        expectedGeneration: item.generation,
+        note: "alpha replay note",
+        externalWait: wait,
+        handoutScopedAgent: "alpha",
+      });
+
+      expect(replay.mutated).toBe(true);
+      const row = rowOf(item);
+      expect(mutatedItem(replay)).toBe(row);
+      // The winner's recorded wait survives the caller's losing write:
+      // alpha's cooldown and note, no second history row from the replay.
+      expect(row.status).toBe("WAITING_EXTERNAL");
+      expect(row.externalWaitBy).toBe("alpha");
+      expect(row.retryAt).toBe(ALPHA_RETRY_AT);
+      expect(client.history).toHaveLength(historyLengthBefore + 1);
+      expect(client.history.at(-1)).toMatchObject({ note: ALPHA_NOTE });
+      expect(client.history.some((h) => h.note === "alpha replay note")).toBe(false);
+    });
+
+    it("an unscoped caller losing the write to a concurrent scoped wait keeps the unchanged replay (post-write fallback, #1430)", async () => {
+      const item = await seedQueued(99);
+      installConcurrentAlphaWait(item);
+      const historyLengthBefore = client.history.length;
+
+      const replay = await markPrFixItem(client, {
+        repo: item.repo,
+        pr: item.pr,
+        status: "WAITING_EXTERNAL",
+        expectedGeneration: item.generation,
+        note: "unscoped wait note",
+        externalWait: wait,
+      });
+
+      expect(replay.mutated).toBe(true);
+      const row = rowOf(item);
+      expect(mutatedItem(replay)).toBe(row);
+      // Unscoped callers are not bound to the recorded waiter: the row comes
+      // back unchanged, still recording alpha as the starter.
+      expect(row.status).toBe("WAITING_EXTERNAL");
+      expect(row.externalWaitBy).toBe("alpha");
+      expect(row.retryAt).toBe(ALPHA_RETRY_AT);
+      expect(client.history).toHaveLength(historyLengthBefore + 1);
+      expect(client.history.at(-1)).toMatchObject({ note: ALPHA_NOTE });
+    });
+
+    it("the fail-closed downgrade write's fallback applies the scoped gate too: not-handed, and the row is never parked (post-write fallback, #1430)", async () => {
+      const item = await seedQueued(100);
+      installConcurrentAlphaWait(item);
+      const historyLengthBefore = client.history.length;
+
+      // Invalid contract (no dependency) → the fail-closed PARKED/invalid_wait
+      // downgrade write is attempted, but the hook flips the row to alpha's
+      // WAITING_EXTERNAL first, so its QUEUED status pin misses.
+      const lost = await markPrFixItem(client, {
+        repo: item.repo,
+        pr: item.pr,
+        status: "WAITING_EXTERNAL",
+        expectedGeneration: item.generation,
+        note: "bravo invalid note",
+        externalWait: {},
+        handoutScopedAgent: "bravo",
+      });
+
+      expect(lost).toEqual({ mutated: false, reason: "not-handed" });
+      const row = rowOf(item);
+      // The row stays on alpha's wait: not parked, no invalid_wait
+      // disposition, no PARKED history row, no park surfacing.
+      expect(row.status).toBe("WAITING_EXTERNAL");
+      expect(row.outcome).toBe(null);
+      expect(row.lane).toBe("NORMAL");
+      expect(row.externalWaitBy).toBe("alpha");
+      expect(row.externalWait).toEqual(wait);
+      expect(row.retryAt).toBe(ALPHA_RETRY_AT);
+      expect(client.history).toHaveLength(historyLengthBefore + 1);
+      expect(client.history.at(-1)).toMatchObject({ status: "WAITING_EXTERNAL", note: ALPHA_NOTE });
+      expect(client.history.some((h) => h.status === "PARKED")).toBe(false);
+      expect(surfacingMocks.surfacePrFixParked).not.toHaveBeenCalled();
+    });
+  });
+});

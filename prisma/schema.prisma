@@ -282,6 +282,13 @@ model PrFixQueueItem {
   // WAITING_EXTERNAL row means a legacy free-text wait (pre-#1250) — surfaced
   // for operator action, never auto-downgraded.
   externalWait             Json?
+  // Identity of the bound worker that started the CURRENT external wait (#1430):
+  // written atomically with the single WAITING_EXTERNAL status write; null for
+  // waits started by unscoped (maintainer/operator/internal) callers. The
+  // idempotent same-generation WAITING_EXTERNAL replay (#1231) is bound to it,
+  // so a scoped worker that never started the wait cannot read the row back.
+  // Cleared wherever agentHandouts is cleared.
+  externalWaitBy           String?
   // #1253 stale-disposition flag: set when fresh actionable evidence arrived
   // while the item sat in a disposition evidence must not override
   // (BLOCKED human decision, cap-exhausted or fail-closed PARKED). Operator-
