@@ -23,9 +23,18 @@
  *
  * Exactly-once replay: every accepted transition commits one
  * `PrFixCIParkLedger` row keyed (item, kind, idempotencyKey) inside one
- * transaction — replay read → ledger create (a P2002 unique violation means
- * a concurrent same-key commit won, so treat the call as a replay and skip
- * the state write) → conditional item update. When the client has no ledger
+ * transaction — replay read → conditional item update (the CAS is the
+ * linearization point) → ledger witness, ONLY after the CAS committed. A
+ * lost CAS therefore writes nothing at all: a refused transition leaves no
+ * witness, so a same-key retry re-answers the refusal instead of replaying
+ * it as a success (a pre-CAS witness would commit with the 409 and poison
+ * every later retry — review finding on this PR). Concurrent same-key
+ * commits still collapse: the loser's CAS counts zero (the winner's state
+ * move breaks its guard) and its re-read finds the winner's witness; the
+ * residual interleave where both CASes match is settled by the witness
+ * itself — the P2002 loser throws out of the transaction (rolling its
+ * no-op CAS write back, so a replay never churns state) and answers the
+ * winner's replay. When the client has no ledger
  * surface (legacy/test clients), the same machinery falls back to state-only
  * writes: a repeated same-key commit is then a same-value idempotent
  * re-apply (safe by construction — the state itself is the replay witness),
@@ -285,20 +294,33 @@ async function findLedgerRow(
 }
 
 /**
- * Record the ledger row for a committing transition INSIDE the caller's
- * transaction. A P2002 means a concurrent same-key commit already owns the
- * row: this call becomes a REPLAY (its outcome is read back from the ledger)
- * and the caller must skip the state write.
+ * Thrown INSIDE a `$transaction` when the witness create collides (P2002)
+ * with a same-key commit that won after this call's CAS matched. Throwing is
+ * the rollback: it discards this transaction's CAS write — a replay must not
+ * churn state — and the caller's outer handler answers the winner's replay.
  */
-async function recordLedgerRow(
+class CIParkWitnessRaced extends Error {
+  constructor() {
+    super("ci-park ledger witness raced");
+  }
+}
+
+/**
+ * Commit the ledger witness for a transition whose CAS ALREADY matched,
+ * INSIDE the caller's transaction — never before the CAS, so a refused (or
+ * rolled-back) transition leaves no witness a later retry could replay as a
+ * success. A P2002 here means a concurrent same-key commit matched past this
+ * call's guard: throw out to roll the write back (see CIParkWitnessRaced).
+ */
+async function commitWitness(
   tx: PrFixQueueClient,
   itemId: string,
   data: { kind: LedgerKind; key: string; fence?: string | null; result?: string | null; head?: string | null; agent?: string | null },
-): Promise<{ replayed: boolean; row: any | null }> {
+): Promise<void> {
   const ledger = ciParkLedger(tx);
-  if (!ledger) return { replayed: false, row: null };
+  if (!ledger) return;
   try {
-    const row = await ledger.create({
+    await ledger.create({
       data: {
         itemId,
         kind: data.kind,
@@ -309,12 +331,8 @@ async function recordLedgerRow(
         ...(data.agent !== undefined ? { agent: data.agent } : {}),
       },
     });
-    return { replayed: false, row };
   } catch (error) {
-    if (isP2002(error)) {
-      const row = await findLedgerRow(tx, itemId, data.kind, data.key);
-      return { replayed: true, row };
-    }
+    if (isP2002(error)) throw new CIParkWitnessRaced();
     throw error;
   }
 }
@@ -438,40 +456,51 @@ export async function ciParkPrFixItem(
   if (mismatch) return mismatch;
   if (item.status !== "QUEUED") return { ok: false, reason: "opportunity-missing" };
 
-  return client.$transaction(async (tx) => {
-    // Authoritative replay inside the transaction: another same-key commit
-    // landing in the read→write gap wins; skip the state write.
-    if (await findLedgerRow(tx, item.id, "park", input.idempotencyKey)) {
+  try {
+    return await client.$transaction(async (tx) => {
+      // Authoritative replay inside the transaction: another same-key commit
+      // landing in the read→write gap wins; skip the state write.
+      if (await findLedgerRow(tx, item.id, "park", input.idempotencyKey)) {
+        return { ok: true, replayed: true, item };
+      }
+      const { count } = await tx.prFixQueueItem.updateMany({
+        where: { id: item.id, generation: input.generation, status: "QUEUED" },
+        data: {
+          ciParkState: "active",
+          ciParkHead: input.head,
+          ciParkKey: input.idempotencyKey,
+          ciParkAt: new Date(),
+        },
+      });
+      if (count === 1) {
+        await commitWitness(tx, item.id, {
+          kind: "park",
+          key: input.idempotencyKey,
+          head: input.head,
+          agent: input.agentName,
+        });
+        return { ok: true, item };
+      }
+      // The pin lost the race: the row's identity (status or generation)
+      // moved between the read and this write. NOTHING has been written by
+      // this call (the witness rides the committed CAS), so every answer
+      // below leaves the retry semantics intact. Re-derive once — a twin's
+      // same-key commit or a deferral that already moved past the park (its
+      // lifecycle evidence replays by state) is committed enough; anything
+      // else is this notice pointing at dead work.
+      const fresh = await tx.prFixQueueItem.findUnique({ where: { id: item.id } });
+      if (!fresh) return { ok: false, reason: "opportunity-missing" };
+      if (parkReplayByState(fresh, input.idempotencyKey)) return { ok: true, replayed: true, item: fresh };
+      return { ok: false, reason: "opportunity-missing" };
+    });
+  } catch (error) {
+    // A same-key twin committed between our matched CAS and the witness:
+    // the transaction rolled our write back; answer its replay.
+    if (error instanceof CIParkWitnessRaced) {
       return { ok: true, replayed: true, item };
     }
-    const recorded = await recordLedgerRow(tx, item.id, {
-      kind: "park",
-      key: input.idempotencyKey,
-      head: input.head,
-      agent: input.agentName,
-    });
-    if (recorded.replayed) return { ok: true, replayed: true, item };
-
-    const { count } = await tx.prFixQueueItem.updateMany({
-      where: { id: item.id, generation: input.generation, status: "QUEUED" },
-      data: {
-        ciParkState: "active",
-        ciParkHead: input.head,
-        ciParkKey: input.idempotencyKey,
-        ciParkAt: new Date(),
-      },
-    });
-    if (count === 1) return { ok: true, item };
-    // The pin lost the race: the row's identity (status or generation)
-    // moved between the read and this write. Re-derive once — a twin's
-    // same-key commit or a deferral that already moved past the park (its
-    // lifecycle evidence replays by state) is committed enough; anything
-    // else is this notice pointing at dead work.
-    const fresh = await tx.prFixQueueItem.findUnique({ where: { id: item.id } });
-    if (!fresh) return { ok: false, reason: "opportunity-missing" };
-    if (parkReplayByState(fresh, input.idempotencyKey)) return { ok: true, replayed: true, item: fresh };
-    return { ok: false, reason: "opportunity-missing" };
-  });
+    throw error;
+  }
 }
 
 // ── CIRESERVE ───────────────────────────────────────────────────────────────
@@ -526,17 +555,8 @@ export async function ciReservePrFixItem(
 
   if (input.head !== item.ciParkHead) return { ok: false, reason: "head-superseded" };
 
-  /** One ledger-create-then-CAS grant attempt. */
+  /** One CAS-then-witness grant attempt; returns the CAS count. */
   const grant = async (tx: PrFixQueueClient) => {
-    const recorded = await recordLedgerRow(tx, item.id, {
-      kind: "reserve",
-      key: input.idempotencyKey,
-      fence: input.fenceToken,
-      agent: input.agentName,
-    });
-    if (recorded.replayed) {
-      return { replayed: true, fence: (recorded.row?.fence ?? null) as string | null, count: 0 as number };
-    }
     const { count } = await tx.prFixQueueItem.updateMany({
       // #1415: the head identity rides the CAS both here and on the retry
       // below — a concurrent re-park that re-binds the deferral between the
@@ -545,51 +565,73 @@ export async function ciReservePrFixItem(
       where: { id: item.id, generation: input.generation, ciParkState: "active", ciParkFence: null, ciParkHead: input.head },
       data: { ciParkFence: input.fenceToken },
     });
-    return { replayed: false, fence: input.fenceToken, count };
+    if (count === 1) {
+      await commitWitness(tx, item.id, {
+        kind: "reserve",
+        key: input.idempotencyKey,
+        fence: input.fenceToken,
+        agent: input.agentName,
+      });
+    }
+    return count;
   };
 
-  return client.$transaction(async (tx) => {
-    // Replay again under the transaction — a same-key commit landing in the
-    // gap replays its committed fence.
-    const replay = await findLedgerRow(tx, item.id, "reserve", input.idempotencyKey);
-    if (replay) return { ok: true, replayed: true, fenceToken: replay.fence ?? input.fenceToken, item };
+  try {
+    return await client.$transaction(async (tx) => {
+      // Replay again under the transaction — a same-key commit landing in the
+      // gap replays its committed fence.
+      const replay = await findLedgerRow(tx, item.id, "reserve", input.idempotencyKey);
+      if (replay) return { ok: true, replayed: true, fenceToken: replay.fence ?? input.fenceToken, item };
 
-    const first = await grant(tx);
-    if (first.replayed) return { ok: true, replayed: true, fenceToken: first.fence ?? input.fenceToken, item };
-    if (first.count === 1) return { ok: true, fenceToken: input.fenceToken, item };
+      const first = await grant(tx);
+      if (first === 1) return { ok: true, fenceToken: input.fenceToken, item };
 
-    // The CAS lost a race. Re-read once and re-derive from the current state:
-    // a deferral no longer active (settled or released, or the row vanished)
-    // is stale opportunity; the marker head superseded by a re-park is a
-    // replaced deferral (head-superseded FIRST — the re-derive must map the
-    // re-bound head before the generic fence answers); a fence held under a
-    // different token is the competitor's; an open vacancy with a matching
-    // head allows exactly one retry; anything unresolved conservatively reads
-    // as held.
-    const fresh = await tx.prFixQueueItem.findUnique({ where: { id: item.id } });
-    if (!fresh || fresh.ciParkState !== "active" || fresh.generation !== input.generation) {
-      if (fresh?.ciParkState === "settled" || fresh?.ciParkState === "released") {
-        return { ok: false, reason: "opportunity-missing" };
+      // The CAS lost a race. NOTHING has been written by this call (the
+      // witness rides the committed CAS), so every refusal below stays
+      // re-answerable by a same-key retry. Re-read once and re-derive from
+      // the current state: a deferral no longer active (settled or released,
+      // or the row vanished) is stale opportunity; the marker head superseded
+      // by a re-park is a replaced deferral (head-superseded FIRST — the
+      // re-derive must map the re-bound head before the generic fence
+      // answers); a fence held under a different token is the competitor's;
+      // an open vacancy with a matching head allows exactly one retry;
+      // anything unresolved conservatively reads as held.
+      const twin = await findLedgerRow(tx, item.id, "reserve", input.idempotencyKey);
+      if (twin) return { ok: true, replayed: true, fenceToken: twin.fence ?? input.fenceToken, item };
+      const fresh = await tx.prFixQueueItem.findUnique({ where: { id: item.id } });
+      if (!fresh || fresh.ciParkState !== "active" || fresh.generation !== input.generation) {
+        if (fresh?.ciParkState === "settled" || fresh?.ciParkState === "released") {
+          return { ok: false, reason: "opportunity-missing" };
+        }
+        if (!fresh || fresh.generation !== input.generation) {
+          return { ok: false, reason: "opportunity-missing" };
+        }
+        return { ok: false, reason: "fence-held" };
       }
-      if (!fresh || fresh.generation !== input.generation) {
-        return { ok: false, reason: "opportunity-missing" };
+      if (fresh.ciParkHead !== input.head) {
+        // #1415: the re-park interleave — the deferral was re-bound to a new
+        // head between the outer head check and the CAS; this reservation
+        // still means the OLD head.
+        return { ok: false, reason: "head-superseded" };
       }
+      if (fresh.ciParkFence != null && fresh.ciParkFence !== input.fenceToken) {
+        return { ok: false, reason: "fence-held" };
+      }
+      const second = await grant(tx);
+      if (second === 1) return { ok: true, fenceToken: input.fenceToken, item };
+      const lateTwin = await findLedgerRow(tx, item.id, "reserve", input.idempotencyKey);
+      if (lateTwin) return { ok: true, replayed: true, fenceToken: lateTwin.fence ?? input.fenceToken, item };
       return { ok: false, reason: "fence-held" };
+    });
+  } catch (error) {
+    // A same-key twin committed between our matched CAS and the witness: the
+    // transaction rolled our write back; answer the committed fence.
+    if (error instanceof CIParkWitnessRaced) {
+      const row = await findLedgerRow(client, item.id, "reserve", input.idempotencyKey);
+      return { ok: true, replayed: true, fenceToken: row?.fence ?? input.fenceToken, item };
     }
-    if (fresh.ciParkHead !== input.head) {
-      // #1415: the re-park interleave — the deferral was re-bound to a new
-      // head between the outer head check and the CAS; this reservation
-      // still means the OLD head.
-      return { ok: false, reason: "head-superseded" };
-    }
-    if (fresh.ciParkFence != null && fresh.ciParkFence !== input.fenceToken) {
-      return { ok: false, reason: "fence-held" };
-    }
-    const second = await grant(tx);
-    if (second.replayed) return { ok: true, replayed: true, fenceToken: second.fence ?? input.fenceToken, item };
-    if (second.count !== 1) return { ok: false, reason: "fence-held" };
-    return { ok: true, fenceToken: input.fenceToken, item };
-  });
+    throw error;
+  }
 }
 
 // ── CIREPAIR ────────────────────────────────────────────────────────────────
@@ -634,33 +676,48 @@ export async function ciRepairPrFixItem(
       return { ok: false, reason: "fence-gone" };
     }
 
-    return client.$transaction(async (tx) => {
-      const replay = await findLedgerRow(tx, item.id, "outcome", input.idempotencyKey);
-      if (replay) return { ok: true, replayed: true, item };
-      const recorded = await recordLedgerRow(tx, item.id, {
-        kind: "outcome",
-        key: input.idempotencyKey,
-        fence: input.fenceToken,
-        result: input.result,
-        head: input.head ?? null,
-        agent: input.agentName,
-      });
-      if (recorded.replayed) return { ok: true, replayed: true, item };
+    try {
+      return await client.$transaction(async (tx) => {
+        const replay = await findLedgerRow(tx, item.id, "outcome", input.idempotencyKey);
+        if (replay) return { ok: true, replayed: true, item };
 
-      const { count } = await tx.prFixQueueItem.updateMany({
-        where: { id: item.id, generation: input.generation, ciParkState: "active", ciParkFence: input.fenceToken as string },
-        data:
-          input.result === "repushed"
-            ? { ciParkHead: input.head as string, ciParkFence: null }
-            : { ciParkState: "settled", ciParkFence: null, ciParkHead: null },
+        const { count } = await tx.prFixQueueItem.updateMany({
+          where: { id: item.id, generation: input.generation, ciParkState: "active", ciParkFence: input.fenceToken as string },
+          data:
+            input.result === "repushed"
+              ? { ciParkHead: input.head as string, ciParkFence: null }
+              : { ciParkState: "settled", ciParkFence: null, ciParkHead: null },
+        });
+        if (count === 1) {
+          await commitWitness(tx, item.id, {
+            kind: "outcome",
+            key: input.idempotencyKey,
+            fence: input.fenceToken,
+            result: input.result,
+            head: input.head ?? null,
+            agent: input.agentName,
+          });
+          return { ok: true, item };
+        }
+        // Race: NOTHING has been written by this call (the witness rides the
+        // committed CAS), so a refused outcome re-answers identically on a
+        // same-key retry. Re-read once — a same-key twin's committed outcome
+        // replays; a settlement that landed after ours (any twin's outcome)
+        // reads as settled — the settled ordering check stands.
+        const twin = await findLedgerRow(tx, item.id, "outcome", input.idempotencyKey);
+        if (twin) return { ok: true, replayed: true, item };
+        const fresh = await tx.prFixQueueItem.findUnique({ where: { id: item.id } });
+        if (fresh?.ciParkState === "settled") return { ok: false, reason: "fence-settled" };
+        return { ok: false, reason: "fence-gone" };
       });
-      if (count === 1) return { ok: true, item };
-      // Race: re-read once; a settlement that landed after ours (any twin's
-      // outcome) reads as settled — the settled ordering check stands.
-      const fresh = await tx.prFixQueueItem.findUnique({ where: { id: item.id } });
-      if (fresh?.ciParkState === "settled") return { ok: false, reason: "fence-settled" };
-      return { ok: false, reason: "fence-gone" };
-    });
+    } catch (error) {
+      // A same-key twin committed between our matched CAS and the witness:
+      // the transaction rolled our write back; answer its replay.
+      if (error instanceof CIParkWitnessRaced) {
+        return { ok: true, replayed: true, item };
+      }
+      throw error;
+    }
   }
 
   // Fence-less release path (result is "unsupported"; the parser refuses
@@ -682,56 +739,76 @@ export async function ciRepairPrFixItem(
       // A key that did not park THIS deferral is stale notice work.
       return { ok: false, reason: "opportunity-missing" };
     }
-    return client.$transaction(async (tx) => {
-      const replay = await findLedgerRow(tx, item.id, "release", input.idempotencyKey);
-      if (replay) return { ok: true, replayed: true, item };
-      const recorded = await recordLedgerRow(tx, item.id, {
-        kind: "release",
-        key: input.idempotencyKey,
-        result: "unsupported",
-        agent: input.agentName,
-      });
-      if (recorded.replayed) return { ok: true, replayed: true, item };
+    try {
+      return await client.$transaction(async (tx) => {
+        const replay = await findLedgerRow(tx, item.id, "release", input.idempotencyKey);
+        if (replay) return { ok: true, replayed: true, item };
 
-      const release = async (cas: PrFixQueueClient) => {
-        const { count } = await cas.prFixQueueItem.updateMany({
-          // #1415: the vacancy rides the CAS — a reservation opening in the
-          // outer-read→write gap must never be wiped by this release write.
-          where: { id: item.id, generation: input.generation, ciParkState: "active", ciParkFence: null, ciParkKey: input.idempotencyKey },
-          data: { ciParkState: "released", ciParkFence: null },
-        });
-        return count;
-      };
-      if ((await release(tx)) === 1) return { ok: true, item };
-      // Race: re-read once — a twin's same-key commit replays by state; a
-      // reservation that opened in the gap holds the deferral that release
-      // meant to vacate (fence-held, before anything else — the reservation
-      // owns the opportunity now); still-live vacancies allow exactly one
-      // retry; else stale.
-      const fresh = await tx.prFixQueueItem.findUnique({ where: { id: item.id } });
-      if (
-        fresh?.ciParkState === "active" &&
-        fresh?.generation === input.generation &&
-        fresh?.ciParkFence != null
-      ) {
-        // #1415: the interleave — an unfenced release must not overrule a
-        // live reservation for the deferral it was meant to release.
-        return { ok: false, reason: "fence-held" };
+        const release = async (cas: PrFixQueueClient) => {
+          const { count } = await cas.prFixQueueItem.updateMany({
+            // #1415: the vacancy rides the CAS — a reservation opening in the
+            // outer-read→write gap must never be wiped by this release write.
+            where: { id: item.id, generation: input.generation, ciParkState: "active", ciParkFence: null, ciParkKey: input.idempotencyKey },
+            data: { ciParkState: "released", ciParkFence: null },
+          });
+          return count;
+        };
+        const witness = () =>
+          commitWitness(tx, item.id, {
+            kind: "release",
+            key: input.idempotencyKey,
+            result: "unsupported",
+            agent: input.agentName,
+          });
+        if ((await release(tx)) === 1) {
+          await witness();
+          return { ok: true, item };
+        }
+        // Race: NOTHING has been written by this call (the witness rides the
+        // committed CAS), so a refused release re-answers identically on a
+        // same-key retry. Re-read once — a twin's same-key commit replays by
+        // witness (or by state, the no-ledger fallback); a reservation that
+        // opened in the gap holds the deferral this release meant to vacate
+        // (fence-held, before anything else — the reservation owns the
+        // opportunity now); still-live vacancies allow exactly one retry;
+        // else stale.
+        const twin = await findLedgerRow(tx, item.id, "release", input.idempotencyKey);
+        if (twin) return { ok: true, replayed: true, item };
+        const fresh = await tx.prFixQueueItem.findUnique({ where: { id: item.id } });
+        if (
+          fresh?.ciParkState === "active" &&
+          fresh?.generation === input.generation &&
+          fresh?.ciParkFence != null
+        ) {
+          // #1415: the interleave — an unfenced release must not overrule a
+          // live reservation for the deferral it was meant to release.
+          return { ok: false, reason: "fence-held" };
+        }
+        if (fresh?.ciParkState === "released" && fresh?.ciParkKey === input.idempotencyKey) {
+          return { ok: true, replayed: true, item: fresh };
+        }
+        if (
+          fresh?.ciParkState === "active" &&
+          fresh?.ciParkFence == null &&
+          fresh?.ciParkKey === input.idempotencyKey &&
+          fresh?.generation === input.generation &&
+          (await release(tx)) === 1
+        ) {
+          await witness();
+          return { ok: true, item: fresh };
+        }
+        const lateTwin = await findLedgerRow(tx, item.id, "release", input.idempotencyKey);
+        if (lateTwin) return { ok: true, replayed: true, item };
+        return { ok: false, reason: "opportunity-missing" };
+      });
+    } catch (error) {
+      // A same-key twin committed between our matched CAS and the witness:
+      // the transaction rolled our write back; answer its replay.
+      if (error instanceof CIParkWitnessRaced) {
+        return { ok: true, replayed: true, item };
       }
-      if (fresh?.ciParkState === "released" && fresh?.ciParkKey === input.idempotencyKey) {
-        return { ok: true, replayed: true, item: fresh };
-      }
-      if (
-        fresh?.ciParkState === "active" &&
-        fresh?.ciParkFence == null &&
-        fresh?.ciParkKey === input.idempotencyKey &&
-        fresh?.generation === input.generation &&
-        (await release(tx)) === 1
-      ) {
-        return { ok: true, item: fresh };
-      }
-      return { ok: false, reason: "opportunity-missing" };
-    });
+      throw error;
+    }
   }
   // The deferral is not active: only the SAME key's own release commit may
   // replay-by-state (the no-ledger fallback), and only as "released".

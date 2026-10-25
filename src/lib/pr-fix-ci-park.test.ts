@@ -748,6 +748,117 @@ describe("ciRepairPrFixItem — fence-less release (result 'unsupported')", () =
   });
 });
 
+describe("CAS losses leave NO witness — a refused transition must never replay as success (#1422 review)", () => {
+  // The witness rides the COMMITTED CAS. A witness created before the CAS
+  // would commit with the loser's 409 and poison every same-key retry into a
+  // replayed success (a losing reservation retrying as a GRANTED fence, a
+  // refused outcome/release retrying as accepted). These sims flip the row
+  // inside the read→CAS gap and pin both halves: the refusal answers, and
+  // the ledger stays empty for that transition key so the retry re-answers
+  // the same coded refusal instead of replaying.
+  it("a lost park CAS leaves no witness; the same-key retry is refused again", async () => {
+    const client = makeCiParkClient();
+    const item = client.makeItem();
+    client.items.push(item);
+    client.hooks.beforeUpdateMany = () => {
+      item.status = "CLAIMED";
+    };
+    refused(await ciParkPrFixItem(client, parkInput()), "opportunity-missing");
+    expect(client.ledger).toHaveLength(0);
+    expect(lifecycleFields(item)).toEqual({ ciParkState: null, ciParkHead: null, ciParkKey: null, ciParkFence: null });
+    refused(await ciParkPrFixItem(client, parkInput()), "opportunity-missing");
+    expect(client.ledger).toHaveLength(0);
+  });
+
+  it("a lost reserve grant leaves no witness; the same-key retry never gets a fence", async () => {
+    const client = makeCiParkClient();
+    const item = client.makeItem();
+    client.items.push(item);
+    ok(await ciParkPrFixItem(client, parkInput()));
+    // A competitor's fence commits inside the gap; the presented-token CAS
+    // (ciParkFence: null) loses.
+    client.hooks.beforeUpdateMany = () => {
+      item.ciParkFence = "fence-rival";
+    };
+    refused(await ciReservePrFixItem(client, reserveInput({ idempotencyKey: "reserve-lost" })), "fence-held");
+    expect(client.ledger.filter((row: any) => row.kind === "reserve")).toHaveLength(0);
+    expect(item.ciParkFence).toBe("fence-rival");
+    refused(await ciReservePrFixItem(client, reserveInput({ idempotencyKey: "reserve-lost" })), "fence-held");
+    expect(client.ledger.filter((row: any) => row.kind === "reserve")).toHaveLength(0);
+  });
+
+  it("a lost outcome CAS leaves no witness; the same-key retry is refused again", async () => {
+    const client = makeCiParkClient();
+    const item = client.makeItem();
+    client.items.push(item);
+    ok(await ciParkPrFixItem(client, parkInput()));
+    ok(await ciReservePrFixItem(client, reserveInput()));
+    client.hooks.beforeUpdateMany = () => {
+      item.ciParkFence = "fence-rival";
+    };
+    refused(await ciRepairPrFixItem(client, repairInput({ idempotencyKey: "outcome-lost" })), "fence-gone");
+    expect(client.ledger.filter((row: any) => row.kind === "outcome")).toHaveLength(0);
+    // The repush never applied its mutation.
+    expect(item.ciParkHead).toBe(HEAD1);
+    expect(item.ciParkFence).toBe("fence-rival");
+    refused(await ciRepairPrFixItem(client, repairInput({ idempotencyKey: "outcome-lost" })), "fence-gone");
+    expect(client.ledger.filter((row: any) => row.kind === "outcome")).toHaveLength(0);
+  });
+
+  it("a fence-less release losing the vacancy race leaves no witness; the retry re-answers fence-held", async () => {
+    const client = makeCiParkClient();
+    const item = client.makeItem();
+    client.items.push(item);
+    ok(await ciParkPrFixItem(client, parkInput()));
+    // A reservation opens inside the release's outer-read→CAS gap.
+    client.hooks.beforeUpdateMany = () => {
+      item.ciParkFence = "fence-race";
+    };
+    refused(
+      await ciRepairPrFixItem(client, repairInput({ idempotencyKey: "park-1", result: "unsupported", fenceToken: null, head: null })),
+      "fence-held",
+    );
+    expect(client.ledger.filter((row: any) => row.kind === "release")).toHaveLength(0);
+    expect(item.ciParkState).toBe("active");
+    refused(
+      await ciRepairPrFixItem(client, repairInput({ idempotencyKey: "park-1", result: "unsupported", fenceToken: null, head: null })),
+      "fence-held",
+    );
+    expect(client.ledger.filter((row: any) => row.kind === "release")).toHaveLength(0);
+    expect(item.ciParkState).toBe("active");
+  });
+
+  it("a committed transition still records exactly its witness and replays as before", async () => {
+    // The positive side: moving the witness after the CAS did not remove the
+    // commit witness or the replay-first semantics.
+    const client = makeCiParkClient();
+    const item = client.makeItem();
+    client.items.push(item);
+    ok(await ciParkPrFixItem(client, parkInput()));
+    ok(await ciReservePrFixItem(client, reserveInput()));
+    ok(await ciRepairPrFixItem(client, repairInput()));
+    expect(client.ledger.map((row: any) => `${row.kind}:${row.key}`)).toEqual([
+      "park:park-1",
+      "reserve:reserve-1",
+      "outcome:outcome-1",
+    ]);
+    // Each key replays with zero further writes.
+    const snapshot = JSON.stringify(client.items[0]);
+    const updateCount = client.updateCalls.length;
+    for (const call of [
+      ciParkPrFixItem(client, parkInput()),
+      ciReservePrFixItem(client, reserveInput()),
+      ciRepairPrFixItem(client, repairInput()),
+    ]) {
+      const replay: any = await call;
+      ok(replay);
+      expect(replay.replayed).toBe(true);
+    }
+    expect(JSON.stringify(client.items[0])).toBe(snapshot);
+    expect(client.updateCalls).toHaveLength(updateCount);
+  });
+});
+
 describe("ciRepairPrFixItem — ledger-absent clients (legacy state-only fallback)", () => {
   it("releases by state and replays by the released row's own park key", async () => {
     const client = makeCiParkClient({ withLedger: false });
