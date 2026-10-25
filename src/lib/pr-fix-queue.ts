@@ -2406,17 +2406,22 @@ export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { 
  * already-live REBASE to a second worker would put two `--force-with-lease`
  * pushes on one branch.
  *
- * "Live" means a non-empty `agentHandouts` list within the lane's hand-out
- * timeout (`PR_FIX_HANDOUT_TIMEOUT_MS`, same bound the reclaim sweep uses),
- * anchored on `dispatchedAt` — the attempt's start, stamped at hand-out.
- * `updatedAt` is deliberately NOT the anchor: re-observation enqueues refresh
- * it, which would keep a dead hand-out blocking the lane forever. The timeout
- * is what keeps the gate from inheriting the queue's oldest stranding mode:
- * an ACKNOWLEDGED hand-out is deliberately never reclaimed (#1211 — a live
- * worker owns its generation), so an acked-then-crashed rebase would
- * otherwise block EVERY rebase dispatch forever. A legitimately long rebase
- * past the timeout may transiently share the lane — accepted best-effort
- * semantics.
+ * "Live" follows the queue's actual ownership semantics, NOT a clock: a
+ * non-empty `agentHandouts` list on a still-QUEUED row gates the lane until
+ * the record is explicitly cleared — settlement (mark/release/terminal
+ * dispositions clear the hand-outs or move the row out of QUEUED), or the
+ * reclaim sweep, which is the ONLY path that ages a hand-out out
+ * (`PR_FIX_HANDOUT_TIMEOUT_MS` bounds the sweep's staleness population, not
+ * this gate): a stale UNACKNOWLEDGED hand-out is reclaimed with a generation
+ * bump that clears the hand-out state, at which point the lane is free. An
+ * ACKNOWLEDGED hand-out is deliberately never reclaimed (#1211 — the worker
+ * durably owns its generation) and gates until it settles; an
+ * acked-then-crashed rebase therefore holds the lane until the worker
+ * reports or an operator requeues. That is deliberate fail-safe behavior: a
+ * visibly stuck lane is recoverable, a silently shared lane is two
+ * `--force-with-lease` pushes on one branch. The previous time-boxed gate
+ * freed the lane under a still-live hand-out once the timeout passed — a
+ * concurrency-2 window the queue's ownership model does not license.
  *
  * Keying on `attemptType` (not the row's mutable `type`) matters: enqueue
  * overwrites `type` on every re-observation, so a mid-attempt flip must
@@ -2431,15 +2436,12 @@ export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { 
  * The lock is MANDATORY and the admission fails CLOSED: when the lock
  * cannot be taken the hand-out is deferred (the next poll retries it)
  * rather than issued through an unlocked check-then-write. So the only
- * remaining best-effort window is the hand-out TIMEOUT above (a live
- * hand-out older than the timeout is not counted), not an admission path.
+ * remaining best-effort window is the anomalous no-`dispatchedAt` hand-out
+ * below, not an admission path.
  */
 export async function hasInFlightRebaseHandout(
   client: PrFixQueueClient,
-  options: { now?: Date } = {},
 ): Promise<boolean> {
-  const now = (options.now ?? new Date()).getTime();
-  const staleBefore = now - prFixHandoutTimeoutMs();
   const rows = await client.prFixQueueItem.findMany({
     where: { status: "QUEUED", OR: [{ type: "REBASE" }, { attemptType: "REBASE" }] },
   });
@@ -2450,12 +2452,10 @@ export async function hasInFlightRebaseHandout(
     // `dispatchedAt` BEFORE pushing the hand-out record, and the only gap
     // left is a stamp write that throws while the later push succeeds. Such
     // a row is invisible to the reclaim sweep too (`dispatchedAt: { lt }`
-    // never matches NULL), so counting it live would re-open the
-    // forever-block door the timeout exists to close. Skip it instead: the
-    // worst case is the transient concurrency-2 window the lane already
-    // accepts best-effort, and the next dispatch re-stamps the row properly.
-    if (!row.dispatchedAt) return false;
-    return new Date(row.dispatchedAt as string | number | Date).getTime() >= staleBefore;
+    // never matches NULL), so counting it live would block the lane with no
+    // recovery path at all. Skip it instead: the worst case is the transient
+    // concurrency-2 window the lane already accepts best-effort.
+    return Boolean(row.dispatchedAt);
   });
 }
 
