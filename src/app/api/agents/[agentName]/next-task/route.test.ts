@@ -591,6 +591,82 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(waiting.agentHandouts).toEqual([]);
   });
 
+  it("an acknowledged REBASE hand-out gates the lane however stale it is (#1327, #1211)", async () => {
+    // #1211: an acknowledged hand-out is never reclaimed — the worker
+    // durably owns its generation — so it gates the lane until it settles.
+    // The old gate freed the lane once `dispatchedAt` passed the hand-out
+    // timeout, letting a second hand-out (a second `--force-with-lease`
+    // push on one branch) issue under a still-live first attempt.
+    const live = {
+      ...prFixRow(21, 2), type: "REBASE",
+      agentHandouts: ["other-agent@2"], handoutAcks: ["other-agent@2"],
+      dispatchedAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+    };
+    const waiting = { ...prFixRow(22), type: "REBASE" };
+    mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+      where?.OR
+        ? [live, waiting].filter((r: any) => r.type === "REBASE" || r.attemptType === "REBASE")
+        : [live, waiting].filter((r) => r.status === "QUEUED"));
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+      (where.id === waiting.id ? waiting : live));
+
+    const body = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.shouldRun).toBe(false);
+    expect(body.prFixItem).toBeUndefined();
+    // No second hand-out was stamped while the acknowledged attempt is live.
+    expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+    expect(live.agentHandouts).toEqual(["other-agent@2"]);
+  });
+
+  it("a stale unacknowledged REBASE frees the lane only once the reclaim sweep clears it (#1327, #1211)", async () => {
+    // The hand-out timeout bounds the reclaim sweep's staleness population,
+    // not the gate: a stale unacknowledged hand-out keeps gating PAST the
+    // timeout, and the lane re-opens only through the sweep's committed
+    // reclaim — the generation bump that clears the hand-out state
+    // (exercised for real against the lib in pr-fix-queue.test.ts).
+    const stale: any = {
+      ...prFixRow(23), type: "REBASE",
+      agentHandouts: ["other-agent@2"],
+      dispatchedGeneration: 2,
+      dispatchedAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+    };
+    mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+      where?.OR
+        ? [stale].filter((r: any) => r.type === "REBASE" || r.attemptType === "REBASE")
+        : [stale].filter((r) => r.status === "QUEUED"));
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+      (where.id === stale.id ? { ...stale } : null));
+
+    const blocked = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(blocked.prFixItem).toBeUndefined();
+    // Still gated past the timeout: no hand-out was stamped.
+    expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+
+    // The reclaim sweep's committed effect: generation bump + cleared
+    // hand-out state (agentHandouts/acks/receipts, dispatched stamps,
+    // attemptType).
+    stale.generation += 1;
+    stale.agentHandouts = [];
+    stale.dispatchedGeneration = null;
+    stale.dispatchedAt = null;
+    stale.attemptType = null;
+
+    const surfacesBefore = mocks.prFixTxSurfaces.length;
+    const body = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem.fixType).toBe("REBASE");
+    // The re-issued hand-out ran inside the serialized admission transaction.
+    const surfaces = mocks.prFixTxSurfaces.slice(surfacesBefore);
+    expect(surfaces).toContain("findMany");
+    expect(surfaces).toContain("updateMany");
+  });
+
   it("defers a REBASE hand-out when the admission transaction fails (fail closed, #1327 review)", async () => {
     // The advisory lock could not be taken (lock_timeout, aborted
     // transaction). The lane is concurrency 1, so the hand-out must be

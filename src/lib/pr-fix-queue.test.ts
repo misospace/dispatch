@@ -5562,8 +5562,9 @@ describe("hasInFlightRebaseHandout (#1327)", () => {
     await enqueuePrFixItem(client, { repo: "org/repo", pr: 401, lane: "NORMAL", type: "REBASE", reason: "r", feedback: "f", evidenceKey: "k401" });
     expect(await hasInFlightRebaseHandout(client)).toBe(false);
 
-    // A live hand-out (agent record, still QUEUED, within the hand-out
-    // timeout) gates the lane.
+    // A live hand-out (agent record, still QUEUED) gates the lane. Liveness
+    // follows the queue's ownership semantics, not a clock: the record gates
+    // until it is cleared by settlement or the reclaim sweep.
     client.items[0].agentHandouts = ["worker-a@1"];
     client.items[0].dispatchedAt = new Date();
     expect(await hasInFlightRebaseHandout(client)).toBe(true);
@@ -5582,24 +5583,52 @@ describe("hasInFlightRebaseHandout (#1327)", () => {
     expect(await hasInFlightRebaseHandout(client)).toBe(false);
   });
 
-  it("ages an unclaimed hand-out out of the lane bound (no whole-lane deadlock)", async () => {
-    // An ACKNOWLEDGED dead hand-out is never reclaimed (#1211). The rebase
-    // lane's concurrency gate must still release once the hand-out passes
-    // the lane's hand-out timeout, or one crashed worker would block every
-    // REBASE dispatch forever.
+  it("an acknowledged hand-out gates the lane however stale it is (never reclaimed, #1211)", async () => {
+    // An ACKNOWLEDGED hand-out is deliberately never reclaimed (#1211 — the
+    // worker durably owns its generation), so it gates the lane until it
+    // settles. The old gate time-boxed liveness on PR_FIX_HANDOUT_TIMEOUT_MS
+    // and freed the lane under a still-live hand-out once the timeout
+    // passed — a concurrency-2 window (two `--force-with-lease` pushes on
+    // one branch) the queue's ownership model does not license. A stuck
+    // acknowledged attempt holds the lane until the worker reports or an
+    // operator requeues: visible and recoverable, never silently shared.
     const client = makeClient();
     await enqueuePrFixItem(client, { repo: "org/repo", pr: 403, lane: "NORMAL", type: "REBASE", reason: "r", feedback: "f", evidenceKey: "k403" });
     client.items[0].agentHandouts = ["worker-a@1"];
     client.items[0].handoutAcks = ["worker-a@1"];
     client.items[0].dispatchedAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
     client.items[0].updatedAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
-    expect(await hasInFlightRebaseHandout(client)).toBe(false);
+    expect(await hasInFlightRebaseHandout(client)).toBe(true);
 
     // No stamped start at all (the anomalous throw-between-writes shape):
     // NOT counted live — the reclaim sweep can never clear such a row
-    // either, so gating on it would block the lane forever.
+    // either (`dispatchedAt: { lt }` never matches NULL), so gating on it
+    // would block the lane with no recovery path at all.
     client.items[0].dispatchedAt = null;
     client.items[0].updatedAt = null;
+    expect(await hasInFlightRebaseHandout(client)).toBe(false);
+  });
+
+  it("frees the lane only when the reclaim sweep clears the stale unacknowledged hand-out", async () => {
+    // The hand-out timeout bounds the RECLAIM SWEEP's staleness population,
+    // not the gate: a stale unacknowledged hand-out keeps gating PAST the
+    // timeout, and the lane re-opens only through the sweep's committed
+    // reclaim (the generation bump that clears the hand-out state).
+    const client = makeClient();
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 406, lane: "NORMAL", type: "REBASE", reason: "r", feedback: "f", evidenceKey: "k406" });
+    client.items[0].agentHandouts = ["worker-a@1"];
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+    client.items[0].dispatchedAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    expect(await hasInFlightRebaseHandout(client)).toBe(true);
+
+    const report = await reclaimStalePrFixHandouts(client, {
+      now: new Date(Date.now() + 60_000),
+      isPrMergedOrClosed: async () => false,
+    });
+    expect(report.reclaimed).toBe(1);
+    expect(client.items[0].agentHandouts).toEqual([]);
+    expect(client.items[0].generation).toBe(2);
+    expect(client.items[0].attemptType ?? null).toBeNull();
     expect(await hasInFlightRebaseHandout(client)).toBe(false);
   });
 
