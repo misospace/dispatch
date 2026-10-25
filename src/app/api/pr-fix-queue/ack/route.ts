@@ -115,9 +115,9 @@ export async function POST(request: Request) {
           { status: 409 },
         );
       case "not-handed":
-        // A bare-agentName ack from an authenticated actor that doesn't
-        // appear in the item's hand-out records — a token that never
-        // received the work cannot pin a future reclaim against it.
+        // The body's agent (whatever tier acked for it) doesn't appear in
+        // the item's hand-out records at that generation — a caller that
+        // never received the work cannot pin a future reclaim against it.
         return NextResponse.json(
           {
             error: "PR fix queue item was not handed to the authenticated agent at that generation",
