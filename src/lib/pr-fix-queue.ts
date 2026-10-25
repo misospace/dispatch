@@ -38,6 +38,16 @@ export type PrFixQueueClient = {
     create: (args: any) => Promise<any>;
     findMany?: (args: any) => Promise<any[]>;
   };
+  // #495: CI park-and-resume lifecycle exactly-once ledger. Optional so
+  // legacy/test clients without the table still work: without a surface the
+  // lifecycle routes fall back to state-only writes where a repeated
+  // same-key commit is a same-value idempotent re-apply (safe by
+  // construction; the state itself is the replay witness), never a
+  // double-apply.
+  prFixCIParkLedger?: {
+    findUnique: (args: any) => Promise<any>;
+    create: (args: any) => Promise<any>;
+  };
   // #1249: durable per-item evidence ledger. Optional so legacy/test clients
   // without the table keep settling: with no surface the enqueue falls back to
   // the bounded `evidenceKeys` cache (identity-only, pre-#1249 semantics) and
@@ -311,17 +321,17 @@ export interface MarkPrFixInput {
    */
   allowStickyReclassify?: boolean;
   /**
-   * Bound worker identity for hand-out-scoped marks (#1430). The route handler
-   * is the only trusted source of this value — the bound token's agent name;
-   * `parseMarkPrFixInput` never accepts it from a request body. When set, the
-   * idempotent same-generation `WAITING_EXTERNAL` duplicate answer (#1231) is
-   * granted ONLY to the agent recorded as the waiter (`externalWaitBy`) on the
-   * already-waiting row — a scoped worker that did not start the wait gets
-   * `not-handed` instead of the row JSON. The wait write records this identity
-   * atomically with the transition; waits started by unscoped callers record
-   * null and grant the replay to nobody at worker scope. Unset
-   * (maintainer/operator paths and internal report settlement) keeps the
-   * existing unconstrained replay behavior.
+   * Hand-out binding for worker-tier settlements (#1428). When set, the mark
+   * is authorized ONLY for rows whose `agentHandouts` carry this agent's
+   * marker at the settled generation (the same `<agentName>@<generation>`
+   * envelope `agentAlreadyHanded`/`ackPrFixHandout` match): a bound worker
+   * credential may settle only the attempt it was handed, never another
+   * agent's. A row without the marker returns `not-handed` — a refusal
+   * distinct from the row's outcome vocabulary, with no mutation. The route
+   * handler is the only trusted source of this value (the bound token's
+   * agent identity); `parseMarkPrFixInput` never accepts it from a body.
+   * Unset (maintainer/operator paths and internal report settlement) keeps
+   * the existing unconstrained behavior.
    */
   handoutScopedAgent?: string;
 }
@@ -1162,11 +1172,13 @@ export function parseAckPrFixHandoutInput(body: unknown): AckPrFixHandoutInput |
   ) {
     return { error: "generation must be an integer >= 1" };
   }
-  // agentName is required (#1211 review): the route layer derives it from the
-  // authenticated bearer actor (no basic / oidc / disabled fallback). The
-  // field is kept in the schema for transport-layer redundancy (the MCP
-  // client forwards it) but parsed even when the bearer layer already
-  // supplied it, so a caller mismatch surfaces as 400 before any DB write.
+  // agentName is required (#1211 review, reframed by #1425): it is the
+  // subject of the ack, supplied by the caller's transport (the MCP client
+  // and Courier's dispatch adapter both forward it). The route layer gates
+  // WHO may ack for it — a worker-tier bearer must be bound to this agent,
+  // the legacy unbound token is refused — and this lib pins the ack to a
+  // hand-out actually issued to (agentName, generation). The route rejects
+  // basic / oidc callers entirely.
   // Type check first so a non-string value (e.g. 7) surfaces as the type
   // error, not as "Missing required field" (nonEmpty is type-agnostic).
   if (input.agentName !== undefined && input.agentName !== null && typeof input.agentName !== "string") {
@@ -2550,11 +2562,11 @@ export async function assertPrHeadMovedForFix(
  * (`mutated: false`): `not-found` when no item matches, `generation-mismatch`
  * when an `expectedGeneration` was supplied and the row's generation no
  * longer matches (the attempt was re-issued between read and write), and
- * `not-handed` when a hand-out-scoped caller (#1430) tried to replay a
- * same-generation `WAITING_EXTERNAL` mark it did not start — a caller-binding
- * refusal, deliberately distinct from the row's outcome vocabulary so a
- * worker can tell "you may not read/settle this" from "the settlement was
- * refused".
+ * `not-handed` when a `handoutScopedAgent` was supplied and the row's
+ * `agentHandouts` do not carry that agent's marker at the settled generation
+ * (#1428) — a caller-binding refusal, deliberately distinct from the row's
+ * outcome vocabulary so a worker can tell "you may not settle this" from
+ * "the settlement was refused".
  */
 export type MarkPrFixResult =
   | { mutated: true; item: any }
@@ -2584,23 +2596,49 @@ export async function markPrFixItem(
   const existing = await client.prFixQueueItem.findUnique({ where: { repo_pr: { repo: input.repo, pr: input.pr } } });
   if (!existing) return { mutated: false, reason: "not-found" };
 
-  // #1430: one rule for every same-generation `WAITING_EXTERNAL` answer —
-  // the pre-read duplicate AND both post-write conflict fallbacks (the
-  // function-scope helpers below are shared by the two WAITING_EXTERNAL
-  // blocks). The duplicate answer hands out the full row, so at worker scope
-  // it is a state read and must be bound to the identity that actually
-  // started the wait. The wait itself cleared `agentHandouts` (no hand-out
-  // marker survives it), which is why this replay can never be re-authorized
-  // by a hand-out check — the waiter column written with the transition is
-  // the only binding left. The fallbacks are load-bearing, not theoretical:
-  // a scoped caller that lost the generation-pinned write to a CONCURRENT
-  // wait by another agent (the lane supports multiple live hand-outs per
-  // generation) must not receive that other agent's row either.
+  // #1430: a WAITING_EXTERNAL transition clears agentHandouts, so its
+  // same-generation idempotent replay can only be scoped by the waiter
+  // identity recorded atomically with that transition.
   const scopedReplayAllowed = (row: { externalWaitBy?: unknown }): boolean =>
     !input.handoutScopedAgent ||
     (typeof row.externalWaitBy === "string" && row.externalWaitBy
       ? row.externalWaitBy
       : null) === input.handoutScopedAgent;
+
+  // Idempotent WAITING_EXTERNAL duplicate for the same generation: never
+  // extend the cooldown, never overwrite the recorded contract or note
+  // (#1231). Checked BEFORE the #1428 hand-out binding below on purpose: the
+  // wait itself cleared `agentHandouts`; #1430 therefore binds this replay
+  // to the waiter identity recorded by the original transition.
+  if (nextStatus === "WAITING_EXTERNAL" && existing.status === "WAITING_EXTERNAL" && existing.generation === expectedGeneration) {
+    if (!scopedReplayAllowed(existing)) {
+      return { mutated: false, reason: "not-handed" };
+    }
+    return { mutated: true, item: existing };
+  }
+
+  // Hand-out binding (#1428): a worker-tier settlement (the route supplies the
+  // bound token's agent as `handoutScopedAgent`) may settle only the attempt
+  // it was actually handed — the row's `agentHandouts` must carry this agent's
+  // `<agentName>@<generation>` marker at the settled generation, the same
+  // envelope `ackPrFixHandout` pins on. Without it the caller is crossing the
+  // agent boundary on the queue (any bound credential could tombstone another
+  // agent's attempt as FIXED/BLOCKED/...), so refuse with `not-handed` — no
+  // mutation, no history row, and a code outside the outcome vocabulary.
+  // Entries from other generations are inert (fail toward `not-handed`, never
+  // toward settling a spent hand-out). Maintainer/operator paths and the
+  // internal report settlement never set this field and stay unconstrained.
+  if (input.handoutScopedAgent) {
+    const handouts: string[] = Array.isArray(existing.agentHandouts) ? existing.agentHandouts : [];
+    const scopedGeneration = expectedGeneration ?? existing.generation;
+    const handedThisAgent = handouts.some((entry) => {
+      const parsed = parseAgentHandoutToken(entry);
+      return parsed !== null && parsed.agentName === input.handoutScopedAgent && parsed.generation === scopedGeneration;
+    });
+    if (!handedThisAgent) {
+      return { mutated: false, reason: "not-handed" };
+    }
+  }
 
   // BLOCKED is reserved for a genuine human decision (#1218): lane NEEDS_HUMAN,
   // outcome human_decision, surfaced with the needs-human label + marker. PARKED
@@ -2615,18 +2653,8 @@ export async function markPrFixItem(
   // src/lib/pr-fix-evidence-requirements.test.ts, which fails if any other
   // production module assigns this status directly.
   if (nextStatus === "WAITING_EXTERNAL") {
-    // Idempotent duplicate for the same generation: never extend the
-    // cooldown, never overwrite the recorded contract or note (#1231).
-    if (existing.status === "WAITING_EXTERNAL" && existing.generation === expectedGeneration) {
-      // A scoped caller that is not the recorded waiter (including a row
-      // whose wait was started by an unscoped caller, `externalWaitBy` null)
-      // gets `not-handed`: refusal, no mutation, no history row. Unscoped
-      // callers keep the unchanged #1231 behavior.
-      if (!scopedReplayAllowed(existing)) {
-        return { mutated: false, reason: "not-handed" };
-      }
-      return { mutated: true, item: existing };
-    }
+    // The same-generation idempotent duplicate (#1231) was already answered
+    // above, before the #1428 hand-out binding.
     if (existing.status !== "QUEUED") return { mutated: false, reason: "generation-mismatch" };
 
     // #1250: a NEW wait must name a concrete, independently verifiable
@@ -3560,6 +3588,11 @@ export async function reconcileArchivedRepoPrFixItems(
 export function freshAttemptGeneration(): {
   generation: { increment: number };
   attemptEvidenceWatermark: null;
+  ciParkState: null;
+  ciParkHead: null;
+  ciParkKey: null;
+  ciParkFence: null;
+  ciParkAt: null;
   attemptType: null;
 } {
   // A fresh attempt has no hand-out yet, so it has no evidence snapshot: the
@@ -3568,6 +3601,12 @@ export function freshAttemptGeneration(): {
   // ledger positions are per-item history, and a stale-low watermark must
   // never survive into a new attempt to make known evidence read as new.
   //
+  // #495 leash: every generation bump also clears the CI park deferral
+  // columns in the same write, so a deferral can never strand an item across
+  // attempts — a requeued, externally-woken, or reclaimed item is dispatchable
+  // again and a crashed Courier cycle leaves no suppression behind. No TTL and
+  // no new env var: this sole generation-bump helper is the expiry.
+  //
   // #1327 review: the DISPATCHED lane resets with the attempt too. A
   // non-null `attemptType` means "this generation was handed out as that
   // lane"; letting it survive a generation bump would make next-task's
@@ -3575,7 +3614,16 @@ export function freshAttemptGeneration(): {
   // REBASE attempt (bypassing the gate and its serialization, a fan-out
   // door) or gating an ordinary fresh attempt behind the rebase lane. The
   // lane is stamped by the hand-out itself; a fresh attempt has none.
-  return { generation: { increment: 1 }, attemptEvidenceWatermark: null, attemptType: null };
+  return {
+    generation: { increment: 1 },
+    attemptEvidenceWatermark: null,
+    ciParkState: null,
+    ciParkHead: null,
+    ciParkKey: null,
+    ciParkFence: null,
+    ciParkAt: null,
+    attemptType: null,
+  };
 }
 
 /**
@@ -3829,6 +3877,10 @@ export function toAgentQueuePrFixItem(item: any) {
     // disposition evidence must not override — operator-visible on queue
     // listings, cleared on reactivation or operator requeue.
     staleDisposition: item.staleDisposition ?? false,
+    // #495: CI park deferral lifecycle ("active" suppresses the hand-out for
+    // any polling agent; null/released/settled dispatch normally). Carried so
+    // the next-task route can honor the deferral before any write.
+    ciParkState: item.ciParkState ?? null,
     queuedAt: item.queuedAt,
     updatedAt: item.updatedAt,
     rankingReason: `queued PR review-fix item (${fixType})`,
