@@ -932,11 +932,11 @@ describe("sweepStaleWork — a stale row never releases a claim a live sibling o
     expect(leases).toHaveLength(0);
   });
 
-  it("needs BOTH arms of the live predicate: a fresh heartbeat alone is not live", async () => {
-    // The sweeper reclaims a row when its heartbeat OR its expiry falls past
-    // the cutoff, so "live" is the exact complement: BOTH must be fresh. A
-    // sibling that is fresh by heartbeat but whose expiry has lapsed is itself
-    // reclaimable, and must not shield the claim forever.
+  it("a fresh heartbeat is live on its own, even with a lapsed expiry (#1418)", async () => {
+    // The live arm is `fresh heartbeat OR live lease`: a sibling that just
+    // checkpointed is direct evidence of an alive worker, so it shields the
+    // claim even though its expiry clock has lapsed (a row shape only legacy
+    // data can produce — the paired writers always refresh both).
     const issue = makeWork().issue;
     const stale = makeWork({
       id: "work-stale",
@@ -961,12 +961,20 @@ describe("sweepStaleWork — a stale row never releases a claim a live sibling o
 
     const report = await sweepStaleWork(client);
 
-    expect(report.released).toBe(1);
-    expect(report.claimRetained).toBe(0);
-    expect(leaseDeleteMany).toHaveBeenCalledTimes(1);
+    expect(report.claimRetained).toBe(1);
+    expect(report.released).toBe(0);
+    // The live claim survives: no lease delete.
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
   });
 
-  it("needs BOTH arms of the live predicate: a fresh expiry alone is not live", async () => {
+  it("a live lease shields the claim despite heartbeat silence (#1418)", async () => {
+    // The #1418 regression: exactly the shape `heartbeatMatchingAgentWork`
+    // leaves between renewals — the renewal wrote the heartbeat and the
+    // renewed expiry (now + DISPATCH_OWNERSHIP_RENEW_TTL_MS) together, then
+    // the worker went silent into one long model call. The heartbeat ages
+    // past the cutoff while the renewed lease stands: the sibling is LIVE
+    // (the lease is liveness), and the older row's reclaim must not take the
+    // claim down.
     const issue = makeWork().issue;
     const stale = makeWork({
       id: "work-stale",
@@ -975,25 +983,90 @@ describe("sweepStaleWork — a stale row never releases a claim a live sibling o
       lastHeartbeatAt: minutesAgo(30),
       leaseExpiresAt: minutesAgo(25),
     });
-    const staleHeartbeatFreshExpiry = makeWork({
-      id: "work-half-stale",
+    const renewingSibling = makeWork({
+      id: "work-renewing",
       issue,
       state: "IN_PROGRESS",
       lastHeartbeatAt: minutesAgo(30),
       leaseExpiresAt: minutesAhead(30),
     });
 
-    const { client, leaseDeleteMany } = makeSweepClient({
+    const { client, auditRows, leaseDeleteMany } = makeSweepClient({
       candidates: [stale],
-      rows: [stale, staleHeartbeatFreshExpiry],
+      rows: [stale, renewingSibling],
       leases: [makeLease()],
     });
 
     const report = await sweepStaleWork(client);
 
+    expect(report.claimRetained).toBe(1);
+    expect(report.released).toBe(0);
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+    const audit = auditRows.find((row) => row.action === "stale_agentwork_claim_retained");
+    expect(audit?.notes).toContain("work-renewing");
+  });
+
+  it("#1418: a renewing worker itself is no reclaim candidate while its lease stands", async () => {
+    // Candidate-side twin of the sibling test: the renewal-extended row is
+    // silent past the cutoff but its lease is live, so the sweep's real
+    // candidate clause must not match it — no STALE mark, no lease delete, no
+    // label removal. The delta control proves the cause: the identical row
+    // with a lapsed lease IS matched, so survival is caused by the live
+    // lease, not by a broken clause.
+    const renewing = makeWork({
+      id: "work-renewing",
+      state: "IN_PROGRESS",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAhead(30),
+    });
+    const { client, auditRows, leaseDeleteMany, candidateClauses } = makeSweepClient({
+      candidates: [],
+      rows: [renewing],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.examined).toBe(0);
+    expect(renewing.state).toBe("IN_PROGRESS");
+    expect(auditRows).toHaveLength(0);
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+
+    // Forensic delta against the REAL clause: the lease-live arm is the only
+    // difference — once the renewed lease lapses, the row is reclaimable.
+    const [candidateClause] = candidateClauses;
+    expect(matchesWhere(renewing as unknown as Record<string, unknown>, candidateClause)).toBe(false);
+    const lapsed = {
+      ...renewing,
+      leaseExpiresAt: minutesAgo(1),
+    } as unknown as Record<string, unknown>;
+    expect(matchesWhere(lapsed, candidateClause)).toBe(true);
+  });
+
+  it("#1418: a renewal-extended row is reclaimed once its lease lapses (not stranded)", async () => {
+    // End-to-end acceptance: the worker died mid-long-run and its renewals
+    // stopped. Past the renewed TTL the lease is no longer live, and the
+    // normal reclaim path applies — duplicate pickup stays blocked exactly as
+    // long as the lease does, and no longer.
+    const dead = makeWork({
+      id: "work-dead-renewer",
+      state: "IN_PROGRESS",
+      lastHeartbeatAt: minutesAgo(40),
+      leaseExpiresAt: minutesAgo(1),
+    });
+    const { client, leaseDeleteMany, leases } = makeSweepClient({
+      candidates: [dead],
+      rows: [dead],
+      leases: [makeLease()],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.examined).toBe(1);
+    expect(dead.state).toBe("STALE");
     expect(report.released).toBe(1);
-    expect(report.claimRetained).toBe(0);
+    expect(report.leasesReleased).toBe(1);
     expect(leaseDeleteMany).toHaveBeenCalledTimes(1);
+    expect(leases).toHaveLength(0);
   });
 
   it("does not treat a sibling on another issue or another agent as live", async () => {
@@ -2105,11 +2178,15 @@ describe("sweepStaleWork — a running wait marker parks the claim (#1334 review
 // every non-pending active row matches exactly one arm of its own family —
 // the sweep reclaims it, or it is live and shields the claim — under the
 // fake's SQL three-valued logic (a NULL timestamp never compares true).
-describe("activeStateFamilies reclaim/live complement (#1316)", () => {
-  const cutoff = minutesAgo(5);
+describe("activeStateFamilies reclaim/live complement (#1316, #1418)", () => {
+  const now = new Date();
+  const cutoff = new Date(now.getTime() - 5 * 60_000);
   const beforeCutoff = new Date(cutoff.getTime() - 60_000);
   const afterCutoff = new Date(cutoff.getTime() + 60_000);
-  const families = activeStateFamilies(cutoff);
+  // #1418: a live lease is liveness on its own — the grid needs a timestamp
+  // past `now` to pin the renewal-shield cells.
+  const future = new Date(now.getTime() + 30 * 60_000);
+  const families = activeStateFamilies(cutoff, now);
   const heartbeat = families.find((family) => family.name === "heartbeat-gated")!;
   const blocked = families.find((family) => family.name === "blocked-park")!;
 
@@ -2133,7 +2210,7 @@ describe("activeStateFamilies reclaim/live complement (#1316)", () => {
   it("every non-pending active row is either reclaimable or live, never both", () => {
     for (const state of ["CLAIMED", "IN_PROGRESS", "BLOCKED"]) {
       for (const lastHeartbeatAt of [beforeCutoff, cutoff, afterCutoff]) {
-        for (const leaseExpiresAt of [beforeCutoff, cutoff, afterCutoff, null]) {
+        for (const leaseExpiresAt of [beforeCutoff, cutoff, afterCutoff, future, null]) {
           const row = { state, staleClaimReleasePending: false, lastHeartbeatAt, leaseExpiresAt };
           const own = state === "BLOCKED" ? blocked : heartbeat;
           const other = state === "BLOCKED" ? heartbeat : blocked;
@@ -2151,7 +2228,7 @@ describe("activeStateFamilies reclaim/live complement (#1316)", () => {
     const silent = { state: "BLOCKED", staleClaimReleasePending: false, lastHeartbeatAt: afterCutoff };
 
     // Parked (deadline in the future): live despite silence — the #1316 fix.
-    expect(matches({ ...silent, leaseExpiresAt: afterCutoff }, blocked)).toEqual({
+    expect(matches({ ...silent, leaseExpiresAt: future }, blocked)).toEqual({
       reclaim: false,
       live: true,
     });
@@ -2168,21 +2245,49 @@ describe("activeStateFamilies reclaim/live complement (#1316)", () => {
     });
   });
 
-  it("the heartbeat-gated family stays live on a fresh heartbeat with a NULL expiry", () => {
+  it("the heartbeat-gated family reclaims silence without a live lease (#1418)", () => {
     const active = { state: "IN_PROGRESS", staleClaimReleasePending: false };
 
-    // SQL 3VL: `NULL < cutoff` is UNKNOWN, so this row is NOT a reclaim
-    // candidate; the live arm's explicit NULL clause keeps it alive.
+    // A live lease is liveness on its own: heartbeat silence past the cutoff
+    // does NOT reclaim a renewal-extended row — the #1418 fix — and the row
+    // is live, so it shields the claim as a sibling too.
+    expect(matches({ ...active, lastHeartbeatAt: beforeCutoff, leaseExpiresAt: future }, heartbeat)).toEqual({
+      reclaim: false,
+      live: true,
+    });
+    // A fresh heartbeat is liveness on its own, even with a lapsed expiry.
+    expect(matches({ ...active, lastHeartbeatAt: afterCutoff, leaseExpiresAt: beforeCutoff }, heartbeat)).toEqual({
+      reclaim: false,
+      live: true,
+    });
+    // SQL 3VL: `NULL < boundary` is UNKNOWN, so a NULL expiry is never live —
+    // with a fresh heartbeat the row stays live through the heartbeat arm;
+    // with silence it is reclaimable (no lease clock to trust).
     expect(matches({ ...active, lastHeartbeatAt: afterCutoff, leaseExpiresAt: null }, heartbeat)).toEqual({
       reclaim: false,
       live: true,
     });
-    // Silence or an elapsed expiry is reclaimable.
-    expect(matches({ ...active, lastHeartbeatAt: beforeCutoff, leaseExpiresAt: afterCutoff }, heartbeat)).toEqual({
+    expect(matches({ ...active, lastHeartbeatAt: beforeCutoff, leaseExpiresAt: null }, heartbeat)).toEqual({
       reclaim: true,
       live: false,
     });
-    expect(matches({ ...active, lastHeartbeatAt: afterCutoff, leaseExpiresAt: beforeCutoff }, heartbeat)).toEqual({
+    // Silence AND a lapsed lease: reclaimable — the genuine-stale shape.
+    expect(matches({ ...active, lastHeartbeatAt: beforeCutoff, leaseExpiresAt: beforeCutoff }, heartbeat)).toEqual({
+      reclaim: true,
+      live: false,
+    });
+    // The boundary is exact: a lease at `now` is still live (`gte` is
+    // inclusive); one moment before `now` is not.
+    expect(matches({ ...active, lastHeartbeatAt: beforeCutoff, leaseExpiresAt: now }, heartbeat)).toEqual({
+      reclaim: false,
+      live: true,
+    });
+    expect(
+      matches(
+        { ...active, lastHeartbeatAt: beforeCutoff, leaseExpiresAt: new Date(now.getTime() - 1) },
+        heartbeat,
+      ),
+    ).toEqual({
       reclaim: true,
       live: false,
     });
@@ -2198,7 +2303,7 @@ describe("activeStateFamilies reclaim/live complement (#1316)", () => {
     // The grid spans every timestamp shape so no freshness window leaks.
     for (const state of ["CLAIMED", "IN_PROGRESS", "BLOCKED"]) {
       for (const lastHeartbeatAt of [beforeCutoff, cutoff, afterCutoff]) {
-        for (const leaseExpiresAt of [beforeCutoff, cutoff, afterCutoff, null]) {
+        for (const leaseExpiresAt of [beforeCutoff, cutoff, afterCutoff, future, null]) {
           const row = { state, staleClaimReleasePending: true, lastHeartbeatAt, leaseExpiresAt };
           // Inert for EVERY family, own or otherwise.
           for (const family of families) {
