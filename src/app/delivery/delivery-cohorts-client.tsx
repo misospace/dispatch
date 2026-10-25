@@ -48,7 +48,7 @@ interface CohortStats {
   mergedThroughputPerDay: number;
   openAges: { count: number; medianOpenMs: number | null; oldestOpenMs: number | null };
   fixRounds: { total: number; itemsWithFixes: number };
-  waiting: { activeExecutionMs: number; unclassifiedMs: number };
+  waiting: { activeExecutionMs: number | null; unclassifiedMs: number };
   confounders: {
     mixedSettings: number;
     missingMetadata: number;
@@ -301,7 +301,11 @@ function CohortRow({ c, keyLabel }: { c: CohortStats; keyLabel: string }) {
             formatMs(c.workerTimeMs)
           )}
           <span className="block text-xs font-normal text-muted-foreground">
-            executing {formatMs(c.waiting.activeExecutionMs)} · unclassified {formatMs(c.waiting.unclassifiedMs)}
+            executing{" "}
+            {c.waiting.activeExecutionMs === null
+              ? "unknown"
+              : formatMs(c.waiting.activeExecutionMs)}{" "}
+            · unclassified {formatMs(c.waiting.unclassifiedMs)}
           </span>
         </span>
       </TableCell>
@@ -598,7 +602,7 @@ export function DeliveryCohortsClient() {
                           </span>
                         </TableCell>
                         <TableCell>
-                          {s.executionAttempts} exec, {s.failedAttempts} failed
+                          {s.executionAttempts} exec, {s.failedAttempts} failed/superseded
                         </TableCell>
                         <TableCell>{s.fixRounds}</TableCell>
                         <TableCell>

@@ -155,6 +155,11 @@ export async function GET(request: NextRequest) {
         where: { occurredAt: { gte: new Date(window.sinceMs), lte: new Date(window.untilMs) } },
         distinct: ["issueId"],
         select: { issueId: true },
+        // Deterministic survivor set under the cap: without an explicit order
+        // the DB may keep an arbitrary subset across identical requests
+        // (#1184 review), and DISTINCT forbids ordering by the non-selected
+        // occurredAt, so the id order is the reproducible key.
+        orderBy: [{ issueId: "asc" }],
         take: MAX_CANDIDATE_ISSUES + 1,
       }),
       prisma.issue.findMany({
@@ -163,6 +168,7 @@ export async function GET(request: NextRequest) {
           closedAt: { gte: new Date(window.sinceMs), lte: new Date(window.untilMs) },
         },
         select: { id: true },
+        orderBy: [{ closedAt: "asc" }, { id: "asc" }],
         take: MAX_CANDIDATE_ISSUES + 1,
       }),
     ]);
@@ -192,10 +198,11 @@ export async function GET(request: NextRequest) {
         definitions: COHORT_DEFINITIONS,
         window: { since: new Date(window.sinceMs).toISOString(), until: new Date(window.untilMs).toISOString() },
         groupBy: dimension,
-        repo: repoParam ?? null,
+        repo: repoFilter,
         totals: report.totals,
         cohorts: report.cohorts,
         samples: [],
+        sampleCount: 0,
         truncated: issuesTruncated,
         notes,
       }, { headers: { "Cache-Control": "no-store" } });
@@ -204,13 +211,13 @@ export async function GET(request: NextRequest) {
     const issueRows = await prisma.issue.findMany({
       where: { id: { in: [...candidateIds] } },
       include: { repository: true },
+      // Deterministic sample order basis for no-claim ties downstream.
+      orderBy: [{ id: "asc" }],
     });
 
     const scopedIssues = repoFilter === null
       ? issueRows
       : issueRows.filter((row) => row.repository.fullName.toLowerCase() === repoFilter);
-
-    if (scopedIssues.length < issueRows.length) issuesTruncated = true;
 
     const scopedIds = scopedIssues.map((row) => row.id);
     const byNumber = new Map<string, Set<number>>();
@@ -243,6 +250,8 @@ export async function GET(request: NextRequest) {
           include: {
             history: { orderBy: [{ at: "asc" }, { id: "asc" }], take: MAX_PRFIX_HISTORY_PER_ITEM + 1 },
           },
+          // Deterministic survivor set under the cap (secondary id key).
+          orderBy: [{ repo: "asc" }, { pr: "asc" }, { id: "asc" }],
           take: MAX_PRFIX_ITEMS_TOTAL + 1,
         })
       : Promise.resolve([]);
@@ -399,11 +408,15 @@ export async function GET(request: NextRequest) {
     });
 
     if (
-      scopedIssues.length < candidateIds.size ||
-      samples.length < scopedIssues.length
+      eventRowsRaw.length > MAX_EVENTS_TOTAL ||
+      prFixRowsRaw.length > MAX_PRFIX_ITEMS_TOTAL ||
+      runRowsRaw.length > MAX_RUNS_TOTAL
     ) {
       issuesTruncated = true;
     }
+    notes.push(
+      "Setting changes observed only per attempt: an attempt that restarted under a different runtime keeps its first observed setting, so intra-attempt config changes are not detected.",
+    );
     if (eventsTruncated) notes.push("Event read hit its row cap; some items have partial event history.");
     if (runsTruncated) notes.push("Run read hit its row cap; some attempt chains have partial execution evidence.");
     if (prFixTruncated) notes.push("PR-fix queue read hit its row cap; some fix-round evidence is partial.");

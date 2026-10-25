@@ -11,9 +11,11 @@ then aggregates them into cohort statistics. The route
 (`src/app/api/delivery-cohorts/route.ts`) only performs bounded reads; all
 math lives in the pure `src/lib/delivery-cohorts.ts` module
 (`deriveDeliverySample`, `aggregateDeliveryCohorts`, `COHORT_DEFINITIONS`).
-Any authorized API caller may read it; errors are `401` / `403` / `400` as
-JSON `{ "error": "..." }`. The read-only page at `/delivery` (desktop nav:
-**Delivery**) renders this contract.
+It requires maintainer-tier credentials (OIDC session, basic auth, or a
+maintainer bearer token; worker-tier bearer tokens are rejected with `403`
+because the path is not on the worker allowlist); errors are `401` / `403` /
+`400` as JSON `{ "error": "..." }`. The read-only page at `/delivery`
+(desktop and mobile nav: **Delivery**) renders this contract.
 
 ## Parameters and defaults
 
@@ -44,6 +46,10 @@ JSON `{ "error": "..." }`. The read-only page at `/delivery` (desktop nav:
 - Merge evidence is only authoritative `pr_merged` lifecycle events — never a
   worker's success report. A merge preceding the first observed claim yields a
   negative `claimToMergeMs` — reported, not hidden.
+- Setting changes are observed **per attempt**: an attempt whose runs restart
+  under a different runtime/model keeps its first observed value, so an
+  intra-attempt config change is not detected (the mixed rule works at
+  attempt granularity).
 
 ## Response (`dispatch.delivery-cohorts/v1`)
 
@@ -84,9 +90,11 @@ null only for an empty group), `claimToDone` / `claimToMerge`
 (`DurationStats | null` — `{ samples, min, max, mean, p50, p90 }` in ms;
 null when no known values), `workerTimeMs` (ms, null when no run evidence),
 `firstPass` (`{ true, false, null }` counts), `mergedThroughputPerDay`,
-`openAges` (`{ count, medianOpenMs, oldestOpenMs }`), `fixRounds`
-(`{ total, itemsWithFixes }`), `waiting` (`{ activeExecutionMs,
-unclassifiedMs }` — execution vs. the remainder of claim→done) and
+`openAges` (`{ count, medianOpenMs, oldestOpenMs }` — open/unknown-delivery
+items with a claim anchor), `fixRounds` (`{ total, itemsWithFixes }`),
+`waiting` (`{ activeExecutionMs, unclassifiedMs }` — execution vs. the
+remainder of claim→done; `activeExecutionMs` is null when no run evidence
+exists, never reported as zero) and
 `confounders` (`{ mixedSettings, missingMetadata, distinctRuntimeRevisions[],
 distinctModels[], distinctWorkers[] }`); a group with more than one model or
 revision is flagged so a row can never be read as single-setting evidence.

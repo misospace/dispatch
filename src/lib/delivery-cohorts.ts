@@ -114,7 +114,9 @@ export interface CohortStats {
   mergedThroughputPerDay: number;
   openAges: OpenAgeStats;
   fixRounds: { total: number; itemsWithFixes: number };
-  waiting: { activeExecutionMs: number; unclassifiedMs: number };
+  // activeExecutionMs stays null (unknown) when no sample carries run
+  // evidence — an unobserved worker time never renders as zero.
+  waiting: { activeExecutionMs: number | null; unclassifiedMs: number };
   confounders: CohortConfounders;
 }
 
@@ -495,7 +497,7 @@ function computeStats(
     openAges,
     fixRounds: { total: fixRoundsTotal, itemsWithFixes },
     waiting: {
-      activeExecutionMs: totalWorkerTimeMs ?? 0,
+      activeExecutionMs: totalWorkerTimeMs,
       unclassifiedMs,
     },
     confounders: {
