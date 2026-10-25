@@ -3,6 +3,7 @@ import { errorResponse } from "@/lib/api-errors";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { markPrFixItem, parseMarkPrFixInput, isPrFixRepoArchived } from "@/lib/pr-fix-queue";
 import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
+import { enforceWorkerBound } from "@/lib/worker-identity";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { fetchPullRequestMergeState } from "@/lib/github-prs";
 
@@ -59,6 +60,19 @@ export async function POST(request: Request) {
       }
       return errorResponse("Marking an item QUEUED or IGNORED requires a maintainer token", 403);
     }
+
+    // #1428: the legacy unbound `DISPATCH_WORKER_TOKEN` carries no agent
+    // identity, so this route cannot bind its mark to a hand-out — refuse it
+    // like the sibling identity-scoped routes (`ack`). `enforceWorkerBound`
+    // records its own best-effort `worker_scope_denied` audit row. A bound
+    // worker credential passes here and is additionally pinned to the rows it
+    // holds the hand-out for via `handoutScopedAgent` below; maintainer
+    // bearers and operator sessions stay unconstrained.
+    const boundError = await enforceWorkerBound(auth);
+    if (boundError) return boundError;
+    // The bound token's agent identity — never a body/header value (#1322).
+    const handoutScopedAgent =
+      auth.type === "bearer" && auth.tier === "worker" ? auth.agentName : undefined;
 
     // #1218 review: the mark's commit-time status pin (status === "QUEUED" for
     // BLOCKED/PARKED settlements) must be honored for worker callers — a
@@ -143,9 +157,39 @@ export async function POST(request: Request) {
     const result = await markPrFixItem(asPrFixQueueClient(prisma), {
       ...input,
       actorTier,
+      ...(handoutScopedAgent ? { handoutScopedAgent } : {}),
       ...(allowStickyReclassify ? { allowStickyReclassify: true } : {}),
     });
     if (!result.mutated) {
+      if (result.reason === "not-handed") {
+        // #1428: the caller does not hold the hand-out that owns this row's
+        // settled generation. Refusal, not an outcome: `reason` lets the
+        // worker tell "you may not settle this" apart from "the settlement
+        // was refused" (the outcome vocabulary stays untouched).
+        try {
+          await prisma.auditLog.create({
+            data: {
+              actor: auditActor,
+              action: "pr_fix_mark",
+              repoFullName: input.repo,
+              issueNumber: null,
+              success: false,
+              errorMessage: `Worker ${handoutScopedAgent ?? "unknown"} holds no hand-out on pr-fix item ${input.repo}#${input.pr} at the settled generation`,
+              beforeLabels: [],
+              afterLabels: [],
+            },
+          });
+        } catch {
+          // Audit log failure should not mask the 403
+        }
+        return NextResponse.json(
+          {
+            error: "PR fix queue item was not handed to the authenticated agent at that generation",
+            reason: "not-handed",
+          },
+          { status: 403 },
+        );
+      }
       if (result.reason === "generation-mismatch") {
         // The item moved to a newer attempt between the caller's read and
         // this write. Conflict, not an error: no mutation happened.
