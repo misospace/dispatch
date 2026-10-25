@@ -3,6 +3,7 @@ import { errorResponse } from "@/lib/api-errors";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { markPrFixItem, parseMarkPrFixInput, isPrFixRepoArchived } from "@/lib/pr-fix-queue";
 import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
+import { enforceWorkerBound } from "@/lib/worker-identity";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { fetchPullRequestMergeState } from "@/lib/github-prs";
 
@@ -60,11 +61,16 @@ export async function POST(request: Request) {
       return errorResponse("Marking an item QUEUED or IGNORED requires a maintainer token", 403);
     }
 
-    // #1430: the bound token's agent identity — never a body/header value
-    // (#1322). It binds the idempotent WAITING_EXTERNAL duplicate answer to
-    // the agent that actually started the wait; maintainer bearers and
-    // operator sessions stay unconstrained, and the legacy unbound worker
-    // token (no identity) keeps the pre-#1430 behavior for this replay only.
+    // #1428: the legacy unbound `DISPATCH_WORKER_TOKEN` carries no agent
+    // identity, so this route cannot bind its mark to a hand-out — refuse it
+    // like the sibling identity-scoped routes (`ack`). `enforceWorkerBound`
+    // records its own best-effort `worker_scope_denied` audit row. A bound
+    // worker credential passes here and is additionally pinned to the rows it
+    // holds the hand-out for via `handoutScopedAgent` below; maintainer
+    // bearers and operator sessions stay unconstrained.
+    const boundError = await enforceWorkerBound(auth);
+    if (boundError) return boundError;
+    // The bound token's agent identity — never a body/header value (#1322).
     const handoutScopedAgent =
       auth.type === "bearer" && auth.tier === "worker" ? auth.agentName : undefined;
 
