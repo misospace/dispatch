@@ -77,6 +77,18 @@ The `next-task` endpoint returns one of three task types:
 | `implement` | `true` | Work exactly one GitHub issue. Open or update one PR, then stop. |
 | `followup-pr` | `true` | Update exactly one existing PR with requested changes, then stop. |
 
+### PR-fix lanes (`prFixItem.fixType`)
+
+A `followup-pr` task names the queued item's lane in `prFixItem.fixType`. The task's `reasons` carry the full contract for the item; `fixType` is the branch key that lets a worker pick the lane without parsing prose. `fixType` is the DISPATCHED lane (the stamped `attemptType`, falling back to the row's current type for pre-stamp rows) — the same value settlement keys on — not the row's mutable type, so a mid-attempt re-observation cannot change the lane a live attempt runs and settles as. The stamp is written only by the hand-out issuance itself (atomically with the hand-out record), so it never names a lane that no issued hand-out backed.
+
+For `REBASE` the one-attempt bound is enforced server-side, not only in prose (#1327): `next-task` hands out at most one live rebase at a time across all PRs (concurrency 1, no fan-out; deferred candidates are retried next poll, including when the lane's admission lock cannot be taken — a rebase is never handed out unlocked), and a `failed` or give-up `blocked` report on a `REBASE` item settles as a terminal `PARKED` — it is never re-dispatched as a fresh attempt the way other fix types are under `PR_FIX_MAX_ATTEMPTS`. A new dirty episode (a new head) re-opens the item. The lane's worker pool is also enforced server-side when the deployment declares it: `DISPATCH_REBASE_AGENTS` (comma or whitespace separated agent names) restricts `REBASE` hand-outs to that local-only pool; an agent outside the pool never receives a REBASE hand-out (unset or empty is fail-closed — no agent is eligible and the lane stops dispatching until the operator declares the pool; a bare `*` value is the explicit unrestricted opt-in).
+
+| `fixType` | Contract |
+|-----------|----------|
+| `REBASE` | Mechanical rebase lane (#1327). Rebase the PR branch onto its base and reconcile conflicts **mechanically only**: lockfiles, version strings, import order, doc indexes, adjacent non-overlapping hunks, and comment-only overlaps where one side is a strict subset. Never edit the same logic on both sides, never merge, never open a PR. Push with `--force-with-lease`, then run the repo's bounded typecheck — an unfixable error in a file this PR touches means the rebase was not mechanical. On **any** semantic conflict, report `outcome: "blocked"` with `blockReason: "human_decision"`, the conflicting files, and why the conflict is not mechanical; do not resolve it yourself. One attempt per dirty episode: do not retry. |
+| `MERGE_CONFLICT` | Pre-#1327 merge-conflict items. Same mechanical walls as `REBASE` — rebase onto the base, reconcile mechanically only, push with `--force-with-lease`, bail to a human on a semantic conflict — but a legacy item's stored reason can be a one-liner, so follow the walls above rather than the item's wording. |
+| `CI_FAILURE`, `REVIEW_FEEDBACK`, `OTHER` | Ordinary requested changes on the PR. |
+
 ### Report Outcomes
 
 The `tasks/report` endpoint accepts these outcomes:
