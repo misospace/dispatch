@@ -224,7 +224,7 @@ curl -s -X POST "DISPATCH_URL/api/pr-fix-queue/mark" \
   -d '{"repo":"org/repo","pr":42,"status":"fixed"}'
 ```
 
-Valid statuses: `FIXED`, `BLOCKED`, `PARKED`, `STALE`, `IGNORED`, `WAITING_EXTERNAL`. `WAITING_EXTERNAL` defers the consumed generation for the configured cooldown; it neither charges an attempt nor signals prerequisite readiness.
+Valid statuses: `FIXED`, `BLOCKED`, `PARKED`, `STALE`, `IGNORED`, `WAITING_EXTERNAL`. `WAITING_EXTERNAL` defers the consumed generation for the configured cooldown; it neither charges an attempt nor signals prerequisite readiness. A duplicate `WAITING_EXTERNAL` mark at the same generation is answered idempotently, but a bound worker credential receives `403` `not-handed` unless it is the agent recorded as having started that wait (#1430) — retry the wait with the same credential that started it.
 
 ### Normal Lane
 

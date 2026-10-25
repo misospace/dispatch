@@ -1416,6 +1416,224 @@ describe("requeuePrFixItem surface cleanup", () => {
   });
 });
 
+describe("hand-out-scoped external waits (#1430)", () => {
+  let client: ReturnType<typeof makeClient>;
+
+  const wait = {
+    kind: "upstream_pr",
+    ref: "org/deps#7",
+    evidence: "upstream PR open",
+    trigger: { kind: "merged" },
+  } as const;
+
+  beforeEach(() => {
+    client = makeClient();
+    surfacingMocks.surfacePrFixBlocked.mockReset();
+    surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    surfacingMocks.surfacePrFixParked.mockReset();
+    surfacingMocks.surfacePrFixParked.mockResolvedValue({ commentPosted: true, commentUpdated: false, skippedTerminal: false, errors: [] });
+  });
+
+  async function seedQueued(pr: number) {
+    return enqueuePrFixItem(client, { repo: "org/repo", pr, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: `k${pr}` });
+  }
+
+  function rowOf(item: any) {
+    return client.items.find((i) => i.id === item.id)!;
+  }
+
+  it("records the bound waiter when a scoped worker starts the wait", async () => {
+    const item = await seedQueued(90);
+    const result = await markPrFixItem(client, {
+      repo: item.repo,
+      pr: item.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: item.generation,
+      externalWait: wait,
+      handoutScopedAgent: "alpha",
+    });
+
+    expect(result.mutated).toBe(true);
+    const row = mutatedItem(result);
+    expect(row.status).toBe("WAITING_EXTERNAL");
+    expect(row.externalWaitBy).toBe("alpha");
+    expect(client.history.at(-1)).toMatchObject({ action: "mark", status: "WAITING_EXTERNAL" });
+  });
+
+  it("records a null waiter when an unscoped caller starts the wait", async () => {
+    const item = await seedQueued(91);
+    const result = await markPrFixItem(client, {
+      repo: item.repo,
+      pr: item.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: item.generation,
+      externalWait: wait,
+    });
+
+    expect(result.mutated).toBe(true);
+    expect(mutatedItem(result).externalWaitBy).toBe(null);
+  });
+
+  it("grants its own same-generation replay idempotently without extending the wait (#1231, #1430)", async () => {
+    const item = await seedQueued(92);
+    const first = await markPrFixItem(client, {
+      repo: item.repo,
+      pr: item.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: item.generation,
+      note: "original note",
+      externalWait: wait,
+      handoutScopedAgent: "alpha",
+    });
+    expect(first.mutated).toBe(true);
+
+    const row = rowOf(item);
+    const retryAtBefore = row.retryAt;
+    const waitBefore = row.externalWait;
+    const historyLengthBefore = client.history.length;
+
+    const replay = await markPrFixItem(client, {
+      repo: row.repo,
+      pr: row.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: row.generation,
+      note: "replay note",
+      externalWait: wait,
+      handoutScopedAgent: "alpha",
+    });
+
+    expect(replay.mutated).toBe(true);
+    expect(mutatedItem(replay)).toBe(row);
+    // No new history row: the replay is the #1231 duplicate answer, not a new mark.
+    expect(client.history).toHaveLength(historyLengthBefore);
+    // The cooldown is never re-armed by the replay.
+    expect(row.retryAt).toBe(retryAtBefore);
+    expect(row.externalWait).toEqual(waitBefore);
+    expect(row.externalWaitBy).toBe("alpha");
+    expect(client.history.at(-1)).toMatchObject({ note: "original note" });
+  });
+
+  it("refuses a same-generation replay from a different bound worker (not-handed)", async () => {
+    const item = await seedQueued(93);
+    const first = await markPrFixItem(client, {
+      repo: item.repo,
+      pr: item.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: item.generation,
+      externalWait: wait,
+      handoutScopedAgent: "alpha",
+    });
+    expect(first.mutated).toBe(true);
+
+    const row = rowOf(item);
+    const retryAtBefore = row.retryAt;
+    const historyLengthBefore = client.history.length;
+
+    const refused = await markPrFixItem(client, {
+      repo: row.repo,
+      pr: row.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: row.generation,
+      externalWait: wait,
+      handoutScopedAgent: "bravo",
+    });
+
+    expect(refused).toEqual({ mutated: false, reason: "not-handed" });
+    // The refusal is a caller-binding denial: no write, no history row.
+    expect(row.status).toBe("WAITING_EXTERNAL");
+    expect(row.externalWaitBy).toBe("alpha");
+    expect(row.retryAt).toBe(retryAtBefore);
+    expect(client.history).toHaveLength(historyLengthBefore);
+  });
+
+  it("refuses a scoped replay of a wait started by an unscoped caller (no recorded waiter)", async () => {
+    const item = await seedQueued(94);
+    const first = await markPrFixItem(client, {
+      repo: item.repo,
+      pr: item.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: item.generation,
+      externalWait: wait,
+    });
+    expect(first.mutated).toBe(true);
+    const row = rowOf(item);
+    expect(row.externalWaitBy).toBe(null);
+
+    const refused = await markPrFixItem(client, {
+      repo: row.repo,
+      pr: row.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: row.generation,
+      externalWait: wait,
+      handoutScopedAgent: "alpha",
+    });
+
+    expect(refused).toEqual({ mutated: false, reason: "not-handed" });
+    expect(row.externalWaitBy).toBe(null);
+  });
+
+  it("keeps the unscoped same-generation replay unchanged for a scoped wait (#1231)", async () => {
+    const item = await seedQueued(95);
+    const first = await markPrFixItem(client, {
+      repo: item.repo,
+      pr: item.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: item.generation,
+      externalWait: wait,
+      handoutScopedAgent: "alpha",
+    });
+    expect(first.mutated).toBe(true);
+
+    const row = rowOf(item);
+    const replay = await markPrFixItem(client, {
+      repo: row.repo,
+      pr: row.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: row.generation,
+      externalWait: wait,
+    });
+
+    expect(replay.mutated).toBe(true);
+    expect(mutatedItem(replay)).toBe(row);
+    expect(row.externalWaitBy).toBe("alpha");
+  });
+
+  it("resets the recorded waiter when the wait is released into a fresh attempt", async () => {
+    const item = await seedQueued(96);
+    const first = await markPrFixItem(client, {
+      repo: item.repo,
+      pr: item.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: item.generation,
+      externalWait: wait,
+      handoutScopedAgent: "alpha",
+    });
+    expect(first.mutated).toBe(true);
+
+    const row = rowOf(item);
+    expect(row.externalWaitBy).toBe("alpha");
+    const generationBefore = row.generation;
+
+    // Operator release: a mark back to QUEUED is a fresh attempt and must not
+    // inherit the dead attempt's recorded waiter or hand-out records.
+    const released = await markPrFixItem(client, {
+      repo: row.repo,
+      pr: row.pr,
+      status: "QUEUED",
+      expectedGeneration: row.generation,
+      actorTier: "maintainer",
+      note: "operator release",
+    });
+
+    expect(released.mutated).toBe(true);
+    const fresh = mutatedItem(released);
+    expect(fresh.status).toBe("QUEUED");
+    expect(fresh.generation).toBe(generationBefore + 1);
+    expect(fresh.externalWaitBy).toBe(null);
+    expect(fresh.agentHandouts).toEqual([]);
+  });
+});
+
 describe("markPrFixItem head SHA guard (#940)", () => {
   beforeEach(() => {
     surfacingMocks.surfacePrFixBlocked.mockClear();

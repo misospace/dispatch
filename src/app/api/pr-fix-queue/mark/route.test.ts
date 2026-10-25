@@ -1,12 +1,15 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMockWithSafeEqual, authedRequest } from "@/test/route-helpers";
 
-const { WORKER_TOKEN } = vi.hoisted(() => ({ WORKER_TOKEN: "worker-token" }));
+const { WORKER_TOKEN, BOUND_ALPHA_TOKEN } = vi.hoisted(() => ({
+  WORKER_TOKEN: "worker-token",
+  BOUND_ALPHA_TOKEN: "bound-alpha-token",
+}));
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
 vi.mock("@/lib/dispatch-env", () =>
-  makeDispatchEnvMockWithSafeEqual(mockToken, { [WORKER_TOKEN]: "worker" }),
+  makeDispatchEnvMockWithSafeEqual(mockToken, { [WORKER_TOKEN]: "worker" }, { [BOUND_ALPHA_TOKEN]: "alpha" }),
 );
 
 const { mocks } = vi.hoisted(() => ({
@@ -451,5 +454,126 @@ describe("POST /api/pr-fix-queue/mark — alreadyAddressed merge gate (#1121)", 
     expect(res.status).toBe(200);
     expect(mergeStateMock).not.toHaveBeenCalled();
     expect(mocks.markPrFixItem).toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/pr-fix-queue/mark — hand-out-scoped external wait replay (#1430)", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+    mocks.prFixQueueClient.mockReturnValue({});
+    mocks.parseMarkPrFixInput.mockReturnValue({
+      repo: "org/repo",
+      pr: 42,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: 3,
+    });
+    mocks.isPrFixRepoArchived.mockResolvedValue(false);
+    mocks.auditLogCreate.mockResolvedValue({ id: "log-1" });
+  });
+
+  // A bound worker credential: the identity is the token's binding, never a
+  // self-reported header or body field.
+  function boundAlphaPost(body: unknown) {
+    return POST(
+      authedRequest("http://localhost/api/pr-fix-queue/mark", {
+        method: "POST",
+        body,
+        token: BOUND_ALPHA_TOKEN,
+      }),
+    );
+  }
+
+  it("maps a not-handed replay refusal to 403 with a failed audit row", async () => {
+    mocks.markPrFixItem.mockResolvedValue({ mutated: false, reason: "not-handed" });
+
+    const res = await boundAlphaPost({ repo: "org/repo", pr: 42, status: "WAITING_EXTERNAL", generation: 3 });
+
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.reason).toBe("not-handed");
+    expect(body.error).toBe(
+      "PR fix queue item external wait was not started by the authenticated agent at that generation",
+    );
+    // The route forwards the bound token's identity — never a body/header value.
+    expect(mocks.markPrFixItem).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        status: "WAITING_EXTERNAL",
+        expectedGeneration: 3,
+        actorTier: "worker",
+        handoutScopedAgent: "alpha",
+      }),
+    );
+    // The refusal is audited as a failure (named to the bound agent), never as a success.
+    expect(mocks.auditLogCreate).toHaveBeenCalledTimes(1);
+    expect(mocks.auditLogCreate).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "pr_fix_mark",
+        actor: "alpha",
+        repoFullName: "org/repo",
+        success: false,
+        errorMessage:
+          "Worker alpha did not start the external wait on pr-fix item org/repo#42 at the recorded generation",
+      }),
+    });
+  });
+
+  it("answers the recorded waiter's own same-generation replay with 200 and the row", async () => {
+    const row = { id: "fix-1", status: "WAITING_EXTERNAL", externalWaitBy: "alpha" };
+    mocks.markPrFixItem.mockResolvedValue({ mutated: true, item: row });
+
+    const res = await boundAlphaPost({ repo: "org/repo", pr: 42, status: "WAITING_EXTERNAL", generation: 3 });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual(row);
+    expect(mocks.markPrFixItem).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        status: "WAITING_EXTERNAL",
+        expectedGeneration: 3,
+        actorTier: "worker",
+        handoutScopedAgent: "alpha",
+      }),
+    );
+    expect(mocks.auditLogCreate).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "pr_fix_mark",
+        actor: "alpha",
+        success: true,
+      }),
+    });
+  });
+
+  it("does not forward a hand-out identity for maintainer marks", async () => {
+    mocks.markPrFixItem.mockResolvedValue({ mutated: true, item: { id: "fix-1", status: "WAITING_EXTERNAL" } });
+
+    const res = await postRequest({ repo: "org/repo", pr: 42, status: "WAITING_EXTERNAL", generation: 3 });
+
+    expect(res.status).toBe(200);
+    const [, input] = mocks.markPrFixItem.mock.calls[0] as [unknown, any];
+    expect(input.handoutScopedAgent).toBeUndefined();
+    expect(input.actorTier).toBe("maintainer");
+  });
+
+  it("keeps the legacy unbound worker token unconstrained (no identity to bind)", async () => {
+    mocks.markPrFixItem.mockResolvedValue({ mutated: true, item: { id: "fix-1", status: "WAITING_EXTERNAL" } });
+
+    const res = await POST(
+      authedRequest("http://localhost/api/pr-fix-queue/mark", {
+        method: "POST",
+        body: { repo: "org/repo", pr: 42, status: "WAITING_EXTERNAL", generation: 3 },
+        token: WORKER_TOKEN,
+        headers: { "x-agent-name": "worker-agent" },
+      }),
+    );
+
+    expect(res.status).toBe(200);
+    const [, input] = mocks.markPrFixItem.mock.calls[0] as [unknown, any];
+    // The unbound token carries no agent identity: the route must not mint one
+    // from the self-reported header (#1322) — the pre-#1430 replay stands.
+    expect(input.handoutScopedAgent).toBeUndefined();
+    expect(input.actorTier).toBe("worker");
   });
 });

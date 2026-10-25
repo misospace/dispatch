@@ -60,6 +60,14 @@ export async function POST(request: Request) {
       return errorResponse("Marking an item QUEUED or IGNORED requires a maintainer token", 403);
     }
 
+    // #1430: the bound token's agent identity — never a body/header value
+    // (#1322). It binds the idempotent WAITING_EXTERNAL duplicate answer to
+    // the agent that actually started the wait; maintainer bearers and
+    // operator sessions stay unconstrained, and the legacy unbound worker
+    // token (no identity) keeps the pre-#1430 behavior for this replay only.
+    const handoutScopedAgent =
+      auth.type === "bearer" && auth.tier === "worker" ? auth.agentName : undefined;
+
     // #1218 review: the mark's commit-time status pin (status === "QUEUED" for
     // BLOCKED/PARKED settlements) must be honored for worker callers — a
     // same-generation second mark cannot erase a recorded human decision.
@@ -143,9 +151,40 @@ export async function POST(request: Request) {
     const result = await markPrFixItem(asPrFixQueueClient(prisma), {
       ...input,
       actorTier,
+      ...(handoutScopedAgent ? { handoutScopedAgent } : {}),
       ...(allowStickyReclassify ? { allowStickyReclassify: true } : {}),
     });
     if (!result.mutated) {
+      if (result.reason === "not-handed") {
+        // #1430: a hand-out-scoped (bound worker) caller tried to replay a
+        // same-generation WAITING_EXTERNAL mark it did not start. Refusal,
+        // not an outcome: `reason` lets the worker tell "you may not read/
+        // settle this" apart from "the settlement was refused" (the outcome
+        // vocabulary stays untouched). No mutation, no success audit row.
+        try {
+          await prisma.auditLog.create({
+            data: {
+              actor: auditActor,
+              action: "pr_fix_mark",
+              repoFullName: input.repo,
+              issueNumber: null,
+              success: false,
+              errorMessage: `Worker ${handoutScopedAgent ?? "unknown"} did not start the external wait on pr-fix item ${input.repo}#${input.pr} at the recorded generation`,
+              beforeLabels: [],
+              afterLabels: [],
+            },
+          });
+        } catch {
+          // Audit log failure should not mask the 403
+        }
+        return NextResponse.json(
+          {
+            error: "PR fix queue item external wait was not started by the authenticated agent at that generation",
+            reason: "not-handed",
+          },
+          { status: 403 },
+        );
+      }
       if (result.reason === "generation-mismatch") {
         // The item moved to a newer attempt between the caller's read and
         // this write. Conflict, not an error: no mutation happened.

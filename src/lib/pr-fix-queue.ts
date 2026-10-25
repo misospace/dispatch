@@ -310,6 +310,20 @@ export interface MarkPrFixInput {
    * settles QUEUED → BLOCKED/PARKED.
    */
   allowStickyReclassify?: boolean;
+  /**
+   * Bound worker identity for hand-out-scoped marks (#1430). The route handler
+   * is the only trusted source of this value — the bound token's agent name;
+   * `parseMarkPrFixInput` never accepts it from a request body. When set, the
+   * idempotent same-generation `WAITING_EXTERNAL` duplicate answer (#1231) is
+   * granted ONLY to the agent recorded as the waiter (`externalWaitBy`) on the
+   * already-waiting row — a scoped worker that did not start the wait gets
+   * `not-handed` instead of the row JSON. The wait write records this identity
+   * atomically with the transition; waits started by unscoped callers record
+   * null and grant the replay to nobody at worker scope. Unset
+   * (maintainer/operator paths and internal report settlement) keeps the
+   * existing unconstrained replay behavior.
+   */
+  handoutScopedAgent?: string;
 }
 
 export interface RequeuePrFixInput {
@@ -943,7 +957,7 @@ async function reactivateDueExternalWaits(client: PrFixQueueClient, now: Date): 
       await client.$transaction(async (tx) => {
         const { count } = await tx.prFixQueueItem.updateMany({
           where: { id: row.id, status: "WAITING_EXTERNAL", generation: row.generation, retryAt: row.retryAt },
-          data: { status: "QUEUED", ...freshAttemptGeneration(), retryAt: null, dispatchedGeneration: null, dispatchedAt: null, postDispatchEvidenceKeys: [], attemptHeadSha: row.headSha ?? row.attemptHeadSha ?? null, outcome: null, decisionDetail: null, agentHandouts: [], handoutAcks: [], handoutReceipts: [], externalWait: Prisma.DbNull },
+          data: { status: "QUEUED", ...freshAttemptGeneration(), retryAt: null, dispatchedGeneration: null, dispatchedAt: null, postDispatchEvidenceKeys: [], attemptHeadSha: row.headSha ?? row.attemptHeadSha ?? null, outcome: null, decisionDetail: null, agentHandouts: [], handoutAcks: [], handoutReceipts: [], externalWaitBy: null, externalWait: Prisma.DbNull },
         });
         if (count === 1) await tx.prFixHistory.create({ data: { itemId: row.id, action: "mark", status: "QUEUED", lane: row.lane, note: "External-wait cooldown elapsed; retrying prerequisite check." } });
       });
@@ -1043,6 +1057,7 @@ export async function reconcileExternalWaitTriggers(
           outcome: null,
           decisionDetail: null,
           agentHandouts: [],
+          externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
           handoutAcks: [],
           handoutReceipts: [],
           externalWait: Prisma.DbNull,
@@ -1421,6 +1436,7 @@ export async function reclaimStalePrFixHandouts(
               data: {
                 status: "STALE",
                 agentHandouts: [],
+                externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
                 handoutAcks: [],
                 handoutReceipts: [],
                 dispatchedGeneration: null,
@@ -1480,6 +1496,7 @@ export async function reclaimStalePrFixHandouts(
                 disposedAt: now,
                 disposedEvidence: null,
                 agentHandouts: [],
+                externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
                 handoutAcks: [],
                 handoutReceipts: [],
                 dispatchedGeneration: null,
@@ -1551,6 +1568,7 @@ export async function reclaimStalePrFixHandouts(
               ...freshAttemptGeneration(),
               handoutReclaims: { increment: 1 },
               agentHandouts: [],
+              externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
               handoutAcks: [],
               handoutReceipts: [],
               postDispatchEvidenceKeys: [],
@@ -1887,6 +1905,7 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
             ? {
                 postDispatchEvidenceKeys: [],
                 agentHandouts: [],
+                externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
                 handoutAcks: [],
                 handoutReceipts: [],
                 staleDisposition: false,
@@ -2530,11 +2549,16 @@ export async function assertPrHeadMovedForFix(
  * (`mutated: true`, with the fresh row) or was skipped without any write
  * (`mutated: false`): `not-found` when no item matches, `generation-mismatch`
  * when an `expectedGeneration` was supplied and the row's generation no
- * longer matches (the attempt was re-issued between read and write).
+ * longer matches (the attempt was re-issued between read and write), and
+ * `not-handed` when a hand-out-scoped caller (#1430) tried to replay a
+ * same-generation `WAITING_EXTERNAL` mark it did not start — a caller-binding
+ * refusal, deliberately distinct from the row's outcome vocabulary so a
+ * worker can tell "you may not read/settle this" from "the settlement was
+ * refused".
  */
 export type MarkPrFixResult =
   | { mutated: true; item: any }
-  | { mutated: false; reason: "generation-mismatch" | "not-found" };
+  | { mutated: false; reason: "generation-mismatch" | "not-found" | "not-handed" };
 
 export async function markPrFixItem(
   client: PrFixQueueClient,
@@ -2576,6 +2600,25 @@ export async function markPrFixItem(
     // Idempotent duplicate for the same generation: never extend the
     // cooldown, never overwrite the recorded contract or note (#1231).
     if (existing.status === "WAITING_EXTERNAL" && existing.generation === expectedGeneration) {
+      // #1430: the duplicate answer hands out the full row, so at worker
+      // scope it is a state read and must be bound to the identity that
+      // actually started the wait. The wait itself cleared `agentHandouts`
+      // (no hand-out marker survives it), which is why this replay can never
+      // be re-authorized by a hand-out check — the waiter column written with
+      // the transition is the only binding left. A scoped caller that is not
+      // the recorded waiter (including a row whose wait was started by an
+      // unscoped caller, `externalWaitBy` null) gets `not-handed`: refusal,
+      // no mutation, no history row. Unscoped callers keep the unchanged
+      // #1231 behavior.
+      if (input.handoutScopedAgent) {
+        const waiter =
+          typeof existing.externalWaitBy === "string" && existing.externalWaitBy
+            ? existing.externalWaitBy
+            : null;
+        if (waiter !== input.handoutScopedAgent) {
+          return { mutated: false, reason: "not-handed" };
+        }
+      }
       return { mutated: true, item: existing };
     }
     if (existing.status !== "QUEUED") return { mutated: false, reason: "generation-mismatch" };
@@ -2657,6 +2700,11 @@ export async function markPrFixItem(
     data.agentHandouts = [];
     data.handoutReceipts = [];
     data.handoutAcks = [];
+    // #1430: record who started this wait, atomically with the transition.
+    // A scoped worker records its bound identity so its own same-generation
+    // retry keeps the #1231 idempotent answer; an unscoped (maintainer/
+    // operator/internal) wait records null and grants no worker-scope replay.
+    data.externalWaitBy = input.handoutScopedAgent ?? null;
   }
 
   // #1218 review: a recorded human decision (BLOCKED) and a recorded operator
@@ -2735,6 +2783,7 @@ export async function markPrFixItem(
           disposedEvidence: null,
           postDispatchEvidenceKeys: [],
           agentHandouts: [],
+          externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
           handoutAcks: [],
           handoutReceipts: [],
           attemptEvidenceWatermark: null,
@@ -2752,6 +2801,7 @@ export async function markPrFixItem(
           // generation must not suppress its re-dispatch (#1133), and the
           // prior generation's acknowledgements are dead (#1211).
           agentHandouts: [],
+          externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
           handoutAcks: [],
           handoutReceipts: [],
         };
@@ -2904,6 +2954,9 @@ export async function markPrFixItem(
       data.agentHandouts = [];
       data.handoutReceipts = [];
       data.handoutAcks = [];
+      // #1430: the recorded waiter belongs to the dead attempt's wait; a
+      // fresh attempt never inherits it.
+      data.externalWaitBy = null;
     }
     // QUEUED → QUEUED: leave the key list untouched — the entries still refer
     // to the current generation and must survive the mark.
@@ -2971,6 +3024,7 @@ export async function markPrFixItem(
             disposedEvidence: null,
             postDispatchEvidenceKeys: [],
             agentHandouts: [],
+            externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
             handoutAcks: [],
             handoutReceipts: [],
             attemptEvidenceWatermark: null,
@@ -2989,6 +3043,7 @@ export async function markPrFixItem(
             // Same for the per-agent hand-out records and their
             // acknowledgements (#1133, #1211).
             agentHandouts: [],
+            externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
             handoutAcks: [],
             handoutReceipts: [],
           };
@@ -3266,6 +3321,7 @@ export async function markPrFixItem(
         disposedEvidence: null,
         postDispatchEvidenceKeys: [],
         agentHandouts: [],
+        externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
         handoutAcks: [],
         handoutReceipts: [],
         attemptEvidenceWatermark: null,
@@ -3283,6 +3339,7 @@ export async function markPrFixItem(
         // generation must not suppress its re-dispatch (#1133), and the
         // prior generation's acknowledgements are dead (#1211).
         agentHandouts: [],
+        externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
         handoutAcks: [],
         handoutReceipts: [],
       };
@@ -3825,6 +3882,7 @@ export async function requeuePrFixItem(client: PrFixQueueClient, rawInput: Reque
         // automatic reclaim, which deliberately counts toward it.
         postDispatchEvidenceKeys: [],
         agentHandouts: [],
+        externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
         handoutAcks: [],
         handoutReceipts: [],
         handoutReclaims: 0,
@@ -4394,6 +4452,7 @@ export async function resolvePrFixFromAgentReport(
             disposedEvidence: null,
             postDispatchEvidenceKeys: [],
             agentHandouts: [],
+            externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
             handoutAcks: [],
             handoutReceipts: [],
           }
@@ -4413,6 +4472,7 @@ export async function resolvePrFixFromAgentReport(
             // not suppress the item's re-dispatch (#1133), and its
             // acknowledgements are dead (#1211).
             agentHandouts: [],
+            externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
             handoutAcks: [],
             handoutReceipts: [],
           };
