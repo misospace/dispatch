@@ -637,9 +637,7 @@ describe("POST /api/pr-fix-queue/mark — hand-out-scoped external wait replay (
     expect(res.status).toBe(403);
     const body = await res.json();
     expect(body.reason).toBe("not-handed");
-    expect(body.error).toBe(
-      "PR fix queue item external wait was not started by the authenticated agent at that generation",
-    );
+    expect(body.error).toContain("not handed to the authenticated agent");
     // The route forwards the bound token's identity — never a body/header value.
     expect(mocks.markPrFixItem).toHaveBeenCalledWith(
       expect.anything(),
@@ -658,8 +656,7 @@ describe("POST /api/pr-fix-queue/mark — hand-out-scoped external wait replay (
         actor: "alpha",
         repoFullName: "org/repo",
         success: false,
-        errorMessage:
-          "Worker alpha did not start the external wait on pr-fix item org/repo#42 at the recorded generation",
+        errorMessage: expect.stringContaining("holds no hand-out"),
       }),
     });
   });
@@ -701,9 +698,7 @@ describe("POST /api/pr-fix-queue/mark — hand-out-scoped external wait replay (
     expect(input.actorTier).toBe("maintainer");
   });
 
-  it("keeps the legacy unbound worker token unconstrained (no identity to bind)", async () => {
-    mocks.markPrFixItem.mockResolvedValue({ mutated: true, item: { id: "fix-1", status: "WAITING_EXTERNAL" } });
-
+  it("refuses the legacy unbound worker token before replay authorization (#1428)", async () => {
     const res = await POST(
       authedRequest("http://localhost/api/pr-fix-queue/mark", {
         method: "POST",
@@ -713,11 +708,8 @@ describe("POST /api/pr-fix-queue/mark — hand-out-scoped external wait replay (
       }),
     );
 
-    expect(res.status).toBe(200);
-    const [, input] = mocks.markPrFixItem.mock.calls[0] as [unknown, any];
-    // The unbound token carries no agent identity: the route must not mint one
-    // from the self-reported header (#1322) — the pre-#1430 replay stands.
-    expect(input.handoutScopedAgent).toBeUndefined();
-    expect(input.actorTier).toBe("worker");
+    expect(res.status).toBe(403);
+    expect((await res.json()).error).toContain("Worker token is not bound to an agent");
+    expect(mocks.markPrFixItem).not.toHaveBeenCalled();
   });
 });
