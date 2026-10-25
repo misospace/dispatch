@@ -513,6 +513,17 @@ export async function ciParkPrFixItem(
  * the parked CI head → grant. The grant's response echoes EXACTLY the
  * presented token: Courier's grant assertion
  * `grant.FenceToken == presented` must hold.
+ *
+ * Closed/merged PR refusal at reserve time is CONNECTOR-owned, not server
+ * state: Courier's `ReserveCIRepair` re-reads the live pull request state
+ * BEFORE the POST and refuses with `source.ErrStaleWork` without ever
+ * calling this route (pinned by `cipark_test.go`: closed/merged fixtures
+ * expect no reserve request at all). The pinned 409 vocabulary therefore
+ * carries no closed/merged code, and the server has no fresher signal — its
+ * PR cache can lag. Dispatch's own server-side enforcement of the same rule
+ * is the merged/closed reap (`reconcileStalePrFixItems`, issues/reconcile),
+ * which settles queue items to STALE out from under any deferral; the next
+ * fresh attempt then clears the deferral columns via `freshAttemptGeneration`.
  */
 export async function ciReservePrFixItem(
   client: PrFixQueueClient,
