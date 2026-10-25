@@ -33,7 +33,10 @@
 #   threshold is NOT hard-coded: it compares against the exported
 #   dispatch_repo_stale_sync_threshold_seconds (two sync intervals, or 3600
 #   when the sync job is disabled), so the rule tracks DISPATCH_SYNC_INTERVAL_MS
-#   exactly like the portable evaluator does.
+#   exactly like the portable evaluator does. That gauge ships with the same
+#   exporter version as this file: against an older Dispatch that does not
+#   emit it, the staleness arm is silently empty and A13 degrades to the
+#   backoff-only leg — upgrade the exporter together with these rules.
 groups:
   - name: dispatch
     interval: 30s

@@ -935,11 +935,12 @@ export function computeObservabilitySnapshot(
   const failedLong = failedSyncRows.filter((f) => now.getTime() - f.at.getTime() <= 3600 * 1000).length;
 
   const eligibleWorkNotHandedOut: boolean | null =
-    !inputs.scheduler.enabled || (syncIntervalKnown === false && everSucceeded)
-      ? // Not evaluable: scheduler unarmed, or the fresh-sync guard has no
-        // interval to evaluate against (sync job disabled) while a success
-        // series exists. Explicit unknown, never a silent false.
-        null
+    !inputs.scheduler.enabled || syncIntervalKnown === false
+    ? // Not evaluable: scheduler unarmed, or the sync job is disabled (no
+      // interval for the fresh-sync guard) — in either success-history shape.
+      // An operator opt-out is explicit unknown, never a silent false (and
+      // never silently true), mirroring the A2/A4 evaluator guards.
+      null
       : openClaimableIssues.length > 0 &&
         executionActive === 0 &&
         pickups30m === 0 &&

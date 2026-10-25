@@ -432,6 +432,7 @@ describe("evaluator for/pending semantics", () => {
     // used to fire only with a sync history, so a never-synced opted-out
     // pipeline classified A4 as healthy.)
     const jobOffNoHistory = {
+      issues: [makeIssue({ id: "work", number: 201, labels: ["status/ready"] })],
       scheduler: { enabled: true, syncIntervalMs: 0, jobs: [] },
       sync: { lastSuccessAt: null, running: 0, failed: [] },
     };

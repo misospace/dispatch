@@ -557,13 +557,19 @@ describe("observability signal derivation", () => {
       expect(disabled.observations.eligibleWorkNotHandedOut).toBeNull();
 
       // Scheduler armed but the sync job disabled: the fresh-sync guard has
-      // no interval to evaluate against while a success series exists, so
-      // A4-style state is unknown, never a silent false or true.
+      // no interval to evaluate against, so the A4-style state is unknown in
+      // either success-history shape — never a silent false or true.
       const syncJobDisabled = snapshot({
         issues: [makeIssue({ id: "i1" })],
         scheduler: { enabled: true, syncIntervalMs: 0, jobs: [] },
       });
       expect(syncJobDisabled.observations.eligibleWorkNotHandedOut).toBeNull();
+      const syncJobDisabledNoHistory = snapshot({
+        issues: [makeIssue({ id: "i1" })],
+        scheduler: { enabled: true, syncIntervalMs: 0, jobs: [] },
+        sync: { lastSuccessAt: null, running: 0, failed: [] },
+      });
+      expect(syncJobDisabledNoHistory.observations.eligibleWorkNotHandedOut).toBeNull();
     });
 
     it("grooming freshness: absent fingerprint is unknown, never fresh", () => {
