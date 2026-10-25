@@ -106,7 +106,7 @@ A PR that goes dirty (GitHub `mergeable_state` = `dirty`, or `mergeable` = `CONF
 
 ### Mark item status
 
-`POST /api/pr-fix-queue/mark` — Marks an item `FIXED`, `BLOCKED`, `PARKED`, `STALE`, `IGNORED`, or `WAITING_EXTERNAL` and records a history event. Requires auth. The body may include an `outcome` (`human_decision`, `no_progress`, `infra_failure`, or `security_failure`) and a `decision` object (`question`, `options`, and `evidence`) when recording a human decision; a `BLOCKED` mark without a `decision` gets a synthesized `decisionDetail` built from the note (#1340). A worker-tier `BLOCKED` mark may escalate a same-generation `PARKED` item (#1340); every other overwrite of a recorded `BLOCKED`/`PARKED` stays refused without operator `allowStickyReclassify`. A duplicate `WAITING_EXTERNAL` mark at the same generation is answered idempotently without extending the cooldown (#1231); for a bound worker credential that replay is granted only to the agent recorded as having started the wait, and any other bound worker gets a `403` with `reason: "not-handed"` and no row (#1430). A wait started by a maintainer/operator records no waiter and replays only to unscoped callers.
+`POST /api/pr-fix-queue/mark` — Marks an item `FIXED`, `BLOCKED`, `PARKED`, `STALE`, `IGNORED`, or `WAITING_EXTERNAL` and records a history event. Requires auth. The body may include an `outcome` (`human_decision`, `no_progress`, `infra_failure`, or `security_failure`) and a `decision` object (`question`, `options`, and `evidence`) when recording a human decision; a `BLOCKED` mark without a `decision` gets a synthesized `decisionDetail` built from the note (#1340). A worker-tier `BLOCKED` mark may escalate a same-generation `PARKED` item (#1340); every other overwrite of a recorded `BLOCKED`/`PARKED` stays refused without operator `allowStickyReclassify`. Worker-tier bearer marks are hand-out-bound (#1428): the request must come from a **bound** credential (`DISPATCH_WORKER_TOKENS`; the legacy unbound `DISPATCH_WORKER_TOKEN` is refused) and may settle only rows whose `agentHandouts` carry that agent's `<agentName>@<generation>` marker at the settled generation; a row the caller does not hold returns `403` with `reason: "not-handed"` — a caller-binding refusal, distinct from the row's outcome vocabulary. Maintainer-tier callers stay unconstrained. A duplicate `WAITING_EXTERNAL` mark at the same generation remains idempotent without extending the cooldown (#1231), but for a bound worker that replay is granted only to the agent recorded as having started the wait; another bound worker gets the same `403` `not-handed` refusal and no row (#1430). A wait started by a maintainer/operator records no waiter and replays only to unscoped callers.
 
 **Request body:**
 ```json
@@ -276,11 +276,15 @@ prove the stamped hand-out reached a live worker, the worker acknowledges it
   bound credential for the wrong agent is refused with 403. Maintainer-tier
   bearers (`DISPATCH_AGENT_TOKEN` / `DISPATCH_MAINTAINER_TOKEN`) pass
   through and may ack for any agent the hand-out table actually stamped —
-  the operator escape hatch for the reclaimer sweep. The authenticated
-  actor (`auth.agentName` for a bound worker, the `x-agent-name` header for
-  the legacy token, the maintainer identity) is the source of truth for
-  `agentName`; a body value that disagrees with the actor is rejected
-  with 400. The underlying write is generation-pinned and idempotent: a
+  the operator escape hatch for the reclaimer sweep. The subject of the ack
+  is the body's `agentName` (#1425): it is **not** equality-checked against
+  the audit-only `auth.actor` (the self-reported `x-agent-name` header with
+  an `"agent"` fallback), so a client that carries its agent binding in the
+  body without an identity header — e.g. Courier's dispatch adapter — is
+  honored at maintainer tier. The defenses against forging are the bound
+  gate (worker credentials) and the hand-out table itself: an ack for an
+  agent that was never handed the stamped generation is refused `403`
+  (`not-handed`). The underlying write is generation-pinned and idempotent: a
   repeat ack for the same `(agent, generation)` returns `200` with
   `alreadyAcknowledged: true`, a late ack for an older generation is
   refused `409` (`generation-mismatch`), a non-`QUEUED` item is refused
