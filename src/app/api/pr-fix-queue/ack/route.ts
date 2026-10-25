@@ -28,9 +28,20 @@ const RATE_LIMIT = { limit: 30, windowMs: 10_000 } as const;
  * bearers (DISPATCH_AGENT_TOKEN / DISPATCH_MAINTAINER_TOKEN) pass through
  * unchanged — they may ack for any agent the hand-out table actually
  * stamped, which keeps the operator escape hatch for the reclaimer sweep.
- * The body's `agentName` is preserved as a redundant transport signal: a
- * caller-supplied value that disagrees with the bound/header actor is
- * rejected before any DB read so the mismatch surfaces clearly.
+ *
+ * The body's `agentName` is the subject of the ack (#1425). It must NOT be
+ * equality-checked against `auth.actor`: actor is an attribution string for
+ * audit rows — the self-reported `x-agent-name` header with a literal
+ * `"agent"` fallback — never an identity binding. Clients that carry their
+ * agent binding in the body (Courier's dispatch adapter sends
+ * `{repo, pr, generation, agentName}` with only an Authorization header) are
+ * maintainer-tier and would otherwise be rejected with a bogus 400, leaving
+ * live hand-outs unacknowledged and exposed to the stale-handout sweep.
+ * The spoof defenses are unchanged: `enforceWorkerAgentScope` keeps a
+ * worker-bound bearer to its own agent (and refuses the legacy unbound
+ * token), and `ackPrFixHandout` pins every ack to a hand-out actually
+ * issued to that `(agentName, generation)` for this repo/PR
+ * (`not-handed` otherwise).
  */
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
@@ -69,14 +80,13 @@ export async function POST(request: Request) {
   const scopeError = await enforceWorkerAgentScope(auth, input.agentName);
   if (scopeError) return scopeError;
 
-  // The actor is the source of truth for who is acking. A mismatch with the
-  // body's `agentName` is a 400 — the caller has misconfigured its transport.
-  if (input.agentName !== auth.actor) {
-    return errorResponse(
-      `Forbidden: agentName in body (${input.agentName}) does not match the authenticated actor (${auth.actor}); the actor identity is authoritative`,
-      400,
-    );
-  }
+  // No body-vs-actor equality check (#1425): `auth.actor` is attribution
+  // metadata (self-reported `x-agent-name`, `"agent"` fallback), not an
+  // identity. A worker-bound caller was already pinned to its own agent by
+  // `enforceWorkerAgentScope` above; a maintainer/dev caller acts for the
+  // body's agent, and `ackPrFixHandout` refuses anything that agent was not
+  // actually handed (`not-handed` → 403), so a forged body cannot pin a
+  // reclaim against a live worker.
 
   try {
     const result = await ackPrFixHandout(asPrFixQueueClient(prisma), input);
@@ -105,9 +115,9 @@ export async function POST(request: Request) {
           { status: 409 },
         );
       case "not-handed":
-        // A bare-agentName ack from an authenticated actor that doesn't
-        // appear in the item's hand-out records — a token that never
-        // received the work cannot pin a future reclaim against it.
+        // The body's agent (whatever tier acked for it) doesn't appear in
+        // the item's hand-out records at that generation — a caller that
+        // never received the work cannot pin a future reclaim against it.
         return NextResponse.json(
           {
             error: "PR fix queue item was not handed to the authenticated agent at that generation",

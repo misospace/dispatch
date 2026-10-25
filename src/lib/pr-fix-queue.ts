@@ -1161,11 +1161,13 @@ export function parseAckPrFixHandoutInput(body: unknown): AckPrFixHandoutInput |
   ) {
     return { error: "generation must be an integer >= 1" };
   }
-  // agentName is required (#1211 review): the route layer derives it from the
-  // authenticated bearer actor (no basic / oidc / disabled fallback). The
-  // field is kept in the schema for transport-layer redundancy (the MCP
-  // client forwards it) but parsed even when the bearer layer already
-  // supplied it, so a caller mismatch surfaces as 400 before any DB write.
+  // agentName is required (#1211 review, reframed by #1425): it is the
+  // subject of the ack, supplied by the caller's transport (the MCP client
+  // and Courier's dispatch adapter both forward it). The route layer gates
+  // WHO may ack for it — a worker-tier bearer must be bound to this agent,
+  // the legacy unbound token is refused — and this lib pins the ack to a
+  // hand-out actually issued to (agentName, generation). The route rejects
+  // basic / oidc callers entirely.
   // Type check first so a non-string value (e.g. 7) surfaces as the type
   // error, not as "Missing required field" (nonEmpty is type-agnostic).
   if (input.agentName !== undefined && input.agentName !== null && typeof input.agentName !== "string") {

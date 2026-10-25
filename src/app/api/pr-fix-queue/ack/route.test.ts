@@ -34,10 +34,11 @@ import { resetRateLimits } from "@/lib/rate-limit";
 // Cast Request as NextRequest for type compatibility in tests
 function asNextRequest(r: Request): any { return r; }
 
-// The route derives `agentName` from the authenticated actor (the x-agent-name
-// header for maintainer / legacy unbound callers; the token for bound callers).
-// The default for these tests is "courier", matching the existing fixture's
-// stamped agent in `agentHandouts`.
+// The route takes the ack's subject agent from the parsed body; the
+// authenticated identity only gates WHO may ack (worker-bound bearers are
+// pinned to their own agent, maintainer bearers pass — #1425). The default
+// for these tests is "courier", matching the existing fixture's stamped
+// agent in `agentHandouts`.
 const ACTOR = "courier";
 
 function postRequest(
@@ -178,7 +179,12 @@ describe("POST /api/pr-fix-queue/ack", () => {
     }
   });
 
-  it("returns 400 when the body's agentName disagrees with the authenticated actor", async () => {
+  it("honors the body agentName for a maintainer caller even when it disagrees with the header actor (#1425)", async () => {
+    // #1425: `auth.actor` is attribution metadata (self-reported
+    // `x-agent-name`, "agent" fallback), never an identity binding. The
+    // maintainer escape hatch acks for the body's agent, and the
+    // hand-out-table binding inside `ackPrFixHandout` (`not-handed`) is
+    // what refuses a forged subject — not a header comparison.
     mocks.parseAckPrFixHandoutInput.mockReturnValue({
       repo: "org/repo",
       pr: 42,
@@ -188,10 +194,13 @@ describe("POST /api/pr-fix-queue/ack", () => {
 
     const res = await postRequest({ repo: "org/repo", pr: 42, generation: 2, agentName: "foreign-agent" });
 
-    expect(res.status).toBe(400);
-    const body = await res.json();
-    expect(body.error).toMatch(/does not match the authenticated actor/);
-    expect(mocks.ackPrFixHandout).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    expect(mocks.ackPrFixHandout).toHaveBeenCalledWith(expect.anything(), {
+      repo: "org/repo",
+      pr: 42,
+      generation: 2,
+      agentName: "foreign-agent",
+    });
   });
 
   it("returns 400 on malformed JSON", async () => {
@@ -229,7 +238,8 @@ describe("POST /api/pr-fix-queue/ack", () => {
     // The default `mockToken` is set as DISPATCH_AGENT_TOKEN → maintainer
     // tier. Maintainer-bearer acks are allowed for any agent the hand-out
     // table actually stamped (the operator escape hatch for the reclaimer
-    // sweep); the body/actor check below already pins the agent.
+    // sweep); the subject agent comes from the body and the lib pins it to
+    // the stamped hand-out records.
     const res = await postRequest({ repo: "org/repo", pr: 42, generation: 2 });
 
     expect(res.status).toBe(200);
@@ -437,9 +447,8 @@ describe("POST /api/pr-fix-queue/ack — bound worker identity (#1207 review)", 
   it("denies a bound worker trying to ack for a different agent", async () => {
     // Repro from review: alpha-bound tries to ack for bravo (or for an
     // arbitrary agent the token does not own). The bound gate is the
-    // single point that catches this — the body/actor mismatch check
-    // alone would also fire, but the scope gate runs first and is
-    // authoritative.
+    // single point that catches this (#1425 removed the header-actor
+    // comparison, so the scope gate is the only route-level defense).
     mocks.parseAckPrFixHandoutInput.mockReturnValue({
       repo: "org/repo",
       pr: 42,
@@ -471,9 +480,8 @@ describe("POST /api/pr-fix-queue/ack — bound worker identity (#1207 review)", 
   it("denies a bound worker trying to ack for a third agent via the body alone", async () => {
     // Even with the `x-agent-name` header agreeing with the bound agent,
     // a body `agentName` that disagrees with the bound identity is a
-    // forgery attempt. The bound-agent gate is authoritative and runs
-    // before the body/actor check, so the route returns the scope
-    // denial (403) — the lib is never called.
+    // forgery attempt. The bound-agent gate is authoritative, so the
+    // route returns the scope denial (403) — the lib is never called.
     mocks.parseAckPrFixHandoutInput.mockReturnValue({
       repo: "org/repo",
       pr: 42,
@@ -537,8 +545,9 @@ describe("POST /api/pr-fix-queue/ack — bound worker identity (#1207 review)", 
 
 // (#1207 review) Maintainer-tier bearers may ack for any agent the
 // hand-out table actually stamped — they are the operator escape hatch
-// for the reclaimer sweep. The body/actor check is the only line of
-// defense; the bound-agent gate is a no-op for maintainer callers.
+// for the reclaimer sweep. The hand-out binding inside `ackPrFixHandout`
+// (`not-handed`) is the defense; the bound-agent gate is a no-op for
+// maintainer callers.
 describe("POST /api/pr-fix-queue/ack — maintainer bearer acks for any agent", () => {
   beforeEach(() => {
     clearAll();
@@ -582,5 +591,135 @@ describe("POST /api/pr-fix-queue/ack — maintainer bearer acks for any agent", 
     );
     expect(res.status).toBe(200);
     expect(mocks.ackPrFixHandout).toHaveBeenCalled();
+  });
+});
+
+// (#1425) Courier's dispatch adapter posts the hand-out ack with only an
+// Authorization header (`internal/source/dispatch/client.go` sets
+// Authorization/Accept/Content-Type); the agent binding lives in the body's
+// `agentName` and no `x-agent-name` identity header is sent. Before #1425 the
+// route compared the body against `auth.actor`, which for such callers fell
+// back to the literal "agent" and rejected every non-"agent" Courier ack
+// with 400 — leaving live hand-outs unacknowledged and exposed to the
+// stale-handout sweep. These tests pin the exact client request shape.
+describe("POST /api/pr-fix-queue/ack — client contract without identity header (#1425)", () => {
+  const MAINTAINER_TOKEN = "maintainer-token-1425";
+  const COURIER_BOUND_TOKEN = "courier-bound-token-1425";
+  const ALPHA_BOUND_TOKEN = "alpha-bound-token-1425";
+
+  beforeEach(() => {
+    clearAll();
+    process.env.DISPATCH_AGENT_TOKEN = MAINTAINER_TOKEN;
+    resetAuthCaches();
+    resetRateLimits();
+    vi.clearAllMocks();
+    mocks.parseAckPrFixHandoutInput.mockReturnValue({
+      repo: "org/repo",
+      pr: 42,
+      generation: 2,
+      agentName: "courier",
+    });
+    mocks.ackPrFixHandout.mockResolvedValue({ acknowledged: true, item: { id: "fix-1", generation: 2 } });
+  });
+
+  afterEach(() => {
+    clearAll();
+    resetAuthCaches();
+    resetRateLimits();
+  });
+
+  // Exactly what the Courier client sends: Authorization + Content-Type
+  // only, body carries the agent binding.
+  function courierShapeRequest(token: string) {
+    return POST(
+      asNextRequest(
+        new Request("http://localhost/api/pr-fix-queue/ack", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ repo: "org/repo", pr: 42, generation: 2, agentName: "courier" }),
+        }),
+      ),
+    );
+  }
+
+  it("accepts a maintainer (DISPATCH_AGENT_TOKEN) ack with body agentName and no identity header", async () => {
+    const res = await courierShapeRequest(MAINTAINER_TOKEN);
+
+    expect(res.status).toBe(200);
+    expect(mocks.ackPrFixHandout).toHaveBeenCalledWith(expect.anything(), {
+      repo: "org/repo",
+      pr: 42,
+      generation: 2,
+      agentName: "courier",
+    });
+  });
+
+  it("accepts the DISPATCH_MAINTAINER_TOKEN alias with body agentName and no identity header", async () => {
+    clearAll();
+    process.env.DISPATCH_MAINTAINER_TOKEN = MAINTAINER_TOKEN;
+    resetAuthCaches();
+    resetRateLimits();
+
+    const res = await courierShapeRequest(MAINTAINER_TOKEN);
+
+    expect(res.status).toBe(200);
+    expect(mocks.ackPrFixHandout).toHaveBeenCalledWith(expect.anything(), {
+      repo: "org/repo",
+      pr: 42,
+      generation: 2,
+      agentName: "courier",
+    });
+  });
+
+  it("still refuses a maintainer ack for an agent the hand-out never stamped (not-handed, not a header 400)", async () => {
+    // The spoofing defense stays in the hand-out table binding: a maintainer
+    // ack for an agent that was never handed the generation lands on the
+    // lib's `not-handed` 403, not on a header comparison.
+    mocks.ackPrFixHandout.mockResolvedValue({ acknowledged: false, reason: "not-handed" });
+
+    const res = await courierShapeRequest(MAINTAINER_TOKEN);
+
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.reason).toBe("not-handed");
+  });
+
+  it("acks for the bound agent when a bound worker sends no identity header", async () => {
+    // Bound-worker identity comes from the token, never the header — the
+    // missing header must not break the worker's own ack.
+    clearAll();
+    process.env.DISPATCH_WORKER_TOKENS = `courier:${COURIER_BOUND_TOKEN}`;
+    resetAuthCaches();
+    resetRateLimits();
+
+    const res = await courierShapeRequest(COURIER_BOUND_TOKEN);
+
+    expect(res.status).toBe(200);
+    expect(mocks.ackPrFixHandout).toHaveBeenCalledWith(expect.anything(), {
+      repo: "org/repo",
+      pr: 42,
+      generation: 2,
+      agentName: "courier",
+    });
+  });
+
+  it("refuses a worker-bound bearer acking for another agent even without an identity header", async () => {
+    // Fail-closed spoof guard survives the #1425 fix: alpha-bound posting
+    // Courier's body shape is denied by the bound gate before any DB read.
+    clearAll();
+    process.env.DISPATCH_WORKER_TOKENS = `alpha:${ALPHA_BOUND_TOKEN}`;
+    resetAuthCaches();
+    resetRateLimits();
+
+    const res = await courierShapeRequest(ALPHA_BOUND_TOKEN);
+
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.error).toContain("alpha");
+    expect(body.error).toContain("courier");
+    expect(mocks.ackPrFixHandout).not.toHaveBeenCalled();
   });
 });

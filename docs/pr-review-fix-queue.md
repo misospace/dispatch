@@ -276,11 +276,15 @@ prove the stamped hand-out reached a live worker, the worker acknowledges it
   bound credential for the wrong agent is refused with 403. Maintainer-tier
   bearers (`DISPATCH_AGENT_TOKEN` / `DISPATCH_MAINTAINER_TOKEN`) pass
   through and may ack for any agent the hand-out table actually stamped —
-  the operator escape hatch for the reclaimer sweep. The authenticated
-  actor (`auth.agentName` for a bound worker, the `x-agent-name` header for
-  the legacy token, the maintainer identity) is the source of truth for
-  `agentName`; a body value that disagrees with the actor is rejected
-  with 400. The underlying write is generation-pinned and idempotent: a
+  the operator escape hatch for the reclaimer sweep. The subject of the ack
+  is the body's `agentName` (#1425): it is **not** equality-checked against
+  the audit-only `auth.actor` (the self-reported `x-agent-name` header with
+  an `"agent"` fallback), so a client that carries its agent binding in the
+  body without an identity header — e.g. Courier's dispatch adapter — is
+  honored at maintainer tier. The defenses against forging are the bound
+  gate (worker credentials) and the hand-out table itself: an ack for an
+  agent that was never handed the stamped generation is refused `403`
+  (`not-handed`). The underlying write is generation-pinned and idempotent: a
   repeat ack for the same `(agent, generation)` returns `200` with
   `alreadyAcknowledged: true`, a late ack for an older generation is
   refused `409` (`generation-mismatch`), a non-`QUEUED` item is refused
