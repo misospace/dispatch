@@ -81,6 +81,17 @@ export async function enforceWorkerBound(
  * - an unbound legacy `DISPATCH_WORKER_TOKEN` is refused (hard cutover): the
  *   shared token carries no identity, so it must not stand in for one.
  *
+ * The "maintainer may act for any agent" arm is load-bearing for routes whose
+ * body names the agent to act FOR (the CI park lifecycle routes
+ * `cipark` / `cireserve` / `cirepair`): the requested agent is authorized by
+ * the QUEUE binding — the row's hand-out marker `<agentName>@<generation>`
+ * that next-task wrote — not by comparing the body against the actor. A
+ * maintainer bearer that sends no `x-agent-name` header resolves its actor to
+ * the literal placeholder "agent", so a body/actor comparison would reject
+ * every well-formed request from a maintainer acting for a named agent. A
+ * bound worker credential keeps STRICT equality: it may act only for its own
+ * agent, and a spoof is refused here (403).
+ *
  * Returns an error `NextResponse` when denied, or `null` when allowed. Token
  * values are never included in the response.
  */

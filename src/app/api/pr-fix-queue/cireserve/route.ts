@@ -28,8 +28,6 @@ export async function POST(request: Request) {
   const limited = enforceRateLimit(`pr-fix-cireserve:${auth.throttleKey}`, RATE_LIMIT);
   if (limited) return limited;
 
-  const auditActor = getAuthorizedActor(auth, request);
-
   let body: unknown;
   try {
     body = await request.json();
@@ -40,18 +38,24 @@ export async function POST(request: Request) {
   const input = parseCIReserveInput(body);
   if ("error" in input) return errorResponse(input.error, 400);
 
+  // The audit actor falls back to the agent the notice acts FOR: a
+  // maintainer bearer that sends no `x-agent-name` header otherwise
+  // attributes every row to the literal placeholder "agent". A bound
+  // worker credential keeps its immutable token-derived identity.
+  const auditActor = getAuthorizedActor(auth, request, input.agentName);
+
   const scopeError = await enforceWorkerAgentScope(auth, input.agentName);
   if (scopeError) return scopeError;
 
-  // The actor is the source of truth for who is reserving (the body's
-  // agentName is redundant transport identity); a mismatch is a 400 at the
-  // ack route's phrasing.
-  if (input.agentName !== auth.actor) {
-    return errorResponse(
-      `Forbidden: agentName in body (${input.agentName}) does not match the authenticated actor (${auth.actor}); the actor identity is authoritative`,
-      400,
-    );
-  }
+  // The body's `agentName` names the agent the notice acts FOR and is never
+  // compared with the authenticated actor. A maintainer credential may act for
+  // any agent (see `enforceWorkerAgentScope`), and the identity such a
+  // credential carries is a placeholder — the literal "agent" for a
+  // maintainer bearer that sends no `x-agent-name` header — so the
+  // comparison rejected every well-formed request. The requested agent is
+  // authorized by the QUEUE binding instead: the lifecycle resolves the row
+  // through the hand-out marker `<agentName>@<generation>` next-task wrote,
+  // and an agent with no live hand-out there answers `opportunity-missing`.
 
   try {
     const result = await ciReservePrFixItem(asPrFixQueueClient(prisma), input);

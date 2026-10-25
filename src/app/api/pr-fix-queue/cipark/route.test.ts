@@ -46,13 +46,15 @@ function asNextRequest(r: Request): any {
   return r;
 }
 
-function postRequest(body: unknown, opts: { includeAuth?: boolean; token?: string; agentName?: string } = {}) {
+function postRequest(body: unknown, opts: { includeAuth?: boolean; token?: string; agentName?: string | null } = {}) {
   const { includeAuth = true, token = mockToken, agentName = "worker" } = opts;
   const req = authedRequest("http://localhost/api/pr-fix-queue/cipark", {
     method: "POST",
     body,
     includeAuth,
-    headers: { "x-agent-name": agentName, ...(token !== mockToken && token ? {} : {}) },
+    // `agentName: null` sends NO identity header — the deployed Courier
+    // client's shape: it names the per-binding agent in the BODY only.
+    headers: agentName ? { "x-agent-name": agentName } : {},
     token,
   } as any);
   return POST(asNextRequest(req));
@@ -136,13 +138,52 @@ describe("POST /api/pr-fix-queue/cipark", () => {
     }
   });
 
-  it("returns 400 when the body's agentName disagrees with the authenticated actor", async () => {
+  it("a maintainer bearer with NO identity header acts for the agent the hand-out binds (the deployed Courier shape)", async () => {
+    // #1415 review: the deployed Courier client names the per-binding agent
+    // in the BODY and sends no `x-agent-name` header. A maintainer bearer's
+    // actor then resolves to the literal placeholder "agent", so comparing
+    // the body against the actor rejected every well-formed request. The
+    // requested agent is authorized by the QUEUE binding — the row's hand-out
+    // marker next-task wrote — not by the actor.
+    harness.items.push(harness.makeItem({ agentHandouts: [MARKER] }));
+    const res = await postRequest(
+      { repo: "acme/widgets", generation: 3, agentName: "worker", head: HEAD1, idempotencyKey: "park-key" },
+      { agentName: null },
+    );
+    expect(res.status).toBe(204);
+    expect(harness.items[0].ciParkState).toBe("active");
+    // The audit row attributes the agent the notice acted FOR, not the
+    // literal placeholder actor a header-less maintainer bearer resolves to.
+    expect(harness.audits.at(-1)).toMatchObject({ action: "pr_fix_ci_park", actor: "worker", success: true });
+  });
+
+  it("a bound worker token may not act for another agent (403, no queue write)", async () => {
+    // These routes are Courier-driven queue mutations, so they are
+    // maintainer-tier: a worker-tier credential is refused before the body is
+    // read. A bound credential's STRICT identity scope
+    // (`enforceWorkerAgentScope`, the second layer) refuses a spoofed agent
+    // with 403 as well; its semantics are pinned in src/lib/auth.test.ts.
+    harness.items.push(harness.makeItem({ agentHandouts: [MARKER] }));
+    const res = await postRequest(
+      { repo: "acme/widgets", generation: 3, agentName: "worker", head: HEAD1, idempotencyKey: "k" },
+      { token: "bound-token", agentName: "alpha" },
+    );
+    expect(res.status).toBe(403);
+    expect((await res.json()).error).toMatch(/requires a maintainer token/);
+    expect(harness.items[0].ciParkState).toBeNull();
+  });
+
+  it("a maintainer naming an agent with no live hand-out is refused by the queue binding", async () => {
+    // The binding IS the authorization for a maintainer: the notice resolves
+    // the row through the hand-out marker `<agentName>@<generation>`, so an
+    // agent that never held the work answers the coded refusal.
+    harness.items.push(harness.makeItem({ agentHandouts: [MARKER] }));
     const res = await postRequest(
       { repo: "acme/widgets", generation: 3, agentName: "other-agent", head: HEAD1, idempotencyKey: "k" },
-      { agentName: "worker" },
+      { agentName: null },
     );
-    expect(res.status).toBe(400);
-    expect((await res.json()).error).toMatch(/does not match the authenticated actor/);
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ reason: "opportunity-missing" });
   });
 
   it("commits a fresh park: 204, item event data recorded, audit success row", async () => {
