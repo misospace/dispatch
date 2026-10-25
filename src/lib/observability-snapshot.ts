@@ -20,6 +20,7 @@ import {
 } from "@/lib/queue-admission";
 import { schedulerConfigFromEnv, schedulerState } from "@/lib/scheduler";
 import { prFixHandoutTimeoutMs } from "@/lib/pr-fix-queue";
+import { syncPipelineDeclarationFromEnv } from "@/lib/sync-pipeline";
 
 const STRANDED_ASSIGNMENT_DEFAULT_MS = 30 * 60 * 1000;
 const STRANDED_ASSIGNMENT_MIN_MS = 60_000;
@@ -261,6 +262,7 @@ export async function collectObservabilitySnapshot(
       })),
     },
     admissionMode,
+    syncPipeline: syncPipelineDeclarationFromEnv(process.env),
     admissionRuns,
     thresholds: {
       strandedAssignmentMs: strandedAssignmentThresholdMs(),
