@@ -5922,7 +5922,14 @@ describe("hand-out-scoped external waits (#1430)", () => {
   });
 
   async function seedQueued(pr: number) {
-    return enqueuePrFixItem(client, { repo: "org/repo", pr, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: `k${pr}` });
+    const item = await enqueuePrFixItem(client, { repo: "org/repo", pr, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: `k${pr}` });
+    // #1431 composes with #1430: a bound worker may start WAITING_EXTERNAL
+    // only from a generation it was actually handed. Seed both live worker
+    // markers so these tests exercise waiter-replay ownership, not the
+    // earlier route-wide hand-out authorization gate.
+    const row = client.items.find((i) => i.id === item.id)!;
+    row.agentHandouts = [`alpha@${row.generation}`, `bravo@${row.generation}`];
+    return item;
   }
 
   function rowOf(item: any) {
