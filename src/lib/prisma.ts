@@ -141,6 +141,10 @@ export function asPrFixQueueClient(client: PrismaClient): PrFixQueueClient {
     // ledger-inert — `readEvidenceLedgerView`/`recordEvidenceTransition` no-op
     // and settlement falls back to the bounded #1119 cache.
     prFixEvidence: client.prFixEvidence,
+    // #495: the CI park lifecycle's exactly-once ledger runs off this
+    // delegate; without it the lifecycle routes degrade to the state-only
+    // writes (same-value idempotent re-applies instead of the ledger).
+    prFixCIParkLedger: client.prFixCIParkLedger,
     $transaction: <T>(fn: (tx: PrFixQueueClient) => Promise<T>): Promise<T> =>
       client.$transaction(fn as (tx: Prisma.TransactionClient) => Promise<T>),
   };
