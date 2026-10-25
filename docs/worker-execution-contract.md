@@ -67,7 +67,7 @@ Content-Type: application/json
 { "repo": "org/repo", "pr": 42, "generation": 2, "agentName": "courier" }
 ```
 
-The route is bearer-only (basic / OIDC sessions are rejected with 403), and `agentName` is verified against the authenticated actor — for `DISPATCH_WORKER_TOKENS` the actor comes from the token's binding, for the legacy `DISPATCH_WORKER_TOKEN` it falls back to the `x-agent-name` header. A body value that disagrees with the bound/header agent returns 400. The underlying write is generation-pinned and idempotent. See `docs/pr-review-fix-queue.md` for the full contract.
+The route is bearer-only (basic / OIDC sessions are rejected with 403). The subject of the ack is the body's `agentName` (#1425): a worker-tier caller must be **bound** to that agent (`DISPATCH_WORKER_TOKENS`; the legacy unbound `DISPATCH_WORKER_TOKEN` is refused with 403), while a maintainer token may ack for any agent — the write itself is pinned to the hand-out table and refuses `403 not-handed` for any agent that was never handed the stamped generation. The body's `agentName` is **not** compared against the audit-only `x-agent-name`-derived actor, so clients that send their binding only in the body (no identity header) are honored. The underlying write is generation-pinned and idempotent. See `docs/pr-review-fix-queue.md` for the full contract.
 
 A worker that cannot ack (because the hand-out stamp does not include its agent identity, e.g. a multi-agent dispatch raced) gets a `403 not-handed` response and should retry against a freshly-issued hand-out. The reclaimer sweep below is maintainer-only and **default-disabled** until every worker is confirmed to call ack.
 
