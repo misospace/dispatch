@@ -10,6 +10,7 @@
 
 import { EnqueuePrFixInput, enqueuePrFixItem, normalizeQueueRepo, recordPrFixEvidenceBaseline, PrFixQueueClient } from "@/lib/pr-fix-queue";
 import { CONFLICTING_STATUSES, FAILURE_CONCLUSIONS } from "@/lib/linked-pr-health";
+import { rebaseWorkItem } from "@/lib/pr-fix-rebase";
 import { extractFailureMarker, extractFailureWorkflow, isScanFailure } from "@/lib/ci-failure-ingestion";
 import { getConfiguredLanes, getEscalationLane } from "@/lib/lane-config";
 import { PARKED_COMMENT_MARKER } from "@/lib/pr-fix-surfacing";
@@ -21,6 +22,12 @@ import {
   type EvidenceVersionFields,
   type PrFixEvidenceKind,
 } from "@/lib/pr-fix-evidence";
+
+// The mechanical rebase contract lives in its own module (#1327) so the
+// linked-PR health materialization writes the same instruction wall. It is
+// re-exported here so every existing importer of the ingestion module keeps
+// working unchanged.
+export { rebaseWorkItem } from "@/lib/pr-fix-rebase";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -524,15 +531,20 @@ const INGEST_DESCRIPTORS: Record<PrFollowupEvent["eventType"], IngestDescriptor>
       !isActionableEvidenceVersion("merge_state", { mergeStateStatus: event.mergeStateStatus }),
     filterTerminalPr: true,
     sourceId: (event) => event.mergeStateStatus ?? "",
-    workItem: (event) => ({
-      lane: "NORMAL",
-      // dirty/conflicting merge states are conflicts; everything else is OTHER
-      type: CONFLICTING_STATUSES.has((event.mergeStateStatus ?? "").toLowerCase())
-        ? "MERGE_CONFLICT"
-        : "OTHER",
-      reason: `Merge state change: ${event.mergeStateStatus}`,
-      feedback: `PR merge state is now ${event.mergeStateStatus}`,
-    }),
+    workItem: (event) => {
+      // dirty/conflicting merge states go through the mechanical rebase lane
+      // (#1327) — code-fix attempts cannot resolve a merge conflict they
+      // cannot rebase away. Everything else stays ordinary fix work.
+      if (CONFLICTING_STATUSES.has((event.mergeStateStatus ?? "").toLowerCase())) {
+        return rebaseWorkItem(event.mergeStateStatus ?? "dirty");
+      }
+      return {
+        lane: "NORMAL",
+        type: "OTHER",
+        reason: `Merge state change: ${event.mergeStateStatus}`,
+        feedback: `PR merge state is now ${event.mergeStateStatus}`,
+      };
+    },
   },
 };
 
@@ -958,7 +970,12 @@ export async function ingestMergeStateEvent(
 /**
  * Detect and enqueue merge conflict items for PRs with mergeable=CONFLICTING.
  * This is the primary function for surfacing merge conflicts as PR review-fix items.
- * 
+ *
+ * Since #1327 the item is type REBASE (mechanical rebase lane), not
+ * MERGE_CONFLICT: the fix loop's code attempts cannot rebase, so a DIRTY PR
+ * cycling fixed generations was pure quota burn. The `MERGE_CONFLICT` type
+ * remains valid for legacy rows.
+ *
  * Returns the evidence key if a new item was enqueued, null if skipped (not conflicting,
  * not eligible, or already queued).
  */
@@ -999,10 +1016,7 @@ export async function ingestMergeConflict(
   await enqueuePrFixItem(client, {
     repo: opts.repoFullName,
     pr: opts.prNumber,
-    lane: "NORMAL",
-    type: "MERGE_CONFLICT",
-    reason: `Merge conflict detected: PR is CONFLICTING`,
-    feedback: `PR has merge conflicts and needs rebase. Use \`git rebase\` to resolve, not patch.`,
+    ...rebaseWorkItem(`CONFLICTING`),
     evidenceKey,
     issue: opts.linkedIssue,
     branch: opts.branch,
@@ -1050,8 +1064,12 @@ export async function clearResolvedConflictItems(
 
   if (!existing) return false;
 
-  // Only clear if it's a merge conflict item and still queued
-  if (existing.type !== "MERGE_CONFLICT" || existing.status !== "QUEUED") return false;
+  // Only clear if it is a conflicts item and still queued. New items are
+  // type REBASE (#1327); MERGE_CONFLICT covers legacy rows the fix loop may
+  // still hold. A REBASE row clearing here is the lane's success path when
+  // GitHub's merge-state recomputes lag the pushed rebase.
+  if (existing.type !== "REBASE" && existing.type !== "MERGE_CONFLICT") return false;
+  if (existing.status !== "QUEUED") return false;
 
   // #1276 review: settle nothing before the ledger says the condition cleared.
   // The `merge_conflict:<repo>#<pr>` row is otherwise left at its last

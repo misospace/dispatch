@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } from "@/test/route-helpers";
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
@@ -20,41 +20,84 @@ const { mocks } = vi.hoisted(() => ({
     fetchPullRequestHeadSha: vi.fn().mockResolvedValue(null),
     capacityHandoffFindMany: vi.fn().mockResolvedValue([]),
     capacityHandoffDeleteMany: vi.fn().mockResolvedValue({ count: 0 }),
+    // #1327 review: when set, the REBASE admission transaction fails
+    // (the advisory lock cannot be taken). The route must then fail CLOSED.
+    prFixTransactionError: null as Error | null,
+    // Queue-client surfaces touched THROUGH the admission transaction.
+    prFixTxSurfaces: [] as string[],
   },
 }));
 
-vi.mock("@/lib/prisma", () => ({
-  prisma: {
-    issue: { findMany: mocks.issueFindMany },
-    prFixQueueItem: {
-      findMany: mocks.prFixFindMany,
-      findUnique: vi.fn(async ({ where }: any) => {
-        const rows = [...mocks.linkedRows, ...(await mocks.prFixFindMany())];
-        if (where.id !== undefined) {
-          const byId = await mocks.prFixFindUnique({ where });
-          return byId ?? rows.find((row: any) => row.id === where.id) ?? null;
-        }
-        return mocks.prFixFindUniqueByRepo({ where });
-      }),
-      create: mocks.prFixCreate,
-      updateMany: mocks.prFixUpdateMany,
-    },
-    prFixHistory: { create: mocks.prFixHistoryCreate },
-    capacityHandoff: {
-      findMany: mocks.capacityHandoffFindMany,
-      deleteMany: mocks.capacityHandoffDeleteMany,
-    },
-    $transaction: async (fn: any) => fn({
-      prFixQueueItem: {
-        create: mocks.prFixCreate,
-        findUnique: mocks.prFixFindUniqueByRepo,
-        updateMany: mocks.prFixUpdateMany,
-      },
-      prFixHistory: { create: mocks.prFixHistoryCreate },
+vi.mock("@/lib/prisma", () => {
+  const prFixQueueItem = {
+    findMany: mocks.prFixFindMany,
+    findUnique: vi.fn(async ({ where }: any) => {
+      const rows = [...mocks.linkedRows, ...((await mocks.prFixFindMany()) ?? [])];
+      if (where?.id !== undefined) {
+        const byId = await mocks.prFixFindUnique({ where });
+        return byId ?? rows.find((row: any) => row.id === where.id) ?? null;
+      }
+      if (where?.repo_pr) return mocks.prFixFindUniqueByRepo({ where });
+      if (where?.repo !== undefined && where?.pr !== undefined) {
+        return rows.find((row: any) => row.repo === where.repo && row.pr === where.pr) ?? null;
+      }
+      return null;
     }),
-  },
-  asPrFixQueueClient: (client: any) => client,
-}));
+    create: mocks.prFixCreate,
+    updateMany: mocks.prFixUpdateMany,
+  };
+  // The admission transaction hands out its OWN queue-client surface, so a
+  // route test can prove that the gate read, the dispatch stamp, and the
+  // hand-out push happened INSIDE the admission transaction — the
+  // serialization the concurrency-1 invariant depends on. The module client
+  // and the transaction client share the same underlying mocks, so the
+  // rows behave identically; only the recorded surface differs.
+  const txPrFixQueueItem = {
+    findMany: async (args: any) => {
+      mocks.prFixTxSurfaces.push("findMany");
+      return prFixQueueItem.findMany(args);
+    },
+    findUnique: async (args: any) => {
+      mocks.prFixTxSurfaces.push("findUnique");
+      return prFixQueueItem.findUnique(args);
+    },
+    create: async (args: any) => {
+      mocks.prFixTxSurfaces.push("create");
+      return prFixQueueItem.create(args);
+    },
+    updateMany: async (args: any) => {
+      mocks.prFixTxSurfaces.push("updateMany");
+      return prFixQueueItem.updateMany(args);
+    },
+  };
+  return {
+    prisma: {
+      issue: { findMany: mocks.issueFindMany },
+      prFixQueueItem,
+      prFixHistory: { create: mocks.prFixHistoryCreate },
+      capacityHandoff: {
+        findMany: mocks.capacityHandoffFindMany,
+        deleteMany: mocks.capacityHandoffDeleteMany,
+      },
+      // The #1327 REBASE admission transaction runs the concurrency gate,
+      // the dispatch stamp, and the hand-out push on the TRANSACTION client;
+      // it mirrors the top-level surface here. $executeRaw is a no-op
+      // standing in for the advisory lock (its real serialization is proven
+      // against PostgreSQL in pr-fix-rebase-type.integration.test.ts).
+      $transaction: async (fn: any) => {
+        // A failed admission (lock timeout, aborted transaction) must make
+        // the route fail CLOSED, so the failure is injectable here.
+        if (mocks.prFixTransactionError) throw mocks.prFixTransactionError;
+        return fn({
+          prFixQueueItem: txPrFixQueueItem,
+          prFixHistory: { create: mocks.prFixHistoryCreate },
+          $executeRaw: async () => 1,
+        });
+      },
+    },
+    asPrFixQueueClient: (client: any) => client,
+  };
+});
 
 vi.mock("@/lib/github", () => ({
   fetchPullRequestLabels: mocks.fetchPullRequestLabels,
@@ -160,12 +203,43 @@ function makeQueueStore() {
  * the per-agent hand-out record) defer to `matchesFirstHandOut` / their own
  * mocks.
  */
+/**
+ * Evaluate the OR clause of a pr-fix queue updateMany against a fake row.
+ * Two shapes exist: the dispatch stamp's first-hand-out arms
+ * (`dispatchedGeneration`) and the hand-out append's issuance pin (#1327),
+ * whose arms anchor the lane being issued (`type` / `attemptType`).
+ */
+function matchesOrConditions(row: any, or: any[]): boolean {
+  return or.some((cond: any) => {
+    if ("dispatchedGeneration" in cond) {
+      if (cond.dispatchedGeneration === null) return row.dispatchedGeneration == null;
+      return (
+        row.dispatchedGeneration != null &&
+        row.dispatchedGeneration !== cond.dispatchedGeneration.not
+      );
+    }
+    // The issuance pin: the row still anchors the lane being issued — its
+    // `type` matches, or the attempt stamp already names it (a re-hand-out
+    // of a dispatched lane). Fixtures that do not model a lane (`type`
+    // absent) cannot race a flip, so the pin is vacuously satisfied for them.
+    if ("type" in cond) return row.type === undefined || row.type === cond.type;
+    if ("attemptType" in cond) return row.attemptType === cond.attemptType;
+    return false;
+  });
+}
+
 function matchesFirstHandOut(row: any, where: any): boolean {
   if (row.id !== where.id || row.generation !== where.generation) return false;
+  // #495: the composed AND groups — the first-hand-out pin and the CI park
+  // deferral guard — each carry OR alternatives, and every group must have
+  // at least one arm that the row satisfies.
   for (const group of where.AND ?? []) {
     if (Array.isArray(group.OR) && !group.OR.some((cond: any) => matchesNullableColumnCondition(row, cond))) return false;
   }
-  return true;
+  // #1327: the issuance pin — the top-level OR arms anchor the lane being
+  // issued (`type` / `attemptType`).
+  if (!where.OR) return true;
+  return matchesOrConditions(row, where.OR);
 }
 
 /**
@@ -313,6 +387,520 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(body.pullRequest.number).toBe(13);
     expect(body.prFixItem.id).toBe(b.id);
     expect(mocks.prFixUpdateMany.mock.calls.every(([args]) => args.where.id === b.id)).toBe(true);
+  });
+
+  it("marks the dispatched PR-fix identity with the item's fixType (#1327)", async () => {
+    mocks.prFixFindMany.mockResolvedValue([{ ...prFixRow(13), type: "REBASE", reason: "Mechanical rebase: PR dirty against base (#1327)" }]);
+    const body = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem.fixType).toBe("REBASE");
+    expect(body.reasons[0]).toContain("Mechanical rebase");
+  });
+
+  describe("rebase worker pool eligibility (DISPATCH_REBASE_AGENTS, #1327)", () => {
+    const rebaseRow = () => ({ ...prFixRow(31), type: "REBASE", reason: "Mechanical rebase: PR dirty against base (#1327)" });
+
+    function rowMocks(row: any) {
+      mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+        where?.OR ? [row] : [row]);
+      mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+        (where.id === row.id ? { ...row } : null));
+    }
+
+    afterEach(() => {
+      delete process.env.DISPATCH_REBASE_AGENTS;
+    });
+
+    it("defers REBASE for an agent outside the configured local pool", async () => {
+      // #1327's rebase worker is the local-only pool; the operator declares
+      // it server-side via DISPATCH_REBASE_AGENTS. An agent outside the pool
+      // must not receive the hand-out — the candidate is deferred (transient,
+      // retried by the next eligible poll), and the deferral happens BEFORE
+      // the lane admission, so the advisory lock is never contended.
+      process.env.DISPATCH_REBASE_AGENTS = "local-coder, other-local";
+      const row = rebaseRow();
+      rowMocks(row);
+
+      const body = await (await GET(request(exclusionUrl()), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })).json();
+      expect(body.shouldRun).toBe(false);
+      expect(body.prFixItem).toBeUndefined();
+      // Deferred before admission: no hand-out stamp, no transaction surface.
+      expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+      expect(mocks.prFixTxSurfaces).toEqual([]);
+      expect(row.agentHandouts).toEqual([]);
+    });
+
+    it("hands REBASE to an agent inside the configured local pool", async () => {
+      process.env.DISPATCH_REBASE_AGENTS = "local-coder, Example-Agent";
+      const row = rebaseRow();
+      rowMocks(row);
+
+      const body = await (await GET(request(exclusionUrl()), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })).json();
+      expect(body.type).toBe("followup-pr");
+      expect(body.prFixItem.fixType).toBe("REBASE");
+      expect(body.prFixItem.id).toBe(row.id);
+      // The config gate precedes, not replaces, the serialized admission:
+      // the hand-out still runs inside the advisory-lock transaction.
+      expect(mocks.prFixTxSurfaces).toContain("findMany");
+      expect(mocks.prFixTxSurfaces).toContain("updateMany");
+    });
+
+    it("still dispatches ordinary fix work for an agent outside the pool", async () => {
+      // The pool gates the REBASE lane only: the same ineligible poll must
+      // keep serving ordinary fix work and issue work.
+      process.env.DISPATCH_REBASE_AGENTS = "local-coder";
+      const rebase = rebaseRow();
+      const fix = prFixRow(32);
+      mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+        where?.OR ? [rebase] : [rebase, fix]);
+      mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+        where.id === fix.id ? { ...fix } : where.id === rebase.id ? { ...rebase } : null);
+
+      const body = await (await GET(request(exclusionUrl()), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })).json();
+      expect(body.type).toBe("followup-pr");
+      expect(body.pullRequest.number).toBe(32);
+    });
+
+    it("empty pool value is fail-closed: no agent receives REBASE", async () => {
+      process.env.DISPATCH_REBASE_AGENTS = "   ";
+      const row = rebaseRow();
+      rowMocks(row);
+
+      const body = await (await GET(request(exclusionUrl()), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })).json();
+      expect(body.shouldRun).toBe(false);
+      expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+      expect(row.agentHandouts).toEqual([]);
+    });
+
+    it("unset pool is fail-closed: REBASE defers while ordinary fix work still dispatches", async () => {
+      // #1327's fail-closed default: with no operator-declared pool, NO
+      // agent is eligible — an unset allowlist must not hand the local-only
+      // lane to every polling agent. The ineligible poll still serves
+      // ordinary fix work, and the REBASE item stays QUEUED (no hand-out
+      // stamp; the next eligible poll retries it).
+      delete process.env.DISPATCH_REBASE_AGENTS;
+      const rebase = rebaseRow();
+      const fix = prFixRow(32);
+      mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+        where?.OR ? [rebase] : [rebase, fix]);
+      mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+        where.id === fix.id ? { ...fix } : where.id === rebase.id ? { ...rebase } : null);
+
+      const body = await (await GET(request(exclusionUrl()), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })).json();
+      expect(body.type).toBe("followup-pr");
+      expect(body.pullRequest.number).toBe(32);
+      // Only the ordinary fix row was stamped: the REBASE item keeps its
+      // QUEUED state for the next eligible poll.
+      expect(mocks.prFixUpdateMany).toHaveBeenCalled();
+      expect(mocks.prFixUpdateMany.mock.calls.every(([args]) => args.where.id === fix.id)).toBe(true);
+      expect(rebase.agentHandouts).toEqual([]);
+    });
+
+    it("a bare * value is the explicit unrestricted opt-in", async () => {
+      // Debugging/backcompat hatch: `*` reopens the lane to every poller —
+      // including an agent no named pool would admit — but only as the
+      // entire value, and never by default.
+      process.env.DISPATCH_REBASE_AGENTS = "*";
+      const row = rebaseRow();
+      rowMocks(row);
+
+      const body = await (await GET(request(exclusionUrl()), {
+        params: Promise.resolve({ agentName: "some-cloud-agent" }),
+      })).json();
+      expect(body.type).toBe("followup-pr");
+      expect(body.prFixItem.fixType).toBe("REBASE");
+      // The hand-out still runs inside the serialized admission transaction.
+      expect(mocks.prFixTxSurfaces).toContain("updateMany");
+    });
+
+    it("a failed append leaves no lane stamp: the flipped row re-enters the REBASE gates (#1327)", async () => {
+      // Regression: the dispatch stamp used to write `attemptType` BEFORE the
+      // hand-out append, so a failed append left a stale same-generation lane
+      // stamp. A row that then flipped to REBASE was trusted as its stale
+      // lane, and the next poll bypassed the worker-pool and serialized
+      // admission gates. The lane stamp now rides the append — atomic with
+      // issuance, pinned to the row's type — so after a failed append the row
+      // is laneless: the next poll re-derives REBASE from the row and
+      // enforces the REBASE gates.
+      const row: any = { ...prFixRow(33), type: "CI_FAILURE" };
+      mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+        where?.OR
+          // The rebase concurrency gate read: only rows anchored to REBASE.
+          ? [row].filter((r: any) => (r.attemptType ?? r.type) === "REBASE")
+          : [row]);
+      mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+        (where.id === row.id ? { ...row } : null));
+
+      // Poll 1 — ordinary lane: the dispatch stamp lands, the hand-out
+      // append FAILS.
+      let stampArgs: any;
+      let appendArgs: any;
+      mocks.prFixUpdateMany
+        .mockImplementationOnce(async (args: any) => { stampArgs = args; return { count: 1 }; })
+        .mockImplementationOnce(async (args: any) => { appendArgs = args; throw new Error("hand-out append failed"); });
+      const first = await (await GET(request(exclusionUrl()), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })).json();
+      expect(first.prFixItem).toBeUndefined();
+      // The stamp ran WITHOUT the lane: attemptType cannot become
+      // authoritative before a hand-out exists.
+      expect(stampArgs.data.attemptType).toBeUndefined();
+      expect(stampArgs.data.dispatchedGeneration).toBe(row.generation);
+      // The append carried the lane and the type pin, and failed.
+      expect(appendArgs.data.attemptType).toBe("CI_FAILURE");
+      expect(appendArgs.where.OR).toEqual([{ type: "CI_FAILURE" }, { attemptType: "CI_FAILURE" }]);
+
+      // A concurrent same-generation re-observation flips the row to REBASE.
+      row.type = "REBASE";
+
+      // Poll 2a — an agent outside the pool is deferred BEFORE the admission
+      // transaction: no gate read, no writes.
+      process.env.DISPATCH_REBASE_AGENTS = "local-coder";
+      mocks.prFixUpdateMany.mockClear();
+      const deferred = await (await GET(request(exclusionUrl()), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })).json();
+      expect(deferred.prFixItem).toBeUndefined();
+      expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+      expect(mocks.prFixTxSurfaces).toEqual([]);
+
+      // Poll 2b — a pool-eligible poll re-derives the lane from the flipped
+      // row and enforces the serialized admission: the gate read and the
+      // hand-out write (carrying the lane stamp) run inside the advisory-lock
+      // transaction, shipping REBASE.
+      process.env.DISPATCH_REBASE_AGENTS = "example-agent";
+      const surfacesBefore = mocks.prFixTxSurfaces.length;
+      const second = await (await GET(request(exclusionUrl()), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })).json();
+      expect(second.type).toBe("followup-pr");
+      expect(second.prFixItem.fixType).toBe("REBASE");
+      const surfaces = mocks.prFixTxSurfaces.slice(surfacesBefore);
+      expect(surfaces).toContain("findMany");
+      expect(surfaces).toContain("updateMany");
+      // The lane stamp rode the issuance, pinned to the flipped row's type.
+      const issued: any = mocks.prFixUpdateMany.mock.calls
+        .map(([args]: any) => args)
+        .find((args: any) => Array.isArray(args.data?.agentHandouts?.push));
+      expect(issued.data.attemptType).toBe("REBASE");
+      expect(issued.where.OR).toEqual([{ type: "REBASE" }, { attemptType: "REBASE" }]);
+    });
+  });
+
+  it("defers REBASE hand-outs while any rebase hand-out is live (concurrency 1, #1327)", async () => {
+    // `live` is a REBASE already handed out (live hand-out record, still
+    // QUEUED); `waiting` is the next DIRTY PR. Neither may be handed out:
+    // `waiting` because the lane is busy, `live` because a second hand-out
+    // would put two force-with-lease pushes on one branch.
+    const live = { ...prFixRow(21, 2), type: "REBASE", agentHandouts: ["other-agent@2"], dispatchedAt: new Date() };
+    const waiting = { ...prFixRow(22), type: "REBASE" };
+    mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+      where?.OR
+        ? [live, waiting].filter((r: any) => r.type === "REBASE" || r.attemptType === "REBASE")
+        : [live, waiting].filter((r) => r.status === "QUEUED"));
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+      (where.id === waiting.id ? waiting : live));
+    const body = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.shouldRun).toBe(false);
+    // Deferred, not dispatched: no hand-out stamp on either item.
+    expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+    expect(live.agentHandouts).toEqual(["other-agent@2"]);
+    expect(waiting.agentHandouts).toEqual([]);
+  });
+
+  it("an acknowledged REBASE hand-out gates the lane however stale it is (#1327, #1211)", async () => {
+    // #1211: an acknowledged hand-out is never reclaimed — the worker
+    // durably owns its generation — so it gates the lane until it settles.
+    // The old gate freed the lane once `dispatchedAt` passed the hand-out
+    // timeout, letting a second hand-out (a second `--force-with-lease`
+    // push on one branch) issue under a still-live first attempt.
+    const live = {
+      ...prFixRow(21, 2), type: "REBASE",
+      agentHandouts: ["other-agent@2"], handoutAcks: ["other-agent@2"],
+      dispatchedAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+    };
+    const waiting = { ...prFixRow(22), type: "REBASE" };
+    mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+      where?.OR
+        ? [live, waiting].filter((r: any) => r.type === "REBASE" || r.attemptType === "REBASE")
+        : [live, waiting].filter((r) => r.status === "QUEUED"));
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+      (where.id === waiting.id ? waiting : live));
+
+    const body = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.shouldRun).toBe(false);
+    expect(body.prFixItem).toBeUndefined();
+    // No second hand-out was stamped while the acknowledged attempt is live.
+    expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+    expect(live.agentHandouts).toEqual(["other-agent@2"]);
+  });
+
+  it("a stale unacknowledged REBASE frees the lane only once the reclaim sweep clears it (#1327, #1211)", async () => {
+    // The hand-out timeout bounds the reclaim sweep's staleness population,
+    // not the gate: a stale unacknowledged hand-out keeps gating PAST the
+    // timeout, and the lane re-opens only through the sweep's committed
+    // reclaim — the generation bump that clears the hand-out state
+    // (exercised for real against the lib in pr-fix-queue.test.ts).
+    const stale: any = {
+      ...prFixRow(23), type: "REBASE",
+      agentHandouts: ["other-agent@2"],
+      dispatchedGeneration: 2,
+      dispatchedAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+    };
+    mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+      where?.OR
+        ? [stale].filter((r: any) => r.type === "REBASE" || r.attemptType === "REBASE")
+        : [stale].filter((r) => r.status === "QUEUED"));
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+      (where.id === stale.id ? { ...stale } : null));
+
+    const blocked = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(blocked.prFixItem).toBeUndefined();
+    // Still gated past the timeout: no hand-out was stamped.
+    expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+
+    // The reclaim sweep's committed effect: generation bump + cleared
+    // hand-out state (agentHandouts/acks/receipts, dispatched stamps,
+    // attemptType).
+    stale.generation += 1;
+    stale.agentHandouts = [];
+    stale.dispatchedGeneration = null;
+    stale.dispatchedAt = null;
+    stale.attemptType = null;
+
+    const surfacesBefore = mocks.prFixTxSurfaces.length;
+    const body = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem.fixType).toBe("REBASE");
+    // The re-issued hand-out ran inside the serialized admission transaction.
+    const surfaces = mocks.prFixTxSurfaces.slice(surfacesBefore);
+    expect(surfaces).toContain("findMany");
+    expect(surfaces).toContain("updateMany");
+  });
+
+  it("defers a REBASE hand-out when the admission transaction fails (fail closed, #1327 review)", async () => {
+    // The advisory lock could not be taken (lock_timeout, aborted
+    // transaction). The lane is concurrency 1, so the hand-out must be
+    // DEFERRED: the removed fallback ran an unlocked check-then-write, which
+    // let two concurrent polls both see an idle lane and both issue a REBASE
+    // task. Deferral costs one poll; the fan-out costs two
+    // `--force-with-lease` pushes on one branch.
+    const row = { ...prFixRow(24), type: "REBASE", reason: "Mechanical rebase: PR dirty against base (#1327)" };
+    mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+      where?.OR ? [row] : [row]);
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+      (where.id === row.id ? { ...row } : null));
+    mocks.prFixTransactionError = new Error("canceling statement due to lock timeout");
+
+    const body = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.shouldRun).toBe(false);
+    // Deferred, not dispatched: no hand-out stamp on the item.
+    expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it("defers a REBASE hand-out when the gate read fails inside the admission (fail closed, #1327 review)", async () => {
+    // One level deeper than the transaction-failure case: the transaction
+    // runs and the advisory lock is taken, but the gate read itself throws
+    // inside the serialized window. The failure must propagate to the same
+    // fail-closed deferral — never a dispatch without the gate (the removed
+    // fallback's behavior) and no hand-out write of any kind.
+    const row = { ...prFixRow(24), type: "REBASE", reason: "Mechanical rebase: PR dirty against base (#1327)" };
+    mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) => {
+      if (where?.OR) throw new Error("gate read unavailable");
+      return [row];
+    });
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+      (where.id === row.id ? { ...row } : null));
+
+    const response = await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    });
+    // The poll stays healthy (no 500); the candidate is deferred.
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.shouldRun).toBe(false);
+    expect(body.prFixItem).toBeUndefined();
+    expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+    expect(row.agentHandouts).toEqual([]);
+  });
+
+  it("still dispatches ordinary fix work when the rebase admission fails (#1327 review)", async () => {
+    // The fail-closed deferral is REBASE-only: ordinary fix work never takes
+    // the lane lock, so a failing REBASE admission must not strand it.
+    const rebase = { ...prFixRow(25), type: "REBASE" };
+    const fix = { ...prFixRow(26) };
+    mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+      where?.OR ? [rebase] : [rebase, fix]);
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+      where.id === fix.id ? { ...fix } : where.id === rebase.id ? { ...rebase } : null);
+    mocks.prFixTransactionError = new Error("canceling statement due to lock timeout");
+
+    const body = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.pullRequest.number).toBe(26);
+  });
+
+  it("writes a REBASE hand-out inside the admission transaction (#1327 review)", async () => {
+    // The concurrency-1 gate only holds if the gate read AND the hand-out
+    // write commit together, inside the advisory-locked transaction. If the
+    // hand-out escaped to the module client it would be an unlocked write
+    // next to a locked read — the check-then-write the lane forbids.
+    const row = { ...prFixRow(27), type: "REBASE", reason: "Mechanical rebase: PR dirty against base (#1327)" };
+    mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+      where?.OR ? [row] : [row]);
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+      (where.id === row.id ? { ...row } : null));
+
+    const body = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.type).toBe("followup-pr");
+    // The dispatch stamp and the hand-out push both ran on the transaction
+    // client.
+    expect(mocks.prFixTxSurfaces.filter((s) => s === "updateMany").length).toBeGreaterThanOrEqual(2);
+    expect(mocks.prFixTxSurfaces).toContain("findMany");
+    expect(mocks.prFixTxSurfaces).toContain("findUnique");
+  });
+
+  it("keeps ordinary fix hand-outs off the admission transaction (#1327 review)", async () => {
+    // Mirror of the case above: ordinary fix work never takes the lane lock,
+    // so it must not run inside the rebase admission transaction.
+    const fix = { ...prFixRow(28) };
+    mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+      where?.OR ? [] : [fix]);
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+      (where.id === fix.id ? { ...fix } : null));
+
+    const body = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.type).toBe("followup-pr");
+    expect(mocks.prFixTxSurfaces).toEqual([]);
+  });
+
+  it("retries a deferred REBASE hand-out on the next poll (#1327 review)", async () => {
+    // Fail-closed defers, it does not strand: a transient admission failure
+    // must leave the item QUEUED and the next poll must hand it out.
+    const row = { ...prFixRow(29), type: "REBASE", reason: "Mechanical rebase: PR dirty against base (#1327)" };
+    mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+      where?.OR ? [row] : [row]);
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+      (where.id === row.id ? { ...row } : null));
+    mocks.prFixTransactionError = new Error("canceling statement due to lock timeout");
+
+    const deferred = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(deferred.shouldRun).toBe(false);
+
+    // The lane recovers on the next poll: the lock is free again.
+    mocks.prFixTransactionError = null;
+    const retried = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(retried.type).toBe("followup-pr");
+    expect(retried.prFixItem.fixType).toBe("REBASE");
+  });
+
+  it("dispatches ordinary fix work while a rebase hand-out is live (#1327)", async () => {
+    // The concurrency-1 gate is REBASE-only: OTHER fix work is unaffected.
+    const live = { ...prFixRow(21, 2), type: "REBASE", agentHandouts: ["other-agent@2"], dispatchedAt: new Date() };
+    const fix = prFixRow(23);
+    mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+      where?.OR
+        ? [live].filter((r: any) => r.type === "REBASE" || r.attemptType === "REBASE")
+        : [live, fix].filter((r) => r.status === "QUEUED"));
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+      (where.id === fix.id ? fix : live));
+    const body = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.pullRequest.number).toBe(23);
+  });
+
+  it("gates a REBASE-dispatched row whose type flipped to OTHER while its hand-out is live (#1327 review)", async () => {
+    // Self-live case on the DISPATCHED lane: the row was handed out as
+    // REBASE and a re-observation flipped the mutable `type` to OTHER. A
+    // second hand-out would still put two `--force-with-lease` pushes on
+    // one branch, so the concurrency gate must defer it.
+    const row = { ...prFixRow(33), type: "OTHER", attemptType: "REBASE", agentHandouts: ["other-agent@1"], dispatchedAt: new Date() };
+    mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+      where?.OR
+        ? [row].filter((r: any) => (r.attemptType ?? r.type) === "REBASE")
+        : [row].filter((r: any) => r.status === "QUEUED"));
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+      (where.id === row.id ? { ...row } : null));
+    const body = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.shouldRun).toBe(false);
+    expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it("ships the persisted dispatched lane when the row type flipped to REBASE mid-attempt (#1327 review)", async () => {
+    // The row was DISPATCHED as an ordinary fix (attemptType stamped at the
+    // first hand-out); a re-observation flipped the mutable `type` to REBASE.
+    // The task must carry the lane the server will settle against
+    // (`attemptType ?? type`), not the mutable row type.
+    const row = { ...prFixRow(31), type: "REBASE", attemptType: "CI_FAILURE" };
+    mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+      where?.OR
+        // The concurrency gate keys on the dispatched lane: this row is not
+        // a live REBASE, so it must not gate itself.
+        ? [row].filter((r: any) => (r.attemptType ?? r.type) === "REBASE" && (r.agentHandouts ?? []).length > 0)
+        : [row].filter((r: any) => r.status === "QUEUED"));
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+      (where.id === row.id ? { ...row } : null));
+    const body = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem.fixType).toBe("CI_FAILURE");
+  });
+
+  it("ships the persisted REBASE dispatched lane after a mid-attempt flip away from REBASE (#1327 review)", async () => {
+    // Mirror direction: dispatched as REBASE, the row's mutable `type` has
+    // since flipped to OTHER. The worker must still see REBASE — settlement
+    // will bound this attempt on the rebase lane (terminal PARKED on
+    // failure), and a payload claiming OTHER would promise the generic
+    // retry ladder the rebase lane deliberately does not get.
+    const row = { ...prFixRow(32), type: "OTHER", attemptType: "REBASE" };
+    mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+      where?.OR
+        ? [row].filter((r: any) => (r.attemptType ?? r.type) === "REBASE" && (r.agentHandouts ?? []).length > 0)
+        : [row].filter((r: any) => r.status === "QUEUED"));
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+      (where.id === row.id ? { ...row } : null));
+    const body = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem.fixType).toBe("REBASE");
   });
 
   it("skips linked generation 1 before materialization or GitHub reads", async () => {
@@ -475,10 +1063,17 @@ describe("GET /api/agents/[agentName]/next-task", () => {
 
   beforeEach(() => {
     delete process.env.DISPATCH_AUTH_MODE;
+    // The REBASE lane mechanic tests dispatch to `example-agent`; the
+    // operator pool itself is pinned per-test in the rebase-worker-pool
+    // describe. Unset/empty admits nobody, so the mechanic tests declare a
+    // pool containing their agent and afterEach clears it again.
+    process.env.DISPATCH_REBASE_AGENTS = "example-agent";
     resetAuthCaches();
     vi.clearAllMocks();
     mocks.prFixFindMany.mockResolvedValue([]);
     mocks.linkedRows = [];
+    mocks.prFixTransactionError = null;
+    mocks.prFixTxSurfaces = [];
     mocks.prFixFindUniqueByRepo.mockImplementation(async ({ where }: any) => {
       const rows = [...mocks.linkedRows, ...(await mocks.prFixFindMany())];
       return rows.find((row: any) => row.repo === where.repo_pr.repo && row.pr === where.repo_pr.pr) ?? null;
@@ -498,12 +1093,16 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       const items = await mocks.prFixFindMany();
       const first = items[0];
       return first
-        ? { reason: first.reason, feedback: first.feedback, generation: first.generation, status: first.status, lane: first.lane, agentHandouts: first.agentHandouts }
+        ? { reason: first.reason, feedback: first.feedback, generation: first.generation, status: first.status, lane: first.lane, agentHandouts: first.agentHandouts, attemptType: first.attemptType, type: first.type }
         : null;
     });
     mocks.prFixUpdateMany.mockResolvedValue({ count: 1 });
     mocks.issueFindMany.mockResolvedValue([]);
     mocks.findLeasedIssueIds.mockResolvedValue([]);
+  });
+
+  afterEach(() => {
+    delete process.env.DISPATCH_REBASE_AGENTS;
   });
 
   it("returns idle when the queue is empty", async () => {
@@ -702,11 +1301,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
         candidate.id === where.id && candidate.generation === where.generation &&
         (where.status === undefined || candidate.status === where.status) &&
         (where.retryAt === undefined || candidate.retryAt?.getTime() === where.retryAt.getTime()) &&
-        (!where.OR || where.OR.some((condition: any) =>
-          condition.dispatchedGeneration === null
-            ? candidate.dispatchedGeneration == null
-            : candidate.dispatchedGeneration !== condition.dispatchedGeneration.not,
-        )),
+        (!where.OR || matchesOrConditions(candidate, where.OR)),
       );
       if (!row) return { count: 0 };
       const patch: Record<string, any> = { ...data };
@@ -1322,9 +1917,16 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     let stampCount = 0;
     const stamps: any[] = [];
     mocks.prFixUpdateMany.mockImplementation(async ({ where, data }: any) => {
-      if (where.NOT) {
-        // The per-agent hand-out record push (#1133) carries a NOT pin; the
-        // stamp (#1119) is the AND-composed generation-conditional update.
+      // Stamps carry the first-hand-out arms inside an AND group (#495 moved
+      // them off the top-level OR so the CI park guard can AND with them); the
+      // per-agent hand-out record push (#1133) carries the issuance pin
+      // (#1327) and a NOT, never a dispatchedGeneration arm.
+      const isStamp =
+        Array.isArray(where.AND) &&
+        where.AND.some((group: any) =>
+          Array.isArray(group.OR) && group.OR.some((cond: any) => "dispatchedGeneration" in cond),
+        );
+      if (!isStamp) {
         const recorded = matchesFirstHandOut(row, where);
         if (recorded) applyUpdate(row, data);
         return { count: recorded ? 1 : 0 };
@@ -2550,6 +3152,99 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     const body = await res.json();
     expect(body.type).toBe("followup-pr");
     expect(body.reasons).toEqual(["Linked PR needs follow-up"]);
+  });
+
+  it("dispatches a conflicted linked PR through the mechanical rebase lane (#1327)", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      linkedIssue(42, 15, {
+        linkedPrMergeState: "dirty",
+        linkedPrFollowupReasons: ["merge_conflict"],
+      }),
+    ]);
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.pullRequest.number).toBe(15);
+    // The dispatch identity names the rebase lane, not the ordinary fix lane.
+    expect(body.prFixItem.fixType).toBe("REBASE");
+    // The materialized row is a REBASE item carrying the contract as its
+    // single feedback entry (the same shape the ingestion path writes).
+    expect(mocks.prFixCreate).toHaveBeenCalledTimes(1);
+    const materialized = mocks.prFixCreate.mock.calls[0][0].data;
+    expect(materialized.type).toBe("REBASE");
+    expect(materialized.feedback).toHaveLength(1);
+    expect(materialized.reason).toContain("Mechanical rebase");
+    // The contract IS the instruction wall: it must reach the worker.
+    const contract = body.reasons.join("\n");
+    expect(contract).toContain("MECHANICALLY ONLY");
+    expect(contract).toContain("--force-with-lease");
+    expect(contract).toContain("human_decision");
+  });
+
+  it("defers a materialized conflicted linked PR for an agent outside the rebase pool (#1327)", async () => {
+    // The linked-PR materialization loop is a second dispatchPrFixCandidate
+    // caller: the pool gate must hold there too — the row is still
+    // materialized (an eligible poller consumes it next poll), but this
+    // ineligible agent receives no hand-out and never enters the lane
+    // admission.
+    process.env.DISPATCH_REBASE_AGENTS = "local-coder";
+    try {
+      mocks.issueFindMany.mockResolvedValue([
+        linkedIssue(42, 15, {
+          linkedPrMergeState: "dirty",
+          linkedPrFollowupReasons: ["merge_conflict"],
+        }),
+      ]);
+
+      const res = await GET(
+        request("/api/agents/example-agent/next-task?lane=local"),
+        { params: Promise.resolve({ agentName: "example-agent" }) },
+      );
+
+      const body = await res.json();
+      expect(body.shouldRun).toBe(false);
+      expect(body.prFixItem).toBeUndefined();
+      // The row is materialized QUEUED (not dropped), but no hand-out was
+      // stamped and the admission transaction was never entered.
+      expect(mocks.prFixCreate).toHaveBeenCalledTimes(1);
+      expect(mocks.prFixCreate.mock.calls[0][0].data.type).toBe("REBASE");
+      expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+      // The only transaction surface is the materialization create itself
+      // (createLinkedPrFixItem writes in its own $transaction); the rebase
+      // lane admission — gate read + hand-out stamp — was never entered.
+      expect(mocks.prFixTxSurfaces).toEqual(["create"]);
+    } finally {
+      delete process.env.DISPATCH_REBASE_AGENTS;
+    }
+  });
+
+  it("materializes a linked PR without a merge conflict as an ordinary fix item (#1327)", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      linkedIssue(42, 15, {
+        linkedPrMergeState: "behind",
+        linkedPrFollowupReasons: ["merge_state_behind"],
+      }),
+    ]);
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem.fixType).toBe("OTHER");
+    expect(mocks.prFixCreate).toHaveBeenCalledTimes(1);
+    const materialized = mocks.prFixCreate.mock.calls[0][0].data;
+    expect(materialized.type).toBe("OTHER");
+    expect(materialized.feedback).toEqual(["merge_state_behind"]);
+    // No conflict, no contract: the health reasons stand unchanged.
+    expect(body.reasons).toEqual(["merge_state_behind"]);
   });
 
   it("normal issue still returns implement when no follow-up exists", async () => {

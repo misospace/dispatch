@@ -876,6 +876,9 @@ describe("the leash: freshAttemptGeneration auto-clears every deferral column", 
       ciParkKey: null,
       ciParkFence: null,
       ciParkAt: null,
+      // #1327: the DISPATCHED lane resets with the attempt too — the merged
+      // helper clears every reset-on-bump column in one write.
+      attemptType: null,
     });
   });
 });

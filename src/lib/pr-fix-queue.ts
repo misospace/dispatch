@@ -58,7 +58,110 @@ export type PrFixQueueClient = {
     upsert: (args: any) => Promise<any>;
   };
   $transaction: <T>(fn: (tx: PrFixQueueClient) => Promise<T>) => Promise<T>;
+  // Raw SQL surface used by the #1327 rebase-lane advisory lock. Optional on
+  // the type (legacy/test clients may omit it) but MANDATORY for a rebase
+  // admission: `withRebaseLaneAdmission` REFUSES to admit without it, because
+  // an admission that cannot take the advisory lock would run the gate read
+  // and the hand-out write unlocked — the check-then-write fan-out the lane
+  // forbids. Every real Prisma transaction client has it.
+  $executeRaw?: (query: Prisma.Sql, ...values: unknown[]) => Promise<number>;
 };
+
+/**
+ * #1327 review: advisory transaction-lock key serializing REBASE lane
+ * admission. One global key — the lane is concurrency 1 across ALL rows and
+ * ALL agents, so every REBASE hand-out contends on exactly this lock.
+ */
+export const REBASE_LANE_ADVISORY_LOCK_KEY = 13270001327n;
+
+/**
+ * #1327: the rebase lane's worker pool is LOCAL-only by contract — git is its
+ * tool surface and it must not consume paid cloud capacity. Dispatch has no
+ * model/runner knowledge of agents, so the pool is operator-declared via
+ * `DISPATCH_REBASE_AGENTS`: only the listed agent names (comma or whitespace
+ * separated, case-insensitive) receive REBASE hand-outs; any other agent's
+ * poll defers the REBASE candidate for an eligible poller (the item stays
+ * QUEUED, the poll keeps serving other work).
+ *
+ * FAIL CLOSED: an unset, empty, or whitespace-only value admits NOBODY. #1327
+ * exists to keep rebases on free local capacity, so a missing allowlist must
+ * not hand the lane to every polling agent — the lane stays QUEUED until the
+ * operator names workers. A bare `*` value is the explicit unrestricted
+ * opt-in (debugging/backcompat): every polling agent is eligible. A `*`
+ * mixed into a list is just an agent name that matches nothing — the opt-in
+ * must be the entire value to count.
+ */
+export function parseRebaseAgentPool(raw: string | undefined): Set<string> | null {
+  if (raw?.trim() === "*") return null;
+  const names = (raw ?? "")
+    .split(/[\s,]+/)
+    .map((name) => name.trim().toLowerCase())
+    .filter(Boolean);
+  return new Set(names);
+}
+
+/** Whether `agentName` may receive a REBASE lane hand-out (see `parseRebaseAgentPool`). */
+export function isRebaseLaneAgent(agentName: string): boolean {
+  const pool = parseRebaseAgentPool(process.env.DISPATCH_REBASE_AGENTS);
+  return pool === null || pool.has(agentName.trim().toLowerCase());
+}
+
+/**
+ * Run a REBASE hand-out admission (gate read + dispatch stamp + hand-out
+ * push) SERIALIZED at the database boundary (#1327 review).
+ *
+ * The concurrency-1 gate is only sound if the liveness read and the
+ * hand-out write commit together — a preflight read followed by separate
+ * writes lets two concurrent polls both observe an idle lane and both
+ * dispatch (the exact fan-out the lane forbids). This helper runs `run`
+ * inside one transaction holding `pg_advisory_xact_lock`: a competing
+ * admission blocks on the lock and, when it proceeds, the gate read inside
+ * its transaction sees the first admission's COMMITTED hand-out and defers.
+ * The lock is transaction-scoped, so commit, rollback, or a dead connection
+ * all release it — it can never strand the lane the way a leaked row lock
+ * would.
+ *
+ * FAIL CLOSED (#1327 review): the advisory lock is MANDATORY, not best
+ * effort. If the lock cannot be taken — no raw SQL surface, a `lock_timeout`
+ * on the wait, an aborted transaction — this helper throws and the caller
+ * MUST defer the hand-out (the next poll retries it). There is deliberately
+ * no unlocked fallback: an admission that ran the gate read and the
+ * hand-out write outside the lock is the check-then-write the lane
+ * forbids, and the review finding was exactly that fallback re-opening
+ * the fan-out window. Deferring costs one poll; fanning out costs two
+ * `--force-with-lease` pushes on one branch.
+ *
+ * `SET LOCAL lock_timeout` bounds the WAIT so even a pathologically long
+ * lock holder cannot stall a poll beyond the timeout: the wait ends on the
+ * PG side, the transaction aborts, and the caller fails closed.
+ */
+export async function withRebaseLaneAdmission<T>(
+  client: PrFixQueueClient,
+  run: (tx: PrFixQueueClient) => Promise<T>,
+): Promise<T> {
+  return client.$transaction(async (tx) => {
+    if (typeof tx.$executeRaw !== "function") {
+      // Fail closed: without the raw surface the advisory lock cannot be
+      // taken, so the gate read and the hand-out write would run
+      // UNSERIALIZED — the fan-out the lane forbids. Refuse the admission
+      // instead of admitting an unlocked hand-out.
+      throw new Error(
+        "rebase lane admission requires a raw SQL surface to take the advisory lock",
+      );
+    }
+    // `SET` accepts no bind parameters, so the interval is a literal.
+    // 3s is deliberately BELOW Prisma's interactive-transaction timeout
+    // (default 5s): the lock wait must end on the PG side — statement
+    // cancelled, transaction aborted, caller fails closed — before Prisma
+    // gives up on a connection still blocked inside the lock function,
+    // where its rollback cannot land and the abandoned transaction would
+    // transiently re-acquire and hold the lock the failing admission just
+    // gave up on.
+    await tx.$executeRaw(Prisma.raw("SET LOCAL lock_timeout = '3s'"));
+    await tx.$executeRaw(Prisma.sql`SELECT pg_advisory_xact_lock(${REBASE_LANE_ADVISORY_LOCK_KEY})`);
+    return run(tx);
+  });
+}
 
 // #1121: upper bound on an already_addressed evidence string, shared by the
 // tasks/report route and the pr-fix-queue/mark parser.
@@ -140,6 +243,12 @@ export interface CreateLinkedPrFixInput {
   lane: PrFixLane;
   reason: string;
   feedback: string[];
+  /**
+   * Queue type for the materialized row (#1327). Absent/null writes the
+   * ordinary fix lane (OTHER); "REBASE" routes a conflicted PR into the
+   * mechanical rebase lane, whose contract the caller supplies in `feedback`.
+   */
+  type?: string | null;
   evidenceKey: string;
   url?: string | null;
   title?: string | null;
@@ -2210,7 +2319,10 @@ export async function createLinkedPrFixItem(
           pr: input.pr,
           issue: input.issue,
           lane: input.lane,
-          type: "OTHER",
+          // The caller picks the lane's type (#1327): a conflicted linked PR
+          // materializes as REBASE, everything else stays the ordinary fix
+          // lane (OTHER).
+          type: normalizePrFixType(input.type),
           status: "QUEUED",
           reason: input.reason,
           feedback: input.feedback,
@@ -2292,6 +2404,69 @@ export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { 
   }
 
   return items;
+}
+
+/**
+ * #1327: the mechanical rebase lane is concurrency 1 with no fan-out — the
+ * issue scopes the lane to a bounded local worker, not a fleet. Hand-out is
+ * gated on this check: a REBASE candidate waits while ANY QUEUED row whose
+ * DISPATCHED lane (`attemptType`, falling back to `type` for rows stamped
+ * before the column existed) is REBASE carries a live hand-out record —
+ * including the candidate itself. The self case matters: re-handing an
+ * already-live REBASE to a second worker would put two `--force-with-lease`
+ * pushes on one branch.
+ *
+ * "Live" follows the queue's actual ownership semantics, NOT a clock: a
+ * non-empty `agentHandouts` list on a still-QUEUED row gates the lane until
+ * the record is explicitly cleared — settlement (mark/release/terminal
+ * dispositions clear the hand-outs or move the row out of QUEUED), or the
+ * reclaim sweep, which is the ONLY path that ages a hand-out out
+ * (`PR_FIX_HANDOUT_TIMEOUT_MS` bounds the sweep's staleness population, not
+ * this gate): a stale UNACKNOWLEDGED hand-out is reclaimed with a generation
+ * bump that clears the hand-out state, at which point the lane is free. An
+ * ACKNOWLEDGED hand-out is deliberately never reclaimed (#1211 — the worker
+ * durably owns its generation) and gates until it settles; an
+ * acked-then-crashed rebase therefore holds the lane until the worker
+ * reports or an operator requeues. That is deliberate fail-safe behavior: a
+ * visibly stuck lane is recoverable, a silently shared lane is two
+ * `--force-with-lease` pushes on one branch. The previous time-boxed gate
+ * freed the lane under a still-live hand-out once the timeout passed — a
+ * concurrency-2 window the queue's ownership model does not license.
+ *
+ * Keying on `attemptType` (not the row's mutable `type`) matters: enqueue
+ * overwrites `type` on every re-observation, so a mid-attempt flip must
+ * neither free the lane from a live rebase (REBASE -> other) nor let an
+ * in-flight ordinary fix attempt block it (other -> REBASE).
+ *
+ * Admission is SERIALIZED at the database boundary: next-task issues every
+ * REBASE hand-out inside `withRebaseLaneAdmission`, which holds a
+ * transaction-scoped advisory lock across this read AND the hand-out write.
+ * A competing poll therefore never passes this check before the winner's
+ * hand-out commits — concurrency 1 is enforced, not preflight-advisory.
+ * The lock is MANDATORY and the admission fails CLOSED: when the lock
+ * cannot be taken the hand-out is deferred (the next poll retries it)
+ * rather than issued through an unlocked check-then-write. So the only
+ * remaining best-effort window is the anomalous no-`dispatchedAt` hand-out
+ * below, not an admission path.
+ */
+export async function hasInFlightRebaseHandout(
+  client: PrFixQueueClient,
+): Promise<boolean> {
+  const rows = await client.prFixQueueItem.findMany({
+    where: { status: "QUEUED", OR: [{ type: "REBASE" }, { attemptType: "REBASE" }] },
+  });
+  return rows.some((row: { attemptType?: unknown; type?: unknown; agentHandouts?: unknown; dispatchedAt?: unknown }) => {
+    if ((row.attemptType ?? row.type) !== "REBASE") return false;
+    if (!Array.isArray(row.agentHandouts) || row.agentHandouts.length === 0) return false;
+    // A hand-out with no stamped start is anomalous: next-task stamps
+    // `dispatchedAt` BEFORE pushing the hand-out record, and the only gap
+    // left is a stamp write that throws while the later push succeeds. Such
+    // a row is invisible to the reclaim sweep too (`dispatchedAt: { lt }`
+    // never matches NULL), so counting it live would block the lane with no
+    // recovery path at all. Skip it instead: the worst case is the transient
+    // concurrency-2 window the lane already accepts best-effort.
+    return Boolean(row.dispatchedAt);
+  });
 }
 
 /**
@@ -3326,6 +3501,7 @@ export function freshAttemptGeneration(): {
   ciParkKey: null;
   ciParkFence: null;
   ciParkAt: null;
+  attemptType: null;
 } {
   // A fresh attempt has no hand-out yet, so it has no evidence snapshot: the
   // watermark resets alongside the post-dispatch list and dies only with the
@@ -3338,6 +3514,14 @@ export function freshAttemptGeneration(): {
   // attempts — a requeued, externally-woken, or reclaimed item is dispatchable
   // again and a crashed Courier cycle leaves no suppression behind. No TTL and
   // no new env var: this sole generation-bump helper is the expiry.
+  //
+  // #1327 review: the DISPATCHED lane resets with the attempt too. A
+  // non-null `attemptType` means "this generation was handed out as that
+  // lane"; letting it survive a generation bump would make next-task's
+  // concurrency gate read a dead attempt as the live lane — masking a fresh
+  // REBASE attempt (bypassing the gate and its serialization, a fan-out
+  // door) or gating an ordinary fresh attempt behind the rebase lane. The
+  // lane is stamped by the hand-out itself; a fresh attempt has none.
   return {
     generation: { increment: 1 },
     attemptEvidenceWatermark: null,
@@ -3346,6 +3530,7 @@ export function freshAttemptGeneration(): {
     ciParkKey: null,
     ciParkFence: null,
     ciParkAt: null,
+    attemptType: null,
   };
 }
 
@@ -3565,10 +3750,15 @@ export async function releaseAgentHandout(
 }
 
 export function toAgentQueuePrFixItem(item: any) {
-  const fixType = normalizePrFixType(item.type);
-  return {
-    type: "pr-review-fix",
-    fixType,
+ const fixType = normalizePrFixType(item.type);
+ return {
+   type: "pr-review-fix",
+   fixType,
+   // #1327 review: the persisted DISPATCHED lane (`attemptType`), the same
+   // value settlement and the rebase concurrency gate key on. Listed so a
+   // consumer (and next-task's gate) sees the lane a live attempt actually
+   // runs, even after the mutable `type` is rewritten by a re-observation.
+   attemptType: item.attemptType == null ? null : normalizePrFixType(item.attemptType),
     id: item.id,
     repo: item.repo,
     pr: item.pr,
@@ -4207,13 +4397,26 @@ export async function resolvePrFixFromAgentReport(
     // transition. The status+generation pins still reject concurrent
     // settles at the same generation (neither BLOCKED nor FIXED bumps).
     const maxFailedRedecisions = 3;
-    let settled: { row: any; capped: boolean } | null = null;
+    let settled: { row: any; capped: boolean; rebaseTerminal: boolean } | null = null;
     for (let pass = 0; pass < maxFailedRedecisions && !settled; pass++) {
       const fresh = await client.prFixQueueItem.findUnique({ where: { id: existing.id } });
       if (!fresh) break;
       if (fresh.status !== "QUEUED") break;
       if (expectedGeneration !== undefined && fresh.generation !== expectedGeneration) break;
-      const capped = (fresh.fixAttempts ?? 1) >= maxPrFixAttempts();
+      // #1327: the mechanical rebase lane is ONE attempt per DIRTY episode.
+      // A failed REBASE never reopens a fresh attempt (the generic
+      // PR_FIX_MAX_ATTEMPTS ladder is for code-fix generations; retrying a
+      // rebase on the same head is exactly the cheap-retry churn this lane
+      // exists to remove). The bound keys on `attemptType` — the lane the
+      // attempt was DISPATCHED as — because enqueue overwrites the row's
+      // `type` on every re-observation, mid-attempt included: a lane flip
+      // during a live attempt must neither smuggle a rebase report back onto
+      // the ladder nor terminal-park an ordinary fix attempt. A new DIRTY
+      // episode is fresh evidence at a new head, which reactivates the park
+      // through the #1253 recovery path (cooldown-gated), not the #940
+      // FIXED-tombstone net.
+      const rebaseTerminal = normalizePrFixType(fresh.attemptType ?? fresh.type) === "REBASE";
+      const capped = rebaseTerminal || (fresh.fixAttempts ?? 1) >= maxPrFixAttempts();
       const data: Record<string, unknown> = capped
         ? {
             status: "PARKED",
@@ -4234,6 +4437,9 @@ export async function resolvePrFixFromAgentReport(
             ...freshAttemptGeneration(),
             fixAttempts: { increment: 1 },
             attemptHeadSha: fresh.headSha ?? fresh.attemptHeadSha ?? null,
+            // The fresh attempt's dispatched lane is stamped at its own
+            // hand-out (#1327); the consumed attempt's stamp must not leak.
+            attemptType: null,
             outcome: null,
             decisionDetail: null,
             postDispatchEvidenceKeys: [],
@@ -4269,7 +4475,9 @@ export async function resolvePrFixFromAgentReport(
             note: [
               input.summary ?? null,
               capped
-                ? `Agent reported failed; bounded at ${fresh.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}), parked instead of re-queuing (#1133).`
+                ? rebaseTerminal
+                  ? "Agent reported failed; the mechanical rebase lane gets one attempt per DIRTY episode (#1327) — parked instead of re-queuing."
+                  : `Agent reported failed; bounded at ${fresh.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}), parked instead of re-queuing (#1133).`
                 : `Agent reported failed; reopened as a fresh attempt so the consumed generation cannot strand the queue (#1133).`,
             ]
               .filter(Boolean)
@@ -4278,7 +4486,7 @@ export async function resolvePrFixFromAgentReport(
         });
         return freshRow;
       });
-      if (row) settled = { row, capped };
+      if (row) settled = { row, capped, rebaseTerminal };
     }
     if (!settled) {
       // The row is gone, its generation moved (the attempt was re-issued),
@@ -4310,7 +4518,9 @@ export async function resolvePrFixFromAgentReport(
       action: settled.capped ? "parked" : "requeued",
       itemId: existing.id ?? null,
       reason: settled.capped
-        ? "agent reported failed; past the fix-attempt cap, parked"
+        ? settled.rebaseTerminal
+          ? "agent reported failed; the rebase lane is one attempt per DIRTY episode, parked"
+          : "agent reported failed; past the fix-attempt cap, parked"
         : "agent reported failed; reopened as a fresh attempt at the next generation",
       attemptGeneration: attempt?.generation ?? null,
     };
