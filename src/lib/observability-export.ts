@@ -171,6 +171,7 @@ export function observabilityMetricFamilies(): string[] {
     "dispatch_queue_withheld",
     "dispatch_queue_withheld_oldest_seconds",
     "dispatch_repo_stale_sync_seconds",
+    "dispatch_repo_stale_sync_threshold_seconds",
     "dispatch_scheduler_healthy",
     "dispatch_scheduler_job_last_success_timestamp_seconds",
     "dispatch_scheduler_job_overdue",
@@ -322,6 +323,13 @@ export function exportObservabilityMetrics(snapshot: ObservabilitySnapshot): str
   families.push(scalar("dispatch_sync_running", "Issue sync runs currently in flight.", snapshot.pipeline.sync.running));
   families.push(windowedByDimension("dispatch_sync_failures_in_window", "Failed syncs per type and failure window (as-of-scrape gauge; evaluate directly).", snapshot.pipeline.sync.failedInWindowByType, "type"));
   families.push(scalar("dispatch_repo_stale_sync_seconds", "Oldest tracked-repo cache staleness (A13).", snapshot.pipeline.maxRepoStaleSyncSeconds));
+  families.push(
+    scalar(
+      "dispatch_repo_stale_sync_threshold_seconds",
+      "A13 repo-staleness threshold as configured: two sync intervals, or 3600 when the sync job is disabled (mirrors the evaluator default so packaged rules track DISPATCH_SYNC_INTERVAL_MS).",
+      defaultRepoStaleSyncThresholdSeconds(snapshot.config.syncIntervalMs),
+    ),
+  );
   families.push(windowedByDimension("dispatch_audit_failures_in_window", "Failed audit mutations per action and failure window (as-of-scrape gauge; evaluate directly, never via delta-style functions — §4.1).", snapshot.failures.auditFailuresInWindowByAction, "action"));
   families.push(scalar("dispatch_health_up", "1: this document exists, so the process and its database answered. A failed scrape is the down signal (A3).", 1));
 
@@ -354,6 +362,15 @@ function syncStaleFlag(snapshot: ObservabilitySnapshot): number | null {
   const age = snapshot.pipeline.sync.secondsSinceLastSuccess;
   if (age === null) return null;
   return age * 1000 > snapshot.config.syncIntervalMs * 2 ? 1 : 0;
+}
+
+/** A13 repo-staleness threshold as configured: two sync intervals, or the
+ *  3600 fallback when the sync job is disabled. Single source of truth shared
+ *  with the evaluator's default so the packaged A13 rule (which compares
+ *  `dispatch_repo_stale_sync_seconds` against this exported gauge) can never
+ *  drift from `DISPATCH_SYNC_INTERVAL_MS`. */
+export function defaultRepoStaleSyncThresholdSeconds(syncIntervalMs: number): number {
+  return syncIntervalMs > 0 ? (syncIntervalMs / 1000) * 2 : 3600;
 }
 
 /** Strict, fail-closed opt-in: the scrape endpoint exists only when the

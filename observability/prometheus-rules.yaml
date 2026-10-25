@@ -29,8 +29,11 @@
 #   turns that into a firing input.
 # - A healthy idle Dispatch is silent everywhere: empty queues, empty PR-fix,
 #   and quiet windows are all zero-valued gauges, never alerts.
-# - Thresholds 3600 (A8/A9/A13 stale-sync) are operator-tunable defaults;
-#   A13's 1800 assumes the default 15m sync interval (2× interval).
+# - Thresholds 3600 (A8/A9) are operator-tunable defaults. A13's stale-sync
+#   threshold is NOT hard-coded: it compares against the exported
+#   dispatch_repo_stale_sync_threshold_seconds (two sync intervals, or 3600
+#   when the sync job is disabled), so the rule tracks DISPATCH_SYNC_INTERVAL_MS
+#   exactly like the portable evaluator does.
 groups:
   - name: dispatch
     interval: 30s
@@ -165,11 +168,11 @@ groups:
           operator_action: "Inspect AuditLog.errorMessage for the action; do not label by error string."
 
       - alert: A13
-        expr: dispatch_repo_stale_sync_seconds > 1800 or dispatch_grooming_backoff > 0
+        expr: dispatch_repo_stale_sync_seconds > dispatch_repo_stale_sync_threshold_seconds or dispatch_grooming_backoff > 0
         for: 15m
         labels:
           severity: warning
         annotations:
           summary: "Upstream evidence unavailable"
-          description: "Repo cache staleness or grooming backoff past the threshold; admission/settlement decisions lack current forge evidence."
+          description: "Repo cache staleness past the configured threshold (two sync intervals; 3600 when the sync job is disabled) or grooming backoff; admission/settlement decisions lack current forge evidence."
           operator_action: "Check GitHub reachability/rate limits; treat unknown as unknown, never healthy."

@@ -23,6 +23,7 @@
  * - Healthy idle is never a page (§6 "Normal inactivity must NOT alert").
  */
 import type { ObservabilitySnapshot } from "@/lib/observability-signals";
+import { defaultRepoStaleSyncThresholdSeconds } from "@/lib/observability-export";
 
 // ─── Alert definitions (docs/observability.md §6) ───────────────────────────
 
@@ -287,8 +288,12 @@ function predicate(
       // Guards make the row not-evaluable rather than silently false:
       // an unarmed scheduler (or an unevaluable fresh-sync guard) means the
       // conjunction cannot be decided (mirrors signals.ts eligibleWorkNotHandedOut).
+      // A disabled sync job (interval 0) is an operator opt-out in either
+      // history shape: the fresh-sync prerequisite can never be established,
+      // so the row is unknown — never `ok` (which would assert healthy) — even
+      // when no sync has ever succeeded (mirrors A2's two guards).
       if (!snapshot.pipeline.scheduler.enabled) return { holds: false, evaluable: false };
-      if (syncIntervalSeconds === 0 && sync.everSucceeded) {
+      if (syncIntervalSeconds === 0) {
         return { holds: false, evaluable: false };
       }
       return {
@@ -376,8 +381,7 @@ export function evaluateObservabilityAlerts(
   const thresholds: ObservabilityAlertThresholds = {
     headOfLineWarningSeconds: 3600,
     humanDecisionWarningSeconds: 3600,
-    repoStaleSyncSeconds:
-      snapshot.config.syncIntervalMs > 0 ? (snapshot.config.syncIntervalMs / 1000) * 2 : 3600,
+    repoStaleSyncSeconds: defaultRepoStaleSyncThresholdSeconds(snapshot.config.syncIntervalMs),
     ...options.thresholds,
   };
   const healthUp = options.healthUp ?? true;

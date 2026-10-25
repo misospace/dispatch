@@ -425,6 +425,24 @@ describe("evaluator for/pending semantics", () => {
       sync: { lastSuccessAt: null, running: 0, failed: [] },
     };
     expect(byId(states(unarmed)).get("A2")?.state).toBe("not_evaluable");
+
+    // Sync job disabled while the scheduler runs: the opt-out is unknown for
+    // A4 in either history shape — never `ok`, which would assert that the
+    // fresh-sync prerequisite held. (AI-review follow-up: the interval-0 guard
+    // used to fire only with a sync history, so a never-synced opted-out
+    // pipeline classified A4 as healthy.)
+    const jobOffNoHistory = {
+      scheduler: { enabled: true, syncIntervalMs: 0, jobs: [] },
+      sync: { lastSuccessAt: null, running: 0, failed: [] },
+    };
+    expect(byId(states(jobOffNoHistory)).get("A4")?.state).toBe("not_evaluable");
+    expect(byId(states(jobOffNoHistory)).get("A2")?.state).toBe("not_evaluable");
+
+    const jobOffWithHistory = {
+      scheduler: { enabled: true, syncIntervalMs: 0, jobs: [] },
+      sync: { lastSuccessAt: ago(120), running: 0, failed: [] },
+    };
+    expect(byId(states(jobOffWithHistory)).get("A4")?.state).toBe("not_evaluable");
   });
 
   it("A8/A9 use the configured thresholds and null ages never hold", () => {

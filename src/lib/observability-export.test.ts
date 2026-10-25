@@ -218,6 +218,22 @@ describe("exportObservabilityMetrics", () => {
     expect(armed).toEqual(["dispatch_sync_job_armed 1"]);
   });
 
+  it("exports the A13 repo-staleness threshold as configured (rules track DISPATCH_SYNC_INTERVAL_MS)", () => {
+    // The packaged A13 rule compares dispatch_repo_stale_sync_seconds
+    // against this gauge instead of a hard-coded 1800.
+    expect(sampleLines(metrics(), "dispatch_repo_stale_sync_threshold_seconds")).toEqual([
+      "dispatch_repo_stale_sync_threshold_seconds 1800",
+    ]);
+    const custom = metrics({ scheduler: { enabled: true, syncIntervalMs: 300_000, jobs: [] } });
+    expect(sampleLines(custom, "dispatch_repo_stale_sync_threshold_seconds")).toEqual([
+      "dispatch_repo_stale_sync_threshold_seconds 600",
+    ]);
+    const disabled = metrics({ scheduler: { enabled: true, syncIntervalMs: 0, jobs: [] } });
+    expect(sampleLines(disabled, "dispatch_repo_stale_sync_threshold_seconds")).toEqual([
+      "dispatch_repo_stale_sync_threshold_seconds 3600",
+    ]);
+  });
+
   it("an unarmed scheduler with a defaulted interval is unknown too: no stale flag", () => {
     // Default deployment: DISPATCH_SCHEDULER_ENABLED off while the sync
     // interval stays at its default. Mirrors the evaluator's A2/A4 opt-out

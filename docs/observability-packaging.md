@@ -29,8 +29,14 @@ DISPATCH_METRICS_ENABLED=true
 ```
 
 Parsing is strict (`=== "true"`, mirroring `DISPATCH_SCHEDULER_ENABLED`) and
-fail-closed: the endpoint answers 404 while disabled, before any auth check,
-so the surface does not exist unless the operator asks for it.
+fail-closed: the route answers 404 while disabled, before any auth check of
+its own, so the surface does not exist unless the operator asks for it. One
+ordering caveat: in `DISPATCH_AUTH_MODE=basic` the edge middleware
+(`src/middleware.ts`) rejects *unauthenticated* requests with 401 before the
+route runs — the same uniform 401 every other API path returns there, so the
+metrics surface is no more discoverable than the rest of the API; the route's
+404-before-auth contract applies to requests that reach it (Bearer, OIDC,
+legacy, and auth-disabled deployments).
 
 Authentication is the same maintainer tier as `GET /api/observability`
 (bearer `DISPATCH_AGENT_TOKEN`, Basic, or OIDC — `src/lib/auth.ts`); worker

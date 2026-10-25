@@ -113,7 +113,11 @@ describe("optional assets match the shipped contracts (#1255)", () => {
       A10: ['dispatch_queue_withheld{reason=~"grooming_unknown|grooming_stale"}'],
       A11: ["dispatch_grooming_backoff"],
       A12: ['sum(dispatch_audit_failures_in_window{window="900"})'],
-      A13: ["dispatch_repo_stale_sync_seconds", "dispatch_grooming_backoff"],
+      A13: [
+        "dispatch_repo_stale_sync_seconds",
+        "dispatch_repo_stale_sync_threshold_seconds",
+        "dispatch_grooming_backoff",
+      ],
     };
     const blocks = alertBlocks(rules);
     const problems: string[] = [];
