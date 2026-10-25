@@ -111,6 +111,7 @@ function baseInputs(
       ],
     },
     admissionMode: "off",
+    syncPipeline: "auto",
     admissionRuns: new Map(),
     thresholds: {
       strandedAssignmentMs: 1_800_000,
@@ -584,6 +585,47 @@ describe("observability signal derivation", () => {
       expect(s.grooming.freshness).toEqual({ fresh: 2, stale: 1, unknown: 1 });
       expect(s.grooming.backoff).toBe(1);
       expect(s.grooming.staleReasons).toEqual({ issue_changed: 1, unknown: 1 });
+    });
+  });
+
+  describe("sync pipeline arm state", () => {
+    it("armed with the in-process scheduler ticking, unknown without it", () => {
+      expect(snapshot().pipeline.syncPipelineState).toBe("armed");
+
+      // The DEFAULT deployment: in-process scheduler off, `auto`. Sync
+      // history is NOT evidence of a pipeline — one manual sync must not arm
+      // anything, so the state stays unknown and A4 stays silent.
+      const unarmed = snapshot({
+        scheduler: { enabled: false, syncIntervalMs: 900_000, jobs: [] },
+        sync: { lastSuccessAt: ago(120), running: 0, failed: [] },
+      });
+      expect(unarmed.pipeline.syncPipelineState).toBe("unknown");
+      expect(unarmed.observations.eligibleWorkNotHandedOut).toBeNull();
+    });
+
+    it("an operator opt-out is off, and stays off despite sync history", () => {
+      const optedOut = snapshot({ syncPipeline: "off" });
+      expect(optedOut.pipeline.syncPipelineState).toBe("off");
+      expect(optedOut.observations.eligibleWorkNotHandedOut).toBeNull();
+    });
+
+    it("a declared external driver is armed even with an unarmed in-process scheduler", () => {
+      const external = snapshot({
+        syncPipeline: "external",
+        scheduler: { enabled: false, syncIntervalMs: 900_000, jobs: [] },
+        issues: [makeIssue({ id: "i1" })],
+      });
+      expect(external.pipeline.syncPipelineState).toBe("armed");
+      expect(external.observations.eligibleWorkNotHandedOut).toBe(true);
+    });
+
+    it("a disabled sync job leaves the freshness window unknown", () => {
+      const disabled = snapshot({
+        scheduler: { enabled: true, syncIntervalMs: 0, jobs: [] },
+        issues: [makeIssue({ id: "i1" })],
+      });
+      expect(disabled.pipeline.syncPipelineState).toBe("off");
+      expect(disabled.observations.eligibleWorkNotHandedOut).toBeNull();
     });
   });
 

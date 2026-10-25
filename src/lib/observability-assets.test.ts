@@ -5,7 +5,7 @@ import {
   evaluateObservabilityAlerts,
   OBSERVABILITY_ALERTS_BY_ID,
 } from "@/lib/observability-alerts";
-import { observabilityMetricFamilies } from "@/lib/observability-export";
+import { exportObservabilityMetrics, observabilityMetricFamilies } from "@/lib/observability-export";
 import type { ObservabilitySnapshot } from "@/lib/observability-signals";
 
 // The optional deploy assets under observability/ are renderings of the
@@ -90,9 +90,8 @@ describe("optional assets match the shipped contracts (#1255)", () => {
     const REQUIRED_LEGS: Record<string, string[]> = {
       A1: ["dispatch_scheduler_job_overdue"],
       A2: [
-        "dispatch_scheduler_up",
+        "dispatch_sync_pipeline_state",
         "absent(",
-        "dispatch_sync_job_armed",
         "dispatch_sync_stale",
         'up{job="dispatch"}',
       ],
@@ -102,9 +101,9 @@ describe("optional assets match the shipped contracts (#1255)", () => {
         "dispatch_execution_active",
         'dispatch_work_pickups_in_window{window="1800"}',
         'dispatch_agent_runs_reported_in_window{window="1800"}',
-        "dispatch_scheduler_healthy",
+        "dispatch_sync_pipeline_state",
         "dispatch_sync_stale",
-        "dispatch_sync_job_armed",
+        "dispatch_scheduler_healthy",
       ],
       A5: ["dispatch_leases_expired", 'dispatch_agent_work{state="STALE"}'],
       A7: ["dispatch_pr_fix_overdue_unacked"],
@@ -148,6 +147,51 @@ describe("optional assets match the shipped contracts (#1255)", () => {
       }
     }
     expect(problems, problems.join("\n")).toEqual([]);
+  });
+
+  it("gates the sync-freshness alerts on the sync-pipeline arm state, not the in-process scheduler", () => {
+    // The in-process scheduler is OFF by default while external cron/CronJob
+    // drivers are a supported topology: gating A2/A4 on it silenced every
+    // sync-freshness alert in exactly the deployments where the pipeline
+    // genuinely runs. The arm state (dispatch_sync_pipeline_state) is the
+    // declared+derived fact that replaces that inference.
+    const blocks = alertBlocks(rules);
+    const problems: string[] = [];
+
+    const a2 = blocks.get("A2") ?? "";
+    if (!a2.includes('dispatch_sync_pipeline_state{state="armed"}')) {
+      problems.push("A2: does not gate on the sync-pipeline arm state");
+    }
+    if (a2.includes("dispatch_scheduler_up == 1")) {
+      problems.push("A2: still gates the pipeline arm on the in-process scheduler");
+    }
+
+    const a4 = blocks.get("A4") ?? "";
+    if (!a4.includes('dispatch_sync_pipeline_state{state="armed"}')) {
+      problems.push("A4: does not gate on the sync-pipeline arm state");
+    }
+    // The scheduler leg may survive inside the guard's `or` (an external
+    // driver has no in-process job to be overdue), but never as a bare
+    // `and on()` conjunct that would gate the arm state on it.
+    if (/and on\(\)\s*dispatch_scheduler_healthy\s*==\s*1/.test(a4)) {
+      problems.push("A4: still gates the pipeline arm on dispatch_scheduler_healthy");
+    }
+
+    expect(problems, problems.join("\n")).toEqual([]);
+  });
+
+  it("renders exactly one active sync-pipeline arm state", () => {
+    const snapshot = emptySnapshot();
+    const body = exportObservabilityMetrics({
+      ...snapshot,
+      pipeline: { ...snapshot.pipeline, syncPipelineState: "off" },
+    });
+    const samples = body
+      .split("\n")
+      .filter((line) => line.startsWith("dispatch_sync_pipeline_state"));
+    expect(samples).toContain('dispatch_sync_pipeline_state{state="armed"} 0');
+    expect(samples).toContain('dispatch_sync_pipeline_state{state="off"} 1');
+    expect(samples).toContain('dispatch_sync_pipeline_state{state="unknown"} 0');
   });
 
   it("arms exactly the enabled catalogue rows, with the catalogue severities and for-windows", () => {
@@ -196,6 +240,7 @@ function emptySnapshot(): ObservabilitySnapshot {
       syncIntervalMs: 900_000,
       prFixHandoutTimeoutMs: 1_800_000,
       strandedAssignmentThresholdMs: 1_800_000,
+      syncPipeline: "auto",
     },
     workSupply: {
       openIssues: 0,
@@ -250,6 +295,7 @@ function emptySnapshot(): ObservabilitySnapshot {
     admission: { mode: "off", notAdmitted: null },
     grooming: { freshness: { fresh: 0, stale: 0, unknown: 0 }, backoff: 0, staleReasons: {}, runsInWindowByStatus: { 900: {}, 3600: {} } },
     pipeline: {
+      syncPipelineState: "armed",
       scheduler: {
         enabled: true,
         overdueJobs: 0,

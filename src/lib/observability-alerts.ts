@@ -250,8 +250,15 @@ function predicate(
   const sync = snapshot.pipeline.sync;
   const syncIntervalSeconds = snapshot.config.syncIntervalMs / 1000;
   const freshSyncWindowSeconds = syncIntervalSeconds * 2;
-  const schedulerHealthy =
-    snapshot.pipeline.scheduler.enabled && snapshot.pipeline.scheduler.overdueJobs === 0;
+  // The arm state answers "should the sync pipeline run?" — the in-process
+  // scheduler alone cannot, because an external cron/CronJob driver is a
+  // supported topology.
+  const pipelineState = snapshot.pipeline.syncPipelineState;
+  // Only the in-process scheduler has jobs that can be overdue; an external
+  // driver has none, so its absence must not block A4.
+  const pipelineJobsTicking = snapshot.pipeline.scheduler.enabled
+    ? snapshot.pipeline.scheduler.overdueJobs === 0
+    : true;
   const syncFresh =
     sync.everSucceeded &&
     sync.secondsSinceLastSuccess !== null &&
@@ -264,15 +271,15 @@ function predicate(
       return { holds: snapshot.pipeline.scheduler.jobs.some((j) => j.overdue === 1), evaluable: true };
     case "A2": {
       // Absent series (never a completed sync) IS the firing case — never
-      // coerced to "ok" (§6 A2). Both guards are operator opt-outs, not
-      // faults: an unarmed scheduler, or a disabled sync job, means the
-      // pipeline should not have run and the row is not evaluable (a default
-      // deployment has the scheduler off while the sync interval stays at its
-      // default, so `syncIntervalMs` alone is the wrong guard).
-      if (!snapshot.pipeline.scheduler.enabled) {
+      // coerced to "ok" (§6 A2). The guards are operator opt-outs and
+      // unknown states, not faults: an opted-out or indeterminate pipeline
+      // means the row is not evaluable (an external-driver deployment has an
+      // unarmed in-process scheduler while the pipeline genuinely runs, so
+      // the scheduler must not be the guard).
+      if (pipelineState === "off") {
         return { holds: false, evaluable: false };
       }
-      if (snapshot.config.syncIntervalMs === 0 && !sync.everSucceeded) {
+      if (pipelineState === "unknown") {
         return { holds: false, evaluable: false };
       }
       if (!sync.everSucceeded) return { holds: true, evaluable: true };
@@ -285,24 +292,27 @@ function predicate(
     case "A3":
       return { holds: !healthUp, evaluable: true };
     case "A4": {
-      // Guards make the row not-evaluable rather than silently false:
-      // an unarmed scheduler (or an unevaluable fresh-sync guard) means the
-      // conjunction cannot be decided (mirrors signals.ts eligibleWorkNotHandedOut).
-      // A disabled sync job (interval 0) is an operator opt-out in either
-      // history shape: the fresh-sync prerequisite can never be established,
-      // so the row is unknown — never `ok` (which would assert healthy) — even
-      // when no sync has ever succeeded (mirrors A2's two guards).
-      if (!snapshot.pipeline.scheduler.enabled) return { holds: false, evaluable: false };
+      // Guards make the row not-evaluable rather than silently false: a
+      // pipeline that is opted out or indeterminate cannot be judged, and a
+      // disabled sync job (interval 0) leaves the fresh-sync prerequisite
+      // unknowable — so the row is unknown, never `ok` (which would assert
+      // healthy). The in-process scheduler's health is NOT a leg here: an
+      // external-driver deployment has no in-process job to be overdue.
+      if (pipelineState !== "armed") return { holds: false, evaluable: false };
       if (syncIntervalSeconds === 0) {
         return { holds: false, evaluable: false };
       }
+      // `pipelineJobsTicking` mirrors the packaged rule's scheduler leg: when
+      // the in-process scheduler runs but a job is overdue, the evaluator
+      // reports `ok` and the packaged rule stays silent — the same case A1
+      // owns — so both agree on not firing.
       return {
         holds:
           snapshot.workSupply.openClaimable > 0 &&
           snapshot.execution.executionActive === 0 &&
           (snapshot.execution.pickupsInWindow["1800"] ?? 0) === 0 &&
           (snapshot.execution.reportedInWindow["1800"] ?? 0) === 0 &&
-          schedulerHealthy &&
+          pipelineJobsTicking &&
           syncFresh,
         evaluable: true,
       };

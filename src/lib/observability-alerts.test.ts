@@ -111,6 +111,7 @@ function baseInputs(
       ],
     },
     admissionMode: "off",
+    syncPipeline: "auto",
     admissionRuns: new Map(),
     thresholds: {
       strandedAssignmentMs: 1_800_000,
@@ -348,6 +349,122 @@ describe("acceptance fixtures (#1255)", () => {
     const result = byId(states(inputs, { prior: { A1: ago(11 * 60).toISOString() } }));
     expect(result.get("A1")?.state).toBe("firing");
     expect(result.get("A4")?.predicateHolds).toBe(false);
+  });
+});
+
+describe("sync pipeline arm state gates A2/A4", () => {
+  const externalScheduler = {
+    enabled: false,
+    syncIntervalMs: 900_000,
+    jobs: [],
+  };
+
+  it("armed and never synced: A2 fires from the absent series", () => {
+    const inputs = {
+      issues: [makeIssue({ id: "i1" })],
+      sync: { lastSuccessAt: null, running: 0, failed: [] },
+    };
+    const s = snapshot(inputs);
+    expect(s.pipeline.syncPipelineState).toBe("armed");
+    const result = byId(states(inputs));
+    expect(result.get("A2")?.predicateHolds).toBe(true);
+    expect(byId(states(inputs, { prior: { A2: ago(6 * 60).toISOString() } })).get("A2")?.state).toBe(
+      "firing",
+    );
+  });
+
+  it("armed with sync history: A2 holds on a stale success and not on a fresh one", () => {
+    const stale = {
+      issues: [makeIssue({ id: "i1" })],
+      sync: { lastSuccessAt: ago(45 * 60), running: 0, failed: [] },
+    };
+    expect(byId(states(stale)).get("A2")?.predicateHolds).toBe(true);
+
+    const fresh = {
+      issues: [makeIssue({ id: "i1" })],
+      sync: { lastSuccessAt: ago(120), running: 0, failed: [] },
+    };
+    const result = byId(states(fresh)).get("A2");
+    expect(result?.predicateHolds).toBe(false);
+    expect(result?.state).toBe("ok");
+  });
+
+  it("an operator opt-out is not_evaluable for A2 and A4 even with sync history", () => {
+    const optedOut = {
+      syncPipeline: "off" as const,
+      issues: [makeIssue({ id: "i1" })],
+      sync: { lastSuccessAt: ago(120), running: 0, failed: [] },
+    };
+    const result = byId(states(optedOut));
+    expect(result.get("A2")?.state).toBe("not_evaluable");
+    expect(result.get("A4")?.state).toBe("not_evaluable");
+  });
+
+  it("an undeterminable pipeline is not_evaluable for A2 and A4", () => {
+    const unknown = {
+      scheduler: externalScheduler,
+      sync: { lastSuccessAt: null, running: 0, failed: [] },
+    };
+    const s = snapshot(unknown);
+    expect(s.pipeline.syncPipelineState).toBe("unknown");
+    const result = byId(states(unknown));
+    expect(result.get("A2")?.state).toBe("not_evaluable");
+    expect(result.get("A4")?.state).toBe("not_evaluable");
+  });
+
+  it("the default deployment never pages on a one-off manual sync", () => {
+    // `auto` + unarmed in-process scheduler + a completed sync in history:
+    // sync history is not evidence of a pipeline, so the arm state stays
+    // unknown and A2/A4 stay silent (not_evaluable) — never a false CRITICAL
+    // page from a single manual `POST /api/sync`.
+    const oneOffSync = {
+      scheduler: externalScheduler,
+      sync: { lastSuccessAt: ago(120), running: 0, failed: [] },
+    };
+    expect(snapshot(oneOffSync).pipeline.syncPipelineState).toBe("unknown");
+    const fresh = byId(states(oneOffSync));
+    expect(fresh.get("A2")?.state).toBe("not_evaluable");
+    expect(fresh.get("A4")?.state).toBe("not_evaluable");
+
+    // Same default deployment, but the one-off sync aged out of the
+    // freshness window: still unknown, still silent.
+    const agedOneOffSync = {
+      scheduler: externalScheduler,
+      sync: { lastSuccessAt: ago(45 * 60), running: 0, failed: [] },
+    };
+    const stale = byId(states(agedOneOffSync));
+    expect(stale.get("A2")?.state).toBe("not_evaluable");
+    expect(stale.get("A4")?.state).toBe("not_evaluable");
+  });
+
+  it("an armed external deployment is evaluable for A2 (never suppressed by an unarmed scheduler)", () => {
+    const external = {
+      syncPipeline: "external" as const,
+      scheduler: externalScheduler,
+      issues: [makeIssue({ id: "i1" })],
+      sync: { lastSuccessAt: ago(120), running: 0, failed: [] },
+    };
+    const s = snapshot(external);
+    expect(s.pipeline.syncPipelineState).toBe("armed");
+    const a2 = byId(states(external)).get("A2");
+    expect(a2?.state).not.toBe("not_evaluable");
+    expect(a2?.state).toBe("ok");
+  });
+
+  it("an armed external deployment with eligible work fires A4", () => {
+    const external = {
+      syncPipeline: "external" as const,
+      scheduler: externalScheduler,
+      issues: [makeIssue({ id: "i1" }), makeIssue({ id: "i2" })],
+      sync: { lastSuccessAt: ago(120), running: 0, failed: [] },
+    };
+    const s = snapshot(external);
+    expect(s.observations.eligibleWorkNotHandedOut).toBe(true);
+    const a4 = byId(states(external)).get("A4");
+    expect(a4?.predicateHolds).toBe(true);
+    expect(
+      byId(states(external, { prior: { A4: ago(31 * 60).toISOString() } })).get("A4")?.state,
+    ).toBe("firing");
   });
 });
 

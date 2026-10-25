@@ -328,11 +328,53 @@ must be allowlisted with an `unknown` bucket.
 | `dispatch_repo_stale_sync_threshold_seconds` | gauge | seconds | derived config: 2× `DISPATCH_SYNC_INTERVAL_MS`, 3600 fallback when the sync job is disabled | — | A13 threshold as a scrapeable series, so packaged rules track the configured interval instead of hard-coding it (same helper as the evaluator default) |
 | `dispatch_health_up` | gauge | 0/1 | `GET /api/health` ok | — | Process + DB liveness. The #1255 exporter renders it as `1` whenever the exposition itself is served (the collector needs the database to answer); the down case is observed as a **failed scrape** (`up == 0`), which is how A3 is wired in the packaged rules — a missing series is never coerced to healthy |
 | `dispatch_scheduler_healthy` | gauge | 0/1 | derived: `dispatch_scheduler_up == 1` **and** no `dispatch_scheduler_job_overdue == 1` | — | Scheduler armed and every job ticking on time |
+| `dispatch_sync_pipeline_state` | gauge | 0/1 per state | operator declaration `DISPATCH_SYNC_PIPELINE` (`auto`/`external`/`off`) + in-process facts (scheduler enabled, sync interval) — **never** sync history | `state` (`armed`,`off`,`unknown`) | Arm state of the issue-sync pipeline under the **declared-topology** model: `armed` = the pipeline is expected to run (freshness IS evaluable; `external` declared, or `auto` with the in-process scheduler ticking), `off` = the operator opted out (`off` declared, or `auto` with the sync interval at `0` — never a fault), `unknown` = it cannot be told (`auto` with no in-process scheduler — never healthy, never stale). Sync history is never evidence: one manual sync is not a pipeline. Exactly one state is 1; the other two are 0 |
 
 Job names (`src/lib/scheduler.ts:88-140`): `sync, groomer, pr-followup,
 ci-failures, prune-closed, reconcile, stale-work, pr-fix-sweep`. `overdue`
 means no run in more than two intervals; `lastRunAt` is in-process and resets on
 restart, so a freshly started process reports `null` until the first tick.
+
+**Sync-pipeline arm state.** `dispatch_sync_pipeline_state` is a *declared +
+derived* fact, not a scheduler inference. The in-process scheduler is **off by
+default** while external cron/CronJob drivers are a supported topology, so
+"is the scheduler armed?" is not the same question as "should the sync
+pipeline run?" — inferring the latter from the former suppressed every
+sync-freshness alert in exactly the deployments where the pipeline genuinely
+runs. The arm state is therefore the operator's **declared topology**
+(`DISPATCH_SYNC_PIPELINE`) plus **in-process facts** (is the in-process
+scheduler ticking? is a sync interval configured?), and it resolves to one of
+three values (`src/lib/sync-pipeline.ts:99`):
+
+- `armed` — the pipeline is expected to run: the operator declared
+  `external`, or `auto` with the in-process scheduler ticking. Freshness IS
+  evaluable; A2/A4 are armed.
+- `off` — the operator opted out (`DISPATCH_SYNC_PIPELINE=off`, or `auto`
+  with the sync job disabled, i.e. the interval at `0`). An opt-out is never a
+  fault.
+- `unknown` — it cannot be told: `auto` with no in-process scheduler running.
+  Never healthy and never stale — the freshness judgement is simply
+  unavailable.
+
+`auto` (the default) means **"the in-process scheduler decides"**: Dispatch
+answers for the topology it can observe. It does **not** mean "guess from what
+happened" — sync history is deliberately **not** part of the arm state. A
+single one-off manual sync is not a pipeline, and history cannot tell a broken
+external driver from a deployment that syncs rarely by design: inferring
+"armed" from history turned the default deployment (in-process scheduler off,
+`auto`, default 15m interval) into a false CRITICAL A2 thirty minutes after
+any manual `POST /api/sync`. The trade-off is explicit — an external driver
+that is not declared `external` is reported as `unknown` (never healthy, never
+stale) and therefore never pages. An operator running an external driver MUST
+declare `external`, and MUST set `DISPATCH_SYNC_INTERVAL_MS` to their own
+cadence: the interval defines the freshness window A2/A4 judge (and the A13
+threshold), so a driver slower than the interval pages falsely.
+
+The sync-staleness gauge is emitted **only** for an armed pipeline that has
+completed at least one sync and has a configured interval — it reads `0` while
+the last sync is fresh and `1` once it is older than two intervals. In every
+other case (not armed, never synced, no configured interval) the series is
+**absent**: no judgement at all, never a coerced `0`.
 
 `IssueSyncRun.status` is a free string whose only persisted values are
 `running` (created at lock acquisition, `src/lib/sync-lock.ts:160`),
@@ -418,9 +460,9 @@ recommendation; the consumer maps it.
 | # | Alert | Condition (predicate) | Enabled | Severity | `for` | Why actionable | Recovery / operator action |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | A1 | Scheduler job overdue | `dispatch_scheduler_job_overdue{job=...} == 1` | yes | critical | 10m | Every queue is fed by these jobs; a stopped timer starves the loop silently | Inspect logs; restart/verify `DISPATCH_SCHEDULER_ENABLED`; supervisor re-arms, but a persistent stop is a real fault |
-| A2 | No successful sync | `dispatch_sync_last_success_timestamp_seconds` series **absent** (no `IssueSyncRun` has ever completed — the never-successful first sync must not be silent) **or** `time() - dispatch_sync_last_success_timestamp_seconds > 2× sync interval` — **and** the sync pipeline is armed (`dispatch_scheduler_up == 1` and the sync job has a configured interval; a disabled pipeline is an operator opt-out, not a fault) **and** the observation is live (the scrape is succeeding, so a dead instance routes to A3 instead) | yes | critical | 5m | Supply is stale, or has never flowed; issues will not enter the queue. Consumers must evaluate the absent-series case as firing (e.g. `absent(...) == 1` in Prometheus), because `time() - <no data> > x` yields no data, not true | Check `IssueSyncRun` errors and GitHub reachability |
+| A2 | No successful sync | `dispatch_sync_last_success_timestamp_seconds` series **absent** (no `IssueSyncRun` has ever completed — the never-successful first sync must not be silent) **or** `time() - dispatch_sync_last_success_timestamp_seconds > 2× sync interval` — **and** the sync pipeline is armed (`dispatch_sync_pipeline_state{state="armed"} == 1`: the pipeline is expected to run — declared via `DISPATCH_SYNC_PIPELINE` (`external`), or `auto` with the in-process scheduler ticking; an opted-out (`off`) or indeterminate (`unknown`) pipeline is not a fault and is not evaluable) **and** the observation is live (the scrape is succeeding, so a dead instance routes to A3 instead) | yes | critical | 5m | Supply is stale, or has never flowed; issues will not enter the queue. Consumers must evaluate the absent-series case as firing (e.g. `absent(...) == 1` in Prometheus), because `time() - <no data> > x` yields no data, not true | Check `IssueSyncRun` errors and GitHub reachability |
 | A3 | Health/DB down | the Dispatch scrape is failing (`up{job="dispatch"} == 0` in the packaged rules; `dispatch_health_up` is rendered by the #1255 exporter as 1-when-served — see §4.9 — so a missing series is the down signal, never an exported 0) | yes | critical | 2m | The service cannot serve work | Check DB connectivity; `/api/health` returns 503 |
-| A4 | Eligible work not handed out | `dispatch_issues_open_claimable > 0` **and** `dispatch_execution_active == 0` **and** `dispatch_work_pickups_in_window{window="1800"} == 0` **and** `dispatch_agent_runs_reported_in_window{window="1800"} == 0` **and** `dispatch_scheduler_healthy == 1` **and** `(time() - dispatch_sync_last_success_timestamp_seconds) <= 2 × sync interval` | yes | warning | 30m | Work exists **and** nothing is executing **and** nothing has been picked up or reported in 30 minutes **and** every scheduled job is ticking **and** the last sync is fresh enough that A2 would be silent — an idle fleet while work waits, i.e. supply is not reaching workers. Three suppressors cover both delivery modes: a task in flight keeps `dispatch_execution_active` at 1 for its full duration (claim/agent-work workers — see §8.6); a fresh claim/start raises the pickup gauge; and any finished task's report lands in the reported gauge even for the canonical loop (next-task → execute → report), which writes no pickup row. Both gauges exclude the non-task system rows (groomer, heartbeat, legacy ingestion) per the §4.3 filter, so a busy groomer or a merely polling fleet cannot mask an idle fleet — nor disarm A4 the other way. Residual blind spot (documented, not solvable from the DB): a worker that materializes no claim/agent-work and runs a *single* task longer than the window without reporting is invisible while mid-task, and A4 fires; that firing is a truthful "Dispatch cannot observe this fleet" warning, and materializing a claim or agent-work start removes the ambiguity. A *hung* claimed task is caught by A5 and the AgentWork heartbeat-age signal instead. The fresh-sync guard is the explicit spelling of A2-suppresses-A4: a scheduler that ticks on time while sync is failing (or has never completed, so the sync series is absent and the guard cannot pass) no longer satisfies A4, and is routed to A2/A13 instead | Check worker availability/credentials; confirm `next-task` returns `implement`; confirm workers materialize a claim or agent-work start |
+| A4 | Eligible work not handed out | `dispatch_issues_open_claimable > 0` **and** `dispatch_execution_active == 0` **and** `dispatch_work_pickups_in_window{window="1800"} == 0` **and** `dispatch_agent_runs_reported_in_window{window="1800"} == 0` **and** `dispatch_sync_pipeline_state{state="armed"} == 1` **and** `(time() - dispatch_sync_last_success_timestamp_seconds) <= 2 × sync interval` **and** the in-process scheduler is either not running (`dispatch_scheduler_up == 0` — an external driver owns the pipeline and has no in-process job that can be overdue) or every scheduled job is ticking (`dispatch_scheduler_healthy == 1`) | yes | warning | 30m | Work exists **and** nothing is executing **and** nothing has been picked up or reported in 30 minutes **and** the in-process scheduler is either not running or every scheduled job is ticking **and** the last sync is fresh enough that A2 would be silent — an idle fleet while work waits, i.e. supply is not reaching workers. Three suppressors cover both delivery modes: a task in flight keeps `dispatch_execution_active` at 1 for its full duration (claim/agent-work workers — see §8.6); a fresh claim/start raises the pickup gauge; and any finished task's report lands in the reported gauge even for the canonical loop (next-task → execute → report), which writes no pickup row. Both gauges exclude the non-task system rows (groomer, heartbeat, legacy ingestion) per the §4.3 filter, so a busy groomer or a merely polling fleet cannot mask an idle fleet — nor disarm A4 the other way. Residual blind spot (documented, not solvable from the DB): a worker that materializes no claim/agent-work and runs a *single* task longer than the window without reporting is invisible while mid-task, and A4 fires; that firing is a truthful "Dispatch cannot observe this fleet" warning, and materializing a claim or agent-work start removes the ambiguity. A *hung* claimed task is caught by A5 and the AgentWork heartbeat-age signal instead. The fresh-sync guard is the explicit spelling of A2-suppresses-A4: a pipeline that ticks on time while sync is failing (or has never completed, so the sync series is absent and the guard cannot pass) no longer satisfies A4, and is routed to A2/A13 instead | Check worker availability/credentials; confirm `next-task` returns `implement`; confirm workers materialize a claim or agent-work start |
 | A5 | Stale ownership | `dispatch_leases_expired > 0` or `dispatch_agent_work{state="STALE"} > 0` | yes | warning | 15m | Ownership is lost; the issue may be stuck in-progress | Stale sweep releases it; if it persists, inspect the sweep job (A1) |
 | A6 | Assigned without execution | **Future gap — must NOT fire on the aggregate.** Intended predicate: an individual **open, eligible** issue (not `done`/`blocked`) has carried `agent/*` with no active lease/`AgentWork` for longer than a threshold T. Per-item waiting age is not derivable from persisted columns today — label assignment carries no timestamp (`Issue` has no `assignedAt`; `updatedAt`/`lastSyncedAt` refresh on unrelated changes), and only actions-route assignments produce `assign_agent` audit rows (`src/app/api/issues/actions/route.ts:14`; claims audit as `claim_issue` but materialize a lease, so they fall outside this predicate), so a GitHub-side assignment has no age source at all. Firing `dispatch_assigned_without_execution > 0` sustained would misreport healthy churn as failure (§8.7), so this row stays pinned — an exporter that ships an age source promotes it to a real alert (§10) | no — pinned future gap | info (pinned; not firing) | — (T applies only when promoted) | Assigned but never picked up; invisible in a queue-depth-only view. Until the age gap closes, execution-loss detection is owned by A5 (expired leases / STALE work) and pickup starvation by A4/A10 | Verify the worker polls its lane; check admission withholding |
 | A7 | Unacknowledged hand-outs (overdue) | `dispatch_pr_fix_overdue_unacked > 0` sustained | yes | warning | 35m | A worker may have died before materializing its run; item is stranded past the configured hand-out timeout. The predicate is age-tied to `dispatchedAt` (per-row `now − dispatchedAt > PR_FIX_HANDOUT_TIMEOUT_MS`), not the aggregate unacked count, so steady churn does not fire | Reclaim sweep (`pr-fix-sweep`, default-disabled) or operator requeue |
@@ -458,11 +500,16 @@ exists.
   `grooming_unknown`): **no alert**. Never-groomed backlog is not a fault.
 - `lastRunAt == null` immediately after process start: **no alert** until at
   least one interval has elapsed.
-- A sync pipeline disabled by configuration (`DISPATCH_SCHEDULER_ENABLED` off,
-  or the sync job's interval set to `0`): **no alert** — an operator opt-out
-  is not a fault. A1/A2 (and A4's fresh-sync guard) are not evaluable while
-  the pipeline is unarmed; the packaged rules gate on the armed state for the
-  same reason.
+- A sync pipeline that is opted out or indeterminate (arm state `off` or
+  `unknown`): **no alert** — an operator opt-out is not a fault, and "cannot be
+  told" is never healthy. `off` is an explicit `DISPATCH_SYNC_PIPELINE=off`,
+  or `auto` with the sync job disabled (the interval at `0`); `unknown` is
+  `auto` with no in-process scheduler running. A1/A2 (and A4's fresh-sync
+  guard) are not evaluable while the pipeline is not armed; the packaged rules
+  gate on `dispatch_sync_pipeline_state{state="armed"}` for the same reason.
+  A **disabled in-process scheduler alone is not an opt-out**: external
+  cron/CronJob drivers are a supported topology, so such a deployment declares
+  `DISPATCH_SYNC_PIPELINE=external`.
 - Workers mid-task **with the work materialized** (live lease or active
   `AgentWork` row): **no alert** for A4 — in-flight work keeps
   `dispatch_execution_active == 1` for the whole task, independent of when — or
@@ -511,6 +558,7 @@ Values are illustrative.
 ```
 dispatch_health_up                                  1
 dispatch_scheduler_up                               1
+dispatch_sync_pipeline_state{state="armed"}        1
 dispatch_scheduler_job_overdue{job="sync"}          0
 dispatch_sync_last_success_timestamp_seconds        (2m ago)
 dispatch_issues{status="ready",state="open"}        12
@@ -531,6 +579,7 @@ decision has aged past the threshold. This is the expected steady state.
 ```
 dispatch_health_up                                  1
 dispatch_scheduler_up                               1
+dispatch_sync_pipeline_state{state="armed"}        1
 dispatch_scheduler_job_overdue{job="sync"}          0
 dispatch_issues_open_claimable                      0
 dispatch_agent_work{state="IN_PROGRESS"}            0
@@ -546,6 +595,7 @@ that most often produces false alarms if inactivity is treated as failure.
 ```
 dispatch_health_up                                  1
 dispatch_scheduler_up                               1
+dispatch_sync_pipeline_state{state="armed"}        1
 dispatch_scheduler_job_overdue{job="sync"}          1     # last tick 45m ago, interval 15m
 dispatch_sync_last_success_timestamp_seconds        (45m ago)
 dispatch_issues_open_claimable                      20
@@ -602,6 +652,7 @@ unacked aggregate is correctly surfaced on the dashboard only.
 ```
 dispatch_health_up                                  1
 dispatch_scheduler_up                               1
+dispatch_sync_pipeline_state{state="armed"}        1
 dispatch_scheduler_job_overdue{job="sync"}          0
 dispatch_sync_last_success_timestamp_seconds        (6m ago)
 dispatch_issues_open_claimable                      7     # backlog exists
@@ -633,6 +684,7 @@ see the blind spot stated in A4.)
 ```
 dispatch_health_up                                  1
 dispatch_scheduler_up                               1
+dispatch_sync_pipeline_state{state="armed"}        1
 dispatch_sync_last_success_timestamp_seconds        (3m ago)
 dispatch_issues{status="ready",state="open"}        5
 dispatch_issue_assigned                             3     # label-assigned supply

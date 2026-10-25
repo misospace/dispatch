@@ -31,6 +31,11 @@ import {
   formatDependencyBlockReason,
   dependencyKey,
 } from "@/lib/issue-dependencies";
+import {
+  resolveSyncPipelineState,
+  type SyncPipelineDeclaration,
+  type SyncPipelineState,
+} from "@/lib/sync-pipeline";
 
 // ─── Bounded window allowlists (§4.10) ──────────────────────────────────────
 
@@ -347,6 +352,8 @@ export interface ObservabilitySnapshotInputs {
   repoLastSyncedAt: Date[];
   scheduler: ObservabilitySchedulerSummary;
   admissionMode: QueueAdmissionMode;
+  /** Operator's sync-pipeline declaration (DISPATCH_SYNC_PIPELINE). */
+  syncPipeline: SyncPipelineDeclaration;
   /** Grooming runs the ready issues' baselines point at (loadAdmissionRuns). */
   admissionRuns: Map<string, AdmissionRunState>;
   thresholds: {
@@ -383,6 +390,8 @@ export interface ObservabilitySnapshot {
     syncIntervalMs: number;
     prFixHandoutTimeoutMs: number;
     strandedAssignmentThresholdMs: number;
+    /** The operator's raw sync-pipeline declaration. */
+    syncPipeline: SyncPipelineDeclaration;
   };
   workSupply: {
     openIssues: number;
@@ -483,6 +492,15 @@ export interface ObservabilitySnapshot {
         overdue: 0 | 1;
       }>;
     };
+    /**
+     * Whether the issue-sync pipeline is expected to run. Derived from the
+     * operator's DECLARED topology (DISPATCH_SYNC_PIPELINE) plus in-process
+     * facts — NOT from the in-process scheduler alone (off by default while
+     * external cron/CronJob topologies are supported) and NEVER from sync
+     * history: one manual sync is not a pipeline, so an undeclared external
+     * driver stays `unknown` instead of arming a false freshness alert.
+     */
+    syncPipelineState: SyncPipelineState;
     sync: {
       /** Null = no completed run has EVER existed: an absent series, not zero. */
       lastSuccessTimestampSeconds: number | null;
@@ -500,10 +518,13 @@ export interface ObservabilitySnapshot {
   observations: {
     /**
      * A4 conjunction: eligible work exists, nothing is executing, nothing was
-     * picked up or reported in the pickup window, the scheduler is armed with
-     * no overdue job, and the last sync is fresh (A2-suppresses-A4 guard).
-     * `null` when the scheduler is disabled and the predicate is not
-     * evaluable.
+     * picked up or reported in the pickup window, the pipeline's own jobs are
+     * ticking, and the last sync is fresh (A2-suppresses-A4 guard).
+     * `null` when the pipeline is not armed — an operator opt-out OR an
+     * indeterminate state (`auto` with the in-process scheduler not running:
+     * only the declaration can say whether a pipeline is expected, never the
+     * sync history) — or when the sync job is disabled (no freshness
+     * window). Never a silent false.
      */
     eligibleWorkNotHandedOut: boolean | null;
     /** A5: expired leases or STALE AgentWork exist. */
@@ -910,6 +931,17 @@ export function computeObservabilitySnapshot(
       secondsSinceLastSuccess !== null &&
       secondsSinceLastSuccess * 1000 > freshSyncWindowMs);
 
+  // The arm state is the single source of truth for "should the sync pipeline
+  // run": the in-process scheduler alone cannot answer it, because external
+  // cron/CronJob drivers are a supported topology. It is driven by the
+  // operator's DECLARATION plus in-process facts only — sync history is not
+  // evidence of a pipeline (one manual sync is not a pipeline, and inferring
+  // "armed" from history paged CRITICAL A2 in the default deployment).
+  const syncPipelineState = resolveSyncPipelineState(inputs.syncPipeline, {
+    schedulerEnabled: inputs.scheduler.enabled,
+    syncIntervalMs: inputs.scheduler.syncIntervalMs,
+  });
+
   const failedSyncRows = inputs.sync.failed
     .filter((f) => f.startedAt <= now)
     .map((f) => ({ at: f.startedAt, dim: bucket(f.syncType, SYNC_TYPES) }));
@@ -931,21 +963,23 @@ export function computeObservabilitySnapshot(
   // ── Observations (distinguishable derived states) ──
   const pickups30m = (windowedCount(pickupTimes, now, [1800])[windowKey(1800)] ?? 0);
   const reported30m = (windowedCount(reportedTimes, now, [1800])[windowKey(1800)] ?? 0);
-  const schedulerHealthy = inputs.scheduler.enabled && overdueJobs === 0;
+  // Only the in-process scheduler has jobs that can be overdue; an external
+  // driver has none, so its absence must not block the observation.
+  const pipelineJobsTicking = inputs.scheduler.enabled ? overdueJobs === 0 : true;
   const failedLong = failedSyncRows.filter((f) => now.getTime() - f.at.getTime() <= 3600 * 1000).length;
 
   const eligibleWorkNotHandedOut: boolean | null =
-    !inputs.scheduler.enabled || syncIntervalKnown === false
-    ? // Not evaluable: scheduler unarmed, or the sync job is disabled (no
-      // interval for the fresh-sync guard) — in either success-history shape.
-      // An operator opt-out is explicit unknown, never a silent false (and
-      // never silently true), mirroring the A2/A4 evaluator guards.
-      null
+    syncPipelineState !== "armed" || !syncIntervalKnown
+      ? // Not evaluable: the pipeline is opted out or its state is unknown,
+        // or the sync job is disabled (no interval for the fresh-sync guard).
+        // An operator opt-out is explicit unknown, never a silent false (and
+        // never silently true), mirroring the A2/A4 evaluator guards.
+        null
       : openClaimableIssues.length > 0 &&
         executionActive === 0 &&
         pickups30m === 0 &&
         reported30m === 0 &&
-        schedulerHealthy &&
+        pipelineJobsTicking &&
         !syncStale;
 
   const agentWorkStale = (agentWorkByState["STALE"] ?? 0) > 0;
@@ -964,6 +998,7 @@ export function computeObservabilitySnapshot(
       syncIntervalMs: inputs.scheduler.syncIntervalMs,
       prFixHandoutTimeoutMs: timeoutMs,
       strandedAssignmentThresholdMs: inputs.thresholds.strandedAssignmentMs,
+      syncPipeline: inputs.syncPipeline,
     },
     workSupply: {
       openIssues: openIssues.length,
@@ -1035,6 +1070,7 @@ export function computeObservabilitySnapshot(
         overdueJobs,
         jobs,
       },
+      syncPipelineState,
       sync: {
         lastSuccessTimestampSeconds: inputs.sync.lastSuccessAt
           ? Math.floor(inputs.sync.lastSuccessAt.getTime() / 1000)

@@ -107,6 +107,7 @@ function baseInputs(
       ],
     },
     admissionMode: "off",
+    syncPipeline: "auto",
     admissionRuns: new Map(),
     thresholds: {
       strandedAssignmentMs: 1_800_000,
@@ -195,6 +196,70 @@ describe("exportObservabilityMetrics", () => {
     expect(sampleLines(body, "dispatch_sync_stale")).toEqual([]);
   });
 
+  it("a disabled sync job is unknown, never healthy: no stale flag, pipeline off", () => {
+    const body = metrics({
+      scheduler: { enabled: true, syncIntervalMs: 0, jobs: [] },
+      sync: { lastSuccessAt: ago(7200), running: 0, failed: [] },
+    });
+    expect(sampleLines(body, "dispatch_sync_stale")).toEqual([]);
+    expect(sampleLines(body, "dispatch_sync_pipeline_state")).toEqual([
+      'dispatch_sync_pipeline_state{state="armed"} 0',
+      'dispatch_sync_pipeline_state{state="off"} 1',
+      'dispatch_sync_pipeline_state{state="unknown"} 0',
+    ]);
+  });
+
+  it("exports the arm state of the sync pipeline with exactly one active value", () => {
+    const armed = sampleLines(metrics(), "dispatch_sync_pipeline_state");
+    expect(armed).toEqual([
+      'dispatch_sync_pipeline_state{state="armed"} 1',
+      'dispatch_sync_pipeline_state{state="off"} 0',
+      'dispatch_sync_pipeline_state{state="unknown"} 0',
+    ]);
+
+    const unknown = sampleLines(
+      metrics({
+        scheduler: { enabled: false, syncIntervalMs: 900_000, jobs: [] },
+        sync: { lastSuccessAt: null, running: 0, failed: [] },
+      }),
+      "dispatch_sync_pipeline_state",
+    );
+    expect(unknown).toEqual([
+      'dispatch_sync_pipeline_state{state="armed"} 0',
+      'dispatch_sync_pipeline_state{state="off"} 0',
+      'dispatch_sync_pipeline_state{state="unknown"} 1',
+    ]);
+
+    const optedOut = sampleLines(
+      metrics({ syncPipeline: "off" }),
+      "dispatch_sync_pipeline_state",
+    );
+    expect(optedOut).toEqual([
+      'dispatch_sync_pipeline_state{state="armed"} 0',
+      'dispatch_sync_pipeline_state{state="off"} 1',
+      'dispatch_sync_pipeline_state{state="unknown"} 0',
+    ]);
+  });
+
+  it("the stale flag is absent unless the pipeline is armed and has synced", () => {
+    // Unknown pipeline: no freshness judgement is possible.
+    const unknown = metrics({
+      scheduler: { enabled: false, syncIntervalMs: 900_000, jobs: [] },
+      sync: { lastSuccessAt: null, running: 0, failed: [] },
+    });
+    expect(sampleLines(unknown, "dispatch_sync_stale")).toEqual([]);
+
+    // Opted out: an opt-out is not a fault, so no staleness is reported.
+    const off = metrics({ syncPipeline: "off" });
+    expect(sampleLines(off, "dispatch_sync_stale")).toEqual([]);
+
+    // Armed but never synced: the absent series IS the A2 firing case, never 0.
+    const neverSynced = metrics({
+      sync: { lastSuccessAt: null, running: 0, failed: [] },
+    });
+    expect(sampleLines(neverSynced, "dispatch_sync_stale")).toEqual([]);
+  });
+
   it("flags a stale completed sync for the fresh-sync guard, absent otherwise", () => {
     const fresh = sampleLines(metrics(), "dispatch_sync_stale");
     expect(fresh).toEqual(["dispatch_sync_stale 0"]);
@@ -205,17 +270,9 @@ describe("exportObservabilityMetrics", () => {
     expect(stale).toEqual(["dispatch_sync_stale 1"]);
   });
 
-  it("a disabled sync job is unknown, never healthy: no stale flag, armed flag 0", () => {
-    const body = metrics({
-      scheduler: { enabled: true, syncIntervalMs: 0, jobs: [] },
-      sync: { lastSuccessAt: ago(7200), running: 0, failed: [] },
-    });
-    expect(sampleLines(body, "dispatch_sync_stale")).toEqual([]);
-    expect(sampleLines(body, "dispatch_sync_job_armed")).toEqual([
-      "dispatch_sync_job_armed 0",
-    ]);
-    const armed = sampleLines(metrics(), "dispatch_sync_job_armed");
-    expect(armed).toEqual(["dispatch_sync_job_armed 1"]);
+  it("no longer emits the scheduler-derived sync-job armed family", () => {
+    expect(observabilityMetricFamilies()).not.toContain("dispatch_sync_job_armed");
+    expect(sampleLines(metrics(), "dispatch_sync_job_armed")).toEqual([]);
   });
 
   it("exports the A13 repo-staleness threshold as configured (rules track DISPATCH_SYNC_INTERVAL_MS)", () => {
@@ -234,25 +291,72 @@ describe("exportObservabilityMetrics", () => {
     ]);
   });
 
-  it("an unarmed scheduler with a defaulted interval is unknown too: no stale flag", () => {
+  it("an unarmed in-process scheduler stays unknown even with sync history", () => {
     // Default deployment: DISPATCH_SCHEDULER_ENABLED off while the sync
-    // interval stays at its default. Mirrors the evaluator's A2/A4 opt-out
-    // guards — the pipeline should not have run, so staleness is unknown,
-    // neither healthy (0) nor stale (1).
-    for (const lastSuccessAt of [ago(120), ago(7200)]) {
-      const body = metrics({
-        scheduler: { enabled: false, syncIntervalMs: 900_000, jobs: [] },
-        sync: { lastSuccessAt, running: 0, failed: [] },
-      });
-      expect(sampleLines(body, "dispatch_sync_stale")).toEqual([]);
-      expect(sampleLines(body, "dispatch_scheduler_up")).toEqual([
-        "dispatch_scheduler_up 0",
-      ]);
-      // Armed stays a config fact: the interval is still configured.
-      expect(sampleLines(body, "dispatch_sync_job_armed")).toEqual([
-        "dispatch_sync_job_armed 1",
-      ]);
-    }
+    // interval stays at its default, and no topology declared. Dispatch cannot
+    // tell whether an external driver runs the pipeline — unknown, neither
+    // healthy (0) nor stale (1).
+    const noEvidence = metrics({
+      scheduler: { enabled: false, syncIntervalMs: 900_000, jobs: [] },
+      sync: { lastSuccessAt: null, running: 0, failed: [] },
+    });
+    expect(sampleLines(noEvidence, "dispatch_sync_stale")).toEqual([]);
+    expect(sampleLines(noEvidence, "dispatch_scheduler_up")).toEqual([
+      "dispatch_scheduler_up 0",
+    ]);
+    expect(sampleLines(noEvidence, "dispatch_sync_pipeline_state")).toEqual([
+      'dispatch_sync_pipeline_state{state="armed"} 0',
+      'dispatch_sync_pipeline_state{state="off"} 0',
+      'dispatch_sync_pipeline_state{state="unknown"} 1',
+    ]);
+
+    // A completed sync is NOT evidence of a pipeline: one manual sync must
+    // not arm the freshness guard, or the default deployment pages CRITICAL
+    // A2 half an hour later. The state stays unknown and the stale flag
+    // stays absent.
+    const withHistory = metrics({
+      scheduler: { enabled: false, syncIntervalMs: 900_000, jobs: [] },
+      sync: { lastSuccessAt: ago(120), running: 0, failed: [] },
+    });
+    expect(sampleLines(withHistory, "dispatch_sync_pipeline_state")).toEqual([
+      'dispatch_sync_pipeline_state{state="armed"} 0',
+      'dispatch_sync_pipeline_state{state="off"} 0',
+      'dispatch_sync_pipeline_state{state="unknown"} 1',
+    ]);
+    expect(sampleLines(withHistory, "dispatch_sync_stale")).toEqual([]);
+  });
+
+  it("a declared external driver is armed and its freshness is evaluated", () => {
+    const external = {
+      syncPipeline: "external" as const,
+      scheduler: { enabled: false, syncIntervalMs: 900_000, jobs: [] },
+    };
+
+    // Fresh: the guard is evaluated and reports 0.
+    const fresh = metrics({
+      ...external,
+      sync: { lastSuccessAt: ago(120), running: 0, failed: [] },
+    });
+    expect(sampleLines(fresh, "dispatch_sync_pipeline_state")).toEqual([
+      'dispatch_sync_pipeline_state{state="armed"} 1',
+      'dispatch_sync_pipeline_state{state="off"} 0',
+      'dispatch_sync_pipeline_state{state="unknown"} 0',
+    ]);
+    expect(sampleLines(fresh, "dispatch_sync_stale")).toEqual(["dispatch_sync_stale 0"]);
+
+    // Stale: 1 — the external driver is judged on its declared cadence.
+    const stale = metrics({
+      ...external,
+      sync: { lastSuccessAt: ago(7200), running: 0, failed: [] },
+    });
+    expect(sampleLines(stale, "dispatch_sync_stale")).toEqual(["dispatch_sync_stale 1"]);
+
+    // Never synced: absent (A2's absent-series case), never 0.
+    const neverSynced = metrics({
+      ...external,
+      sync: { lastSuccessAt: null, running: 0, failed: [] },
+    });
+    expect(sampleLines(neverSynced, "dispatch_sync_stale")).toEqual([]);
   });
 
   it("escapes label values and never emits high-cardinality dimensions", () => {

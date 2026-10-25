@@ -22,6 +22,7 @@
  *   full contract lives in `observabilityMetricFamilies()`.
  */
 import type { ObservabilitySnapshot } from "@/lib/observability-signals";
+import { SYNC_PIPELINE_STATES } from "@/lib/sync-pipeline";
 
 const ADMISSION_MODES = ["off", "audit", "enforce"] as const;
 
@@ -177,8 +178,8 @@ export function observabilityMetricFamilies(): string[] {
     "dispatch_scheduler_job_overdue",
     "dispatch_scheduler_up",
     "dispatch_sync_failures_in_window",
-    "dispatch_sync_job_armed",
     "dispatch_sync_last_success_timestamp_seconds",
+    "dispatch_sync_pipeline_state",
     "dispatch_sync_running",
     "dispatch_sync_stale",
     "dispatch_work_pickups_in_window",
@@ -309,15 +310,18 @@ export function exportObservabilityMetrics(snapshot: ObservabilitySnapshot): str
   families.push(
     scalar(
       "dispatch_sync_stale",
-      "1 when the last completed sync is older than two sync intervals (fresh-sync guard of A4; absent until the first completion, and absent while the pipeline is opted out — sync job disabled or scheduler unarmed — an opted-out pipeline is unknown, never healthy).",
+      "1 when the last completed sync is older than two sync intervals (fresh-sync guard of A4; absent until the first completion, and absent unless the sync pipeline is armed — an unarmed or unknown pipeline is unknown, never healthy).",
       syncStaleFlag(snapshot),
     ),
   );
   families.push(
-    scalar(
-      "dispatch_sync_job_armed",
-      "1 when the sync job has a configured interval (a config fact; the A2/A4 rules additionally gate on dispatch_scheduler_up/healthy, so an unarmed scheduler is silent too).",
-      snapshot.config.syncIntervalMs > 0 ? 1 : 0,
+    family(
+      "dispatch_sync_pipeline_state",
+      "Arm state of the issue-sync pipeline (1 for the active state): armed (the pipeline is expected to run), off (operator opted out), unknown (cannot tell — never healthy, never stale).",
+      SYNC_PIPELINE_STATES.map((state) => ({
+        labels: [["state", state] as [string, string]],
+        value: snapshot.pipeline.syncPipelineState === state ? 1 : 0,
+      })),
     ),
   );
   families.push(scalar("dispatch_sync_running", "Issue sync runs currently in flight.", snapshot.pipeline.sync.running));
@@ -348,17 +352,16 @@ export function exportObservabilityMetrics(snapshot: ObservabilitySnapshot): str
 }
 
 /** §4.9 fresh-sync guard: stale past 2× interval; only meaningful once a sync
- *  has ever completed — before that the series is absent (the A2 firing
- *  case), and while the pipeline is opted out it is absent too: either the
- *  sync job is disabled (interval 0) or the scheduler is unarmed with the
- *  interval left at its default (the default deployment). Both are opt-outs —
- *  unknown, never healthy — so the rules' A4 guard leg goes empty exactly
- *  like the evaluator's not_evaluable (mirrors the A2/A4 scheduler guards in
+ *  has ever completed AND the pipeline is armed. Before the first completion
+ *  the series is absent (the A2 firing case); an unarmed or unknown pipeline
+ *  has no freshness window to judge (an opt-out is unknown, never healthy) —
+ *  so the rules' A4 guard leg goes empty exactly like the evaluator's
+ *  not_evaluable (mirrors the A2/A4 arm-state guards in
  *  observability-alerts.ts). */
 function syncStaleFlag(snapshot: ObservabilitySnapshot): number | null {
-  if (!snapshot.pipeline.scheduler.enabled) return null;
-  if (snapshot.config.syncIntervalMs <= 0) return null;
+  if (snapshot.pipeline.syncPipelineState !== "armed") return null;
   if (!snapshot.pipeline.sync.everSucceeded) return null;
+  if (snapshot.config.syncIntervalMs <= 0) return null;
   const age = snapshot.pipeline.sync.secondsSinceLastSuccess;
   if (age === null) return null;
   return age * 1000 > snapshot.config.syncIntervalMs * 2 ? 1 : 0;

@@ -138,4 +138,29 @@ describe("collectObservabilitySnapshot", () => {
       }),
     );
   });
+
+  it("passes the operator's sync-pipeline declaration through and derives the arm state", async () => {
+    const previous = process.env.DISPATCH_SYNC_PIPELINE;
+    try {
+      process.env.DISPATCH_SYNC_PIPELINE = "external";
+      const external = await collectObservabilitySnapshot(NOW);
+      expect(external.config.syncPipeline).toBe("external");
+      expect(external.pipeline.syncPipelineState).toBe("armed");
+
+      process.env.DISPATCH_SYNC_PIPELINE = "off";
+      const off = await collectObservabilitySnapshot(NOW);
+      expect(off.config.syncPipeline).toBe("off");
+      expect(off.pipeline.syncPipelineState).toBe("off");
+
+      delete process.env.DISPATCH_SYNC_PIPELINE;
+      const auto = await collectObservabilitySnapshot(NOW);
+      expect(auto.config.syncPipeline).toBe("auto");
+      // No in-process scheduler and no declared topology: the state cannot be
+      // told (sync history is never evidence of a pipeline).
+      expect(auto.pipeline.syncPipelineState).toBe("unknown");
+    } finally {
+      if (previous === undefined) delete process.env.DISPATCH_SYNC_PIPELINE;
+      else process.env.DISPATCH_SYNC_PIPELINE = previous;
+    }
+  });
 });

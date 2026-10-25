@@ -24,6 +24,21 @@
 # - A6 ("assigned without execution") is deliberately ABSENT: it is the one
 #   disabled row of the catalogue — its aggregate stays nonzero under healthy
 #   churn, so it must never page (§8.7). Do not add it.
+# - A2 and A4 gate on the SYNC-PIPELINE ARM STATE, not on the in-process
+#   scheduler. dispatch_sync_pipeline_state{state="armed"} is the pipeline-arm
+#   gate: armed = the pipeline is expected to run, off = the operator opted
+#   out, unknown = it cannot be told (never healthy, never stale). The arm
+#   state is the operator's DECLARED topology (DISPATCH_SYNC_PIPELINE) plus
+#   in-process facts — never sync history: one manual sync is not a pipeline,
+#   and history cannot tell a broken external driver from a deployment that
+#   syncs rarely by design. `auto` (the default) means "the in-process
+#   scheduler decides"; the in-process scheduler is OFF by default while
+#   external cron/CronJob drivers are a supported topology, so gating on the
+#   scheduler alone would silence every sync-freshness alert in exactly the
+#   deployments where the pipeline genuinely runs. An operator driving sync
+#   externally MUST set DISPATCH_SYNC_PIPELINE=external, and
+#   DISPATCH_SYNC_INTERVAL_MS to their own cadence — the interval defines the
+#   freshness window A2/A4 judge and the A13 threshold.
 # - A2 evaluates the absent-series case: a Dispatch that has never completed a
 #   sync emits no dispatch_sync_last_success_timestamp_seconds, and absent()
 #   turns that into a firing input.
@@ -36,7 +51,15 @@
 #   exactly like the portable evaluator does. That gauge ships with the same
 #   exporter version as this file: against an older Dispatch that does not
 #   emit it, the staleness arm is silently empty and A13 degrades to the
-#   backoff-only leg — upgrade the exporter together with these rules.
+#   backoff-only leg.
+# - VERSION SKEW: dispatch_sync_pipeline_state — the A2/A4 arm-state gate —
+#   ships with the SAME exporter version as this file, and the family it
+#   replaces, dispatch_sync_job_armed, was REMOVED from the exporter. Keeping
+#   an OLD rules file against a NEW Dispatch therefore breaks A2/A4 SILENTLY:
+#   the old file gates on dispatch_sync_job_armed, which no longer exists, so
+#   the arm leg is empty and the sync-freshness alerts can never fire — the
+#   exact opposite of the intent. Upgrade the exporter AND these rules
+#   together, in both directions.
 groups:
   - name: dispatch
     interval: 30s
@@ -53,10 +76,9 @@ groups:
 
       - alert: A2
         expr: >-
-          dispatch_scheduler_up == 1
+          dispatch_sync_pipeline_state{state="armed"} == 1
           and on() (
             (absent(dispatch_sync_last_success_timestamp_seconds{job="dispatch"}) == 1
-             and on() dispatch_sync_job_armed == 1
              and on() (up{job="dispatch"} == 1))
             or dispatch_sync_stale == 1
           )
@@ -65,7 +87,7 @@ groups:
           severity: critical
         annotations:
           summary: "No successful issue sync"
-          description: "No IssueSyncRun has ever completed (absent series), or the last completion is older than two sync intervals. Gated on the sync pipeline being armed and the scrape itself succeeding: an opted-out pipeline is not a fault, and a dead instance routes to A3 instead."
+          description: "No IssueSyncRun has ever completed (absent series), or the last completion is older than two sync intervals. Gated on the sync pipeline's arm state (dispatch_sync_pipeline_state{state=\"armed\"}) and the scrape itself succeeding: an opted-out or indeterminate pipeline is not a fault, and a dead instance routes to A3 instead."
           operator_action: "Check IssueSyncRun errors and GitHub reachability."
 
       - alert: A3
@@ -84,20 +106,31 @@ groups:
         # the full label set — the intersection would be empty and the alert
         # could never fire. on() makes the conjunction label-insensitive.
         # Assumes one scrape target under the job (see the header note).
+        # The last leg is the in-process-scheduler guard: an external driver
+        # has no in-process job that can be overdue, so "the scheduler is not
+        # running" must not block A4 — but an overdue in-process job leaves
+        # both operands empty, and A1 owns that case.
+        # Inside that guard the `or` is PLAIN on purpose: its two operands are
+        # mutually exclusive (the scheduler is down, or it is healthy) and
+        # carry the SAME label set ({job,instance}), so Prometheus' default
+        # label matching is equivalent here — and a plain `or` avoids the
+        # empty-label-list `on()` modifier, which some Prometheus-compatible
+        # backends (VictoriaMetrics/vmalert) do not accept. The surrounding
+        # `and on()` conjunctions stay label-insensitive as they are.
         expr: >-
           dispatch_issues_open_claimable > 0
           and on() dispatch_execution_active == 0
           and on() sum(dispatch_work_pickups_in_window{window="1800"}) == 0
           and on() sum(dispatch_agent_runs_reported_in_window{window="1800"}) == 0
-          and on() dispatch_scheduler_healthy == 1
+          and on() dispatch_sync_pipeline_state{state="armed"} == 1
           and on() dispatch_sync_stale == 0
-          and on() dispatch_sync_job_armed == 1
+          and on() (dispatch_scheduler_up == 0 or dispatch_scheduler_healthy == 1)
         for: 30m
         labels:
           severity: warning
         annotations:
           summary: "Eligible work not handed out"
-          description: "Work exists, nothing executes, nothing was picked up or reported in 30m, and the pipeline is healthy and sync-fresh."
+          description: "Work exists, nothing executes, nothing was picked up or reported in 30m, and the sync pipeline is armed and sync-fresh. The 'every scheduled job is ticking' leg applies only when the in-process scheduler runs — an external driver has no in-process job that can be overdue."
           operator_action: "Check worker availability/credentials; confirm next-task returns work."
 
       - alert: A5

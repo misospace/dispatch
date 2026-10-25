@@ -63,6 +63,42 @@ scrape_configs:
       - targets: ["dispatch.example.internal:3000"]
 ```
 
+## Sync-pipeline topology (which deployments arm the pipeline)
+
+The sync-freshness alerts (A2, and A4's fresh-sync guard) only fire when the
+issue-sync pipeline is **expected to run**. Dispatch supports two pipeline
+topologies — the in-process scheduler, or an external driver — and the
+in-process scheduler is **off by default**, so the operator declares the
+pipeline's arm state with `DISPATCH_SYNC_PIPELINE`:
+
+| Value | Meaning |
+|---|---|
+| `auto` (default) | "The in-process scheduler decides": armed when the in-process scheduler is ticking; `off` when the sync job is disabled (`DISPATCH_SYNC_INTERVAL_MS=0`); `unknown` otherwise (no in-process scheduler — Dispatch cannot see an external driver, so it does not guess). |
+| `external` | An external driver (k8s CronJob, platform cron, systemd timer) owns the pipeline. Always `armed`, whatever the in-process scheduler does. |
+| `off` | The operator opted out. Always `off` — never a page. |
+
+An unrecognised value falls back to `auto` (logged once), so a typo can never
+silence the pipeline.
+
+Sync **history** is deliberately not part of the arm state: a one-off manual
+sync is not a pipeline, and history cannot tell a broken external driver from
+a deployment that syncs rarely by design. Inferring "armed" from history turned
+the default deployment (in-process scheduler off, `auto`, default 15m
+interval) into a false CRITICAL A2 thirty minutes after any manual
+`POST /api/sync`. The trade-off is explicit: an undeclared external driver is
+reported as `unknown` — never healthy, never stale — and therefore never
+pages.
+
+**Set `DISPATCH_SYNC_PIPELINE=external`** when a CronJob hits the sync
+endpoint (`/api/sync/scheduled`) instead of the in-process scheduler — otherwise
+the arm state is `unknown` and the sync-freshness alerts stay silent in a
+deployment where the pipeline genuinely runs. Set `DISPATCH_SYNC_INTERVAL_MS` to
+your driver's cadence as well: the interval defines the freshness window A2/A4
+judge (two intervals) and the A13 staleness threshold, so it must match how
+often the driver actually runs. Left unset, the window silently defaults to
+900000 ms (15m), so a slower driver pages falsely — Dispatch logs a one-time
+warning at boot for exactly that misconfiguration.
+
 ## Metric family contract
 
 `exportObservabilityMetrics` (`src/lib/observability-export.ts`) renders the
@@ -94,11 +130,16 @@ assets reference anything outside it. Mapping notes against the §4 catalogue:
 - **Absent series is load-bearing**: `dispatch_sync_last_success_timestamp_seconds`
   does not exist until the first sync completes — the A2 firing case — and
   null ages omit their series instead of exporting zero. `dispatch_sync_stale`
-  is likewise absent while the pipeline is opted out — sync job disabled
-  (`DISPATCH_SYNC_INTERVAL_MS=0`) **or** scheduler unarmed
-  (`DISPATCH_SCHEDULER_ENABLED` off with the interval left at its default, the
-  default deployment) — mirroring the evaluator's A2/A4 `not_evaluable`
-  guards: an opted-out pipeline is unknown, never exported as healthy.
+  is likewise absent unless the sync pipeline is **armed**: it is exported only
+  when a sync has ever completed and the sync interval is greater than zero —
+  mirroring the evaluator's A2/A4 `not_evaluable` guards: an opted-out (`off`)
+  or unknown pipeline is unknown, never exported as healthy.
+- **The arm state is an explicit family**: `dispatch_sync_pipeline_state`
+  replaces the scheduler-derived family that used to gate A2/A4
+  (`dispatch_sync_job_armed` no longer exists). It is a gauge with one `state`
+  label (`armed`, `off`, `unknown`) and exactly one active value — the pipeline
+  is expected to run, the operator opted out, or it cannot be told. An unknown
+  pipeline is exported as unknown, never as healthy.
 - Families with no samples emit nothing; the empty-Dispatch document still
   carries every always-present family with zero values, so a completely idle
   Dispatch **renders** (zeros, not gaps) in any consumer.
@@ -118,9 +159,10 @@ the `since` timestamp.
   `firing` after the catalogue's duration. The evaluator itself is stateless
   and pure, so fixtures replay deterministically and any backend, cron job,
   or script can drive it.
-- **`not_evaluable` is explicit**: an unarmed scheduler, a disabled sync job,
-  or admission `off` makes the dependent rows unevaluable rather than silently
-  healthy. A disabled pipeline is an operator opt-out, never a page.
+- **`not_evaluable` is explicit**: a sync pipeline whose arm state is `off`
+  (opted out) or `unknown` (indeterminate), a disabled sync job, or admission
+  `off` makes the dependent rows unevaluable rather than silently healthy. A
+  disabled pipeline is an operator opt-out, never a page.
 - **Disabled rows never fire.** A6 is disabled by design: its aggregate stays
   nonzero under healthy assignment churn (§8.7). Its age-tied evidence
   (`assignmentObservation.agedPastThreshold`) is reported for humans, and the

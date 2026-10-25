@@ -54,6 +54,7 @@ git-hook installation, migrations, DATABASE_URL requirements, or test execution 
 | `NEXTAUTH_URL` | No | NextAuth.js URL |
 | `DISPATCH_SCHEDULER_ENABLED` | No | `true` runs periodic jobs (sync, groomer, PR-followup, prune-closed) in-process instead of via external cronjobs. Off by default. Confine to a single replica. |
 | `DISPATCH_SYNC_INTERVAL_MS` | No | Scheduled-sync interval when the scheduler is enabled (default 900000 = 15m; `0` disables the job) |
+| `DISPATCH_SYNC_PIPELINE` | No | Declares whether the issue-sync pipeline is expected to run: `auto` (default — "the in-process scheduler decides"), `external` (required for a cron/CronJob-driven pipeline, so the sync-freshness alerts fire without the in-process scheduler), or `off` (explicit operator opt-out, never a page). The arm state is the declaration plus in-process facts; sync history is never evidence. See [docs/observability-packaging.md](./docs/observability-packaging.md). |
 | `DISPATCH_GROOMER_INTERVAL_MS` | No | Groomer run interval (default 600000 = 10m; `0` disables) |
 | `DISPATCH_PR_FOLLOWUP_INTERVAL_MS` | No | PR-followup sync interval (default 900000 = 15m; `0` disables) |
 | `DISPATCH_PRUNE_CLOSED_INTERVAL_MS` | No | Closed-issue prune interval (default 86400000 = 24h; `0` disables) |
@@ -239,6 +240,7 @@ Cross-cutting concerns and where they live. Read these first when working in tha
 | Worker ownership capability + derived states (#1251) | `app/api/agent-work/ownership/route.ts` (register/renew/disposition), `lib/worker-ownership.ts`, `lib/ownership-state.ts` (derivation), `lib/ownership-inspect.ts`, `app/api/issues/[issueId]/ownership/` + `app/api/issues/ownership/` (operator inspect), [docs/worker-ownership-capability.md](./docs/worker-ownership-capability.md) |
 | Ownership reconciliation + §8.7 release intents (#1254) | `lib/ownership-reconciliation.ts` (ladder + Phase A/B/C + supersede), `OwnershipReleaseIntent`/`OwnershipReconcileCandidate` (schema), claim-route barrier (409 while intent pending) + lease-before-remote-add, [docs/ownership-reconciliation.md](./docs/ownership-reconciliation.md) |
 | Auth & audit actor identity | `lib/auth.ts` (`authorizeRequest`, `getAuthorizedActor`) |
+| Sync-pipeline arm state (#1255) | `lib/sync-pipeline.ts` (declaration + arm-state resolution), `lib/observability-signals.ts` (derivation), `lib/observability-alerts.ts` / `lib/observability-export.ts` (consumers) |
 | Lifecycle event stream (claim/status evidence, #1202) | `lib/issue-lifecycle.ts`, `docs/issue-lifecycle-events.md` |
 | Standalone observability snapshot (#1252) | `app/api/observability/route.ts`, `lib/observability-signals.ts` (pure derivation + allowlists), `lib/observability-snapshot.ts` (read-only collector), `docs/observability-snapshot.md` |
 | Board UI component tree | `app/board/page.tsx` → `kanban-board-client.tsx` → `components/kanban-board.tsx` → `components/issue-card.tsx` |

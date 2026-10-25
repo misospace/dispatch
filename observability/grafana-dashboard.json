@@ -925,8 +925,8 @@
     {
       "id": 25,
       "type": "stat",
-      "title": "Scheduler healthy",
-      "description": null,
+      "title": "In-process scheduler healthy",
+      "description": "Reads 0 when the in-process scheduler is off — expected in external-driver deployments, not a fault.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1038,7 +1038,7 @@
       "id": 28,
       "type": "stat",
       "title": "Sync stale (fresh-sync guard)",
-      "description": null,
+      "description": "Absent series = no freshness judgement, for three distinct reasons: the pipeline is not armed (opted out, or indeterminate/unknown), no sync has ever completed, or no sync interval is configured (no freshness window to judge). Never read the absence as healthy.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1322,6 +1322,59 @@
           "displayMode": "list",
           "placement": "bottom"
         }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 36,
+      "type": "stat",
+      "title": "Sync pipeline state",
+      "description": "armed = the pipeline is expected to run; off = operator opt-out; unknown = cannot be told.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 28,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "dispatch_sync_pipeline_state{state=\"armed\"}",
+          "legendFormat": "armed",
+          "instant": true,
+          "range": false
+        },
+        {
+          "refId": "B",
+          "expr": "dispatch_sync_pipeline_state{state=\"off\"}",
+          "legendFormat": "off",
+          "instant": true,
+          "range": false
+        },
+        {
+          "refId": "C",
+          "expr": "dispatch_sync_pipeline_state{state=\"unknown\"}",
+          "legendFormat": "unknown",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background"
       },
       "fieldConfig": {
         "defaults": {

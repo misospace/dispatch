@@ -29,6 +29,22 @@ Nothing in this directory is required to run Dispatch.
    DISPATCH_METRICS_ENABLED=true
    ```
 
+   If a cron/k8s CronJob drives the sync instead of the in-process scheduler,
+   also declare the topology so the sync-freshness alerts can fire:
+
+   ```env
+   DISPATCH_SYNC_PIPELINE=external
+   DISPATCH_SYNC_INTERVAL_MS=900000
+   ```
+
+   `auto` (the default) means "the in-process scheduler decides" — armed when
+   it is ticking, off when the sync job is disabled, unknown otherwise; sync
+   history is never evidence (one manual sync is not a pipeline). `external`
+   states it outright (set `DISPATCH_SYNC_INTERVAL_MS` to your driver's
+   cadence — the interval defines the freshness window the alerts judge, and
+   it defaults to 15m when unset, so a slower driver pages falsely); `off` is
+   an explicit opt-out.
+
 2. Scrape it (maintainer-tier bearer token; the endpoint is read-only):
 
    ```yaml
