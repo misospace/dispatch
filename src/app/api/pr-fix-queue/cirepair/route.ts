@@ -16,11 +16,14 @@ export async function POST(request: Request) {
   }
 
   // Bearer only (or `disabled`, the tokenless dev mode): the outcome settles
-  // a repair opportunity on the PR-fix queue on behalf of an agent, the same
-  // identity gate the ack route enforces.
+  // a repair opportunity on the PR-fix queue on behalf of an agent. These
+  // routes are MAINTAINER-tier (absent from `WORKER_ALLOWLIST`), so a
+  // worker-tier credential is refused by `authorizeRequest` before this
+  // check — the maintainer bearer is the connector's credential, and the
+  // agent it names in the body is bound by the queue hand-out marker below.
   if (auth.type !== "bearer" && auth.type !== "disabled") {
     return errorResponse(
-      "Forbidden: pr-fix CI repair requires a bearer token (DISPATCH_AGENT_TOKEN or DISPATCH_WORKER_TOKEN); basic / OIDC sessions cannot repair on behalf of an agent",
+      "Forbidden: pr-fix CI repair requires a bearer token (DISPATCH_AGENT_TOKEN or DISPATCH_MAINTAINER_TOKEN); basic / OIDC sessions cannot repair on behalf of an agent",
       403,
     );
   }

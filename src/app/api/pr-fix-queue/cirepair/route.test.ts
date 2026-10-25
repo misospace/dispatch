@@ -268,12 +268,14 @@ describe("POST /api/pr-fix-queue/cirepair", () => {
     expect(harness.audits.at(-1)).toMatchObject({ action: "pr_fix_ci_repair", actor: "worker", success: true });
   });
 
-  it("a bound worker token may not act for another agent (403, no queue write)", async () => {
+  it("a worker-tier credential is refused by the maintainer-tier gate (403, no queue write)", async () => {
     // These routes are Courier-driven queue mutations, so they are
-    // maintainer-tier: a worker-tier credential is refused before the body is
-    // read. A bound credential's STRICT identity scope
-    // (`enforceWorkerAgentScope`, the second layer) refuses a spoofed agent
-    // with 403 as well; its semantics are pinned in src/lib/auth.test.ts.
+    // MAINTAINER-tier: a worker-tier credential — bound or legacy-unbound —
+    // is refused by the route tier before the body is even read, so this test
+    // pins the TIER refusal, not the identity scope.
+    // `enforceWorkerAgentScope` is the defense-in-depth second layer (it
+    // refuses a spoofed agent with 403); its strict-equality semantics are
+    // pinned in src/lib/auth.test.ts.
     const item = await seededPark({ reserve: true });
     const res = await postRequest(
       { repo: REPO, generation: GEN, agentName: "worker", idempotencyKey: "k", result: "unsupported" },
