@@ -232,6 +232,10 @@ describe("exportObservabilityMetrics", () => {
       expect(sampleLines(body, "dispatch_scheduler_up")).toEqual([
         "dispatch_scheduler_up 0",
       ]);
+      // Armed stays a config fact: the interval is still configured.
+      expect(sampleLines(body, "dispatch_sync_job_armed")).toEqual([
+        "dispatch_sync_job_armed 1",
+      ]);
     }
   });
 

@@ -315,7 +315,7 @@ export function exportObservabilityMetrics(snapshot: ObservabilitySnapshot): str
   families.push(
     scalar(
       "dispatch_sync_job_armed",
-      "1 when the sync job has a configured interval (the pipeline is expected to run). The A2/A4 rules gate on this so an operator opt-out is silent.",
+      "1 when the sync job has a configured interval (a config fact; the A2/A4 rules additionally gate on dispatch_scheduler_up/healthy, so an unarmed scheduler is silent too).",
       snapshot.config.syncIntervalMs > 0 ? 1 : 0,
     ),
   );
