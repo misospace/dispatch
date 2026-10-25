@@ -51,6 +51,13 @@ type PrFixCandidate = {
  * stamp so evidence enqueued in the gap ships in this payload or is
  * flagged for a reopen rather than being swallowed.
  *
+ * The LANE is deliberately not stamped here: `attemptType` is written by
+ * the hand-out append in `issueHandout`, atomically with the issued
+ * hand-out record, so a persisted lane always has a hand-out behind it.
+ * A stamp that outlived its append would let the next poll trust a stale
+ * same-generation lane past the REBASE worker-pool and serialized
+ * admission gates (#1327).
+ *
  * Bounded retry: if the re-read shows the row's generation moved
  * between the queue read and the stamp (another path took over the
  * item), the stamp+re-read runs once more against the NEW generation.
@@ -118,10 +125,12 @@ type PrFixCandidate = {
           dispatchedAt: new Date(),
           dispatchedGeneration: stampGeneration,
           postDispatchEvidenceKeys: [],
-          // #1327: stamp the lane THIS attempt is dispatched as. The row's
-          // `type` stays mutable across re-enqueues; the rebase terminal
-          // settlement and the concurrency gate key on this stamp.
-          attemptType: candidate.fixType ?? null,
+          // The lane is deliberately NOT stamped here: `attemptType` rides
+          // the hand-out append below (see `issueHandout`), so the stamp can
+          // never name a lane without an issued hand-out to back it — a
+          // failed append would otherwise leave a stale same-generation lane
+          // stamp that the next poll's gate trusts past the REBASE
+          // worker-pool and serialized-admission checks.
         },
       });
       if (stamp.count === 1) newlyDispatchedGeneration = stampGeneration;
@@ -395,14 +404,20 @@ export async function GET(
        // #1256: the exhausted capacity must not be re-handed the attempt it
        // gave up (and an undeclared capacity is conservatively treated the
        // same); unrelated capacities dispatch it normally.
-       if (skipPrForCapacity(candidate.repo, candidate.pr)) return null;
-       if (agentAlreadyHanded(candidate, agentName)) return null;
+      if (skipPrForCapacity(candidate.repo, candidate.pr)) return null;
+      if (agentAlreadyHanded(candidate, agentName)) return null;
 
-       // Stamp-confirm the live row, then push the hand-out/receipt pair.
-       // `client` decides where those writes run: on the module client for
-       // ordinary fix work, or on the REBASE admission transaction so the
-       // writes commit atomically with the concurrency gate read (#1327).
-       const issueHandout = async (client: PrFixQueueClient) => {
+      // The lane THIS hand-out issues as: the persisted dispatched lane when
+      // this generation was already handed out, else the queue-read type.
+      // Also the gate key below — one derivation, so the gate, the pin, and
+      // the stamped lane can never disagree.
+      const dispatchedLane = candidate.attemptType ?? candidate.fixType;
+
+      // Stamp-confirm the live row, then push the hand-out/receipt pair.
+      // `client` decides where those writes run: on the module client for
+      // ordinary fix work, or on the REBASE admission transaction so the
+      // writes commit atomically with the concurrency gate read (#1327).
+      const issueHandout = async (client: PrFixQueueClient) => {
          const confirmed = await confirmPrFixHandOut(candidate, agentName, excluded, client);
          if (!confirmed) return null;
 
@@ -416,12 +431,33 @@ export async function GET(
          // at the same generation, and never another agent's.
          const handoutToken = newHandoutToken();
          try {
-           // Conditional append fences concurrent polls for the same agent/generation.
+           // Conditional append fences concurrent polls for the same agent/generation,
+           // and PINS the lane at issuance: the hand-out may only land while the row
+           // still anchors `dispatchedLane` — its mutable type is still the queue-read
+           // lane, or the attempt stamp already names it (a re-hand-out of a lane a
+           // real hand-out dispatched; the accepted mid-attempt flip). A concurrent
+           // same-generation flip to another lane matches NEITHER arm: zero rows
+           // apply and the candidate defers — the next poll re-derives the lane from
+           // the flipped row (a flip to REBASE then walks the worker-pool and
+           // serialized-admission gates) instead of issuing under the stale one.
            const claimed = await client.prFixQueueItem.updateMany({
-             where: { id: candidate.id, generation: confirmed.generation, status: "QUEUED", NOT: { agentHandouts: { has: agentHandoutToken(agentName, confirmed.generation) } } },
+             where: {
+               id: candidate.id,
+               generation: confirmed.generation,
+               status: "QUEUED",
+               NOT: { agentHandouts: { has: agentHandoutToken(agentName, confirmed.generation) } },
+               ...(dispatchedLane ? { OR: [{ type: dispatchedLane }, { attemptType: dispatchedLane }] } : {}),
+             },
              data: {
                agentHandouts: { push: [agentHandoutToken(agentName, confirmed.generation)] },
                handoutReceipts: { push: [handoutReceipt(handoutToken, agentName, confirmed.generation)] },
+               // The lane stamp IS the issuance: written atomically with the
+               // hand-out record, never before it, so a failed append can never
+               // leave a stale same-generation lane stamp for the next poll's
+               // gate to trust. `freshAttemptGeneration` clears it on every
+               // generation bump; the release/reclaim paths keep it (the
+               // attempt they reset was genuinely issued as that lane).
+               ...(dispatchedLane ? { attemptType: dispatchedLane } : {}),
              },
            });
            if (claimed.count !== 1) return null;
@@ -467,12 +503,13 @@ export async function GET(
        // transient: the next poll retries it. The admission FAILS CLOSED — a
        // lane that cannot take the lock defers the hand-out rather than
        // issuing it unlocked — so concurrency 1 holds on every path.
-       // Non-rebase fix work is unaffected. `attemptType` is trustworthy as
-       // the current attempt's lane because `freshAttemptGeneration` clears
-       // it on every generation bump: non-null here means THIS generation
-       // was handed out as that lane; a fresh attempt falls back to the
-       // queue type.
-        const dispatchedLane = candidate.attemptType ?? candidate.fixType;
+       // Non-rebase fix work is unaffected. `attemptType` is authoritative
+       // because the hand-out append is its ONLY writer — atomically with the
+       // issued hand-out record, pinned to the row's type — so non-null here
+       // means a hand-out was actually issued at this generation as that lane.
+       // `freshAttemptGeneration` clears it on every generation bump, and a
+       // failed append leaves it null: the next poll falls back to the row's
+       // live type instead of trusting a stamp no hand-out ever backed.
         if (dispatchedLane === "REBASE") {
           // #1327 review: the rebase worker pool is local-only by contract —
           // git is its tool surface and it must not consume paid cloud

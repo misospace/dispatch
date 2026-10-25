@@ -199,17 +199,35 @@ function makeQueueStore() {
  * != the stamped generation). Lets updateMany genuinely no-op on re-hand-outs
  * of an already-stamped generation.
  */
+/**
+ * Evaluate the OR clause of a pr-fix queue updateMany against a fake row.
+ * Two shapes exist: the dispatch stamp's first-hand-out arms
+ * (`dispatchedGeneration`) and the hand-out append's issuance pin (#1327),
+ * whose arms anchor the lane being issued (`type` / `attemptType`).
+ */
+function matchesOrConditions(row: any, or: any[]): boolean {
+  return or.some((cond: any) => {
+    if ("dispatchedGeneration" in cond) {
+      if (cond.dispatchedGeneration === null) return row.dispatchedGeneration == null;
+      return (
+        row.dispatchedGeneration != null &&
+        row.dispatchedGeneration !== cond.dispatchedGeneration.not
+      );
+    }
+    // The issuance pin: the row still anchors the lane being issued — its
+    // `type` matches, or the attempt stamp already names it (a re-hand-out
+    // of a dispatched lane). Fixtures that do not model a lane (`type`
+    // absent) cannot race a flip, so the pin is vacuously satisfied for them.
+    if ("type" in cond) return row.type === undefined || row.type === cond.type;
+    if ("attemptType" in cond) return row.attemptType === cond.attemptType;
+    return false;
+  });
+}
+
 function matchesFirstHandOut(row: any, where: any): boolean {
   if (row.id !== where.id || row.generation !== where.generation) return false;
   if (!where.OR) return true;
-  return where.OR.some((cond: any) => {
-    if (!("dispatchedGeneration" in cond)) return false;
-    if (cond.dispatchedGeneration === null) return row.dispatchedGeneration == null;
-    return (
-      row.dispatchedGeneration != null &&
-      row.dispatchedGeneration !== cond.dispatchedGeneration.not
-    );
-  });
+  return matchesOrConditions(row, where.OR);
 }
 
 /**
@@ -474,6 +492,79 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       expect(body.prFixItem.fixType).toBe("REBASE");
       // The hand-out still runs inside the serialized admission transaction.
       expect(mocks.prFixTxSurfaces).toContain("updateMany");
+    });
+
+    it("a failed append leaves no lane stamp: the flipped row re-enters the REBASE gates (#1327)", async () => {
+      // Regression: the dispatch stamp used to write `attemptType` BEFORE the
+      // hand-out append, so a failed append left a stale same-generation lane
+      // stamp. A row that then flipped to REBASE was trusted as its stale
+      // lane, and the next poll bypassed the worker-pool and serialized
+      // admission gates. The lane stamp now rides the append — atomic with
+      // issuance, pinned to the row's type — so after a failed append the row
+      // is laneless: the next poll re-derives REBASE from the row and
+      // enforces the REBASE gates.
+      const row: any = { ...prFixRow(33), type: "CI_FAILURE" };
+      mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+        where?.OR
+          // The rebase concurrency gate read: only rows anchored to REBASE.
+          ? [row].filter((r: any) => (r.attemptType ?? r.type) === "REBASE")
+          : [row]);
+      mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+        (where.id === row.id ? { ...row } : null));
+
+      // Poll 1 — ordinary lane: the dispatch stamp lands, the hand-out
+      // append FAILS.
+      let stampArgs: any;
+      let appendArgs: any;
+      mocks.prFixUpdateMany
+        .mockImplementationOnce(async (args: any) => { stampArgs = args; return { count: 1 }; })
+        .mockImplementationOnce(async (args: any) => { appendArgs = args; throw new Error("hand-out append failed"); });
+      const first = await (await GET(request(exclusionUrl()), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })).json();
+      expect(first.prFixItem).toBeUndefined();
+      // The stamp ran WITHOUT the lane: attemptType cannot become
+      // authoritative before a hand-out exists.
+      expect(stampArgs.data.attemptType).toBeUndefined();
+      expect(stampArgs.data.dispatchedGeneration).toBe(row.generation);
+      // The append carried the lane and the type pin, and failed.
+      expect(appendArgs.data.attemptType).toBe("CI_FAILURE");
+      expect(appendArgs.where.OR).toEqual([{ type: "CI_FAILURE" }, { attemptType: "CI_FAILURE" }]);
+
+      // A concurrent same-generation re-observation flips the row to REBASE.
+      row.type = "REBASE";
+
+      // Poll 2a — an agent outside the pool is deferred BEFORE the admission
+      // transaction: no gate read, no writes.
+      process.env.DISPATCH_REBASE_AGENTS = "local-coder";
+      mocks.prFixUpdateMany.mockClear();
+      const deferred = await (await GET(request(exclusionUrl()), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })).json();
+      expect(deferred.prFixItem).toBeUndefined();
+      expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+      expect(mocks.prFixTxSurfaces).toEqual([]);
+
+      // Poll 2b — a pool-eligible poll re-derives the lane from the flipped
+      // row and enforces the serialized admission: the gate read and the
+      // hand-out write (carrying the lane stamp) run inside the advisory-lock
+      // transaction, shipping REBASE.
+      process.env.DISPATCH_REBASE_AGENTS = "example-agent";
+      const surfacesBefore = mocks.prFixTxSurfaces.length;
+      const second = await (await GET(request(exclusionUrl()), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })).json();
+      expect(second.type).toBe("followup-pr");
+      expect(second.prFixItem.fixType).toBe("REBASE");
+      const surfaces = mocks.prFixTxSurfaces.slice(surfacesBefore);
+      expect(surfaces).toContain("findMany");
+      expect(surfaces).toContain("updateMany");
+      // The lane stamp rode the issuance, pinned to the flipped row's type.
+      const issued: any = mocks.prFixUpdateMany.mock.calls
+        .map(([args]: any) => args)
+        .find((args: any) => Array.isArray(args.data?.agentHandouts?.push));
+      expect(issued.data.attemptType).toBe("REBASE");
+      expect(issued.where.OR).toEqual([{ type: "REBASE" }, { attemptType: "REBASE" }]);
     });
   });
 
@@ -1103,11 +1194,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
         candidate.id === where.id && candidate.generation === where.generation &&
         (where.status === undefined || candidate.status === where.status) &&
         (where.retryAt === undefined || candidate.retryAt?.getTime() === where.retryAt.getTime()) &&
-        (!where.OR || where.OR.some((condition: any) =>
-          condition.dispatchedGeneration === null
-            ? candidate.dispatchedGeneration == null
-            : candidate.dispatchedGeneration !== condition.dispatchedGeneration.not,
-        )),
+        (!where.OR || matchesOrConditions(candidate, where.OR)),
       );
       if (!row) return { count: 0 };
       const patch: Record<string, any> = { ...data };
@@ -1716,8 +1803,11 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     let stampCount = 0;
     const stamps: any[] = [];
     mocks.prFixUpdateMany.mockImplementation(async ({ where, data }: any) => {
-      if (!where.OR) {
-        // The per-agent hand-out record push (#1133) is not a stamp.
+      // Stamps carry the first-hand-out OR arms; the per-agent hand-out
+      // record push (#1133) carries the issuance pin (#1327) or no OR.
+      const isStamp = Array.isArray(where.OR) &&
+        where.OR.some((cond: any) => "dispatchedGeneration" in cond);
+      if (!isStamp) {
         const recorded = matchesFirstHandOut(row, where);
         if (recorded) applyUpdate(row, data);
         return { count: recorded ? 1 : 0 };
