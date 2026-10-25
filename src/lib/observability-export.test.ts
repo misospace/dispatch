@@ -218,6 +218,23 @@ describe("exportObservabilityMetrics", () => {
     expect(armed).toEqual(["dispatch_sync_job_armed 1"]);
   });
 
+  it("an unarmed scheduler with a defaulted interval is unknown too: no stale flag", () => {
+    // Default deployment: DISPATCH_SCHEDULER_ENABLED off while the sync
+    // interval stays at its default. Mirrors the evaluator's A2/A4 opt-out
+    // guards — the pipeline should not have run, so staleness is unknown,
+    // neither healthy (0) nor stale (1).
+    for (const lastSuccessAt of [ago(120), ago(7200)]) {
+      const body = metrics({
+        scheduler: { enabled: false, syncIntervalMs: 900_000, jobs: [] },
+        sync: { lastSuccessAt, running: 0, failed: [] },
+      });
+      expect(sampleLines(body, "dispatch_sync_stale")).toEqual([]);
+      expect(sampleLines(body, "dispatch_scheduler_up")).toEqual([
+        "dispatch_scheduler_up 0",
+      ]);
+    }
+  });
+
   it("escapes label values and never emits high-cardinality dimensions", () => {
     const body = metrics({
       issues: [makeIssue({ id: "x", labels: ['status/ready', 'agent/evil"\\name'] })],

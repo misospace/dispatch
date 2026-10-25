@@ -87,7 +87,12 @@ assets reference anything outside it. Mapping notes against the §4 catalogue:
   every windowed count under §4.1).
 - **Absent series is load-bearing**: `dispatch_sync_last_success_timestamp_seconds`
   does not exist until the first sync completes — the A2 firing case — and
-  null ages omit their series instead of exporting zero.
+  null ages omit their series instead of exporting zero. `dispatch_sync_stale`
+  is likewise absent while the pipeline is opted out — sync job disabled
+  (`DISPATCH_SYNC_INTERVAL_MS=0`) **or** scheduler unarmed
+  (`DISPATCH_SCHEDULER_ENABLED` off with the interval left at its default, the
+  default deployment) — mirroring the evaluator's A2/A4 `not_evaluable`
+  guards: an opted-out pipeline is unknown, never exported as healthy.
 - Families with no samples emit nothing; the empty-Dispatch document still
   carries every always-present family with zero values, so a completely idle
   Dispatch **renders** (zeros, not gaps) in any consumer.

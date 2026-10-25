@@ -308,7 +308,7 @@ export function exportObservabilityMetrics(snapshot: ObservabilitySnapshot): str
   families.push(
     scalar(
       "dispatch_sync_stale",
-      "1 when the last completed sync is older than two sync intervals (fresh-sync guard of A4; absent until the first completion, and absent while the sync job is disabled — an opted-out pipeline is unknown, never healthy).",
+      "1 when the last completed sync is older than two sync intervals (fresh-sync guard of A4; absent until the first completion, and absent while the pipeline is opted out — sync job disabled or scheduler unarmed — an opted-out pipeline is unknown, never healthy).",
       syncStaleFlag(snapshot),
     ),
   );
@@ -341,10 +341,14 @@ export function exportObservabilityMetrics(snapshot: ObservabilitySnapshot): str
 
 /** §4.9 fresh-sync guard: stale past 2× interval; only meaningful once a sync
  *  has ever completed — before that the series is absent (the A2 firing
- *  case), and while the sync job is disabled it is absent too (an opt-out is
- *  unknown, never healthy, so the rules' A4 guard leg goes empty exactly like
- *  the evaluator's not_evaluable). */
+ *  case), and while the pipeline is opted out it is absent too: either the
+ *  sync job is disabled (interval 0) or the scheduler is unarmed with the
+ *  interval left at its default (the default deployment). Both are opt-outs —
+ *  unknown, never healthy — so the rules' A4 guard leg goes empty exactly
+ *  like the evaluator's not_evaluable (mirrors the A2/A4 scheduler guards in
+ *  observability-alerts.ts). */
 function syncStaleFlag(snapshot: ObservabilitySnapshot): number | null {
+  if (!snapshot.pipeline.scheduler.enabled) return null;
   if (snapshot.config.syncIntervalMs <= 0) return null;
   if (!snapshot.pipeline.sync.everSucceeded) return null;
   const age = snapshot.pipeline.sync.secondsSinceLastSuccess;
