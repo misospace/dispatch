@@ -5716,10 +5716,25 @@ describe("rebase worker pool eligibility (DISPATCH_REBASE_AGENTS, #1327)", () =>
     delete process.env.DISPATCH_REBASE_AGENTS;
   });
 
-  it("unset means no restriction", () => {
+  it("unset is fail-closed: no agent is eligible", () => {
+    // #1327 exists to keep rebases on free local capacity, so a missing
+    // allowlist must not hand the lane to every polling agent.
     delete process.env.DISPATCH_REBASE_AGENTS;
-    expect(parseRebaseAgentPool(undefined)).toBeNull();
+    expect(parseRebaseAgentPool(undefined)).toEqual(new Set());
+    expect(isRebaseLaneAgent("anyone")).toBe(false);
+  });
+
+  it("a bare * value is the explicit unrestricted opt-in", () => {
+    process.env.DISPATCH_REBASE_AGENTS = "*";
+    expect(parseRebaseAgentPool("*")).toBeNull();
     expect(isRebaseLaneAgent("anyone")).toBe(true);
+  });
+
+  it("a * mixed into a list is an agent name, not the opt-in", () => {
+    process.env.DISPATCH_REBASE_AGENTS = "*, local-coder";
+    expect(parseRebaseAgentPool("*, local-coder")).toEqual(new Set(["*", "local-coder"]));
+    expect(isRebaseLaneAgent("local-coder")).toBe(true);
+    expect(isRebaseLaneAgent("anyone")).toBe(false);
   });
 
   it("parses comma and whitespace separated names case-insensitively", () => {

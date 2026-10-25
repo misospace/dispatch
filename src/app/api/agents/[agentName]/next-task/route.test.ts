@@ -432,6 +432,49 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
       expect(row.agentHandouts).toEqual([]);
     });
+
+    it("unset pool is fail-closed: REBASE defers while ordinary fix work still dispatches", async () => {
+      // #1327's fail-closed default: with no operator-declared pool, NO
+      // agent is eligible — an unset allowlist must not hand the local-only
+      // lane to every polling agent. The ineligible poll still serves
+      // ordinary fix work, and the REBASE item stays QUEUED (no hand-out
+      // stamp; the next eligible poll retries it).
+      delete process.env.DISPATCH_REBASE_AGENTS;
+      const rebase = rebaseRow();
+      const fix = prFixRow(32);
+      mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+        where?.OR ? [rebase] : [rebase, fix]);
+      mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+        where.id === fix.id ? { ...fix } : where.id === rebase.id ? { ...rebase } : null);
+
+      const body = await (await GET(request(exclusionUrl()), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })).json();
+      expect(body.type).toBe("followup-pr");
+      expect(body.pullRequest.number).toBe(32);
+      // Only the ordinary fix row was stamped: the REBASE item keeps its
+      // QUEUED state for the next eligible poll.
+      expect(mocks.prFixUpdateMany).toHaveBeenCalled();
+      expect(mocks.prFixUpdateMany.mock.calls.every(([args]) => args.where.id === fix.id)).toBe(true);
+      expect(rebase.agentHandouts).toEqual([]);
+    });
+
+    it("a bare * value is the explicit unrestricted opt-in", async () => {
+      // Debugging/backcompat hatch: `*` reopens the lane to every poller —
+      // including an agent no named pool would admit — but only as the
+      // entire value, and never by default.
+      process.env.DISPATCH_REBASE_AGENTS = "*";
+      const row = rebaseRow();
+      rowMocks(row);
+
+      const body = await (await GET(request(exclusionUrl()), {
+        params: Promise.resolve({ agentName: "some-cloud-agent" }),
+      })).json();
+      expect(body.type).toBe("followup-pr");
+      expect(body.prFixItem.fixType).toBe("REBASE");
+      // The hand-out still runs inside the serialized admission transaction.
+      expect(mocks.prFixTxSurfaces).toContain("updateMany");
+    });
   });
 
   it("defers REBASE hand-outs while any rebase hand-out is live (concurrency 1, #1327)", async () => {
@@ -822,6 +865,11 @@ describe("GET /api/agents/[agentName]/next-task", () => {
 
   beforeEach(() => {
     delete process.env.DISPATCH_AUTH_MODE;
+    // The REBASE lane mechanic tests dispatch to `example-agent`; the
+    // operator pool itself is pinned per-test in the rebase-worker-pool
+    // describe. Unset/empty admits nobody, so the mechanic tests declare a
+    // pool containing their agent and afterEach clears it again.
+    process.env.DISPATCH_REBASE_AGENTS = "example-agent";
     resetAuthCaches();
     vi.clearAllMocks();
     mocks.prFixFindMany.mockResolvedValue([]);
@@ -853,6 +901,10 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     mocks.prFixUpdateMany.mockResolvedValue({ count: 1 });
     mocks.issueFindMany.mockResolvedValue([]);
     mocks.findLeasedIssueIds.mockResolvedValue([]);
+  });
+
+  afterEach(() => {
+    delete process.env.DISPATCH_REBASE_AGENTS;
   });
 
   it("returns idle when the queue is empty", async () => {

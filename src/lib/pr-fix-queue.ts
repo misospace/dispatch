@@ -67,19 +67,23 @@ export const REBASE_LANE_ADVISORY_LOCK_KEY = 13270001327n;
 /**
  * #1327: the rebase lane's worker pool is LOCAL-only by contract — git is its
  * tool surface and it must not consume paid cloud capacity. Dispatch has no
- * model/runner knowledge of agents, so the pool is operator-declared: when
- * `DISPATCH_REBASE_AGENTS` is set to a non-empty list of agent names
- * (comma or whitespace separated, case-insensitive), only those agents
- * receive REBASE hand-outs; any other agent's poll defers the REBASE
- * candidate for an eligible poller (the item stays QUEUED, the poll keeps
- * serving other work). Unset: no restriction — legacy behavior, where any
- * polling worker may take the lane and the operator relies on the harness
- * to route it. An explicitly EMPTY value is fail-closed: no agent is
- * eligible and the lane stops dispatching until the operator names workers.
+ * model/runner knowledge of agents, so the pool is operator-declared via
+ * `DISPATCH_REBASE_AGENTS`: only the listed agent names (comma or whitespace
+ * separated, case-insensitive) receive REBASE hand-outs; any other agent's
+ * poll defers the REBASE candidate for an eligible poller (the item stays
+ * QUEUED, the poll keeps serving other work).
+ *
+ * FAIL CLOSED: an unset, empty, or whitespace-only value admits NOBODY. #1327
+ * exists to keep rebases on free local capacity, so a missing allowlist must
+ * not hand the lane to every polling agent — the lane stays QUEUED until the
+ * operator names workers. A bare `*` value is the explicit unrestricted
+ * opt-in (debugging/backcompat): every polling agent is eligible. A `*`
+ * mixed into a list is just an agent name that matches nothing — the opt-in
+ * must be the entire value to count.
  */
 export function parseRebaseAgentPool(raw: string | undefined): Set<string> | null {
-  if (raw === undefined) return null;
-  const names = raw
+  if (raw?.trim() === "*") return null;
+  const names = (raw ?? "")
     .split(/[\s,]+/)
     .map((name) => name.trim().toLowerCase())
     .filter(Boolean);

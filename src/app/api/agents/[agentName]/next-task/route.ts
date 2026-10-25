@@ -482,7 +482,9 @@ export async function GET(
           // next eligible poll hands it out) instead of entering the lane
           // admission at all. The check is config-only and precedes the
           // advisory lock, so ineligible polls never contend on the lane
-          // lock. Unset keeps the legacy no-restriction behavior.
+          // lock. FAIL CLOSED: unset or empty admits nobody — the lane stays
+          // QUEUED until the operator names workers — and a bare `*` value
+          // is the explicit unrestricted opt-in.
           if (!isRebaseLaneAgent(agentName)) {
             console.info(`[next-task-pr-fix] deferring REBASE ${candidate.repo}#${candidate.pr}: agent ${agentName} is not in the rebase worker pool (DISPATCH_REBASE_AGENTS, #1327)`);
             return null;
