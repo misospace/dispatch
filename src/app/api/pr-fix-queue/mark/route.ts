@@ -162,11 +162,10 @@ export async function POST(request: Request) {
     });
     if (!result.mutated) {
       if (result.reason === "not-handed") {
-        // #1430: a hand-out-scoped (bound worker) caller tried to replay a
-        // same-generation WAITING_EXTERNAL mark it did not start. Refusal,
-        // not an outcome: `reason` lets the worker tell "you may not read/
-        // settle this" apart from "the settlement was refused" (the outcome
-        // vocabulary stays untouched). No mutation, no success audit row.
+        // #1428: the caller does not hold the hand-out that owns this row's
+        // settled generation. Refusal, not an outcome: `reason` lets the
+        // worker tell "you may not settle this" apart from "the settlement
+        // was refused" (the outcome vocabulary stays untouched).
         try {
           await prisma.auditLog.create({
             data: {
@@ -175,7 +174,7 @@ export async function POST(request: Request) {
               repoFullName: input.repo,
               issueNumber: null,
               success: false,
-              errorMessage: `Worker ${handoutScopedAgent ?? "unknown"} did not start the external wait on pr-fix item ${input.repo}#${input.pr} at the recorded generation`,
+              errorMessage: `Worker ${handoutScopedAgent ?? "unknown"} holds no hand-out on pr-fix item ${input.repo}#${input.pr} at the settled generation`,
               beforeLabels: [],
               afterLabels: [],
             },
@@ -185,7 +184,7 @@ export async function POST(request: Request) {
         }
         return NextResponse.json(
           {
-            error: "PR fix queue item external wait was not started by the authenticated agent at that generation",
+            error: "PR fix queue item was not handed to the authenticated agent at that generation",
             reason: "not-handed",
           },
           { status: 403 },
