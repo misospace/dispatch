@@ -2584,6 +2584,24 @@ export async function markPrFixItem(
   const existing = await client.prFixQueueItem.findUnique({ where: { repo_pr: { repo: input.repo, pr: input.pr } } });
   if (!existing) return { mutated: false, reason: "not-found" };
 
+  // #1430: one rule for every same-generation `WAITING_EXTERNAL` answer —
+  // the pre-read duplicate AND both post-write conflict fallbacks (the
+  // function-scope helpers below are shared by the two WAITING_EXTERNAL
+  // blocks). The duplicate answer hands out the full row, so at worker scope
+  // it is a state read and must be bound to the identity that actually
+  // started the wait. The wait itself cleared `agentHandouts` (no hand-out
+  // marker survives it), which is why this replay can never be re-authorized
+  // by a hand-out check — the waiter column written with the transition is
+  // the only binding left. The fallbacks are load-bearing, not theoretical:
+  // a scoped caller that lost the generation-pinned write to a CONCURRENT
+  // wait by another agent (the lane supports multiple live hand-outs per
+  // generation) must not receive that other agent's row either.
+  const scopedReplayAllowed = (row: { externalWaitBy?: unknown }): boolean =>
+    !input.handoutScopedAgent ||
+    (typeof row.externalWaitBy === "string" && row.externalWaitBy
+      ? row.externalWaitBy
+      : null) === input.handoutScopedAgent;
+
   // BLOCKED is reserved for a genuine human decision (#1218): lane NEEDS_HUMAN,
   // outcome human_decision, surfaced with the needs-human label + marker. PARKED
   // is bounded exhaustion or an operational failure: lane NORMAL, no
@@ -2600,24 +2618,12 @@ export async function markPrFixItem(
     // Idempotent duplicate for the same generation: never extend the
     // cooldown, never overwrite the recorded contract or note (#1231).
     if (existing.status === "WAITING_EXTERNAL" && existing.generation === expectedGeneration) {
-      // #1430: the duplicate answer hands out the full row, so at worker
-      // scope it is a state read and must be bound to the identity that
-      // actually started the wait. The wait itself cleared `agentHandouts`
-      // (no hand-out marker survives it), which is why this replay can never
-      // be re-authorized by a hand-out check — the waiter column written with
-      // the transition is the only binding left. A scoped caller that is not
-      // the recorded waiter (including a row whose wait was started by an
-      // unscoped caller, `externalWaitBy` null) gets `not-handed`: refusal,
-      // no mutation, no history row. Unscoped callers keep the unchanged
-      // #1231 behavior.
-      if (input.handoutScopedAgent) {
-        const waiter =
-          typeof existing.externalWaitBy === "string" && existing.externalWaitBy
-            ? existing.externalWaitBy
-            : null;
-        if (waiter !== input.handoutScopedAgent) {
-          return { mutated: false, reason: "not-handed" };
-        }
+      // A scoped caller that is not the recorded waiter (including a row
+      // whose wait was started by an unscoped caller, `externalWaitBy` null)
+      // gets `not-handed`: refusal, no mutation, no history row. Unscoped
+      // callers keep the unchanged #1231 behavior.
+      if (!scopedReplayAllowed(existing)) {
+        return { mutated: false, reason: "not-handed" };
       }
       return { mutated: true, item: existing };
     }
@@ -2679,7 +2685,12 @@ export async function markPrFixItem(
         return { mutated: true, item: downgraded };
       }
       const latest = await client.prFixQueueItem.findUnique({ where: { id: existing.id } });
-      if (latest?.status === "WAITING_EXTERNAL" && latest.generation === expectedGeneration) return { mutated: true, item: latest };
+      if (latest?.status === "WAITING_EXTERNAL" && latest.generation === expectedGeneration) {
+        // #1430: the concurrent wait that beat this attempt belongs to its
+        // starter; a scoped caller that is not the recorded waiter does not
+        // get that row back either.
+        return scopedReplayAllowed(latest) ? { mutated: true, item: latest } : { mutated: false, reason: "not-handed" };
+      }
       return { mutated: false, reason: "generation-mismatch" };
     }
     data.retryAt = new Date(Date.now() + externalWaitCooldownMs());
@@ -2756,7 +2767,13 @@ export async function markPrFixItem(
     });
     if (result) return { mutated: true, item: result };
     const latest = await client.prFixQueueItem.findUnique({ where: { id: existing.id } });
-    if (latest?.status === "WAITING_EXTERNAL" && latest.generation === expectedGeneration) return { mutated: true, item: latest };
+    if (latest?.status === "WAITING_EXTERNAL" && latest.generation === expectedGeneration) {
+      // #1430: a scoped caller that lost the QUEUED→WAITING_EXTERNAL write to
+      // another agent's concurrent wait at the same generation must not read
+      // that agent's wait back; only the recorded waiter keeps the #1231
+      // idempotent answer here (own retry winning the race twice is fine).
+      return scopedReplayAllowed(latest) ? { mutated: true, item: latest } : { mutated: false, reason: "not-handed" };
+    }
     return { mutated: false, reason: "generation-mismatch" };
   }
 

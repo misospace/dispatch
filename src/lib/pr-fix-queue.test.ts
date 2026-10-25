@@ -1632,6 +1632,171 @@ describe("hand-out-scoped external waits (#1430)", () => {
     expect(fresh.externalWaitBy).toBe(null);
     expect(fresh.agentHandouts).toEqual([]);
   });
+
+  // Post-write conflict fallback race (#1430): the scoped caller reads the row
+  // as QUEUED, a CONCURRENT mark at the same generation wins the
+  // QUEUED→WAITING_EXTERNAL transition before the caller's generation-pinned
+  // write runs (status where-pin misses, count 0), and the fallback re-read
+  // must apply the same scoped-replay gate as the pre-read duplicate. Each of
+  // the two fallback paths (normal wait write, fail-closed downgrade) runs
+  // exactly one updateMany — the pinned write itself — so the one-shot
+  // `beforeUpdateMany` hook lands the concurrent winner right before it.
+  describe("concurrent same-generation wait races (post-write fallback)", () => {
+    const ALPHA_RETRY_AT = new Date(Date.UTC(2026, 5, 15, 12, 30));
+    const ALPHA_NOTE = "alpha is waiting on the upstream PR";
+
+    function installConcurrentAlphaWait(item: { id: string }) {
+      client.hooks.beforeUpdateMany = () => {
+        const row = client.items.find((i) => i.id === item.id)!;
+        // Alpha's winning wait write: distinct note (history) and retryAt
+        // from anything the losing caller would have recorded; generation
+        // unchanged (same-generation race).
+        Object.assign(row, {
+          status: "WAITING_EXTERNAL",
+          retryAt: ALPHA_RETRY_AT,
+          externalWait: wait,
+          outcome: null,
+          decisionDetail: null,
+          postDispatchEvidenceKeys: [],
+          disposedAt: new Date(Date.UTC(2026, 5, 16, 0, 0)),
+          disposedEvidence: null,
+          attemptEvidenceWatermark: null,
+          dispatchedGeneration: null,
+          dispatchedAt: null,
+          agentHandouts: [],
+          handoutReceipts: [],
+          handoutAcks: [],
+          externalWaitBy: "alpha",
+          updatedAt: new Date(Date.UTC(2026, 5, 17, 0, 0)),
+        });
+        client.history.push({
+          id: `history-${client.history.length + 1}`,
+          at: new Date(),
+          itemId: row.id,
+          action: "mark",
+          status: "WAITING_EXTERNAL",
+          lane: row.lane,
+          note: ALPHA_NOTE,
+        });
+      };
+    }
+
+    it("a scoped caller losing the QUEUED→WAITING_EXTERNAL write to a concurrent wait by another agent gets not-handed (post-write fallback, #1430)", async () => {
+      const item = await seedQueued(97);
+      installConcurrentAlphaWait(item);
+      const historyLengthBefore = client.history.length;
+
+      const lost = await markPrFixItem(client, {
+        repo: item.repo,
+        pr: item.pr,
+        status: "WAITING_EXTERNAL",
+        expectedGeneration: item.generation,
+        note: "bravo wait note",
+        externalWait: wait,
+        handoutScopedAgent: "bravo",
+      });
+
+      expect(lost).toEqual({ mutated: false, reason: "not-handed" });
+      const row = rowOf(item);
+      // The row keeps the concurrent winner's wait, not bravo's: alpha is the
+      // recorded waiter with alpha's cooldown, and bravo's attempt left no
+      // history row (its pinned write missed before the history create).
+      expect(row.status).toBe("WAITING_EXTERNAL");
+      expect(row.externalWaitBy).toBe("alpha");
+      expect(row.retryAt).toBe(ALPHA_RETRY_AT);
+      expect(client.history).toHaveLength(historyLengthBefore + 1);
+      expect(client.history.at(-1)).toMatchObject({ action: "mark", status: "WAITING_EXTERNAL", note: ALPHA_NOTE });
+      expect(client.history.some((h) => h.note === "bravo wait note")).toBe(false);
+    });
+
+    it("a scoped caller losing the write to its own concurrent wait keeps the idempotent answer (post-write fallback double submit, #1430)", async () => {
+      const item = await seedQueued(98);
+      installConcurrentAlphaWait(item);
+      const historyLengthBefore = client.history.length;
+
+      const replay = await markPrFixItem(client, {
+        repo: item.repo,
+        pr: item.pr,
+        status: "WAITING_EXTERNAL",
+        expectedGeneration: item.generation,
+        note: "alpha replay note",
+        externalWait: wait,
+        handoutScopedAgent: "alpha",
+      });
+
+      expect(replay.mutated).toBe(true);
+      const row = rowOf(item);
+      expect(mutatedItem(replay)).toBe(row);
+      // The winner's recorded wait survives the caller's losing write:
+      // alpha's cooldown and note, no second history row from the replay.
+      expect(row.status).toBe("WAITING_EXTERNAL");
+      expect(row.externalWaitBy).toBe("alpha");
+      expect(row.retryAt).toBe(ALPHA_RETRY_AT);
+      expect(client.history).toHaveLength(historyLengthBefore + 1);
+      expect(client.history.at(-1)).toMatchObject({ note: ALPHA_NOTE });
+      expect(client.history.some((h) => h.note === "alpha replay note")).toBe(false);
+    });
+
+    it("an unscoped caller losing the write to a concurrent scoped wait keeps the unchanged replay (post-write fallback, #1430)", async () => {
+      const item = await seedQueued(99);
+      installConcurrentAlphaWait(item);
+      const historyLengthBefore = client.history.length;
+
+      const replay = await markPrFixItem(client, {
+        repo: item.repo,
+        pr: item.pr,
+        status: "WAITING_EXTERNAL",
+        expectedGeneration: item.generation,
+        note: "unscoped wait note",
+        externalWait: wait,
+      });
+
+      expect(replay.mutated).toBe(true);
+      const row = rowOf(item);
+      expect(mutatedItem(replay)).toBe(row);
+      // Unscoped callers are not bound to the recorded waiter: the row comes
+      // back unchanged, still recording alpha as the starter.
+      expect(row.status).toBe("WAITING_EXTERNAL");
+      expect(row.externalWaitBy).toBe("alpha");
+      expect(row.retryAt).toBe(ALPHA_RETRY_AT);
+      expect(client.history).toHaveLength(historyLengthBefore + 1);
+      expect(client.history.at(-1)).toMatchObject({ note: ALPHA_NOTE });
+    });
+
+    it("the fail-closed downgrade write's fallback applies the scoped gate too: not-handed, and the row is never parked (post-write fallback, #1430)", async () => {
+      const item = await seedQueued(100);
+      installConcurrentAlphaWait(item);
+      const historyLengthBefore = client.history.length;
+
+      // Invalid contract (no dependency) → the fail-closed PARKED/invalid_wait
+      // downgrade write is attempted, but the hook flips the row to alpha's
+      // WAITING_EXTERNAL first, so its QUEUED status pin misses.
+      const lost = await markPrFixItem(client, {
+        repo: item.repo,
+        pr: item.pr,
+        status: "WAITING_EXTERNAL",
+        expectedGeneration: item.generation,
+        note: "bravo invalid note",
+        externalWait: {},
+        handoutScopedAgent: "bravo",
+      });
+
+      expect(lost).toEqual({ mutated: false, reason: "not-handed" });
+      const row = rowOf(item);
+      // The row stays on alpha's wait: not parked, no invalid_wait
+      // disposition, no PARKED history row, no park surfacing.
+      expect(row.status).toBe("WAITING_EXTERNAL");
+      expect(row.outcome).toBe(null);
+      expect(row.lane).toBe("NORMAL");
+      expect(row.externalWaitBy).toBe("alpha");
+      expect(row.externalWait).toEqual(wait);
+      expect(row.retryAt).toBe(ALPHA_RETRY_AT);
+      expect(client.history).toHaveLength(historyLengthBefore + 1);
+      expect(client.history.at(-1)).toMatchObject({ status: "WAITING_EXTERNAL", note: ALPHA_NOTE });
+      expect(client.history.some((h) => h.status === "PARKED")).toBe(false);
+      expect(surfacingMocks.surfacePrFixParked).not.toHaveBeenCalled();
+    });
+  });
 });
 
 describe("markPrFixItem head SHA guard (#940)", () => {
