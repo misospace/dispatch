@@ -369,6 +369,13 @@ export async function getActiveWorkByAgent(client: AgentWorkClient, agentName: s
  * while a `BLOCKED` row is gated on its park deadline only — reclaimable
  * once `leaseExpiresAt` elapsed or when it never had one (NULL) — so a
  * parked blocked claim is never destroyed here either.
+ *
+ * NOT updated for #1418: the canonical reclaim gate is `activeStateFamilies`
+ * in `stale-work.ts`, whose `CLAIMED`/`IN_PROGRESS` arm no longer reclaims on
+ * heartbeat silence alone while the execution lease is still live. This copy
+ * still encodes the pre-#1418 OR-shape and has no production caller — if it
+ * is ever re-wired, defer to `activeStateFamilies` rather than extending this
+ * mirror, or the renewed-lease liveness shield silently regresses.
  */
 function reclaimGateClauses(cutoff: Date) {
   return [

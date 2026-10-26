@@ -212,7 +212,10 @@ export const WORKER_ALLOWLIST: ReadonlyArray<{ method: string | "*"; pattern: Re
   { method: "GET", pattern: /^\/api\/issues\/state$/ },
   { method: "POST", pattern: /^\/api\/issues\/status$/ },
   { method: "GET", pattern: /^\/api\/issues$/ },
-  // PR-fix queue reads + status marks
+  // PR-fix queue reads + status marks. The mark route is hand-out-scoped
+  // (#1428): the legacy unbound `DISPATCH_WORKER_TOKEN` is refused
+  // (`enforceWorkerBound`), and a bound worker may only settle rows whose
+  // `agentHandouts` carry its own marker at the settled generation.
   { method: "GET", pattern: /^\/api\/pr-fix-queue\/queued$/ },
   { method: "GET", pattern: /^\/api\/pr-fix-queue\/history$/ },
   { method: "POST", pattern: /^\/api\/pr-fix-queue\/mark$/ },

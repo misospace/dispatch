@@ -653,7 +653,22 @@ describe("legacy fallback and snapshot lifecycle (#1249)", () => {
   });
 
   it("freshAttemptGeneration resets the watermark everywhere a fresh attempt is minted", () => {
-    expect(freshAttemptGeneration()).toEqual({ generation: { increment: 1 }, attemptEvidenceWatermark: null });
+    // #495: every generation bump also clears the CI park deferral columns —
+    // the deferral's leash (no TTL, no env var; every fresh attempt is
+    // dispatchable again and a crashed Courier cycle leaves no suppression).
+    //
+    // #1327 review: the DISPATCHED lane resets with the attempt too, so a
+    // reopened row never masquerades as the previous attempt's lane.
+    expect(freshAttemptGeneration()).toEqual({
+      generation: { increment: 1 },
+      attemptEvidenceWatermark: null,
+      ciParkState: null,
+      ciParkHead: null,
+      ciParkKey: null,
+      ciParkFence: null,
+      ciParkAt: null,
+      attemptType: null,
+    });
   });
 });
 

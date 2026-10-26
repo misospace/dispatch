@@ -888,7 +888,7 @@ describe("ingestMergeStateEvent", () => {
     expect(client.items).toHaveLength(0);
   });
 
-  it("populates MERGE_CONFLICT type for DIRTY merge state", async () => {
+  it("populates REBASE type for DIRTY merge state (mechanical rebase lane, #1327)", async () => {
     process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
     const client = makeClient();
 
@@ -903,7 +903,31 @@ describe("ingestMergeStateEvent", () => {
     });
 
     expect(client.items).toHaveLength(1);
-    expect(client.items[0].type).toBe("MERGE_CONFLICT");
+    expect(client.items[0].type).toBe("REBASE");
+    // The item's reasons ARE the worker's contract wall for a rebase hand-off.
+    expect(client.items[0].feedback[0]).toContain("Mechanical rebase required");
+    expect(client.items[0].feedback[0]).toContain("MECHANICALLY ONLY");
+    expect(client.items[0].feedback[0]).toContain("--force-with-lease");
+    expect(client.items[0].feedback[0]).toContain("human_decision");
+  });
+
+  it("keeps non-conflict merge states as OTHER fix work", async () => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    const client = makeClient();
+
+    await ingestMergeStateEvent(client, {
+      repoFullName: "misospace/dispatch",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/misospace/dispatch/pull/42",
+      title: "Fix test issue",
+      author: "itsmiso-ai",
+      mergeStateStatus: "behind",
+    });
+
+    expect(client.items).toHaveLength(1);
+    expect(client.items[0].type).toBe("OTHER");
+    expect(client.items[0].feedback[0]).toBe("PR merge state is now behind");
   });
 
 
@@ -1678,6 +1702,7 @@ describe("durable evidence fields (#1249)", () => {
 
     expect(evidenceEnqueueInputs).toHaveLength(1);
     const input = evidenceEnqueueInputs[0];
+    expect(input.type).toBe("REBASE");
     expect(input.evidenceKind).toBe("merge_conflict");
     expect(input.evidenceKey).toBe("merge_conflict:org/repo#42");
     expect(input.evidenceVersion).toBe("mergeable=conflicting|head=head-mc");
@@ -2260,7 +2285,7 @@ describe("clearResolvedConflictItems ledger baseline (#1276 review)", () => {
     }
   });
 
-  it("keeps the QUEUED/MERGE_CONFLICT guard and still requires a non-conflicting state", async () => {
+  it("keeps the QUEUED guard and still requires a non-conflicting state", async () => {
     const client = makeLedgerClient();
     const item = await conflicting(client);
     item.status = "BLOCKED";
@@ -2280,10 +2305,28 @@ describe("clearResolvedConflictItems ledger baseline (#1276 review)", () => {
       mergeable: "CONFLICTING",
       headSha: "head-1",
     })).toBe(false);
-    // Still conflicting, or not a merge conflict item: nothing recorded, nothing settled.
+    // Still conflicting, or not a clearable status: nothing recorded, nothing settled.
     expect(client.ledger[0]).toMatchObject({ version: "mergeable=conflicting|head=head-1", actionable: true });
     expect(item.status).toBe("BLOCKED");
     expect(client.items).toHaveLength(1);
     expect(client.history).toHaveLength(historyBefore);
+  });
+
+  it("settles a legacy MERGE_CONFLICT row FIXED when the conflict clears", async () => {
+    // Pre-#1327 rows queued by the fix loop carry MERGE_CONFLICT; the guard
+    // clears them the same as REBASE rows.
+    const client = makeLedgerClient();
+    const item = await conflicting(client);
+    item.type = "MERGE_CONFLICT";
+
+    const cleared = await clearResolvedConflictItems(client, {
+      repoFullName: CONFLICT.repoFullName,
+      prNumber: CONFLICT.prNumber,
+      mergeable: "MERGEABLE",
+      headSha: "head-1",
+    });
+
+    expect(cleared).toBe(true);
+    expect(item.status).toBe("FIXED");
   });
 });

@@ -81,6 +81,7 @@ function makePrFix(overrides: Partial<ObservabilityPrFixRow>): ObservabilityPrFi
     dispatchedGeneration: null,
     generation: 1,
     handoutAcks: [],
+    handoutAckTimes: [],
     outcome: null,
     ...overrides,
   };
@@ -111,11 +112,13 @@ function baseInputs(
       ],
     },
     admissionMode: "off",
+    syncPipeline: "auto",
     admissionRuns: new Map(),
     thresholds: {
       strandedAssignmentMs: 1_800_000,
       assignmentEvidenceLookbackMs: 30 * 24 * 60 * 60 * 1000,
       prFixHandoutTimeoutMs: 1_800_000,
+      prFixAckLivenessMs: 24 * 60 * 60 * 1000,
     },
     ...overrides,
   };
@@ -388,6 +391,54 @@ describe("observability signal derivation", () => {
       expect(s.prFix.handouts.unackedAggregate).toBe(1);
     });
 
+    it("stuck acknowledged hand-out past the ack-liveness window counts as overdueAcked (#1419)", () => {
+      // Acked current generation dispatched 30h ago — past the 24h default.
+      const overdue = snapshot({
+        prFixItems: [
+          makePrFix({
+            dispatchedAt: ago(30 * 3600),
+            dispatchedGeneration: 1,
+            generation: 1,
+            handoutAcks: ["worker-a@1"],
+          }),
+        ],
+      });
+      expect(overdue.prFix.handouts.overdueAcked).toBe(1);
+      expect(overdue.prFix.handouts.unackedAggregate).toBe(0);
+      // Fresh ack inside the window is not stuck.
+      const fresh = snapshot({
+        prFixItems: [
+          makePrFix({
+            dispatchedAt: ago(120),
+            dispatchedGeneration: 1,
+            generation: 1,
+            handoutAcks: ["worker-a@1"],
+          }),
+        ],
+      });
+      expect(fresh.prFix.handouts.overdueAcked).toBe(0);
+      // A long-running attempt dispatched 30h ago but acked 2m ago is a
+      // HEALTHY long run — keyed on the ack timestamp, not the dispatch stamp.
+      const recentlyAckedLongRun = snapshot({
+        prFixItems: [
+          makePrFix({
+            dispatchedAt: ago(30 * 3600),
+            dispatchedGeneration: 1,
+            generation: 1,
+            handoutAcks: ["worker-a@1"],
+            handoutAckTimes: [new Date(NOW.getTime() - 2 * 60 * 1000).toISOString()],
+          }),
+        ],
+      });
+      expect(recentlyAckedLongRun.prFix.handouts.overdueAcked).toBe(0);
+      // Unacked overdue stays in the unacked bucket, not the acked one.
+      const unacked = snapshot({
+        prFixItems: [makePrFix({ dispatchedAt: ago(30 * 3600), dispatchedGeneration: 1 })],
+      });
+      expect(unacked.prFix.handouts.overdueAcked).toBe(0);
+      expect(unacked.prFix.handouts.overdueUnacked).toBe(1);
+    });
+
     it("acks parse with @-bearing agent names and reject malformed entries", () => {
       const acked = snapshot({
         prFixItems: [
@@ -557,13 +608,19 @@ describe("observability signal derivation", () => {
       expect(disabled.observations.eligibleWorkNotHandedOut).toBeNull();
 
       // Scheduler armed but the sync job disabled: the fresh-sync guard has
-      // no interval to evaluate against while a success series exists, so
-      // A4-style state is unknown, never a silent false or true.
+      // no interval to evaluate against, so the A4-style state is unknown in
+      // either success-history shape — never a silent false or true.
       const syncJobDisabled = snapshot({
         issues: [makeIssue({ id: "i1" })],
         scheduler: { enabled: true, syncIntervalMs: 0, jobs: [] },
       });
       expect(syncJobDisabled.observations.eligibleWorkNotHandedOut).toBeNull();
+      const syncJobDisabledNoHistory = snapshot({
+        issues: [makeIssue({ id: "i1" })],
+        scheduler: { enabled: true, syncIntervalMs: 0, jobs: [] },
+        sync: { lastSuccessAt: null, running: 0, failed: [] },
+      });
+      expect(syncJobDisabledNoHistory.observations.eligibleWorkNotHandedOut).toBeNull();
     });
 
     it("grooming freshness: absent fingerprint is unknown, never fresh", () => {
@@ -578,6 +635,47 @@ describe("observability signal derivation", () => {
       expect(s.grooming.freshness).toEqual({ fresh: 2, stale: 1, unknown: 1 });
       expect(s.grooming.backoff).toBe(1);
       expect(s.grooming.staleReasons).toEqual({ issue_changed: 1, unknown: 1 });
+    });
+  });
+
+  describe("sync pipeline arm state", () => {
+    it("armed with the in-process scheduler ticking, unknown without it", () => {
+      expect(snapshot().pipeline.syncPipelineState).toBe("armed");
+
+      // The DEFAULT deployment: in-process scheduler off, `auto`. Sync
+      // history is NOT evidence of a pipeline — one manual sync must not arm
+      // anything, so the state stays unknown and A4 stays silent.
+      const unarmed = snapshot({
+        scheduler: { enabled: false, syncIntervalMs: 900_000, jobs: [] },
+        sync: { lastSuccessAt: ago(120), running: 0, failed: [] },
+      });
+      expect(unarmed.pipeline.syncPipelineState).toBe("unknown");
+      expect(unarmed.observations.eligibleWorkNotHandedOut).toBeNull();
+    });
+
+    it("an operator opt-out is off, and stays off despite sync history", () => {
+      const optedOut = snapshot({ syncPipeline: "off" });
+      expect(optedOut.pipeline.syncPipelineState).toBe("off");
+      expect(optedOut.observations.eligibleWorkNotHandedOut).toBeNull();
+    });
+
+    it("a declared external driver is armed even with an unarmed in-process scheduler", () => {
+      const external = snapshot({
+        syncPipeline: "external",
+        scheduler: { enabled: false, syncIntervalMs: 900_000, jobs: [] },
+        issues: [makeIssue({ id: "i1" })],
+      });
+      expect(external.pipeline.syncPipelineState).toBe("armed");
+      expect(external.observations.eligibleWorkNotHandedOut).toBe(true);
+    });
+
+    it("a disabled sync job leaves the freshness window unknown", () => {
+      const disabled = snapshot({
+        scheduler: { enabled: true, syncIntervalMs: 0, jobs: [] },
+        issues: [makeIssue({ id: "i1" })],
+      });
+      expect(disabled.pipeline.syncPipelineState).toBe("off");
+      expect(disabled.observations.eligibleWorkNotHandedOut).toBeNull();
     });
   });
 

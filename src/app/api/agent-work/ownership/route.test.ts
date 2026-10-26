@@ -341,8 +341,9 @@ function makeAgentWork(overrides: Record<string, unknown> = {}) {
     issueId: "iss1",
     state: "IN_PROGRESS",
     lastHeartbeatAt: inMin(-2),
-    // The stale-work sweeper reads both timestamps: a row is reclaimed when
-    // its heartbeat OR its lease expiry falls past the sweep cutoff.
+    // The stale-work sweeper reads both timestamps: a row is reclaimed only
+    // when its heartbeat fell past the cutoff AND its lease expiry is not
+    // live (#1418) — silence alone is not abandonment while the lease stands.
     leaseExpiresAt: inMin(5),
     staleClaimReleasePending: false,
     blockerReason: null,
@@ -365,6 +366,7 @@ function makeAgentWork(overrides: Record<string, unknown> = {}) {
 /** The clause keys the sweeper's WHERE clause is allowed to use. */
 const SWEEP_CLAUSE_KEYS = new Set([
   "OR",
+  "AND",
   "state",
   "staleClaimReleasePending",
   "lastHeartbeatAt",
@@ -373,7 +375,7 @@ const SWEEP_CLAUSE_KEYS = new Set([
 
 /**
  * Evaluate the operators the sweep's clause uses. A clause key or operator
- * this evaluator does not implement (`AND`, `NOT`, `NOT_IN`, …) throws, so
+ * this evaluator does not implement (`NOT`, `NOT_IN`, `gte`, …) throws, so
  * the fake can never silently disagree with the clause — an unimplemented
  * clause must not read as "no candidates".
  */
@@ -383,6 +385,11 @@ function matchesWhere(row: Record<string, unknown>, where: unknown): boolean {
     if (key === "OR") {
       const clauses = cond as unknown[];
       if (!clauses.some((clause) => matchesWhere(row, clause))) return false;
+      continue;
+    }
+    if (key === "AND") {
+      const clauses = cond as unknown[];
+      if (!clauses.every((clause) => matchesWhere(row, clause))) return false;
       continue;
     }
     if (!SWEEP_CLAUSE_KEYS.has(key)) {
@@ -907,11 +914,13 @@ describe("POST /api/agent-work/ownership — renew atomicity (#1315)", () => {
 });
 
 describe("POST /api/agent-work/ownership — renew keeps the worker alive for the stale-work sweep (#1251)", () => {
-  // The sweeper reclaims an active AgentWork row whose `lastHeartbeatAt` OR
-  // whose `leaseExpiresAt` fell past its cutoff. The AgentWork lease is the
-  // short one (5 minutes, set by start/checkpoint), so a renewal that moved
-  // only the heartbeat would still be reclaimable — and a long-running
-  // worker that keeps renewing would be reclaimed anyway.
+  // The sweeper reclaims an active AgentWork row only when its
+  // `lastHeartbeatAt` fell past the cutoff AND its `leaseExpiresAt` is not
+  // live (#1418). The AgentWork lease is the short one (5 minutes, set by
+  // start/checkpoint), so a renewal that moved only the heartbeat would
+  // shield the worker for barely the heartbeat window — the renewed expiry
+  // is what buys the whole ownership TTL for a long-running worker that
+  // keeps renewing.
 
   it("writes the renewed expiry and the operation clock onto the matching active AgentWork row", async () => {
     db.agentWork = makeAgentWork({ lastHeartbeatAt: inMin(-12), leaseExpiresAt: inMin(-10) });
@@ -952,7 +961,7 @@ describe("POST /api/agent-work/ownership — renew keeps the worker alive for th
     expect(capturedClauses).toHaveLength(1);
   });
 
-  it("negative control: the pre-fix write shape IS selected by the same clause", async () => {
+  it("negative control: the pre-renewal write shape IS selected by the same clause", async () => {
     db.agentWork = makeAgentWork({ lastHeartbeatAt: inMin(-12), leaseExpiresAt: inMin(-10) });
     const res = await post(baseBody({ operation: "renew" }));
     expect(res.status).toBe(200);
@@ -962,20 +971,28 @@ describe("POST /api/agent-work/ownership — renew keeps the worker alive for th
     await sweepStaleWork(client);
     const [clause] = capturedClauses;
 
-    // What the renewal would have left behind WITHOUT the expiry
-    // propagation: a fresh heartbeat, the old (lapsed) lease expiry.
-    const preFixRow = { ...renewedRow, leaseExpiresAt: inMin(-10) };
-    expect(matchesWhere(preFixRow, clause)).toBe(true);
-    // And the fully pre-renewal row (old heartbeat, old expiry).
+    // The fully pre-renewal row (old heartbeat, old lapsed expiry): silence
+    // without a live lease — reclaimable, exactly as before #1418.
     const preRenewalRow = { ...renewedRow, lastHeartbeatAt: inMin(-12), leaseExpiresAt: inMin(-10) };
     expect(matchesWhere(preRenewalRow, clause)).toBe(true);
-    // The renewed row is not.
+
+    // The heartbeat-only pre-fix shape (fresh heartbeat, lapsed expiry) is
+    // not reclaimable NOW — a fresh heartbeat is liveness on its own
+    // (#1418) — but it ages into the cutoff within the 5-minute heartbeat
+    // window, while the renewed row stays protected through the whole
+    // renewed TTL. The expiry propagation is what buys the ownership window:
+    const preFixRow = { ...renewedRow, leaseExpiresAt: inMin(-10) };
+    expect(matchesWhere(preFixRow, clause)).toBe(false);
+    expect(
+      matchesWhere({ ...preFixRow, lastHeartbeatAt: inMin(-12) }, clause),
+    ).toBe(true);
+    // The renewed row is not reclaimable at any point inside the TTL.
     expect(matchesWhere(renewedRow, clause)).toBe(false);
 
-    // The sweeper itself selects the pre-fix shape: examined 1 means the
+    // The sweeper itself selects the aged pre-fix shape: examined 1 means the
     // clause returned it (the inert mark transaction keeps the release path
     // out of this control).
-    const control = makeSweepClient(() => preFixRow);
+    const control = makeSweepClient(() => ({ ...preFixRow, lastHeartbeatAt: inMin(-12) }));
     const controlReport = await sweepStaleWork(control.client);
     expect(controlReport.examined).toBe(1);
     expect(controlReport.released).toBe(0);
@@ -986,9 +1003,6 @@ describe("stale-work clause evaluator (#1251)", () => {
   it("throws on a clause key or operator it does not implement, instead of reading as 'no candidates'", () => {
     // An unimplemented clause must not silently select nothing: the fake
     // would then agree with a clause it does not actually understand.
-    expect(() => matchesWhere({ state: "IN_PROGRESS" }, { AND: [{ state: "IN_PROGRESS" }] })).toThrow(
-      /unsupported where clause key/,
-    );
     expect(() => matchesWhere({ state: "IN_PROGRESS" }, { NOT: { state: "STALE" } })).toThrow(
       /unsupported where clause key/,
     );

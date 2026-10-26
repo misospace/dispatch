@@ -140,10 +140,25 @@ row with a stale `lastHeartbeatAt`. Its presence is weak liveness evidence.
 every 5 min when the in-process scheduler is enabled
 (`src/lib/scheduler.ts:129-133`).
 
-- Candidates: `AgentWork` in `CLAIMED/IN_PROGRESS/BLOCKED` whose
-  `lastHeartbeatAt` or `leaseExpiresAt` is older than **5 min**
-  (`DEFAULT_STALE_WORK_MAX_AGE_MS`, `src/lib/stale-work.ts:6`), plus
-  `STALE` rows still owing a release (`staleClaimReleasePending`).
+- Candidates: `AgentWork` in `CLAIMED/IN_PROGRESS/BLOCKED`. The
+  `CLAIMED`/`IN_PROGRESS` arm is silence-without-a-live-lease (#1418): a row
+  is a candidate only when its `lastHeartbeatAt` is older than **5 min**
+  (`DEFAULT_STALE_WORK_MAX_AGE_MS`, `src/lib/stale-work.ts:6`) AND its
+  execution lease is not live (`leaseExpiresAt` NULL or past `now`).
+  Heartbeat silence alone no longer reclaims while the lease stands: an
+  ownership renewal (#1251) propagates the renewed TTL (30 min default) onto
+  the active row in the same transaction as the heartbeat, so a worker
+  renewing on a cadence longer than the heartbeat window — one long model call
+  or test run — is no longer reclaimed, its lease deleted, and its
+  `agent/*` label stripped mid-flight. The shield is bounded by the renewed
+  TTL, which is exactly the window the lease still blocks duplicate pickup
+  for; once renewals stop, the lease lapses and the normal reclaim path
+  applies, so a dead worker is never stranded. This matches the §4 derived
+  state model, where a live lease is liveness
+  (`lease_still_live` → `CLAIMED_LONG_RUNNING`, never release). The `BLOCKED`
+  arm is unchanged: reclaimable once the park deadline elapsed or when it
+  never had one. Plus `STALE` rows still owing a release
+  (`staleClaimReleasePending`).
 - Two-phase, crash-safe: mark `STALE` (+ `staleClaimReleasePending` when a
   release is owed), then release the GitHub claim via `releaseIssueClaim` with
   `allowMissingAgent` + `preserveStatus`, then clear the pending flag. For
@@ -158,10 +173,11 @@ every 5 min when the in-process scheduler is enabled
   delete the lease of a NEWER live claim epoch of the same agent on the same
   issue. Two guards close it:
   1. **Live-sibling deferral** — if another `CLAIMED`/`IN_PROGRESS`/`BLOCKED`
-     row for the same pair is still live (fresh heartbeat AND fresh-or-null
-     lease expiry), the sweep defers entirely: no lease delete, no label
-     removal, no release. The row is still reclaimed and reported
-     `claimRetained`.
+      row for the same pair is still live (fresh heartbeat OR a live
+      execution lease — the exact complement of the reclaim arms, #1418),
+      the sweep defers entirely: no lease delete, no label
+      removal, no release. The row is still reclaimed and reported
+      `claimRetained`.
   2. **Claim-epoch CAS** — the lease delete compares against a snapshot of
      `{claimToken, expiredAt, lastRenewalObservedAt}` taken before the sibling
      lookup, and a post-delete existence recheck catches a fresh claim that
@@ -177,9 +193,14 @@ every 5 min when the in-process scheduler is enabled
   still owed a claim release (`staleClaimReleasePending`) and fencing each delete
   on the scanned row's state, owner and issue (#1350).
 
-**Gap:** the sweep's liveness inputs are still heartbeat and lease-expiry age
-only. A worker whose model call or test run exceeds the heartbeat window, or
-that is disconnected but not dead, is reclaimed on a later tick. The fencing is
+**Gap:** the sweep's liveness inputs are heartbeat and lease-expiry only.
+Since #1418 a renewed lease counts as liveness for the reclaim decision, so a
+renewing worker is shielded for as long as its renewals keep the lease live;
+a worker that adopted the ownership capability and renews is therefore
+covered. A worker that does NOT renew (legacy or capability-abandoned) and
+whose model call or test run exceeds the heartbeat window is still reclaimed
+on a later tick — its execution lease crosses at the same silence moment, so
+its reclaim timing is unchanged. The fencing is
 deliberately conservative in the other direction too: when the epoch cannot be
 proved stable, the sweep retains the claim — so a lease whose epoch is actually
 dead (e.g. a worker that starts work before claiming) can keep the issue

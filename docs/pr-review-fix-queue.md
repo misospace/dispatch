@@ -69,6 +69,19 @@ Incoming feedback is classified as **actionable** or **needs_human**:
 
 Items in the `NEEDS_HUMAN` lane receive `BLOCKED` status and are excluded from the normal agent queue unless `include_blocked=true`.
 
+## Mechanical rebase lane (#1327)
+
+A PR that goes dirty (GitHub `mergeable_state` = `dirty`, or `mergeable` = `CONFLICTING`) is not handed to the code-fix loop: a fix generation cannot rebase, so the item churned while consuming paid capacity on work a bounded local rebase can do. The queue enqueues an item of type **`REBASE`** instead — one bounded mechanical rebase attempt.
+
+- **Trigger:** three paths enqueue `REBASE` (Normal lane, top type priority alongside the legacy `MERGE_CONFLICT`): the `merge_state` ingestion descriptor, `ingestMergeConflict`, and the linked-PR health materialization in `next-task` (the reconcile path that observes `linkedPrMergeState`). Non-conflict merge states (`behind`, `unstable`, `has_hooks`) stay ordinary fix work.
+- **Contract:** the item's `feedback` is the worker contract — rebase onto the base, reconcile conflicts mechanically only (lockfiles, version strings, import order, doc indexes, adjacent non-overlapping hunks, comment-only overlaps where one side is a strict subset), push with `--force-with-lease`, run the repo's bounded typecheck after a clean rebase, and bail to a human on any semantic conflict (`blocked` + `blockReason: "human_decision"`). The queue has no merge capability, so a rebase task can never merge a PR.
+- **Success:** while GitHub recomputes mergeability, the `pr_updated` report defers; the next PR-followup sync settles the row through `clearResolvedConflictItems`, which clears `REBASE` (and legacy `MERGE_CONFLICT`) rows and marks them `FIXED` against the cleared `merge_conflict` ledger baseline.
+- **Failure:** the `blocked`/`human_decision` report settles the row `BLOCKED`/`NEEDS_HUMAN` (needs-human label + marker comment); evidence must not auto-override it, and only an operator requeues it.
+- **Bound:** "one attempt per dirty episode" is enforced server-side, not just prose. A worker's `failed` report on a `REBASE` attempt settles to a terminal `PARKED`: it never reopens a fresh attempt the way other fix types do under `PR_FIX_MAX_ATTEMPTS`. A bare give-up parks the same way; a semantic conflict pins `BLOCKED`/`NEEDS_HUMAN`. The bound keys on the lane the attempt was **dispatched** as (the per-attempt `attemptType` stamp next-task writes with the hand-out), not the row's mutable `type` — enqueue overwrites `type` on every re-observation, so a mid-attempt flip neither smuggles a failed rebase back onto the ladder nor terminal-parks an ordinary fix attempt. A new dirty episode is fresh evidence at a new head, which reactivates the park through the row-recovery path (#1253, cooldown-gated) exactly as it reactivates a cap-parked fix item. An unacknowledged hand-out is reclaimed by the generic reclaim sweep (recovery of an attempt that never ran, not a retry). Every transition is visible in `PrFixHistory`.
+- **Concurrency:** the lane is concurrency 1 with no fan-out. `next-task` defers handing out a `REBASE` item while any QUEUED rebase-lane row carries a live hand-out record (`hasInFlightRebaseHandout`), including the candidate itself — a second hand-out would put two `--force-with-lease` pushes on one branch. "Live" follows the queue's ownership semantics, not a clock: a hand-out record on a still-QUEUED REBASE row gates the lane until it is explicitly cleared — by settlement (mark/release/terminal dispositions), or by the reclaim sweep, which is the only path that ages a hand-out out (`PR_FIX_HANDOUT_TIMEOUT_MS`, default 30m, bounds the sweep's staleness population, NOT the gate): a stale UNACKNOWLEDGED hand-out is reclaimed with a generation bump that clears its hand-out state, at which point the lane is free. An ACKNOWLEDGED hand-out is deliberately never reclaimed (#1211 — the worker durably owns its generation) and gates until it settles; an acked-then-crashed rebase holds the lane until the worker reports, the dead-owner recovery ladder reclaims it once its ack ages past `PR_FIX_ACK_LIVENESS_MS` with no liveness evidence (#1419), or an operator requeues — a visibly stuck lane is recoverable, a silently shared lane is two `--force-with-lease` pushes on one branch (the earlier time-boxed gate freed the lane under a still-live hand-out once the timeout passed — a concurrency-2 window the ownership model does not license). Admission is SERIALIZED at the database boundary, not preflight-advisory: every REBASE hand-out runs inside `withRebaseLaneAdmission`, one transaction holding a transaction-scoped advisory lock (`pg_advisory_xact_lock`) across the gate read AND the dispatch stamp + hand-out push, so a competing poll's gate observes the winner's committed hand-out instead of racing past it. The lock is MANDATORY and admission fails CLOSED: when it cannot be taken (no raw SQL surface, the `lock_timeout` on the wait, an aborted transaction) the hand-out is DEFERRED and the next poll retries it — there is no unlocked fallback, because a check-then-write outside the lock is precisely the fan-out the lane forbids. Ordinary fix work never takes the lock, so it dispatches unchanged even while a rebase is live or the lane's admission is failing. The gate keys on the DISPATCHED lane (`attemptType`, falling back to the queue type): a row whose mutable `type` flipped mid-attempt belongs to whichever lane is live on it. The lane stamp is written ONLY by the hand-out append — atomically with the issued hand-out record, and pinned: the append applies only while the row still anchors the lane being issued (its `type` still matches, or `attemptType` already names it for a re-hand-out) — so a persisted stamp always has an issued hand-out behind it; a failed append leaves the row laneless and the next poll re-derives the lane from the row's live type (a concurrent flip to `REBASE` then walks the pool + admission gates) instead of trusting a stamp no hand-out ever backed. Model-pool routing (the issue's "local-only pool") is operator-declared server-side: `DISPATCH_REBASE_AGENTS` (comma or whitespace separated agent names, case-insensitive) restricts `REBASE` hand-outs to that pool — an agent outside the pool defers the candidate before the lane admission (the lock is never contended, ordinary work dispatches unchanged) and the item waits QUEUED for an eligible poller. The default is FAIL CLOSED: unset or EMPTY admits no agent, and the lane stops dispatching until the operator names workers — #1327 exists to keep rebases off paid cloud capacity, so a missing allowlist must not hand the lane to every polling agent (Dispatch is harness-agnostic and knows nothing about which agents run local models — the hand-off payload carries `prFixItem.fixType` so a deployment can also confine `REBASE` consumption harness-side). A bare `*` value is the explicit unrestricted opt-in for debugging/backcompat, restoring the pre-#1327 behavior where any polling worker may take the lane.
+
+`REBASE` is a Postgres enum value (`PrFixType`), so the schema, the migration, and the app-side type union must move together — `src/lib/pr-fix-type-enum.test.ts` guards that, and `src/lib/pr-fix-rebase-type.integration.test.ts` proves the write path against a real PostgreSQL.
+
 ## Endpoints
 
 ### Enqueue
@@ -93,7 +106,7 @@ Items in the `NEEDS_HUMAN` lane receive `BLOCKED` status and are excluded from t
 
 ### Mark item status
 
-`POST /api/pr-fix-queue/mark` — Marks an item `FIXED`, `BLOCKED`, `PARKED`, `STALE`, `IGNORED`, or `WAITING_EXTERNAL` and records a history event. Requires auth. The body may include an `outcome` (`human_decision`, `no_progress`, `infra_failure`, or `security_failure`) and a `decision` object (`question`, `options`, and `evidence`) when recording a human decision; a `BLOCKED` mark without a `decision` gets a synthesized `decisionDetail` built from the note (#1340). A worker-tier `BLOCKED` mark may escalate a same-generation `PARKED` item (#1340); every other overwrite of a recorded `BLOCKED`/`PARKED` stays refused without operator `allowStickyReclassify`.
+`POST /api/pr-fix-queue/mark` — Marks an item `FIXED`, `BLOCKED`, `PARKED`, `STALE`, `IGNORED`, or `WAITING_EXTERNAL` and records a history event. Requires auth. The body may include an `outcome` (`human_decision`, `no_progress`, `infra_failure`, or `security_failure`) and a `decision` object (`question`, `options`, and `evidence`) when recording a human decision; a `BLOCKED` mark without a `decision` gets a synthesized `decisionDetail` built from the note (#1340). A worker-tier `BLOCKED` mark may escalate a same-generation `PARKED` item (#1340); every other overwrite of a recorded `BLOCKED`/`PARKED` stays refused without operator `allowStickyReclassify`. Worker-tier bearer marks are hand-out-bound (#1428): the request must come from a **bound** credential (`DISPATCH_WORKER_TOKENS`; the legacy unbound `DISPATCH_WORKER_TOKEN` is refused) and may settle only rows whose `agentHandouts` carry that agent's `<agentName>@<generation>` marker at the settled generation; a row the caller does not hold returns `403` with `reason: "not-handed"` — a caller-binding refusal, distinct from the row's outcome vocabulary. Maintainer-tier callers stay unconstrained. A duplicate `WAITING_EXTERNAL` mark at the same generation remains idempotent without extending the cooldown (#1231), but for a bound worker that replay is granted only to the agent recorded as having started the wait; another bound worker gets the same `403` `not-handed` refusal and no row (#1430). A wait started by a maintainer/operator records no waiter and replays only to unscoped callers.
 
 **Request body:**
 ```json
@@ -263,11 +276,15 @@ prove the stamped hand-out reached a live worker, the worker acknowledges it
   bound credential for the wrong agent is refused with 403. Maintainer-tier
   bearers (`DISPATCH_AGENT_TOKEN` / `DISPATCH_MAINTAINER_TOKEN`) pass
   through and may ack for any agent the hand-out table actually stamped —
-  the operator escape hatch for the reclaimer sweep. The authenticated
-  actor (`auth.agentName` for a bound worker, the `x-agent-name` header for
-  the legacy token, the maintainer identity) is the source of truth for
-  `agentName`; a body value that disagrees with the actor is rejected
-  with 400. The underlying write is generation-pinned and idempotent: a
+  the operator escape hatch for the reclaimer sweep. The subject of the ack
+  is the body's `agentName` (#1425): it is **not** equality-checked against
+  the audit-only `auth.actor` (the self-reported `x-agent-name` header with
+  an `"agent"` fallback), so a client that carries its agent binding in the
+  body without an identity header — e.g. Courier's dispatch adapter — is
+  honored at maintainer tier. The defenses against forging are the bound
+  gate (worker credentials) and the hand-out table itself: an ack for an
+  agent that was never handed the stamped generation is refused `403`
+  (`not-handed`). The underlying write is generation-pinned and idempotent: a
   repeat ack for the same `(agent, generation)` returns `200` with
   `alreadyAcknowledged: true`, a late ack for an older generation is
   refused `409` (`generation-mismatch`), a non-`QUEUED` item is refused
@@ -300,10 +317,22 @@ as the `pr-fix-sweep` job:
   identity — but `fixAttempts` is **not** bumped, because the hand-out never
   reached a worker. The CAS pins the exact `handoutAcks` snapshot the sweep
   read, so an ack landing in the read→write gap no-ops the reclaim.
-- An **acknowledged live attempt is never reclaimed**, even when stale by
-  wall-clock: the ack pins the generation and every terminal write (STALE,
+- An **acknowledged live attempt whose owner shows liveness is never
+  reclaimed**: the ack pins the generation and every terminal write (STALE,
   BLOCKED, fresh-generation) is CAS-pinned on the same `handoutAcks` snapshot,
-  so a worker that acknowledges mid-sweep is not clobbered.
+  so a worker that acknowledges mid-sweep is not clobbered. (The next bullet
+  defines when an acked generation stops being protected.)
+- **Dead-owner recovery (#1419):** the durable ack is no longer authoritative
+  forever. Each ack records a landing timestamp (`handoutAckTimes`, parallel to
+  `handoutAcks`); past `PR_FIX_ACK_LIVENESS_MS` (default 24 h) an acked
+  generation is reclaimable through the same bounded ladder when EVERY acking
+  agent is provably dead — no recent `AgentRun` activity by the agent (the
+  operative guard: workers heartbeat per task cycle), plus a defensive probe
+  for an open `AgentRun` associated with the `(item, generation)` attempt.
+  Probes and probe errors fail closed; legacy acks without a timestamp are
+  dated by the dispatch stamp so already-stranded rows stay recoverable. Queue listings expose the stuck generation
+  (`handoutAcks`, `dispatchedAt`, `dispatchedGeneration`) and a derived
+  `idleReason`; the observability snapshot counts `overdueAcked`.
 - A **merged or closed** PR goes `STALE` (nothing left to fix).
 - **Unknown PR state** defers the item (`unknownState`): a possibly-closed PR is
   never reclaimed into a fresh attempt.

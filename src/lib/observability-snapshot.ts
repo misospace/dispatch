@@ -19,7 +19,8 @@ import {
   type AdmissionRunState,
 } from "@/lib/queue-admission";
 import { schedulerConfigFromEnv, schedulerState } from "@/lib/scheduler";
-import { prFixHandoutTimeoutMs } from "@/lib/pr-fix-queue";
+import { prFixHandoutTimeoutMs, prFixAckLivenessMs } from "@/lib/pr-fix-queue";
+import { syncPipelineDeclarationFromEnv } from "@/lib/sync-pipeline";
 
 const STRANDED_ASSIGNMENT_DEFAULT_MS = 30 * 60 * 1000;
 const STRANDED_ASSIGNMENT_MIN_MS = 60_000;
@@ -116,6 +117,7 @@ export async function collectObservabilitySnapshot(
         dispatchedGeneration: true,
         generation: true,
         handoutAcks: true,
+        handoutAckTimes: true,
         outcome: true,
       },
     }),
@@ -218,6 +220,7 @@ export async function collectObservabilitySnapshot(
       dispatchedGeneration: row.dispatchedGeneration,
       generation: row.generation,
       handoutAcks: row.handoutAcks,
+      handoutAckTimes: row.handoutAckTimes,
       outcome: row.outcome,
     })),
     prFixHistory: prFixHistoryRows.map((row) => ({
@@ -261,11 +264,13 @@ export async function collectObservabilitySnapshot(
       })),
     },
     admissionMode,
+    syncPipeline: syncPipelineDeclarationFromEnv(process.env),
     admissionRuns,
     thresholds: {
       strandedAssignmentMs: strandedAssignmentThresholdMs(),
       assignmentEvidenceLookbackMs: ASSIGNMENT_LOOKBACK_MS,
       prFixHandoutTimeoutMs: prFixHandoutTimeoutMs(),
+      prFixAckLivenessMs: prFixAckLivenessMs(),
     },
   });
 }

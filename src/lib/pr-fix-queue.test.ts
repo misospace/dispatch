@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { createLinkedPrFixItem, enqueuePrFixItem, normalizeQueueRepo, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, parseMarkPrFixInput, parseEnqueuePrFixInput, resolvePrFixFromAgentReport, ackPrFixHandout, parseAckPrFixHandoutInput, reclaimStalePrFixHandouts, prFixHandoutTimeoutMs, maxPrFixReclaims, agentAlreadyHanded, DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS, DEFAULT_PR_FIX_MAX_RECLAIMS, PrFixQueueClient, type MarkPrFixResult } from "./pr-fix-queue";
+import { createLinkedPrFixItem, enqueuePrFixItem, hasInFlightRebaseHandout, withRebaseLaneAdmission, REBASE_LANE_ADVISORY_LOCK_KEY, normalizeQueueRepo, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, parseMarkPrFixInput, parseEnqueuePrFixInput, resolvePrFixFromAgentReport, ackPrFixHandout, parseAckPrFixHandoutInput, reclaimStalePrFixHandouts, prFixHandoutTimeoutMs, maxPrFixReclaims, prFixAckLivenessMs, DEFAULT_PR_FIX_ACK_LIVENESS_MS, agentAlreadyHanded, isRebaseLaneAgent, parseRebaseAgentPool, DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS, DEFAULT_PR_FIX_MAX_RECLAIMS, PrFixQueueClient, type MarkPrFixResult } from "./pr-fix-queue";
 
 function mutatedItem(result: MarkPrFixResult): any {
   if (!result.mutated) throw new Error(`expected mutation, got ${result.reason}`);
@@ -68,6 +68,7 @@ function makeClient(): PrFixQueueClient & {
   items: any[];
   history: any[];
   handoffs: any[];
+  agentRuns: any[];
   inTransaction: boolean;
   hooks: {
     beforeUpdateMany: (() => void) | null;
@@ -78,11 +79,33 @@ function makeClient(): PrFixQueueClient & {
   const history: any[] = [];
   // #1256: capacity-scoped cooldown rows.
   const handoffs: any[] = [];
+  // #1419: agent-run liveness ledger rows for the reclaimer's dead-owner
+  // probes (agentName/createdAt and item/generation/finishedAt filters).
+  const agentRuns: any[] = [];
   let seq = 0;
   const client: any = {
     items,
     history,
     handoffs,
+    agentRuns,
+    // #1419: agent liveness ledger read model for the reclaimer's probes.
+    agentRun: {
+      findFirst: async ({ where }: any) => {
+        const w = where ?? {};
+        return (
+          agentRuns.find(
+            (r) =>
+              (w.agentName === undefined || r.agentName === w.agentName) &&
+              (w.createdAt?.gt === undefined ||
+                new Date(r.createdAt).getTime() > new Date(w.createdAt.gt).getTime()) &&
+              (w.prFixQueueItemId === undefined || r.prFixQueueItemId === w.prFixQueueItemId) &&
+              (w.prFixGeneration === undefined || r.prFixGeneration === w.prFixGeneration) &&
+              (w.finishedAt === undefined ||
+                (w.finishedAt === null ? r.finishedAt == null : r.finishedAt === w.finishedAt)),
+          ) ?? null
+        );
+      },
+    },
     capacityHandoff: {
       create: async ({ data }: any) => {
         const row = { id: `handoff-${handoffs.length + 1}`, createdAt: new Date(), ...data };
@@ -163,6 +186,7 @@ function makeClient(): PrFixQueueClient & {
           // #1211 hand-out ack/reclaim columns: default to their schema values
           // so a freshly created row reads back as "no ack, never reclaimed".
           handoutAcks: [], // mirrors the column's @default([])
+          handoutAckTimes: [], // mirrors the column's @default([]) — parallel ack timestamps (#1419)
           agentHandouts: [], // mirrors the column's @default([])
           // #1256 review: per-hand-out receipts (bijection with agentHandouts).
           handoutReceipts: [], // mirrors the column's @default([])
@@ -223,6 +247,10 @@ function makeClient(): PrFixQueueClient & {
             (where.handoutAcks === undefined ||
               JSON.stringify(i.handoutAcks ?? []) ===
                 JSON.stringify(where.handoutAcks.equals ?? [])) &&
+            // #1419: parallel ack-timestamp pin (same CAS as the ack list).
+            (where.handoutAckTimes === undefined ||
+              JSON.stringify(i.handoutAckTimes ?? []) ===
+                JSON.stringify(where.handoutAckTimes.equals ?? [])) &&
             // #1256 review: receipt/hand-out list pins (exact-owner CAS).
             (where.handoutReceipts === undefined ||
               JSON.stringify(i.handoutReceipts ?? []) ===
@@ -242,6 +270,11 @@ function makeClient(): PrFixQueueClient & {
         let result = items.slice();
         if (where?.repo) result = result.filter((i) => i.repo === where.repo);
         if (where?.pr?.in) result = result.filter((i) => where.pr.in.includes(i.pr));
+        if (where?.type) result = result.filter((i) => i.type === where.type);
+        // Mirror a top-level `OR` of plain equality conditions (the #1327
+        // rebase-lane gate query) so the SQL predicate is exercised, not
+        // just the helper's JS post-filter.
+        if (where?.OR) result = result.filter((i) => where.OR.some((cond: any) => Object.entries(cond).every(([key, value]) => i[key] === value)));
         if (where?.status) {
           result = Array.isArray(where.status.in)
             ? result.filter((i) => where.status.in.includes(i.status))
@@ -652,6 +685,40 @@ describe("work generation identity (#1044)", () => {
     expect(toAgentQueuePrFixItem(client.items[0]).generation).toBe(1);
   });
 
+  it("exposes stuck-generation idle reasons on the agent queue listing (#1419)", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 12, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k12",
+    });
+    const row = client.items[0];
+    row.status = "QUEUED";
+    row.dispatchedGeneration = row.generation;
+    row.dispatchedAt = new Date(Date.now() - 2 * 60 * 60 * 1000); // 2h ago — past the 30m hand-out timeout
+    row.agentHandouts = ["courier@1"];
+    // Freshly stamped, never acked: still inside the timeout → no reason.
+    row.dispatchedAt = new Date(Date.now() - 5 * 60 * 1000);
+    expect(toAgentQueuePrFixItem(row).idleReason).toBeNull();
+    // Stale and unacked (past PR_FIX_HANDOUT_TIMEOUT_MS).
+    row.dispatchedAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    expect(toAgentQueuePrFixItem(row).idleReason).toBe("stale-unacknowledged-handout");
+    // Acked 2h ago on a 2h-old dispatch: a fresh ack is a healthy long run —
+    // NOT stuck; the acknowledged reason keys on PR_FIX_ACK_LIVENESS_MS.
+    row.handoutAcks = ["courier@1"];
+    row.handoutAckTimes = [new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString()];
+    expect(toAgentQueuePrFixItem(row).idleReason).toBeNull();
+    // Acked 30h ago (legacy row: no timestamp → dispatch-stamp lower bound):
+    // stuck acknowledged generation awaiting dead-owner recovery.
+    row.handoutAckTimes = [];
+    row.dispatchedAt = new Date(Date.now() - 30 * 60 * 60 * 1000);
+    expect(toAgentQueuePrFixItem(row).idleReason).toBe("stale-acknowledged-handout");
+    expect(toAgentQueuePrFixItem(row).handoutAcks).toEqual(["courier@1"]);
+    expect(toAgentQueuePrFixItem(row).dispatchedGeneration).toBe(row.generation);
+    // A fresh QUEUED item with no stamp has no idle reason.
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 13, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k13",
+    });
+    expect(toAgentQueuePrFixItem(client.items[1]).idleReason).toBeNull();
+  });
+
   it("bumps generation on explicit requeue from BLOCKED, and again from FIXED", async () => {
     await enqueuePrFixItem(client, {
       repo: "org/repo", pr: 11, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k1",
@@ -910,6 +977,39 @@ describe("reconcileStalePrFixItems", () => {
     // note keeps the true upstream state rather than the "merged" fallback.
     // history[0] is the enqueue row; the mark row is last.
     expect(client.history[client.history.length - 1].note).toContain("state=merged");
+  });
+
+  it("keeps handoutAckTimes index-aligned with handoutAcks and clears both on settlement (#1419)", async () => {
+    const client = makeClient();
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 225, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k225",
+    });
+    const row = client.items[0];
+    row.dispatchedGeneration = row.generation;
+    row.dispatchedAt = new Date("2026-01-01T00:00:00Z");
+    row.agentHandouts = ["courier@1", "beta@1"];
+    const first = await ackPrFixHandout(client, { repo: "org/repo", pr: 225, generation: 1, agentName: "courier" });
+    expect(first.acknowledged).toBe(true);
+    const second = await ackPrFixHandout(client, { repo: "org/repo", pr: 225, generation: 1, agentName: "beta" });
+    expect(second.acknowledged).toBe(true);
+    const acked = client.items[0];
+    expect(acked.handoutAcks).toEqual(["courier@1", "beta@1"]);
+    expect(acked.handoutAckTimes).toHaveLength(2);
+    for (const t of acked.handoutAckTimes) expect(Number.isNaN(Date.parse(t))).toBe(false);
+    // The reclaimer's terminal paths clear BOTH parallel arrays together:
+    // a dead-acked item on a merged/closed PR reaps to STALE with both wiped.
+    // Age the acks past the liveness window (the acks above used the real clock).
+    const aged = client.items[0];
+    aged.handoutAckTimes = aged.handoutAckTimes.map((_t: string, i: number) =>
+      new Date(Date.now() - 48 * 60 * 60 * 1000 - i * 1000).toISOString(),
+    );
+    await reclaimStalePrFixHandouts(client, {
+      ackLivenessMs: 30 * 60 * 1000,
+      isPrMergedOrClosed: async () => true,
+    });
+    expect(client.items[0].status).toBe("STALE");
+    expect(client.items[0].handoutAcks).toEqual([]);
+    expect(client.items[0].handoutAckTimes).toEqual([]);
   });
 });
 
@@ -3411,6 +3511,40 @@ describe("createLinkedPrFixItem materialization (#1145)", () => {
     ]);
   });
 
+  it("persists the REBASE type when the caller asks for the rebase lane (#1327)", async () => {
+    const client = makeClient();
+    const { item, created } = await createLinkedPrFixItem(client, {
+      repo: "org/repo",
+      pr: 15,
+      issue: 42,
+      lane: "NORMAL",
+      type: "REBASE",
+      reason: "Mechanical rebase: PR dirty against base (#1327)",
+      feedback: ["Mechanical rebase required: this PR is dirty against its base branch (#1327)."],
+      evidenceKey: "linked-health:42:2026-01-01T00:00:00.000Z",
+    });
+
+    expect(created).toBe(true);
+    expect(item.type).toBe("REBASE");
+    expect(client.items[0].type).toBe("REBASE");
+  });
+
+  it("persists OTHER when the caller passes no type (#1327)", async () => {
+    const client = makeClient();
+    const { item } = await createLinkedPrFixItem(client, {
+      repo: "org/repo",
+      pr: 15,
+      issue: 42,
+      lane: "NORMAL",
+      reason: "changes_requested",
+      feedback: ["changes_requested"],
+      evidenceKey: "linked-health:42:unknown",
+    });
+
+    expect(item.type).toBe("OTHER");
+    expect(client.items[0].type).toBe("OTHER");
+  });
+
   it("leaves the baseline null when GitHub could not be read", async () => {
     const client = makeClient();
     const { item } = await createLinkedPrFixItem(client, {
@@ -3648,9 +3782,17 @@ describe("reclaim stale hand-outs (#1211)", () => {
     expect(client.items[0].agentHandouts).toEqual([]);
   });
 
-  it("never reclaims a generation a live worker acknowledged", async () => {
+  it("never reclaims a generation a live worker acknowledged (#1419)", async () => {
+    // Acked 48h ago — past the default 24h ack-liveness window — but the
+    // agent still shows recent AgentRun activity (heartbeat/report): live.
     const row = await seedStaleUnacked(203);
     row.handoutAcks = ["courier@1"];
+    row.handoutAckTimes = ["2025-12-30T01:00:00Z"];
+    client.agentRuns.push({
+      agentName: "courier",
+      createdAt: new Date("2026-01-01T00:45:00Z"), // 15m before STALE_NOW
+      finishedAt: null,
+    });
     const report = await reclaimStalePrFixHandouts(client, {
       now: STALE_NOW,
       isPrMergedOrClosed: async () => false,
@@ -3659,6 +3801,187 @@ describe("reclaim stale hand-outs (#1211)", () => {
     expect(report.reclaimed).toBe(0);
     expect(client.items[0].generation).toBe(1);
     expect(client.items[0].handoutAcks).toEqual(["courier@1"]);
+  });
+
+  it("never reclaims a generation with an open associated AgentRun (#1419)", async () => {
+    // Acked past the liveness window with no recent agent-wide activity, but
+    // an AgentRun row is durably associated with the attempt and still open —
+    // live execution evidence protects the acked generation.
+    const row = await seedStaleUnacked(216);
+    row.handoutAcks = ["courier@1"];
+    row.handoutAckTimes = ["2025-12-30T01:00:00Z"];
+    client.agentRuns.push({
+      agentName: "other-worker",
+      createdAt: new Date("2025-12-31T00:00:00Z"), // old agent-wide activity
+      prFixQueueItemId: row.id,
+      prFixGeneration: row.generation,
+      finishedAt: null,
+    });
+    const report = await reclaimStalePrFixHandouts(client, {
+      now: STALE_NOW,
+      isPrMergedOrClosed: async () => false,
+    });
+    expect(report.skipped).toBe(1);
+    expect(report.reclaimed).toBe(0);
+    expect(client.items[0].handoutAcks).toEqual(["courier@1"]);
+  });
+
+  it("never reclaims an acked generation whose ack timestamp is inside the liveness window (#1419)", async () => {
+    const row = await seedStaleUnacked(219);
+    row.handoutAcks = ["courier@1"];
+    row.handoutAckTimes = [new Date(STALE_NOW.getTime() - 60 * 60 * 1000).toISOString()]; // 1h old < 24h window
+    const report = await reclaimStalePrFixHandouts(client, {
+      now: STALE_NOW,
+      isPrMergedOrClosed: async () => false,
+    });
+    expect(report.skipped).toBe(1);
+    expect(report.reclaimed).toBe(0);
+    expect(client.items[0].generation).toBe(1);
+  });
+
+  it("dates a legacy ack without a timestamp by its dispatch stamp inside the window (fail-closed, #1419)", async () => {
+    // Pre-#1419 rows carry acks with no parallel timestamp; the ack is dated
+    // by the dispatch stamp, which here is only 1h old — inside the 24h
+    // default window, so the generation stays protected.
+    const row = await seedStaleUnacked(220);
+    row.handoutAcks = ["courier@1"];
+    row.handoutAckTimes = [];
+    const report = await reclaimStalePrFixHandouts(client, {
+      now: STALE_NOW,
+      isPrMergedOrClosed: async () => false,
+    });
+    expect(report.skipped).toBe(1);
+    expect(report.reclaimed).toBe(0);
+  });
+
+  it("recovers a legacy acked row once its dispatch-aged ack is past the window (#1419)", async () => {
+    // The already-stranded population: acked before #1419 shipped (no
+    // timestamp), dispatch far in the past, acking agent dead (no activity).
+    const row = await seedStaleUnacked(226);
+    row.dispatchedAt = new Date("2025-12-28T01:00:00Z"); // ~3 days before STALE_NOW
+    row.handoutAcks = ["courier@1"];
+    row.handoutAckTimes = [];
+    const report = await reclaimStalePrFixHandouts(client, {
+      now: STALE_NOW,
+      isPrMergedOrClosed: async () => false,
+    });
+    expect(report.reclaimed).toBe(1);
+    expect(client.items[0].generation).toBe(2);
+    expect(client.items[0].handoutAcks).toEqual([]);
+    expect(client.items[0].handoutAckTimes).toEqual([]);
+  });
+
+  it("never reclaims an acked generation when the client lacks the agentRun surface (fail-closed, #1419)", async () => {
+    // Production-shaped regression guard (#1419 review): the sweep route
+    // hands the reclaimer an asPrFixQueueClient client. A client without the
+    // agentRun delegate must fail closed (live), never TypeError-reclaim.
+    const row = await seedStaleUnacked(227);
+    row.handoutAcks = ["courier@1"];
+    row.handoutAckTimes = ["2025-12-30T01:00:00Z"]; // past the default 24h window
+    const bare: any = { ...client };
+    delete bare.agentRun;
+    const report = await reclaimStalePrFixHandouts(bare, {
+      now: STALE_NOW,
+      isPrMergedOrClosed: async () => false,
+    });
+    expect(report.skipped).toBe(1);
+    expect(report.reclaimed).toBe(0);
+    expect(report.errors).toEqual([]);
+  });
+
+  it("never reclaims an acked generation when the liveness probe errors (fail-closed, #1419)", async () => {
+    const row = await seedStaleUnacked(221);
+    row.handoutAcks = ["courier@1"];
+    row.handoutAckTimes = ["2025-12-30T01:00:00Z"]; // past the default 24h window
+    const report = await reclaimStalePrFixHandouts(client, {
+      now: STALE_NOW,
+      isPrMergedOrClosed: async () => false,
+      agentHasRecentActivity: async () => {
+        throw new Error("ledger unavailable");
+      },
+    });
+    // The probe error is live evidence at the call site, not a report error.
+    expect(report.skipped).toBe(1);
+    expect(report.reclaimed).toBe(0);
+    expect(report.errors).toEqual([]);
+  });
+
+  it("recovers a single-agent ack+crash hand-out once all liveness evidence is dead (#1419)", async () => {
+    const row = await seedStaleUnacked(222);
+    row.handoutAcks = ["courier@1"];
+    row.handoutAckTimes = ["2026-01-01T00:05:00Z"]; // 55m before STALE_NOW
+    const historyBefore = client.history.length;
+    const report = await reclaimStalePrFixHandouts(client, {
+      now: STALE_NOW,
+      ackLivenessMs: 30 * 60 * 1000, // 30m window: the ack is provably past it, no agent activity at all
+      isPrMergedOrClosed: async () => false,
+    });
+    expect(report.reclaimed).toBe(1);
+    expect(report.skipped).toBe(0);
+    const after = client.items[0];
+    expect(after.generation).toBe(2);
+    expect(after.agentHandouts).toEqual([]);
+    expect(after.handoutAcks).toEqual([]);
+    expect(after.handoutAckTimes).toEqual([]);
+    expect(after.handoutReceipts).toEqual([]);
+    expect(after.handoutReclaims).toBe(1);
+    expect(after.dispatchedGeneration).toBeNull();
+    expect(after.fixAttempts).toBe(1);
+    const last = client.history.at(-1);
+    expect(last.action).toBe("reclaim");
+    expect(last.note).toContain("#1419");
+    expect(client.history.length).toBe(historyBefore + 1);
+  });
+
+  it("parks a dead-acknowledged item at the reclaim cap (no_progress, #1419)", async () => {
+    const row = await seedStaleUnacked(223);
+    row.handoutAcks = ["courier@1"];
+    row.handoutAckTimes = ["2026-01-01T00:05:00Z"];
+    row.handoutReclaims = 3;
+    const prevMaxReclaims = process.env.PR_FIX_MAX_RECLAIMS;
+    process.env.PR_FIX_MAX_RECLAIMS = "3";
+    try {
+      surfacingMocks.surfacePrFixParked.mockClear();
+      const report = await reclaimStalePrFixHandouts(client, {
+        now: STALE_NOW,
+        ackLivenessMs: 30 * 60 * 1000,
+        isPrMergedOrClosed: async () => false,
+      });
+      expect(report.parked).toBe(1);
+      expect(report.blocked).toBe(1);
+      expect(report.reclaimed).toBe(0);
+      const after = client.items[0];
+      expect(after.status).toBe("PARKED");
+      expect(after.lane).toBe("NORMAL");
+      expect(after.outcome).toBe("no_progress");
+      expect(after.handoutAckTimes).toEqual([]);
+      expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledTimes(1);
+      const last = client.history.at(-1);
+      expect(last.note).toContain("#1419");
+    } finally {
+      if (prevMaxReclaims === undefined) delete process.env.PR_FIX_MAX_RECLAIMS;
+      else process.env.PR_FIX_MAX_RECLAIMS = prevMaxReclaims;
+    }
+  });
+
+  it("does not reclaim while ANY acking agent of the generation is live (#1419)", async () => {
+    const row = await seedStaleUnacked(224);
+    row.agentHandouts = ["alpha@1", "beta@1"];
+    row.handoutAcks = ["alpha@1", "beta@1"];
+    row.handoutAckTimes = ["2026-01-01T00:05:00Z", "2026-01-01T00:05:00Z"];
+    client.agentRuns.push({
+      agentName: "beta", // beta is still alive
+      createdAt: new Date("2026-01-01T00:45:00Z"),
+      finishedAt: null,
+    });
+    const report = await reclaimStalePrFixHandouts(client, {
+      now: STALE_NOW,
+      ackLivenessMs: 30 * 60 * 1000,
+      isPrMergedOrClosed: async () => false,
+    });
+    expect(report.skipped).toBe(1);
+    expect(report.reclaimed).toBe(0);
+    expect(client.items[0].generation).toBe(1);
   });
 
   it("a late ack for generation N cannot touch N+1 (generation-mismatch)", async () => {
@@ -3898,6 +4221,9 @@ describe("reclaim stale hand-outs (#1211)", () => {
     expect(first.acknowledged).toBe(true);
     if (!first.acknowledged) throw new Error("expected ack");
     expect(first.item.handoutAcks).toEqual(["courier@1"]);
+    // #1419: the ack records a parallel landing timestamp.
+    expect(first.item.handoutAckTimes).toHaveLength(1);
+    expect(Number.isNaN(Date.parse(first.item.handoutAckTimes[0]))).toBe(false);
     const ackHistory = client.history.at(-1);
     expect(ackHistory).toMatchObject({ action: "ack", status: "QUEUED" });
     expect(ackHistory.note).toContain("generation 1");
@@ -4204,21 +4530,36 @@ describe("reclaim stale hand-outs (#1211)", () => {
   it("exposes the env-bounded defaults and getters", () => {
     expect(DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS).toBe(30 * 60 * 1000);
     expect(DEFAULT_PR_FIX_MAX_RECLAIMS).toBe(3);
+    expect(DEFAULT_PR_FIX_ACK_LIVENESS_MS).toBe(24 * 60 * 60 * 1000);
     const prevTimeout = process.env.PR_FIX_HANDOUT_TIMEOUT_MS;
     const prevReclaims = process.env.PR_FIX_MAX_RECLAIMS;
+    const prevAckLiveness = process.env.PR_FIX_ACK_LIVENESS_MS;
     try {
       delete process.env.PR_FIX_HANDOUT_TIMEOUT_MS;
       delete process.env.PR_FIX_MAX_RECLAIMS;
+      delete process.env.PR_FIX_ACK_LIVENESS_MS;
       expect(prFixHandoutTimeoutMs()).toBe(DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS);
       expect(maxPrFixReclaims()).toBe(DEFAULT_PR_FIX_MAX_RECLAIMS);
+      expect(prFixAckLivenessMs()).toBe(DEFAULT_PR_FIX_ACK_LIVENESS_MS);
       process.env.PR_FIX_HANDOUT_TIMEOUT_MS = "1000";
       process.env.PR_FIX_MAX_RECLAIMS = "7";
+      process.env.PR_FIX_ACK_LIVENESS_MS = String(48 * 60 * 60 * 1000);
       expect(prFixHandoutTimeoutMs()).toBe(1000);
       expect(maxPrFixReclaims()).toBe(7);
+      expect(prFixAckLivenessMs()).toBe(48 * 60 * 60 * 1000);
+      // #1419 review: the ack-liveness knob is clamped 1h–7d — a value below
+      // the floor would make every acked generation near-immediately
+      // reclaimable (and shrink the agent-activity horizon with it).
+      process.env.PR_FIX_ACK_LIVENESS_MS = "1000";
+      expect(prFixAckLivenessMs()).toBe(60 * 60 * 1000);
+      process.env.PR_FIX_ACK_LIVENESS_MS = String(30 * 24 * 60 * 60 * 1000);
+      expect(prFixAckLivenessMs()).toBe(7 * 24 * 60 * 60 * 1000);
       process.env.PR_FIX_HANDOUT_TIMEOUT_MS = "0";
       process.env.PR_FIX_MAX_RECLAIMS = "nope";
+      process.env.PR_FIX_ACK_LIVENESS_MS = "nope";
       expect(prFixHandoutTimeoutMs()).toBe(DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS);
       expect(maxPrFixReclaims()).toBe(DEFAULT_PR_FIX_MAX_RECLAIMS);
+      expect(prFixAckLivenessMs()).toBe(DEFAULT_PR_FIX_ACK_LIVENESS_MS);
     } finally {
       if (prevTimeout === undefined) delete process.env.PR_FIX_HANDOUT_TIMEOUT_MS;
       else process.env.PR_FIX_HANDOUT_TIMEOUT_MS = prevTimeout;
@@ -4621,6 +4962,130 @@ describe("PR-fix outcome separation (#1218)", () => {
       expect(row.outcome).toBe("no_progress");
       expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledTimes(1);
       expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+    } finally {
+      if (prev === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
+      else process.env.PR_FIX_MAX_ATTEMPTS = prev;
+    }
+  });
+
+  it("parks a failed REBASE report instead of reopening a retry (#1327)", async () => {
+    // The generic cap must NOT be what parks it: with a generous cap, the
+    // rebase lane still settles terminally — one attempt per DIRTY episode.
+    const prev = process.env.PR_FIX_MAX_ATTEMPTS;
+    process.env.PR_FIX_MAX_ATTEMPTS = "5";
+    try {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 305, lane: "NORMAL", type: "REBASE", reason: "r", feedback: "f", evidenceKey: "k305", headSha: "H1",
+      });
+      const result = await resolvePrFixFromAgentReport({
+        client: client as PrFixQueueClient,
+        repoFullName: "org/repo",
+        pullRequestNumber: 305,
+        outcome: "failed",
+        summary: "semantic conflict, not mechanical",
+        attempt: { itemId: client.items[0].id, generation: 1 },
+      });
+
+      expect(result.action).toBe("parked");
+      const row = client.items[0];
+      expect(row.status).toBe("PARKED");
+      expect(row.lane).toBe("NORMAL");
+      expect(row.outcome).toBe("no_progress");
+      // No fresh attempt: same generation, no attempt-budget spend.
+      expect(row.generation).toBe(1);
+      expect(row.fixAttempts).toBe(1);
+      expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledTimes(1);
+      expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+      const note = client.history.at(-1)?.note ?? "";
+      expect(note).toContain("#1327");
+      expect(note).not.toContain("PR_FIX_MAX_ATTEMPTS");
+    } finally {
+      if (prev === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
+      else process.env.PR_FIX_MAX_ATTEMPTS = prev;
+    }
+  });
+
+  it("still reopens a failed legacy conflict report below the cap (#1327)", async () => {
+    // Only REBASE is terminal per episode; the legacy MERGE_CONFLICT code-fix
+    // lane keeps the generic PR_FIX_MAX_ATTEMPTS ladder.
+    const prev = process.env.PR_FIX_MAX_ATTEMPTS;
+    process.env.PR_FIX_MAX_ATTEMPTS = "5";
+    try {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 306, lane: "NORMAL", type: "MERGE_CONFLICT", reason: "r", feedback: "f", evidenceKey: "k306", headSha: "H1",
+      });
+      const result = await resolvePrFixFromAgentReport({
+        client: client as PrFixQueueClient,
+        repoFullName: "org/repo",
+        pullRequestNumber: 306,
+        outcome: "failed",
+        attempt: { itemId: client.items[0].id, generation: 1 },
+      });
+
+      expect(result.action).toBe("requeued");
+      expect(client.items[0].status).toBe("QUEUED");
+      expect(client.items[0].generation).toBe(2);
+      expect(surfacingMocks.surfacePrFixParked).not.toHaveBeenCalled();
+    } finally {
+      if (prev === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
+      else process.env.PR_FIX_MAX_ATTEMPTS = prev;
+    }
+  });
+
+  it("terminal-parks a failed REBASE attempt even when the row type flipped mid-attempt (#1327)", async () => {
+    // The bound keys on the DISPATCHED lane (attemptType), not the row's
+    // mutable type: mid-attempt evidence must not smuggle a failed rebase
+    // back onto the reopen ladder for a second rebase on the same head.
+    const prev = process.env.PR_FIX_MAX_ATTEMPTS;
+    process.env.PR_FIX_MAX_ATTEMPTS = "5";
+    try {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 307, lane: "NORMAL", type: "REBASE", reason: "r", feedback: "f", evidenceKey: "k307", headSha: "H1",
+      });
+      client.items[0].attemptType = "REBASE";
+      client.items[0].type = "REVIEW_FEEDBACK";
+      const result = await resolvePrFixFromAgentReport({
+        client: client as PrFixQueueClient,
+        repoFullName: "org/repo",
+        pullRequestNumber: 307,
+        outcome: "failed",
+        attempt: { itemId: client.items[0].id, generation: 1 },
+      });
+
+      expect(result.action).toBe("parked");
+      expect(client.items[0].status).toBe("PARKED");
+      expect(client.items[0].generation).toBe(1);
+    } finally {
+      if (prev === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
+      else process.env.PR_FIX_MAX_ATTEMPTS = prev;
+    }
+  });
+
+  it("does not terminal-park an ordinary attempt whose row flipped into the rebase lane mid-run (#1327)", async () => {
+    // A code-fix attempt (attemptType CI_FAILURE) that observed the PR go
+    // dirty mid-run keeps the generic ladder; the rebase bound attaches to
+    // rebase DISPATCHES only.
+    const prev = process.env.PR_FIX_MAX_ATTEMPTS;
+    process.env.PR_FIX_MAX_ATTEMPTS = "5";
+    try {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 308, lane: "NORMAL", type: "CI_FAILURE", reason: "r", feedback: "f", evidenceKey: "k308", headSha: "H1",
+      });
+      client.items[0].attemptType = "CI_FAILURE";
+      client.items[0].type = "REBASE";
+      const result = await resolvePrFixFromAgentReport({
+        client: client as PrFixQueueClient,
+        repoFullName: "org/repo",
+        pullRequestNumber: 308,
+        outcome: "failed",
+        attempt: { itemId: client.items[0].id, generation: 1 },
+      });
+
+      expect(result.action).toBe("requeued");
+      expect(client.items[0].status).toBe("QUEUED");
+      expect(client.items[0].generation).toBe(2);
+      // The consumed attempt's lane stamp does not leak into the fresh one.
+      expect(client.items[0].attemptType).toBeNull();
     } finally {
       if (prev === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
       else process.env.PR_FIX_MAX_ATTEMPTS = prev;
@@ -5389,6 +5854,743 @@ describe("PR-fix outcome separation (#1218)", () => {
       expect(client.items[0].lane).toBe("NEEDS_HUMAN");
       expect(client.items[0].outcome).toBe("human_decision");
       expect(client.history.length).toBe(historyBefore);
+    });
+  });
+});
+
+describe("hasInFlightRebaseHandout (#1327)", () => {
+  it("flags QUEUED REBASE rows with live hand-out records only", async () => {
+    const client = makeClient();
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 401, lane: "NORMAL", type: "REBASE", reason: "r", feedback: "f", evidenceKey: "k401" });
+    expect(await hasInFlightRebaseHandout(client)).toBe(false);
+
+    // A live hand-out (agent record, still QUEUED) gates the lane. Liveness
+    // follows the queue's ownership semantics, not a clock: the record gates
+    // until it is cleared by settlement or the reclaim sweep.
+    client.items[0].agentHandouts = ["worker-a@1"];
+    client.items[0].dispatchedAt = new Date();
+    expect(await hasInFlightRebaseHandout(client)).toBe(true);
+
+    // A live hand-out on a non-REBASE item must not gate the rebase lane.
+    client.items[0].agentHandouts = [];
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 402, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k402" });
+    client.items[1].agentHandouts = ["worker-b@1"];
+    client.items[1].dispatchedAt = new Date();
+    expect(await hasInFlightRebaseHandout(client)).toBe(false);
+
+    // A settled REBASE (no longer QUEUED) does not gate, even with stale
+    // records: settlement/reclaim clearing is what frees the lane.
+    client.items[0].agentHandouts = ["worker-a@1"];
+    client.items[0].status = "PARKED";
+    expect(await hasInFlightRebaseHandout(client)).toBe(false);
+  });
+
+  it("an acknowledged hand-out gates the lane however stale it is (never reclaimed, #1211)", async () => {
+    // An ACKNOWLEDGED hand-out is deliberately never reclaimed (#1211 — the
+    // worker durably owns its generation), so it gates the lane until it
+    // settles. The old gate time-boxed liveness on PR_FIX_HANDOUT_TIMEOUT_MS
+    // and freed the lane under a still-live hand-out once the timeout
+    // passed — a concurrency-2 window (two `--force-with-lease` pushes on
+    // one branch) the queue's ownership model does not license. A stuck
+    // acknowledged attempt holds the lane until the worker reports or an
+    // operator requeues: visible and recoverable, never silently shared.
+    const client = makeClient();
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 403, lane: "NORMAL", type: "REBASE", reason: "r", feedback: "f", evidenceKey: "k403" });
+    client.items[0].agentHandouts = ["worker-a@1"];
+    client.items[0].handoutAcks = ["worker-a@1"];
+    client.items[0].dispatchedAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    client.items[0].updatedAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    expect(await hasInFlightRebaseHandout(client)).toBe(true);
+
+    // No stamped start at all (the anomalous throw-between-writes shape):
+    // NOT counted live — the reclaim sweep can never clear such a row
+    // either (`dispatchedAt: { lt }` never matches NULL), so gating on it
+    // would block the lane with no recovery path at all.
+    client.items[0].dispatchedAt = null;
+    client.items[0].updatedAt = null;
+    expect(await hasInFlightRebaseHandout(client)).toBe(false);
+  });
+
+  it("frees the lane only when the reclaim sweep clears the stale unacknowledged hand-out", async () => {
+    // The hand-out timeout bounds the RECLAIM SWEEP's staleness population,
+    // not the gate: a stale unacknowledged hand-out keeps gating PAST the
+    // timeout, and the lane re-opens only through the sweep's committed
+    // reclaim (the generation bump that clears the hand-out state).
+    const client = makeClient();
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 406, lane: "NORMAL", type: "REBASE", reason: "r", feedback: "f", evidenceKey: "k406" });
+    client.items[0].agentHandouts = ["worker-a@1"];
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+    client.items[0].dispatchedAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    expect(await hasInFlightRebaseHandout(client)).toBe(true);
+
+    const report = await reclaimStalePrFixHandouts(client, {
+      now: new Date(Date.now() + 60_000),
+      isPrMergedOrClosed: async () => false,
+    });
+    expect(report.reclaimed).toBe(1);
+    expect(client.items[0].agentHandouts).toEqual([]);
+    expect(client.items[0].generation).toBe(2);
+    expect(client.items[0].attemptType ?? null).toBeNull();
+    expect(await hasInFlightRebaseHandout(client)).toBe(false);
+  });
+
+  it("keys the lane on the DISPATCHED type, not the mutable row type", async () => {
+    const client = makeClient();
+    // A REBASE attempt whose row flipped to another lane mid-attempt still
+    // occupies the lane.
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 404, lane: "NORMAL", type: "REBASE", reason: "r", feedback: "f", evidenceKey: "k404" });
+    client.items[0].type = "REVIEW_FEEDBACK";
+    client.items[0].attemptType = "REBASE";
+    client.items[0].agentHandouts = ["worker-a@1"];
+    client.items[0].dispatchedAt = new Date();
+    expect(await hasInFlightRebaseHandout(client)).toBe(true);
+    client.items[0].agentHandouts = [];
+
+    // An ordinary fix attempt whose row flipped INTO REBASE mid-attempt is
+    // not the rebase lane and must not block it.
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 405, lane: "NORMAL", type: "CI_FAILURE", reason: "r", feedback: "f", evidenceKey: "k405" });
+    client.items[1].attemptType = "CI_FAILURE";
+    client.items[1].type = "REBASE";
+    client.items[1].agentHandouts = ["worker-b@1"];
+    client.items[1].dispatchedAt = new Date();
+    expect(await hasInFlightRebaseHandout(client)).toBe(false);
+  });
+});
+
+describe("withRebaseLaneAdmission (#1327 review)", () => {
+  it("holds the advisory transaction lock across the admission run", async () => {
+    const raw: { sql: string; values: string[] }[] = [];
+    const client: any = {
+      $transaction: async (fn: any) => fn(client),
+      $executeRaw: async (query: any) => {
+        raw.push({
+          sql: String(query?.sql ?? query),
+          values: (query?.values ?? []).map((value: unknown) => String(value)),
+        });
+        return 1;
+      },
+    };
+    const result = await withRebaseLaneAdmission(client, async (tx) => {
+      // The run executes with the lock statements already issued, inside
+      // the same transaction client it receives.
+      expect(tx).toBe(client);
+      return "admitted";
+    });
+    expect(result).toBe("admitted");
+    expect(raw).toHaveLength(2);
+    expect(raw[0].sql).toContain("lock_timeout");
+    expect(raw[1].sql).toContain("pg_advisory_xact_lock");
+    expect(raw[1].values).toContain(String(REBASE_LANE_ADVISORY_LOCK_KEY));
+  });
+
+  it("refuses admission when the client has no raw surface (fail closed)", async () => {
+    // Without $executeRaw the advisory lock cannot be taken, so the gate read
+    // and the hand-out write would run UNSERIALIZED — the check-then-write
+    // fan-out the lane forbids. The admission must refuse rather than admit
+    // an unlocked hand-out; the caller defers and the next poll retries.
+    const client: any = { $transaction: async (fn: any) => fn(client) };
+    await expect(withRebaseLaneAdmission(client, async () => "admitted")).rejects.toThrow(
+      /advisory lock/,
+    );
+  });
+
+  it("propagates an admission failure so the caller can fail closed", async () => {
+    const client: any = {
+      $transaction: async () => {
+        throw new Error("lock_timeout");
+      },
+    };
+    await expect(withRebaseLaneAdmission(client, async () => "admitted")).rejects.toThrow("lock_timeout");
+  });
+});
+
+describe("fresh attempts drop the previous attempt's dispatched lane (#1327 review)", () => {
+  it("requeue clears attemptType with the generation bump", async () => {
+    const client = makeClient();
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 410, lane: "NORMAL", type: "REBASE", reason: "r", feedback: "f", evidenceKey: "k410" });
+    // The REBASE attempt was handed out (lane stamped) and parked blocked.
+    client.items[0].attemptType = "REBASE";
+    client.items[0].agentHandouts = ["worker-a@1"];
+    client.items[0].status = "BLOCKED";
+
+    const requeued = await requeuePrFixItem(client, { repo: "org/repo", pr: 410, note: "fresh episode" });
+    expect(requeued?.generation, "requeue is a fresh work identity").toBe(2);
+    expect(requeued?.attemptType, "a fresh attempt carries no dispatched lane").toBeNull();
+  });
+
+  it("a reopen after a settled REBASE does not inherit the rebase lane", async () => {
+    // The reviewed bypass: a REBASE episode settles, the PR later re-observes
+    // as ordinary work, and the reopened row's STALE attemptType made
+    // next-task treat the fresh attempt as the dead lane — skipping the
+    // rebase serialization for what is a fresh REBASE by type, or gating
+    // ordinary work behind the rebase lane. The lane resets with the
+    // generation, so the row's lane is its queue type again.
+    const client = makeClient();
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 411, lane: "NORMAL", type: "REBASE", reason: "r", feedback: "f", evidenceKey: "merge_state:org/repo#411" });
+    client.items[0].attemptType = "REBASE";
+    await markPrFixItem(client, { repo: "org/repo", pr: 411, status: "FIXED", note: "rebased" });
+
+    const reopened = await enqueuePrFixItem(client, { repo: "org/repo", pr: 411, lane: "NORMAL", type: "CI_FAILURE", reason: "r2", feedback: "f2", evidenceKey: "checks_failed:org/repo#411" });
+    expect(reopened.status).toBe("QUEUED");
+    expect(reopened.attemptType, "the reopen is a fresh attempt, not the old REBASE dispatch").toBeNull();
+
+    // With a live hand-out, the gate reads the row by its current lane
+    // (CI_FAILURE): the ordinary attempt must not occupy the rebase lane.
+    reopened.agentHandouts = ["worker-a@2"];
+    reopened.dispatchedAt = new Date();
+    expect(await hasInFlightRebaseHandout(client)).toBe(false);
+  });
+});
+
+describe("rebase worker pool eligibility (DISPATCH_REBASE_AGENTS, #1327)", () => {
+  afterEach(() => {
+    delete process.env.DISPATCH_REBASE_AGENTS;
+  });
+
+  it("unset is fail-closed: no agent is eligible", () => {
+    // #1327 exists to keep rebases on free local capacity, so a missing
+    // allowlist must not hand the lane to every polling agent.
+    delete process.env.DISPATCH_REBASE_AGENTS;
+    expect(parseRebaseAgentPool(undefined)).toEqual(new Set());
+    expect(isRebaseLaneAgent("anyone")).toBe(false);
+  });
+
+  it("a bare * value is the explicit unrestricted opt-in", () => {
+    process.env.DISPATCH_REBASE_AGENTS = "*";
+    expect(parseRebaseAgentPool("*")).toBeNull();
+    expect(isRebaseLaneAgent("anyone")).toBe(true);
+  });
+
+  it("a * mixed into a list is an agent name, not the opt-in", () => {
+    process.env.DISPATCH_REBASE_AGENTS = "*, local-coder";
+    expect(parseRebaseAgentPool("*, local-coder")).toEqual(new Set(["*", "local-coder"]));
+    expect(isRebaseLaneAgent("local-coder")).toBe(true);
+    expect(isRebaseLaneAgent("anyone")).toBe(false);
+  });
+
+  it("parses comma and whitespace separated names case-insensitively", () => {
+    process.env.DISPATCH_REBASE_AGENTS = "Local-Coder, other-local\nthird";
+    expect(parseRebaseAgentPool("Local-Coder, other-local\nthird")).toEqual(new Set(["local-coder", "other-local", "third"]));
+    expect(isRebaseLaneAgent("  LOCAL-CODER ")).toBe(true);
+    expect(isRebaseLaneAgent("someone-else")).toBe(false);
+  });
+
+  it("an explicitly empty value is fail-closed: the pool admits nobody", () => {
+    process.env.DISPATCH_REBASE_AGENTS = "   ";
+    expect(parseRebaseAgentPool("   ")).toEqual(new Set());
+    expect(isRebaseLaneAgent("local-coder")).toBe(false);
+  });
+});
+
+describe("mark hand-out binding for worker settlements (#1428)", () => {
+  let client: ReturnType<typeof makeClient>;
+
+  beforeEach(() => {
+    client = makeClient();
+  });
+
+  it("lets a scoped agent holding the marker at the settled generation settle", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 500, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k500" });
+    client.items[0].agentHandouts = ["alpha@1"];
+
+    const result = await markPrFixItem(client, { repo: "org/repo", pr: 500, status: "FIXED", expectedGeneration: 1, handoutScopedAgent: "alpha" });
+
+    expect(mutatedItem(result).status).toBe("FIXED");
+    expect(client.history.at(-1)).toMatchObject({ action: "mark", status: "FIXED" });
+  });
+
+  it("refuses a scoped agent with no hand-out record: not-handed, zero writes", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 501, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k501" });
+
+    const result = await markPrFixItem(client, { repo: "org/repo", pr: 501, status: "FIXED", expectedGeneration: 1, handoutScopedAgent: "alpha" });
+
+    expect(result).toEqual({ mutated: false, reason: "not-handed" });
+    expect(client.items[0].status).toBe("QUEUED");
+    expect(client.history.filter((h) => h.action === "mark")).toHaveLength(0);
+  });
+
+  it("refuses a scoped agent whose marker belongs to another agent", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 502, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k502" });
+    client.items[0].agentHandouts = ["bravo@1"];
+
+    const result = await markPrFixItem(client, { repo: "org/repo", pr: 502, status: "BLOCKED", expectedGeneration: 1, handoutScopedAgent: "alpha" });
+
+    expect(result).toEqual({ mutated: false, reason: "not-handed" });
+    expect(client.items[0].status).toBe("QUEUED");
+    expect(client.history.filter((h) => h.action === "mark")).toHaveLength(0);
+  });
+
+  it("refuses a scoped agent whose marker belongs to another generation (fail-closed)", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 503, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k503" });
+    // A spent hand-out from a previous generation must not authorize the
+    // current attempt's settlement.
+    client.items[0].generation = 2;
+    client.items[0].agentHandouts = ["alpha@1"];
+
+    const result = await markPrFixItem(client, { repo: "org/repo", pr: 503, status: "FIXED", expectedGeneration: 2, handoutScopedAgent: "alpha" });
+
+    expect(result).toEqual({ mutated: false, reason: "not-handed" });
+    expect(client.items[0].status).toBe("QUEUED");
+    expect(client.history.filter((h) => h.action === "mark")).toHaveLength(0);
+  });
+
+  it("treats malformed hand-out entries as inert (never authorizes)", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 504, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k504" });
+    client.items[0].agentHandouts = ["alpha", "alpha@0", "alpha@x"];
+
+    const result = await markPrFixItem(client, { repo: "org/repo", pr: 504, status: "PARKED", expectedGeneration: 1, handoutScopedAgent: "alpha" });
+
+    expect(result).toEqual({ mutated: false, reason: "not-handed" });
+  });
+
+  it("an agent name containing @ keeps its marker matching (last-@ split)", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 505, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k505" });
+    client.items[0].agentHandouts = ["bot@corp@1"];
+
+    const result = await markPrFixItem(client, { repo: "org/repo", pr: 505, status: "STALE", expectedGeneration: 1, handoutScopedAgent: "bot@corp" });
+
+    expect(mutatedItem(result).status).toBe("STALE");
+  });
+
+  it("an unscoped mark (maintainer/internal path) stays unconstrained", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 506, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k506" });
+
+    const result = await markPrFixItem(client, { repo: "org/repo", pr: 506, status: "FIXED", expectedGeneration: 1, actorTier: "maintainer" });
+
+    expect(mutatedItem(result).status).toBe("FIXED");
+  });
+
+  it("refuses a scoped WAITING_EXTERNAL on a row without the agent's hand-out", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 507, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k507" });
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 507, status: "WAITING_EXTERNAL", expectedGeneration: 1, handoutScopedAgent: "alpha",
+      externalWait: { kind: "upstream_pr", ref: "org/deps#7", evidence: "upstream PR open", trigger: { kind: "merged" } },
+    });
+
+    expect(result).toEqual({ mutated: false, reason: "not-handed" });
+    expect(client.items[0].status).toBe("QUEUED");
+    expect(client.history.filter((h) => h.action === "mark")).toHaveLength(0);
+  });
+
+  it("keeps the #1231 idempotent WAITING_EXTERNAL replay authorized after the wait cleared the hand-outs", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 508, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k508" });
+    const wait = { kind: "upstream_pr", ref: "org/deps#7", evidence: "upstream PR open", trigger: { kind: "merged" } };
+    client.items[0].agentHandouts = ["alpha@1"];
+
+    const first = await markPrFixItem(client, { repo: "org/repo", pr: 508, status: "WAITING_EXTERNAL", expectedGeneration: 1, handoutScopedAgent: "alpha", externalWait: wait });
+    expect(mutatedItem(first).status).toBe("WAITING_EXTERNAL");
+    expect(client.items[0].agentHandouts).toEqual([]);
+
+    // A retry after a lost response: the wait consumed (and cleared) the
+    // hand-out records, so the binding must not turn the idempotent replay
+    // into a 403 — the duplicate answers before the binding runs.
+    const retry = await markPrFixItem(client, { repo: "org/repo", pr: 508, status: "WAITING_EXTERNAL", expectedGeneration: 1, handoutScopedAgent: "alpha", externalWait: wait });
+    expect(retry.mutated).toBe(true);
+    expect(mutatedItem(retry).status).toBe("WAITING_EXTERNAL");
+    expect(client.history.filter((h) => h.status === "WAITING_EXTERNAL")).toHaveLength(1);
+  });
+
+  it("only the agent holding the marker at the settled generation authorizes", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 509, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k509" });
+    client.items[0].generation = 2;
+    client.items[0].agentHandouts = ["alpha@1", "bravo@2"];
+
+    const result = await markPrFixItem(client, { repo: "org/repo", pr: 509, status: "BLOCKED", expectedGeneration: 2, handoutScopedAgent: "alpha" });
+
+    expect(result).toEqual({ mutated: false, reason: "not-handed" });
+    // bravo holds the live hand-out and can still settle it.
+    const other = await markPrFixItem(client, { repo: "org/repo", pr: 509, status: "BLOCKED", expectedGeneration: 2, handoutScopedAgent: "bravo" });
+    expect(mutatedItem(other).status).toBe("BLOCKED");
+  });
+});
+
+describe("hand-out-scoped external waits (#1430)", () => {
+  let client: ReturnType<typeof makeClient>;
+
+  const wait = {
+    kind: "upstream_pr",
+    ref: "org/deps#7",
+    evidence: "upstream PR open",
+    trigger: { kind: "merged" },
+  } as const;
+
+  beforeEach(() => {
+    client = makeClient();
+    surfacingMocks.surfacePrFixBlocked.mockReset();
+    surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    surfacingMocks.surfacePrFixParked.mockReset();
+    surfacingMocks.surfacePrFixParked.mockResolvedValue({ commentPosted: true, commentUpdated: false, skippedTerminal: false, errors: [] });
+  });
+
+  async function seedQueued(pr: number) {
+    const item = await enqueuePrFixItem(client, { repo: "org/repo", pr, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: `k${pr}` });
+    // #1431 composes with #1430: a bound worker may start WAITING_EXTERNAL
+    // only from a generation it was actually handed. Seed both live worker
+    // markers so these tests exercise waiter-replay ownership, not the
+    // earlier route-wide hand-out authorization gate.
+    const row = client.items.find((i) => i.id === item.id)!;
+    row.agentHandouts = [`alpha@${row.generation}`, `bravo@${row.generation}`];
+    return item;
+  }
+
+  function rowOf(item: any) {
+    return client.items.find((i) => i.id === item.id)!;
+  }
+
+  it("records the bound waiter when a scoped worker starts the wait", async () => {
+    const item = await seedQueued(90);
+    const result = await markPrFixItem(client, {
+      repo: item.repo,
+      pr: item.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: item.generation,
+      externalWait: wait,
+      handoutScopedAgent: "alpha",
+    });
+
+    expect(result.mutated).toBe(true);
+    const row = mutatedItem(result);
+    expect(row.status).toBe("WAITING_EXTERNAL");
+    expect(row.externalWaitBy).toBe("alpha");
+    expect(client.history.at(-1)).toMatchObject({ action: "mark", status: "WAITING_EXTERNAL" });
+  });
+
+  it("records a null waiter when an unscoped caller starts the wait", async () => {
+    const item = await seedQueued(91);
+    const result = await markPrFixItem(client, {
+      repo: item.repo,
+      pr: item.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: item.generation,
+      externalWait: wait,
+    });
+
+    expect(result.mutated).toBe(true);
+    expect(mutatedItem(result).externalWaitBy).toBe(null);
+  });
+
+  it("grants its own same-generation replay idempotently without extending the wait (#1231, #1430)", async () => {
+    const item = await seedQueued(92);
+    const first = await markPrFixItem(client, {
+      repo: item.repo,
+      pr: item.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: item.generation,
+      note: "original note",
+      externalWait: wait,
+      handoutScopedAgent: "alpha",
+    });
+    expect(first.mutated).toBe(true);
+
+    const row = rowOf(item);
+    const retryAtBefore = row.retryAt;
+    const waitBefore = row.externalWait;
+    const historyLengthBefore = client.history.length;
+
+    const replay = await markPrFixItem(client, {
+      repo: row.repo,
+      pr: row.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: row.generation,
+      note: "replay note",
+      externalWait: wait,
+      handoutScopedAgent: "alpha",
+    });
+
+    expect(replay.mutated).toBe(true);
+    expect(mutatedItem(replay)).toBe(row);
+    // No new history row: the replay is the #1231 duplicate answer, not a new mark.
+    expect(client.history).toHaveLength(historyLengthBefore);
+    // The cooldown is never re-armed by the replay.
+    expect(row.retryAt).toBe(retryAtBefore);
+    expect(row.externalWait).toEqual(waitBefore);
+    expect(row.externalWaitBy).toBe("alpha");
+    expect(client.history.at(-1)).toMatchObject({ note: "original note" });
+  });
+
+  it("refuses a same-generation replay from a different bound worker (not-handed)", async () => {
+    const item = await seedQueued(93);
+    const first = await markPrFixItem(client, {
+      repo: item.repo,
+      pr: item.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: item.generation,
+      externalWait: wait,
+      handoutScopedAgent: "alpha",
+    });
+    expect(first.mutated).toBe(true);
+
+    const row = rowOf(item);
+    const retryAtBefore = row.retryAt;
+    const historyLengthBefore = client.history.length;
+
+    const refused = await markPrFixItem(client, {
+      repo: row.repo,
+      pr: row.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: row.generation,
+      externalWait: wait,
+      handoutScopedAgent: "bravo",
+    });
+
+    expect(refused).toEqual({ mutated: false, reason: "not-handed" });
+    // The refusal is a caller-binding denial: no write, no history row.
+    expect(row.status).toBe("WAITING_EXTERNAL");
+    expect(row.externalWaitBy).toBe("alpha");
+    expect(row.retryAt).toBe(retryAtBefore);
+    expect(client.history).toHaveLength(historyLengthBefore);
+  });
+
+  it("refuses a scoped replay of a wait started by an unscoped caller (no recorded waiter)", async () => {
+    const item = await seedQueued(94);
+    const first = await markPrFixItem(client, {
+      repo: item.repo,
+      pr: item.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: item.generation,
+      externalWait: wait,
+    });
+    expect(first.mutated).toBe(true);
+    const row = rowOf(item);
+    expect(row.externalWaitBy).toBe(null);
+
+    const refused = await markPrFixItem(client, {
+      repo: row.repo,
+      pr: row.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: row.generation,
+      externalWait: wait,
+      handoutScopedAgent: "alpha",
+    });
+
+    expect(refused).toEqual({ mutated: false, reason: "not-handed" });
+    expect(row.externalWaitBy).toBe(null);
+  });
+
+  it("keeps the unscoped same-generation replay unchanged for a scoped wait (#1231)", async () => {
+    const item = await seedQueued(95);
+    const first = await markPrFixItem(client, {
+      repo: item.repo,
+      pr: item.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: item.generation,
+      externalWait: wait,
+      handoutScopedAgent: "alpha",
+    });
+    expect(first.mutated).toBe(true);
+
+    const row = rowOf(item);
+    const replay = await markPrFixItem(client, {
+      repo: row.repo,
+      pr: row.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: row.generation,
+      externalWait: wait,
+    });
+
+    expect(replay.mutated).toBe(true);
+    expect(mutatedItem(replay)).toBe(row);
+    expect(row.externalWaitBy).toBe("alpha");
+  });
+
+  it("resets the recorded waiter when the wait is released into a fresh attempt", async () => {
+    const item = await seedQueued(96);
+    const first = await markPrFixItem(client, {
+      repo: item.repo,
+      pr: item.pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: item.generation,
+      externalWait: wait,
+      handoutScopedAgent: "alpha",
+    });
+    expect(first.mutated).toBe(true);
+
+    const row = rowOf(item);
+    expect(row.externalWaitBy).toBe("alpha");
+    const generationBefore = row.generation;
+
+    // Operator release: a mark back to QUEUED is a fresh attempt and must not
+    // inherit the dead attempt's recorded waiter or hand-out records.
+    const released = await markPrFixItem(client, {
+      repo: row.repo,
+      pr: row.pr,
+      status: "QUEUED",
+      expectedGeneration: row.generation,
+      actorTier: "maintainer",
+      note: "operator release",
+    });
+
+    expect(released.mutated).toBe(true);
+    const fresh = mutatedItem(released);
+    expect(fresh.status).toBe("QUEUED");
+    expect(fresh.generation).toBe(generationBefore + 1);
+    expect(fresh.externalWaitBy).toBe(null);
+    expect(fresh.agentHandouts).toEqual([]);
+  });
+
+  // Post-write conflict fallback race (#1430): the scoped caller reads the row
+  // as QUEUED, a CONCURRENT mark at the same generation wins the
+  // QUEUED→WAITING_EXTERNAL transition before the caller's generation-pinned
+  // write runs (status where-pin misses, count 0), and the fallback re-read
+  // must apply the same scoped-replay gate as the pre-read duplicate. Each of
+  // the two fallback paths (normal wait write, fail-closed downgrade) runs
+  // exactly one updateMany — the pinned write itself — so the one-shot
+  // `beforeUpdateMany` hook lands the concurrent winner right before it.
+  describe("concurrent same-generation wait races (post-write fallback)", () => {
+    const ALPHA_RETRY_AT = new Date(Date.UTC(2026, 5, 15, 12, 30));
+    const ALPHA_NOTE = "alpha is waiting on the upstream PR";
+
+    function installConcurrentAlphaWait(item: { id: string }) {
+      client.hooks.beforeUpdateMany = () => {
+        const row = client.items.find((i) => i.id === item.id)!;
+        // Alpha's winning wait write: distinct note (history) and retryAt
+        // from anything the losing caller would have recorded; generation
+        // unchanged (same-generation race).
+        Object.assign(row, {
+          status: "WAITING_EXTERNAL",
+          retryAt: ALPHA_RETRY_AT,
+          externalWait: wait,
+          outcome: null,
+          decisionDetail: null,
+          postDispatchEvidenceKeys: [],
+          disposedAt: new Date(Date.UTC(2026, 5, 16, 0, 0)),
+          disposedEvidence: null,
+          attemptEvidenceWatermark: null,
+          dispatchedGeneration: null,
+          dispatchedAt: null,
+          agentHandouts: [],
+          handoutReceipts: [],
+          handoutAcks: [],
+          externalWaitBy: "alpha",
+          updatedAt: new Date(Date.UTC(2026, 5, 17, 0, 0)),
+        });
+        client.history.push({
+          id: `history-${client.history.length + 1}`,
+          at: new Date(),
+          itemId: row.id,
+          action: "mark",
+          status: "WAITING_EXTERNAL",
+          lane: row.lane,
+          note: ALPHA_NOTE,
+        });
+      };
+    }
+
+    it("a scoped caller losing the QUEUED→WAITING_EXTERNAL write to a concurrent wait by another agent gets not-handed (post-write fallback, #1430)", async () => {
+      const item = await seedQueued(97);
+      installConcurrentAlphaWait(item);
+      const historyLengthBefore = client.history.length;
+
+      const lost = await markPrFixItem(client, {
+        repo: item.repo,
+        pr: item.pr,
+        status: "WAITING_EXTERNAL",
+        expectedGeneration: item.generation,
+        note: "bravo wait note",
+        externalWait: wait,
+        handoutScopedAgent: "bravo",
+      });
+
+      expect(lost).toEqual({ mutated: false, reason: "not-handed" });
+      const row = rowOf(item);
+      // The row keeps the concurrent winner's wait, not bravo's: alpha is the
+      // recorded waiter with alpha's cooldown, and bravo's attempt left no
+      // history row (its pinned write missed before the history create).
+      expect(row.status).toBe("WAITING_EXTERNAL");
+      expect(row.externalWaitBy).toBe("alpha");
+      expect(row.retryAt).toBe(ALPHA_RETRY_AT);
+      expect(client.history).toHaveLength(historyLengthBefore + 1);
+      expect(client.history.at(-1)).toMatchObject({ action: "mark", status: "WAITING_EXTERNAL", note: ALPHA_NOTE });
+      expect(client.history.some((h) => h.note === "bravo wait note")).toBe(false);
+    });
+
+    it("a scoped caller losing the write to its own concurrent wait keeps the idempotent answer (post-write fallback double submit, #1430)", async () => {
+      const item = await seedQueued(98);
+      installConcurrentAlphaWait(item);
+      const historyLengthBefore = client.history.length;
+
+      const replay = await markPrFixItem(client, {
+        repo: item.repo,
+        pr: item.pr,
+        status: "WAITING_EXTERNAL",
+        expectedGeneration: item.generation,
+        note: "alpha replay note",
+        externalWait: wait,
+        handoutScopedAgent: "alpha",
+      });
+
+      expect(replay.mutated).toBe(true);
+      const row = rowOf(item);
+      expect(mutatedItem(replay)).toBe(row);
+      // The winner's recorded wait survives the caller's losing write:
+      // alpha's cooldown and note, no second history row from the replay.
+      expect(row.status).toBe("WAITING_EXTERNAL");
+      expect(row.externalWaitBy).toBe("alpha");
+      expect(row.retryAt).toBe(ALPHA_RETRY_AT);
+      expect(client.history).toHaveLength(historyLengthBefore + 1);
+      expect(client.history.at(-1)).toMatchObject({ note: ALPHA_NOTE });
+      expect(client.history.some((h) => h.note === "alpha replay note")).toBe(false);
+    });
+
+    it("an unscoped caller losing the write to a concurrent scoped wait keeps the unchanged replay (post-write fallback, #1430)", async () => {
+      const item = await seedQueued(99);
+      installConcurrentAlphaWait(item);
+      const historyLengthBefore = client.history.length;
+
+      const replay = await markPrFixItem(client, {
+        repo: item.repo,
+        pr: item.pr,
+        status: "WAITING_EXTERNAL",
+        expectedGeneration: item.generation,
+        note: "unscoped wait note",
+        externalWait: wait,
+      });
+
+      expect(replay.mutated).toBe(true);
+      const row = rowOf(item);
+      expect(mutatedItem(replay)).toBe(row);
+      // Unscoped callers are not bound to the recorded waiter: the row comes
+      // back unchanged, still recording alpha as the starter.
+      expect(row.status).toBe("WAITING_EXTERNAL");
+      expect(row.externalWaitBy).toBe("alpha");
+      expect(row.retryAt).toBe(ALPHA_RETRY_AT);
+      expect(client.history).toHaveLength(historyLengthBefore + 1);
+      expect(client.history.at(-1)).toMatchObject({ note: ALPHA_NOTE });
+    });
+
+    it("the fail-closed downgrade write's fallback applies the scoped gate too: not-handed, and the row is never parked (post-write fallback, #1430)", async () => {
+      const item = await seedQueued(100);
+      installConcurrentAlphaWait(item);
+      const historyLengthBefore = client.history.length;
+
+      // Invalid contract (no dependency) → the fail-closed PARKED/invalid_wait
+      // downgrade write is attempted, but the hook flips the row to alpha's
+      // WAITING_EXTERNAL first, so its QUEUED status pin misses.
+      const lost = await markPrFixItem(client, {
+        repo: item.repo,
+        pr: item.pr,
+        status: "WAITING_EXTERNAL",
+        expectedGeneration: item.generation,
+        note: "bravo invalid note",
+        externalWait: {},
+        handoutScopedAgent: "bravo",
+      });
+
+      expect(lost).toEqual({ mutated: false, reason: "not-handed" });
+      const row = rowOf(item);
+      // The row stays on alpha's wait: not parked, no invalid_wait
+      // disposition, no PARKED history row, no park surfacing.
+      expect(row.status).toBe("WAITING_EXTERNAL");
+      expect(row.outcome).toBe(null);
+      expect(row.lane).toBe("NORMAL");
+      expect(row.externalWaitBy).toBe("alpha");
+      expect(row.externalWait).toEqual(wait);
+      expect(row.retryAt).toBe(ALPHA_RETRY_AT);
+      expect(client.history).toHaveLength(historyLengthBefore + 1);
+      expect(client.history.at(-1)).toMatchObject({ status: "WAITING_EXTERNAL", note: ALPHA_NOTE });
+      expect(client.history.some((h) => h.status === "PARKED")).toBe(false);
+      expect(surfacingMocks.surfacePrFixParked).not.toHaveBeenCalled();
     });
   });
 });

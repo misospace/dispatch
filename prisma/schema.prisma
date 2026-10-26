@@ -161,6 +161,11 @@ enum PrFixType {
   CI_FAILURE
   REVIEW_FEEDBACK
   OTHER
+  // Mechanical rebase lane (#1327): a DIRTY PR is handed a bounded rebase
+  // attempt instead of a code-fix generation. The Postgres enum is the write
+  // path's contract — a value it lacks cannot be persisted at all — so it
+  // must move together with `PrFixType` in src/types/index.ts.
+  REBASE
 }
 
 model PrFixQueueItem {
@@ -195,6 +200,12 @@ model PrFixQueueItem {
   // captured when the attempt becomes dispatchable. The FIXED guard compares
   // the PR head against this baseline, not the mutable enqueue-time headSha.
   attemptHeadSha           String?
+  // The PR-fix lane this attempt was handed out as (#1327): stamped with the
+  // first hand-out of each generation. The row's `type` is mutable — every
+  // re-enqueue overwrites it, mid-attempt included — so the terminal rebase
+  // bound and the rebase concurrency gate key on the lane the attempt was
+  // actually dispatched as, not the current type.
+  attemptType              String?
   // Dispatchable fix attempts since creation or the last operator requeue
   // (#1103): 1 on creation, +1 per fresh attempt. PR_FIX_MAX_ATTEMPTS bounds
   // this, not evidence keys — one review can carry many comment keys.
@@ -243,6 +254,13 @@ model PrFixQueueItem {
   // generation any agent acknowledged; entries for older generations are inert
   // and every fresh attempt clears the list.
   handoutAcks              String[]        @default([])
+  // Parallel ISO-8601 timestamps for `handoutAcks` (#1419): entry i records
+  // when the ack at handoutAcks[i] landed, so the reclaimer can require an
+  // acked owner to re-evidence liveness instead of staying authoritative
+  // forever. Every site that clears or filters `handoutAcks` must treat
+  // `handoutAckTimes` as its parallel array — cleared together, appended
+  // together in the same atomic write, and index-matched on removal.
+  handoutAckTimes          String[]        @default([])
   // Bounded automatic reclamations of stale unacknowledged hand-outs (#1211):
   // counts how many times the reclaimer has reopened this item because a
   // stamped hand-out was never acknowledged. Past PR_FIX_MAX_RECLAIMS the item
@@ -271,6 +289,13 @@ model PrFixQueueItem {
   // WAITING_EXTERNAL row means a legacy free-text wait (pre-#1250) — surfaced
   // for operator action, never auto-downgraded.
   externalWait             Json?
+  // Identity of the bound worker that started the CURRENT external wait (#1430):
+  // written atomically with the single WAITING_EXTERNAL status write; null for
+  // waits started by unscoped (maintainer/operator/internal) callers. The
+  // idempotent same-generation WAITING_EXTERNAL replay (#1231) is bound to it,
+  // so a scoped worker that never started the wait cannot read the row back.
+  // Cleared wherever agentHandouts is cleared.
+  externalWaitBy           String?
   // #1253 stale-disposition flag: set when fresh actionable evidence arrived
   // while the item sat in a disposition evidence must not override
   // (BLOCKED human decision, cap-exhausted or fail-closed PARKED). Operator-
@@ -295,11 +320,45 @@ model PrFixQueueItem {
   // freshness or satisfaction predicate; NULL = never considered.
   triggerEvaluatedAt       DateTime?
   author                   String?
+  // CI park-and-resume deferral (misospace/courier#495): server-side state
+  // for Courier's "park while CI runs, reserve one repair opportunity, settle
+  // the outcome" lifecycle over the PR-fix queue. Null `ciParkState` = no
+  // lifecycle ever recorded for this row.
+  //
+  // `ciParkState`: "active" (a park notice is in force — the queued hand-out
+  // stays quiet for ANY polling agent until settlement), "released" (a
+  // fence-less unsupported outcome handed stewardship back), or "settled"
+  // (a fenced exhausted/unsupported outcome handed stewardship back).
+  // The notice's agentName is transport identity only — suppression is
+  // per-item, never per-agent.
+  //
+  // `ciParkHead`: the parked CI head (head-superseded fences reservations).
+  // `ciParkKey`: the idempotencyKey of the park notice that produced the
+  // current state. `ciParkFence`: the live reservation fence (one repair
+  // opportunity per deferral) or null. `ciParkAt`: when the current state
+  // was committed.
+  //
+  // Passive on non-QUEUED dispositions: a BLOCKED/PARKED/STALE row is not in
+  // the QUEUED hand-out listing, so a stale `ciParkState` there is inert; the
+  // row's next requeue/reactivation goes through `freshAttemptGeneration`,
+  // which bumps the generation and clears all five columns in the same write
+  // (the "leash": a deferral can never strand the item — no TTL or new env
+  // var). Unwritten columns stay null for every pre-feature row.
+  ciParkState              String?
+  ciParkHead               String?
+  ciParkKey                String?
+  ciParkFence              String?
+  ciParkAt                 DateTime?
   history                  PrFixHistory[]
   evidence                 PrFixEvidence[]
   // #1183: worker executions durably associated to this item's fix rounds
   // (AgentRun.prFixQueueItemId). SetNull on item deletion keeps run evidence.
   agentRuns                AgentRun[]
+  // Exactly-once replay ledger for the CI park lifecycle routes (#495): one
+  // row per (item, kind, idempotencyKey) transition. The composite unique
+  // index is the commitment record — a retried notice whose create races
+  // into a P2002 replays instead of re-applying.
+  ciParkLedger             PrFixCIParkLedger[]
 
   @@unique([repo, pr])
   @@index([status])
@@ -373,6 +432,31 @@ model PrFixEvidence {
   @@unique([itemId, identity])
   @@index([itemId, sequence])
   @@index([itemId, contentSignature])
+}
+
+// Exactly-once replay ledger for the CI park-and-resume lifecycle routes
+// (misospace/courier#495): every accepted transition of /cipark, /cireserve,
+// /cirepair commits exactly one row keyed (item, kind, idempotencyKey). The
+// composite unique index doubles as the commitment record: a retried call
+// whose ledger create hits the unique violation replays its original
+// acceptance without touching state. `kind` is "park" | "reserve" |
+// "outcome" | "release"; fence/result/head/agent carry the transition's
+// payload for replay responses and audit.
+model PrFixCIParkLedger {
+  id        String         @id @default(cuid())
+  itemId    String
+  item      PrFixQueueItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  // "park" | "reserve" | "outcome" | "release"
+  kind      String
+  // Caller-presented idempotency key — the replay identity with the kind.
+  key       String
+  fence     String?
+  result    String?
+  head      String?
+  agent     String?
+  createdAt DateTime       @default(now())
+
+  @@unique([itemId, kind, key])
 }
 
 model AgentRun {

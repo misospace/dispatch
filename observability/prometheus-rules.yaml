@@ -1,0 +1,214 @@
+# Dispatch standalone alert rules (#1255) — OPTIONAL deploy asset.
+#
+# Prometheus/VictoriaMetrics rule mapping of the backend-neutral alert
+# catalogue in docs/observability.md §6. Upstream semantics live in that
+# document and in src/lib/observability-alerts.ts (the portable definitions
+# and evaluator); this file is a rendering for Prometheus-compatible backends
+# and is safe to copy into any rules directory. VictoriaMetrics/vmalert
+# accepts it unchanged. Notification routing (Alertmanager or otherwise) is
+# deployment-owned and intentionally not packaged.
+#
+# Scrape source: Dispatch's opt-in exposition at GET /api/metrics
+# (DISPATCH_METRICS_ENABLED=true, maintainer bearer auth) — see
+# docs/observability-packaging.md for a scrape_config snippet. Name the job
+# "dispatch" or adjust the A2/A3 selectors (`up{job="dispatch"}` and the
+# absent() selector in A2). Use exactly one target under the job: the A2/A4
+# conjunctions match label-insensitively (on()), so multiple targets under
+# one job could mix states across instances.
+#
+# Semantics preserved from the catalogue:
+# - Windowed gauges (dispatch_*_in_window) are as-of-scrape counts: they are
+#   evaluated DIRECTLY (sum(...) > 0). rate()/increase()/delta() are unsound
+#   over these non-monotonic series (docs/observability.md §4.1) and none
+#   appear below.
+# - A6 ("assigned without execution") is deliberately ABSENT: it is the one
+#   disabled row of the catalogue — its aggregate stays nonzero under healthy
+#   churn, so it must never page (§8.7). Do not add it.
+# - A2 and A4 gate on the SYNC-PIPELINE ARM STATE, not on the in-process
+#   scheduler. dispatch_sync_pipeline_state{state="armed"} is the pipeline-arm
+#   gate: armed = the pipeline is expected to run, off = the operator opted
+#   out, unknown = it cannot be told (never healthy, never stale). The arm
+#   state is the operator's DECLARED topology (DISPATCH_SYNC_PIPELINE) plus
+#   in-process facts — never sync history: one manual sync is not a pipeline,
+#   and history cannot tell a broken external driver from a deployment that
+#   syncs rarely by design. `auto` (the default) means "the in-process
+#   scheduler decides"; the in-process scheduler is OFF by default while
+#   external cron/CronJob drivers are a supported topology, so gating on the
+#   scheduler alone would silence every sync-freshness alert in exactly the
+#   deployments where the pipeline genuinely runs. An operator driving sync
+#   externally MUST set DISPATCH_SYNC_PIPELINE=external, and
+#   DISPATCH_SYNC_INTERVAL_MS to their own cadence — the interval defines the
+#   freshness window A2/A4 judge and the A13 threshold.
+# - A2 evaluates the absent-series case: a Dispatch that has never completed a
+#   sync emits no dispatch_sync_last_success_timestamp_seconds, and absent()
+#   turns that into a firing input.
+# - A healthy idle Dispatch is silent everywhere: empty queues, empty PR-fix,
+#   and quiet windows are all zero-valued gauges, never alerts.
+# - Thresholds 3600 (A8/A9) are operator-tunable defaults. A13's stale-sync
+#   threshold is NOT hard-coded: it compares against the exported
+#   dispatch_repo_stale_sync_threshold_seconds (two sync intervals, or 3600
+#   when the sync job is disabled), so the rule tracks DISPATCH_SYNC_INTERVAL_MS
+#   exactly like the portable evaluator does. That gauge ships with the same
+#   exporter version as this file: against an older Dispatch that does not
+#   emit it, the staleness arm is silently empty and A13 degrades to the
+#   backoff-only leg.
+# - VERSION SKEW: dispatch_sync_pipeline_state — the A2/A4 arm-state gate —
+#   ships with the SAME exporter version as this file, and the family it
+#   replaces, dispatch_sync_job_armed, was REMOVED from the exporter. Keeping
+#   an OLD rules file against a NEW Dispatch therefore breaks A2/A4 SILENTLY:
+#   the old file gates on dispatch_sync_job_armed, which no longer exists, so
+#   the arm leg is empty and the sync-freshness alerts can never fire — the
+#   exact opposite of the intent. Upgrade the exporter AND these rules
+#   together, in both directions.
+groups:
+  - name: dispatch
+    interval: 30s
+    rules:
+      - alert: A1
+        expr: dispatch_scheduler_job_overdue == 1
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Scheduler job overdue ({{ $labels.job }})"
+          description: "A scheduled job has not run within two intervals; every queue is fed by these jobs."
+          operator_action: "Inspect logs; restart/verify DISPATCH_SCHEDULER_ENABLED."
+
+      - alert: A2
+        expr: >-
+          dispatch_sync_pipeline_state{state="armed"} == 1
+          and on() (
+            (absent(dispatch_sync_last_success_timestamp_seconds{job="dispatch"}) == 1
+             and on() (up{job="dispatch"} == 1))
+            or dispatch_sync_stale == 1
+          )
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No successful issue sync"
+          description: "No IssueSyncRun has ever completed (absent series), or the last completion is older than two sync intervals. Gated on the sync pipeline's arm state (dispatch_sync_pipeline_state{state=\"armed\"}) and the scrape itself succeeding: an opted-out or indeterminate pipeline is not a fault, and a dead instance routes to A3 instead."
+          operator_action: "Check IssueSyncRun errors and GitHub reachability."
+
+      - alert: A3
+        expr: up{job="dispatch"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Dispatch health/DB down"
+          description: "The metrics scrape is failing; the service cannot serve work."
+          operator_action: "Check DB connectivity; /api/health returns 503."
+
+      - alert: A4
+        # `and on()` is load-bearing: the bare gauges carry {job,instance}
+        # while the sum() legs are label-less, and plain `and` intersects on
+        # the full label set — the intersection would be empty and the alert
+        # could never fire. on() makes the conjunction label-insensitive.
+        # Assumes one scrape target under the job (see the header note).
+        # The last leg is the in-process-scheduler guard: an external driver
+        # has no in-process job that can be overdue, so "the scheduler is not
+        # running" must not block A4 — but an overdue in-process job leaves
+        # both operands empty, and A1 owns that case.
+        # Inside that guard the `or` is PLAIN on purpose: its two operands are
+        # mutually exclusive (the scheduler is down, or it is healthy) and
+        # carry the SAME label set ({job,instance}), so Prometheus' default
+        # label matching is equivalent here — and a plain `or` avoids the
+        # empty-label-list `on()` modifier, which some Prometheus-compatible
+        # backends (VictoriaMetrics/vmalert) do not accept. The surrounding
+        # `and on()` conjunctions stay label-insensitive as they are.
+        expr: >-
+          dispatch_issues_open_claimable > 0
+          and on() dispatch_execution_active == 0
+          and on() sum(dispatch_work_pickups_in_window{window="1800"}) == 0
+          and on() sum(dispatch_agent_runs_reported_in_window{window="1800"}) == 0
+          and on() dispatch_sync_pipeline_state{state="armed"} == 1
+          and on() dispatch_sync_stale == 0
+          and on() (dispatch_scheduler_up == 0 or dispatch_scheduler_healthy == 1)
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Eligible work not handed out"
+          description: "Work exists, nothing executes, nothing was picked up or reported in 30m, and the sync pipeline is armed and sync-fresh. The 'every scheduled job is ticking' leg applies only when the in-process scheduler runs — an external driver has no in-process job that can be overdue."
+          operator_action: "Check worker availability/credentials; confirm next-task returns work."
+
+      - alert: A5
+        expr: (dispatch_leases_expired > 0) or (dispatch_agent_work{state="STALE"} > 0)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Stale ownership"
+          description: "Expired leases or STALE AgentWork exist; an issue may be stuck in-progress."
+          operator_action: "The stale sweep releases it; if it persists, inspect the sweep job (A1)."
+
+      - alert: A7
+        expr: dispatch_pr_fix_overdue_unacked > 0
+        for: 35m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PR-fix hand-outs stranded (overdue unacked)"
+          description: "A hand-out has waited past the ack timeout without an acknowledgement; the worker may have died."
+          operator_action: "Enable the reclaim sweep (pr-fix-sweep) or requeue as operator."
+
+      - alert: A8
+        expr: dispatch_pr_fix_oldest_queued_seconds > 3600
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PR-fix head-of-line stuck"
+          description: "The oldest queued PR-fix item has waited past the threshold."
+          operator_action: "Check worker concurrency, lane routing, and fixAttempts saturation."
+
+      - alert: A9
+        expr: dispatch_pr_fix_human_decisions > 0 and dispatch_pr_fix_oldest_human_decision_seconds > 3600
+        for: 1h
+        labels:
+          severity: info
+        annotations:
+          summary: "Human decisions piling up"
+          description: "BLOCKED (human_decision) items are aging past the threshold; PARKED is excluded."
+          operator_action: "Review the BLOCKED item's decision context and act."
+
+      - alert: A10
+        expr: dispatch_queue_withheld{reason=~"grooming_unknown|grooming_stale"} > 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Admission withholding ({{ $labels.reason }})"
+          description: "The admission gate is starving the queue on missing/stale grooming."
+          operator_action: "Fix the grooming pipeline; or apply a per-issue admission override."
+
+      - alert: A11
+        expr: dispatch_grooming_backoff > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Grooming backoff"
+          description: "Issues are backing off after unreadable upstream reads; grooming cannot proceed."
+          operator_action: "Check GitHub reachability/rate limits."
+
+      - alert: A12
+        expr: sum(dispatch_audit_failures_in_window{window="900"}) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit failures in the last 15 minutes"
+          description: "Mutations are failing. Direct evaluation of the as-of-scrape windowed gauge — a rate-style function over the rolling count could read zero when an old failure expires as a new one arrives."
+          operator_action: "Inspect AuditLog.errorMessage for the action; do not label by error string."
+
+      - alert: A13
+        expr: dispatch_repo_stale_sync_seconds > dispatch_repo_stale_sync_threshold_seconds or dispatch_grooming_backoff > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Upstream evidence unavailable"
+          description: "Repo cache staleness past the configured threshold (two sync intervals; 3600 when the sync job is disabled) or grooming backoff; admission/settlement decisions lack current forge evidence."
+          operator_action: "Check GitHub reachability/rate limits; treat unknown as unknown, never healthy."

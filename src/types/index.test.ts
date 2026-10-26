@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { BOARD_COLUMNS, STATUS_LABELS, StatusLabel } from "./index";
+import { BOARD_COLUMNS, STATUS_LABELS, StatusLabel, normalizePrFixType, PR_FIX_TYPE_PRIORITY, VALID_PR_FIX_TYPES } from "./index";
 
 describe("BOARD_COLUMNS", () => {
   it("has exactly six columns", () => {
@@ -51,5 +51,22 @@ describe("STATUS_LABELS derivation", () => {
       "status/done",
     ];
     expect(STATUS_LABELS).toEqual(expected);
+  });
+});
+
+describe("REBASE PrFixType (#1327)", () => {
+  it("normalizes rebase spellings to the REBASE type", () => {
+    expect(normalizePrFixType("rebase")).toBe("REBASE");
+    expect(normalizePrFixType("REBASE")).toBe("REBASE");
+    expect(normalizePrFixType(" rebase ")).toBe("REBASE");
+  });
+
+  it("keeps legacy MERGE_CONFLICT rows valid", () => {
+    expect(normalizePrFixType("MERGE_CONFLICT")).toBe("MERGE_CONFLICT");
+  });
+
+  it("outranks code work alongside MERGE_CONFLICT", () => {
+    expect(VALID_PR_FIX_TYPES).toContain("REBASE");
+    expect(PR_FIX_TYPE_PRIORITY.REBASE).toBe(0);
   });
 });

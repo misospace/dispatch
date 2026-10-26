@@ -38,7 +38,7 @@ Dispatch bearer tokens have two tiers. A **worker** token may call exactly:
 - `POST /api/issues/claim` (without `force`) and `POST /api/issues/unclaim` (for the caller's own agent)
 - `GET /api/issues/state`, `POST /api/issues/status` (status only for issues assigned to the caller's own agent)
 - `GET /api/issues`, `GET /api/pr-fix-queue/queued`, `GET /api/pr-fix-queue/history`
-- `POST /api/pr-fix-queue/mark` with `FIXED`, `BLOCKED`, `PARKED`, `STALE`, or `WAITING_EXTERNAL` (generation required)
+- `POST /api/pr-fix-queue/mark` with `FIXED`, `BLOCKED`, `PARKED`, `STALE`, or `WAITING_EXTERNAL` (generation required; hand-out-bound #1428: a bound worker may only settle rows whose `agentHandouts` carry its own `<agentName>@<generation>` marker at the settled generation — a row it does not hold returns `403` with `reason: "not-handed"`, and the legacy unbound `DISPATCH_WORKER_TOKEN` is refused on this route)
 - `POST /api/pr-fix-queue/ack` (the durable hand-out acknowledgement, see "Hand-out acknowledgement" below)
 
 The **maintainer** token (`DISPATCH_AGENT_TOKEN`, or the `DISPATCH_MAINTAINER_TOKEN` alias) keeps full rights and acts on any agent's behalf. A worker token calling a maintainer-only route gets an HTTP 403 naming the required tier: force claims, `QUEUED`/`IGNORED` marks, `POST /api/pr-fix-queue/requeue`, and the `POST /api/pr-fix-queue/sweep` reclaim job are maintainer-only. Unclaim is not tier-gated — the target agent is bound to the caller and is only bounded by the assignment check; the legacy `DISPATCH_WORKER_TOKEN` falls back to the request body, but `DISPATCH_WORKER_TOKENS` overrides that with a token-derived identity. A `DISPATCH_WORKER_TOKEN` value that duplicates a maintainer token resolves to the lower worker tier (fail-closed) and logs a one-time boot warning — set it to a distinct value.
@@ -67,7 +67,7 @@ Content-Type: application/json
 { "repo": "org/repo", "pr": 42, "generation": 2, "agentName": "courier" }
 ```
 
-The route is bearer-only (basic / OIDC sessions are rejected with 403), and `agentName` is verified against the authenticated actor — for `DISPATCH_WORKER_TOKENS` the actor comes from the token's binding, for the legacy `DISPATCH_WORKER_TOKEN` it falls back to the `x-agent-name` header. A body value that disagrees with the bound/header agent returns 400. The underlying write is generation-pinned and idempotent. See `docs/pr-review-fix-queue.md` for the full contract.
+The route is bearer-only (basic / OIDC sessions are rejected with 403). The subject of the ack is the body's `agentName` (#1425): a worker-tier caller must be **bound** to that agent (`DISPATCH_WORKER_TOKENS`; the legacy unbound `DISPATCH_WORKER_TOKEN` is refused with 403), while a maintainer token may ack for any agent — the write itself is pinned to the hand-out table and refuses `403 not-handed` for any agent that was never handed the stamped generation. The body's `agentName` is **not** compared against the audit-only `x-agent-name`-derived actor, so clients that send their binding only in the body (no identity header) are honored. The underlying write is generation-pinned and idempotent. See `docs/pr-review-fix-queue.md` for the full contract.
 
 A worker that cannot ack (because the hand-out stamp does not include its agent identity, e.g. a multi-agent dispatch raced) gets a `403 not-handed` response and should retry against a freshly-issued hand-out. The reclaimer sweep below is maintainer-only and **default-disabled** until every worker is confirmed to call ack.
 
@@ -98,7 +98,7 @@ Before selecting any work from the assignment queue, the worker **must** check t
    - Alternatively, query `GET /api/pr-fix-queue/queued?lane=normal` directly for PR-fix items only.
 2. For each item with `type: "pr-review-fix"`:
    - Verify the PR is still open and authored by the expected bot account.
-   - If the task was issued via next-task with a prFixItem token, acknowledge the hand-out after the run is durably created so the stale hand-out reclaimer does not reopen a live attempt: `POST /api/pr-fix-queue/ack` with `{ repo, pr, generation, agentName? }` (MCP `ack_pr_fix`). The ack is generation-pinned and idempotent; an unacknowledged hand-out older than `PR_FIX_HANDOUT_TIMEOUT_MS` (default 30m) is reclaimed by the scheduled pr-fix-sweep.
+   - If the task was issued via next-task with a prFixItem token, acknowledge the hand-out after the run is durably created so the stale hand-out reclaimer does not reopen a live attempt: `POST /api/pr-fix-queue/ack` with `{ repo, pr, generation, agentName? }` (MCP `ack_pr_fix`). The ack is generation-pinned and idempotent; an unacknowledged hand-out older than `PR_FIX_HANDOUT_TIMEOUT_MS` (default 30m) is reclaimed by the scheduled pr-fix-sweep. An ACKNOWLEDGED hand-out stays protected only while its owner shows liveness: past `PR_FIX_ACK_LIVENESS_MS` (default 24h) a generation whose acking agent produced no recent `AgentRun` activity is reclaimable by the dead-owner recovery ladder (#1419) — keep heartbeating per task cycle and report through `tasks/report` so a live attempt is never treated as dead and re-run.
    - Verify the head owner matches the trusted owner (`misospace` or `joryirving`).
    - Fetch origin, checkout the queued branch, pull/rebase as appropriate.
    - Read the item's `feedback[]` array to determine the requested fix (from PR comments, reviews, and check failures).
@@ -224,7 +224,7 @@ curl -s -X POST "DISPATCH_URL/api/pr-fix-queue/mark" \
   -d '{"repo":"org/repo","pr":42,"status":"fixed"}'
 ```
 
-Valid statuses: `FIXED`, `BLOCKED`, `PARKED`, `STALE`, `IGNORED`, `WAITING_EXTERNAL`. `WAITING_EXTERNAL` defers the consumed generation for the configured cooldown; it neither charges an attempt nor signals prerequisite readiness.
+Valid statuses: `FIXED`, `BLOCKED`, `PARKED`, `STALE`, `IGNORED`, `WAITING_EXTERNAL`. `WAITING_EXTERNAL` defers the consumed generation for the configured cooldown; it neither charges an attempt nor signals prerequisite readiness. A duplicate `WAITING_EXTERNAL` mark at the same generation is answered idempotently, but a bound worker credential receives `403` `not-handed` unless it is the agent recorded as having started that wait (#1430); retry the wait with the same credential that started it.
 
 ### Normal Lane
 
