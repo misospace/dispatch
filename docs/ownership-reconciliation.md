@@ -299,7 +299,10 @@ fenced delete), and its issue holds no `OwnershipReleaseIntent` (the §8.7
 Phase C settle re-check reads exactly that row). A settled release deletes
 the lease row directly, so under `enforce` tombstones are bounded; `audit`
 skips the delete like every other mutation and accepts the same
-staleness-for-purity trade as the ladder source.
+staleness-for-purity trade as the ladder source. Under the default `off` mode
+the reconciler scans nothing at all — tombstones keep accumulating from the
+claim path as inert storage growth, with no bounded window to starve until an
+operator enables `enforce`.
 
 ## 4. Ownership state model
 

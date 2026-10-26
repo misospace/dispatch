@@ -1329,7 +1329,19 @@ async function selectCandidates(
     })
     .map((row: any) => row.id);
   if (!readOnly && deadTombstoneIds.length > 0) {
-    await client.lease.deleteMany({ where: { id: { in: deadTombstoneIds } } });
+    // Fence the delete with the same CAS shape as releaseExpiredLeases's
+    // stamp (including its `retryAfter` 3VL handling): every guard above was
+    // evaluated at scan time, and a re-claim or renewal can reactivate the
+    // row in place (disposition cleared, `expiredAt` moved to the future)
+    // between the scan and this delete. The fence makes such a delete match
+    // zero rows instead of destroying the live receipt.
+    await client.lease.deleteMany({
+      where: {
+        id: { in: deadTombstoneIds },
+        expiredAt: { lte: now },
+        OR: [{ retryAfter: null }, { retryAfter: { lte: now } }],
+      },
+    });
   }
 
   // Cap AFTER the label/intent filters: released or intent-held issues must

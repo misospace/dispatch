@@ -1440,6 +1440,72 @@ describe("ownership reconciliation (#1254)", () => {
       expect(report.examined).toBe(0);
       expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-parked"]);
     });
+
+    it("an open issue whose agent label moved on (park spent) is pruned too", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.issue.push(
+        closedIssueRow("issue-closed", 90),
+        {
+          id: "issue-reassigned",
+          number: 92,
+          state: "open",
+          labels: ["status/ready"], // the claim moved on: no agent/* label left
+          blockedReason: null,
+          linkedPrNumber: null,
+          linkedPrMergeState: null,
+          repository: { fullName: REPO },
+        },
+      );
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-dead", issueId: "issue-closed", expiredMinutesAgo: 120 }),
+        tombstoneLease(now, { id: "tomb-moved", issueId: "issue-reassigned", expiredMinutesAgo: 110 }),
+        tombstoneLease(now, { id: "tomb-live", issueId: ISSUE_ID, expiredMinutesAgo: 50 }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "3");
+      const report = await runReconcile(fixture, now, "enforce");
+      expect(report.examined).toBe(1);
+      expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-live"]);
+    });
+
+    it("a reactivation committed between the scan and the delete survives the fence", async () => {
+      // The guards are evaluated on the scan read; the DELETE must be
+      // CAS-fenced so a claim that reactivates the row in place (disposed-row
+      // path: disposition cleared, token rotated, expiredAt pushed forward)
+      // between the two is never destroyed.
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.issue.push(closedIssueRow("issue-closed", 90));
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-dead", issueId: "issue-closed", expiredMinutesAgo: 120 }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+      const baseDeleteMany = fixture.client.lease.deleteMany;
+      let reactivated = false;
+      fixture.client.lease.deleteMany = async (args: any) => {
+        if (!reactivated && args?.where?.id) {
+          reactivated = true;
+          const row = fixture.tables.lease.find((r) => r.id === "tomb-dead");
+          if (row) {
+            row.disposition = null;
+            row.claimToken = "tok-rotated";
+            row.expiredAt = new Date(now.getTime() + 30 * MIN);
+          }
+        }
+        return baseDeleteMany(args);
+      };
+      const report = await runReconcile(fixture, now, "enforce");
+      expect(report.examined).toBe(0);
+      expect(reactivated).toBe(true);
+      expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-dead"]);
+      expect(fixture.tables.lease[0].claimToken).toBe("tok-rotated");
+    });
   });
 
   describe("§8.7 pinned negative controls", () => {
