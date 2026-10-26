@@ -136,6 +136,10 @@ export function asPrFixQueueClient(client: PrismaClient): PrFixQueueClient {
     issue: client.issue,
     prFixQueueItem: client.prFixQueueItem,
     prFixHistory: client.prFixHistory,
+    // #1419: the dead-owner recovery probes read agent-run liveness off this
+    // delegate; without it they fail closed (treat every acked attempt as
+    // live) instead of reclaiming blind.
+    agentRun: client.agentRun,
     capacityHandoff: client.capacityHandoff,
     // #1249: without this delegate every route handler's queue client was
     // ledger-inert — `readEvidenceLedgerView`/`recordEvidenceTransition` no-op

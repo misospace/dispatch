@@ -1,0 +1,15 @@
+-- Parallel ack timestamps for PR-fix hand-out acknowledgements (#1419).
+--
+-- `handoutAckTimes` records, entry-for-entry with `handoutAcks`, the ISO-8601
+-- time each ack landed. The durable ack is thereby separated from enduring
+-- liveness: past PR_FIX_ACK_LIVENESS_MS (default 24h) an acked generation
+-- whose owning agent shows no recent AgentRun activity and has no open
+-- associated run is reclaimable through the same bounded ladder as an
+-- unacknowledged hand-out. Every site that clears or filters `handoutAcks`
+-- treats `handoutAckTimes` as its parallel array — cleared together, appended
+-- together in the same atomic write, and index-matched on removal.
+--
+-- No backfill: legacy acks carry no timestamp and are dated by the item's
+-- `dispatchedAt` (the ack cannot predate the dispatch), so already-stranded
+-- acked rows remain recoverable instead of failing closed forever.
+ALTER TABLE "PrFixQueueItem" ADD COLUMN IF NOT EXISTS "handoutAckTimes" TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[];

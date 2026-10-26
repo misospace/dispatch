@@ -81,6 +81,7 @@ function makePrFix(overrides: Partial<ObservabilityPrFixRow>): ObservabilityPrFi
     dispatchedGeneration: null,
     generation: 1,
     handoutAcks: [],
+    handoutAckTimes: [],
     outcome: null,
     ...overrides,
   };
@@ -117,6 +118,7 @@ function baseInputs(
       strandedAssignmentMs: 1_800_000,
       assignmentEvidenceLookbackMs: 30 * 24 * 60 * 60 * 1000,
       prFixHandoutTimeoutMs: 1_800_000,
+      prFixAckLivenessMs: 24 * 60 * 60 * 1000,
     },
     ...overrides,
   };
@@ -387,6 +389,54 @@ describe("observability signal derivation", () => {
         ],
       });
       expect(s.prFix.handouts.unackedAggregate).toBe(1);
+    });
+
+    it("stuck acknowledged hand-out past the ack-liveness window counts as overdueAcked (#1419)", () => {
+      // Acked current generation dispatched 30h ago — past the 24h default.
+      const overdue = snapshot({
+        prFixItems: [
+          makePrFix({
+            dispatchedAt: ago(30 * 3600),
+            dispatchedGeneration: 1,
+            generation: 1,
+            handoutAcks: ["worker-a@1"],
+          }),
+        ],
+      });
+      expect(overdue.prFix.handouts.overdueAcked).toBe(1);
+      expect(overdue.prFix.handouts.unackedAggregate).toBe(0);
+      // Fresh ack inside the window is not stuck.
+      const fresh = snapshot({
+        prFixItems: [
+          makePrFix({
+            dispatchedAt: ago(120),
+            dispatchedGeneration: 1,
+            generation: 1,
+            handoutAcks: ["worker-a@1"],
+          }),
+        ],
+      });
+      expect(fresh.prFix.handouts.overdueAcked).toBe(0);
+      // A long-running attempt dispatched 30h ago but acked 2m ago is a
+      // HEALTHY long run — keyed on the ack timestamp, not the dispatch stamp.
+      const recentlyAckedLongRun = snapshot({
+        prFixItems: [
+          makePrFix({
+            dispatchedAt: ago(30 * 3600),
+            dispatchedGeneration: 1,
+            generation: 1,
+            handoutAcks: ["worker-a@1"],
+            handoutAckTimes: [new Date(NOW.getTime() - 2 * 60 * 1000).toISOString()],
+          }),
+        ],
+      });
+      expect(recentlyAckedLongRun.prFix.handouts.overdueAcked).toBe(0);
+      // Unacked overdue stays in the unacked bucket, not the acked one.
+      const unacked = snapshot({
+        prFixItems: [makePrFix({ dispatchedAt: ago(30 * 3600), dispatchedGeneration: 1 })],
+      });
+      expect(unacked.prFix.handouts.overdueAcked).toBe(0);
+      expect(unacked.prFix.handouts.overdueUnacked).toBe(1);
     });
 
     it("acks parse with @-bearing agent names and reject malformed entries", () => {

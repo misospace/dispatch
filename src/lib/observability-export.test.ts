@@ -78,6 +78,7 @@ function makePrFix(overrides: Partial<ObservabilityPrFixRow>): ObservabilityPrFi
     dispatchedGeneration: null,
     generation: 1,
     handoutAcks: [],
+    handoutAckTimes: [],
     outcome: null,
     ...overrides,
   };
@@ -113,6 +114,7 @@ function baseInputs(
       strandedAssignmentMs: 1_800_000,
       assignmentEvidenceLookbackMs: 30 * 24 * 60 * 60 * 1000,
       prFixHandoutTimeoutMs: 1_800_000,
+      prFixAckLivenessMs: 24 * 60 * 60 * 1000,
     },
     ...overrides,
   };
