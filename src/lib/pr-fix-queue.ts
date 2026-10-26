@@ -17,9 +17,16 @@ import { parseExternalWaitInput, parseStoredExternalWait, evaluateExternalWaitTr
 import { evaluateRecovery, recoveryCooldownMs, type RecoveryDecision } from "./pr-fix-recovery";
 
 export type PrFixQueueClient = {
-  issue: {
-    findFirst: (args: any) => Promise<any>;
-  };
+issue: {
+findFirst: (args: any) => Promise<any>;
+};
+// #1419: agent-run liveness ledger for the dead-owner recovery probes.
+// Optional so legacy/test clients without the model keep the fail-closed
+// behavior — an absent surface resolves "live" and never authorizes a
+// reclaim; the production client (asPrFixQueueClient) always provides it.
+agentRun?: {
+findFirst: (args: any) => Promise<any>;
+};
   prFixQueueItem: {
     findUnique: (args: any) => Promise<any>;
     findMany: (args?: any) => Promise<any[]>;
@@ -967,7 +974,7 @@ async function reactivateDueExternalWaits(client: PrFixQueueClient, now: Date): 
       await client.$transaction(async (tx) => {
         const { count } = await tx.prFixQueueItem.updateMany({
           where: { id: row.id, status: "WAITING_EXTERNAL", generation: row.generation, retryAt: row.retryAt },
-          data: { status: "QUEUED", ...freshAttemptGeneration(), retryAt: null, dispatchedGeneration: null, dispatchedAt: null, postDispatchEvidenceKeys: [], attemptHeadSha: row.headSha ?? row.attemptHeadSha ?? null, outcome: null, decisionDetail: null, agentHandouts: [], handoutAcks: [], handoutReceipts: [], externalWaitBy: null, externalWait: Prisma.DbNull },
+          data: { status: "QUEUED", ...freshAttemptGeneration(), retryAt: null, dispatchedGeneration: null, dispatchedAt: null, postDispatchEvidenceKeys: [], attemptHeadSha: row.headSha ?? row.attemptHeadSha ?? null, outcome: null, decisionDetail: null, agentHandouts: [], handoutAcks: [], handoutAckTimes: [], handoutReceipts: [], externalWaitBy: null, externalWait: Prisma.DbNull },
         });
         if (count === 1) await tx.prFixHistory.create({ data: { itemId: row.id, action: "mark", status: "QUEUED", lane: row.lane, note: "External-wait cooldown elapsed; retrying prerequisite check." } });
       });
@@ -1069,6 +1076,7 @@ export async function reconcileExternalWaitTriggers(
           agentHandouts: [],
           externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
           handoutAcks: [],
+          handoutAckTimes: [],
           handoutReceipts: [],
           externalWait: Prisma.DbNull,
           staleDisposition: false,
@@ -1129,6 +1137,32 @@ export function prFixHandoutTimeoutMs(): number {
 export function maxPrFixReclaims(): number {
   const n = Number(process.env.PR_FIX_MAX_RECLAIMS);
   return Number.isInteger(n) && n > 0 ? n : DEFAULT_PR_FIX_MAX_RECLAIMS;
+}
+
+/**
+ * How long an ACKNOWLEDGED hand-out remains authoritative without fresh
+ * liveness evidence (#1419). Past this window, an acked generation whose
+ * owning agent shows no recent activity and no open associated run is
+ * reclaimable like an unacknowledged one. Deliberately far longer than the
+ * unacknowledged hand-out timeout: a live model run can take hours, and
+ * reclaiming it would duplicate execution the ack was written to protect.
+ * Overridable via PR_FIX_ACK_LIVENESS_MS; defaults to 24 hours.
+ */
+export const DEFAULT_PR_FIX_ACK_LIVENESS_MS = 24 * 60 * 60 * 1000;
+
+export function prFixAckLivenessMs(): number {
+  const n = Number(process.env.PR_FIX_ACK_LIVENESS_MS);
+  if (!Number.isInteger(n) || n <= 0) return DEFAULT_PR_FIX_ACK_LIVENESS_MS;
+  // Clamped like every sibling knob (#1419 review): a value below 1h makes
+  // every acked generation near-immediately reclaimable (and shrinks the
+  // agent-activity evidence horizon with it), and a value above 7d strands
+  // dead-acked items longer than the recovery is worth.
+  return Math.min(Math.max(n, 60 * 60 * 1000), 7 * 24 * 60 * 60 * 1000);
+}
+
+/** Current wall-clock as an ISO string, injectable in tests via options.now. */
+function nowIso(now: Date = new Date()): string {
+  return now.toISOString();
 }
 
 /**
@@ -1258,10 +1292,27 @@ export async function ackPrFixHandout(
   // misses (returns generation-mismatch for the caller to retry) — so no
   // duplicate tokens and no lost update.
   const nextAcks = [...acks, token];
+  // Parallel ack timestamps (#1419): each ack records when it landed so the
+  // reclaimer can require an acked owner to re-evidence liveness instead of
+  // staying authoritative forever. Appended in the SAME atomic write as the
+  // ack token, so the two arrays can never drift out of index alignment —
+  // including on a legacy row whose acks predate #1419 and carry no
+  // timestamps: the existing list is padded to the ack list's length first,
+  // so entry i of handoutAckTimes always corresponds to handoutAcks[i].
+  const priorAckTimes = Array.isArray(existing.handoutAckTimes) ? existing.handoutAckTimes : [];
+  const alignedPriorAckTimes = [...priorAckTimes];
+  while (alignedPriorAckTimes.length < acks.length) alignedPriorAckTimes.push("");
+  const nextAckTimes = [...alignedPriorAckTimes, nowIso()];
   const item = await client.$transaction(async (tx) => {
     const { count } = await tx.prFixQueueItem.updateMany({
-      where: { id: existing.id, generation: input.generation, status: "QUEUED", handoutAcks: { equals: acks } },
-      data: { handoutAcks: nextAcks },
+      where: {
+        id: existing.id,
+        generation: input.generation,
+        status: "QUEUED",
+        handoutAcks: { equals: acks },
+        handoutAckTimes: { equals: Array.isArray(existing.handoutAckTimes) ? existing.handoutAckTimes : [] },
+      },
+      data: { handoutAcks: nextAcks, handoutAckTimes: nextAckTimes },
     });
     if (count !== 1) return null;
     await tx.prFixHistory.create({
@@ -1285,6 +1336,80 @@ export interface ReclaimStalePrFixHandoutsOptions {
   maxReclaims?: number;
   batchSize?: number;
   isPrMergedOrClosed?: (repo: string, pr: number) => Promise<boolean | null>;
+  /**
+   * Liveness window for ACKNOWLEDGED hand-outs (#1419): an acked generation
+   * stays authoritative only while its owner re-evidences liveness. Defaults
+   * to prFixAckLivenessMs().
+   */
+  ackLivenessMs?: number;
+  /**
+   * Injectable liveness probes for tests. Defaults read the `agentRun`
+   * ledger: any recent run row by the agent (heartbeat, report, or legacy
+   * ingestion) proves the worker process is alive, and an open AgentRun
+   * associated with the (item, generation) attempt proves the attempt is
+   * still executing. Both fail CLOSED — a probe error is treated as live
+   * evidence, never as permission to reclaim.
+   */
+  agentHasRecentActivity?: (agentName: string, since: Date) => Promise<boolean>;
+  itemHasOpenRun?: (itemId: string, generation: number) => Promise<boolean>;
+}
+
+/**
+ * Default agent-liveness probe (#1419): true when the agent produced ANY
+ * AgentRun row (heartbeat, tasks/report, or legacy run ingestion) after
+ * `since`. Workers heartbeat per task cycle and every attempt reports
+ * through AgentRun, so a live worker nearly always leaves fresh rows; a
+ * worker whose process died leaves none. Errors resolve TRUE (live) so an
+ * unreadable ledger can never authorize a reclaim.
+ */
+async function defaultAgentHasRecentActivity(
+  client: PrFixQueueClient,
+  agentName: string,
+  since: Date,
+): Promise<boolean> {
+  // An absent surface (legacy/test client without the agentRun delegate)
+  // resolves live — the fail-closed rule, not a silent TypeError.
+  if (typeof (client as any).agentRun?.findFirst !== "function") return true;
+  try {
+    const row = await (client as any).agentRun.findFirst({
+      where: { agentName, createdAt: { gt: since } },
+      select: { id: true },
+    });
+    return row != null;
+  } catch (error) {
+    console.warn(
+      `[pr-fix-queue] agent liveness probe failed for ${agentName}; treating agent as live:`,
+      error instanceof Error ? error.message : error,
+    );
+    return true;
+  }
+}
+
+/**
+ * Default attempt-liveness probe (#1419): true when an AgentRun row is
+ * associated with this (item, generation) and has not finished — a durably
+ * recorded run that is still executing. Errors resolve TRUE (live), same
+ * fail-closed rule as the agent probe.
+ */
+async function defaultItemHasOpenRun(
+  client: PrFixQueueClient,
+  itemId: string,
+  generation: number,
+): Promise<boolean> {
+  if (typeof (client as any).agentRun?.findFirst !== "function") return true;
+  try {
+    const row = await (client as any).agentRun.findFirst({
+      where: { prFixQueueItemId: itemId, prFixGeneration: generation, finishedAt: null },
+      select: { id: true },
+    });
+    return row != null;
+  } catch (error) {
+    console.warn(
+      `[pr-fix-queue] attempt liveness probe failed for item ${itemId} generation ${generation}; treating attempt as live:`,
+      error instanceof Error ? error.message : error,
+    );
+    return true;
+  }
 }
 
 export interface ReclaimStalePrFixHandoutsReport {
@@ -1325,9 +1450,10 @@ async function defaultIsPrMergedOrClosed(repo: string, pr: number): Promise<bool
 }
 
 /**
- * Reclaim stamped-but-unacknowledged PR-fix hand-outs (#1211).
+ * Reclaim stamped-but-unacknowledged PR-fix hand-outs (#1211), and recover
+ * ACKNOWLEDGED hand-outs whose owning agent is provably dead (#1419).
  *
- * The failure mode: next-task stamps `dispatchedGeneration`/`dispatchedAt`
+ * The #1211 failure mode: next-task stamps `dispatchedGeneration`/`dispatchedAt`
  * and records the agent in `agentHandouts`, but the executor dies before it
  * durably creates its run — no ack lands, and `agentAlreadyHanded` suppresses
  * re-handing the same agent, so the item is stranded. This sweep finds QUEUED
@@ -1344,6 +1470,21 @@ async function defaultIsPrMergedOrClosed(repo: string, pr: number): Promise<bool
  *   the reclaim. The ack-list pin makes an acknowledgement landing in the
  *   read→write gap a no-op, so a live worker is never clobbered.
  *
+ * The #1419 extension: a durable ack previously pinned a generation against
+ * reclamation FOREVER, so a worker that acked and then crashed stranded the
+ * item in a single-agent lane indefinitely. Now an ack is separated from
+ * enduring liveness: an acked generation is recoverable through the SAME
+ * three-way flow above only when EVERY acking agent of the current generation
+ * is dead — its ack timestamp (parallel `handoutAckTimes` array) is older than
+ * `PR_FIX_ACK_LIVENESS_MS` (default 24h), the agent produced no recent
+ * AgentRun activity, and no open AgentRun is associated with this
+ * (item, generation). Any live evidence or probe failure fails CLOSED and
+ * the generation stays protected. A legacy ack without a timestamp is dated
+ * by the dispatch stamp (the ack-time lower bound), so already-stranded
+ * rows stay recoverable; the agent-activity probe is the operative liveness
+ * guard (attempt-scoped runs are only recorded at report time today), so a
+ * live worker that keeps heartbeating is never reclaimed.
+ *
  * No network call runs inside a `$transaction` (#1124): the PR-state probe
  * runs before every write.
  */
@@ -1356,6 +1497,13 @@ export async function reclaimStalePrFixHandouts(
   const maxReclaims = options.maxReclaims ?? maxPrFixReclaims();
   const batchSize = options.batchSize ?? 50;
   const probe = options.isPrMergedOrClosed ?? defaultIsPrMergedOrClosed;
+  const ackLivenessMs = options.ackLivenessMs ?? prFixAckLivenessMs();
+  const agentLive =
+    options.agentHasRecentActivity ??
+    ((agentName: string, since: Date) => defaultAgentHasRecentActivity(client, agentName, since));
+  const attemptOpen =
+    options.itemHasOpenRun ??
+    ((itemId: string, generation: number) => defaultItemHasOpenRun(client, itemId, generation));
 
   const report: ReclaimStalePrFixHandoutsReport = {
     examined: 0,
@@ -1409,18 +1557,69 @@ export async function reclaimStalePrFixHandouts(
           continue;
         }
 
-        // A live acknowledged attempt must never be reclaimed, even when stale
-        // by wall-clock: the worker durably owns the generation. The cheap
-        // `some` over `handoutAcks` covers the same generation as the item;
-        // older-generation entries are inert and never match.
+        // An acknowledged hand-out is no longer authoritative FOREVER (#1419):
+        // the durable ack is separated from enduring liveness. A generation
+        // acked by agent(s) is reclaimable only when EVERY acking agent is
+        // dead — its ack is older than the ack-liveness window, the agent
+        // produced no recent AgentRun activity, and no open AgentRun is
+        // associated with this (item, generation). Any live evidence or
+        // probe error fails CLOSED and keeps the skip; the item-level probe
+        // runs once and protects every acking agent at once.
         const acks: string[] = Array.isArray(item.handoutAcks) ? item.handoutAcks : [];
-        const acknowledgedForGeneration = acks.some((entry) => {
-          const parsed = parseAgentHandoutToken(entry);
-          return parsed !== null && parsed.generation === item.generation;
-        });
-        if (acknowledgedForGeneration) {
-          report.skipped++;
-          continue;
+        const ackTimes: string[] = Array.isArray(item.handoutAckTimes) ? item.handoutAckTimes : [];
+        const ackedEntries = acks
+          .map((entry, index) => ({ entry, index }))
+          .filter(({ entry }) => {
+            const parsed = parseAgentHandoutToken(entry);
+            return parsed !== null && parsed.generation === item.generation;
+          });
+        // True when the flow below is reached via the #1419 acked-dead path
+        // rather than the original #1211 unacknowledged path (notes differ).
+        const ackedDead = ackedEntries.length > 0;
+        if (ackedDead) {
+          let anyLive = false;
+          try {
+            if (await attemptOpen(item.id, item.generation)) anyLive = true;
+          } catch {
+            // Fail-closed at the call site, not only inside the default
+            // probes: an injected probe that throws is live evidence, never
+            // permission to reclaim (#1419 review).
+            anyLive = true;
+          }
+          if (!anyLive) {
+            for (const { entry, index } of ackedEntries) {
+              const parsed = parseAgentHandoutToken(entry);
+              const agentName = parsed?.agentName ?? "";
+              // Ack age: the parallel timestamp. A legacy ack that predates
+              // #1419 has none, so it is dated by the dispatch stamp — an
+              // ack cannot predate the hand-out that produced it, so
+              // `dispatchedAt` is the ack-time lower bound; this keeps the
+              // already-stranded legacy rows this issue targets recoverable
+              // instead of failing closed forever. A row with neither a
+              // timestamp nor a stamp cannot be dated at all and stays
+              // protected. (The stampedThisGeneration check above already
+              // required dispatchedAtMs, so it is non-null here.)
+              const rawAckMs = Date.parse(ackTimes[index] ?? "");
+              const ackTimeMs = Number.isNaN(rawAckMs) ? (dispatchedAtMs as number) : rawAckMs;
+              if (!agentName || now.getTime() - ackTimeMs <= ackLivenessMs) {
+                anyLive = true;
+                break;
+              }
+              try {
+                if (await agentLive(agentName, new Date(now.getTime() - ackLivenessMs))) {
+                  anyLive = true;
+                  break;
+                }
+              } catch {
+                anyLive = true;
+                break;
+              }
+            }
+          }
+          if (anyLive) {
+            report.skipped++;
+            continue;
+          }
         }
 
         const merged = await probe(item.repo, item.pr);
@@ -1437,6 +1636,7 @@ export async function reclaimStalePrFixHandouts(
           // wiped to STALE — the same loss class the reclaim already
           // guards against.
           const acksBeforeStale: string[] = Array.isArray(item.handoutAcks) ? item.handoutAcks : [];
+          const ackTimesBeforeStale: string[] = Array.isArray(item.handoutAckTimes) ? item.handoutAckTimes : [];
           const { count } = await client.$transaction(async (tx) => {
             const result = await tx.prFixQueueItem.updateMany({
               where: {
@@ -1444,12 +1644,14 @@ export async function reclaimStalePrFixHandouts(
                 generation: item.generation,
                 status: "QUEUED",
                 handoutAcks: { equals: acksBeforeStale },
+                handoutAckTimes: { equals: ackTimesBeforeStale },
               },
               data: {
                 status: "STALE",
                 agentHandouts: [],
                 externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
                 handoutAcks: [],
+                handoutAckTimes: [],
                 handoutReceipts: [],
                 dispatchedGeneration: null,
                 dispatchedAt: null,
@@ -1466,7 +1668,9 @@ export async function reclaimStalePrFixHandouts(
                   action: "mark",
                   status: "STALE",
                   lane: item.lane,
-                  note: `Stale unacknowledged hand-out: upstream PR is merged or closed; reaped to STALE (#1211).`,
+                  note: ackedDead
+                    ? `Stale acknowledged hand-out: upstream PR is merged or closed; reaped to STALE (#1419).`
+                    : `Stale unacknowledged hand-out: upstream PR is merged or closed; reaped to STALE (#1211).`,
                 },
               });
             }
@@ -1486,6 +1690,7 @@ export async function reclaimStalePrFixHandouts(
           // would otherwise wipe a freshly-acknowledged live attempt off
           // the parked state, never to be reclaimed again.
           const acksBeforeBlock: string[] = Array.isArray(item.handoutAcks) ? item.handoutAcks : [];
+          const ackTimesBeforeBlock: string[] = Array.isArray(item.handoutAckTimes) ? item.handoutAckTimes : [];
           const { count } = await client.$transaction(async (tx) => {
             const result = await tx.prFixQueueItem.updateMany({
               where: {
@@ -1493,6 +1698,7 @@ export async function reclaimStalePrFixHandouts(
                 generation: item.generation,
                 status: "QUEUED",
                 handoutAcks: { equals: acksBeforeBlock },
+                handoutAckTimes: { equals: ackTimesBeforeBlock },
               },
               data: {
                 status: "PARKED",
@@ -1510,6 +1716,7 @@ export async function reclaimStalePrFixHandouts(
                 agentHandouts: [],
                 externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
                 handoutAcks: [],
+                handoutAckTimes: [],
                 handoutReceipts: [],
                 dispatchedGeneration: null,
                 dispatchedAt: null,
@@ -1525,7 +1732,9 @@ export async function reclaimStalePrFixHandouts(
                   status: "PARKED",
                   lane: "NORMAL",
                   outcome: "no_progress",
-                  note: `Hand-out reclaimed ${reclaimCount} times without acknowledgement (PR_FIX_MAX_RECLAIMS=${maxReclaims}); parked (#1211).`,
+                  note: ackedDead
+                    ? `Dead acknowledged hand-out reclaimed ${reclaimCount} times (PR_FIX_MAX_RECLAIMS=${maxReclaims}); parked (#1419).`
+                    : `Hand-out reclaimed ${reclaimCount} times without acknowledgement (PR_FIX_MAX_RECLAIMS=${maxReclaims}); parked (#1211).`,
                 },
               });
             }
@@ -1549,7 +1758,9 @@ export async function reclaimStalePrFixHandouts(
                 pr: item.pr,
                 reason: item.reason,
                 outcome: "no_progress",
-                latestNote: `Reclaimed ${reclaimCount} times without acknowledgement; parked (#1211).`,
+                latestNote: ackedDead
+                  ? `Dead acknowledged hand-out reclaimed ${reclaimCount} times; parked (#1419).`
+                  : `Reclaimed ${reclaimCount} times without acknowledgement; parked (#1211).`,
                 context: await buildPrFixBlockedContext(client, { ...item, fixAttempts: item.fixAttempts ?? null }),
               });
             } catch (error) {
@@ -1568,6 +1779,7 @@ export async function reclaimStalePrFixHandouts(
         // NOT count a fix attempt — the hand-out never reached a worker. The
         // `handoutAcks` pin makes an ack landing in the read→write gap a no-op.
         const acksBeforeReclaim: string[] = Array.isArray(item.handoutAcks) ? item.handoutAcks : [];
+        const ackTimesBeforeReclaim: string[] = Array.isArray(item.handoutAckTimes) ? item.handoutAckTimes : [];
         const { count } = await client.$transaction(async (tx) => {
           const result = await tx.prFixQueueItem.updateMany({
             where: {
@@ -1575,6 +1787,7 @@ export async function reclaimStalePrFixHandouts(
               generation: item.generation,
               status: "QUEUED",
               handoutAcks: { equals: acksBeforeReclaim },
+              handoutAckTimes: { equals: ackTimesBeforeReclaim },
             },
             data: {
               ...freshAttemptGeneration(),
@@ -1582,6 +1795,7 @@ export async function reclaimStalePrFixHandouts(
               agentHandouts: [],
               externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
               handoutAcks: [],
+              handoutAckTimes: [],
               handoutReceipts: [],
               postDispatchEvidenceKeys: [],
               dispatchedGeneration: null,
@@ -1596,7 +1810,9 @@ export async function reclaimStalePrFixHandouts(
                 action: "reclaim",
                 status: "QUEUED",
                 lane: "NORMAL",
-                note: `Stale unacknowledged hand-out reclaimed; reopened as generation ${item.generation + 1} (#1211).`,
+                note: ackedDead
+              ? `Stale acknowledged hand-out recovered: acking agent showed no liveness evidence; reopened as generation ${item.generation + 1} (#1419).`
+              : `Stale unacknowledged hand-out reclaimed; reopened as generation ${item.generation + 1} (#1211).`,
               },
             });
           }
@@ -1919,6 +2135,7 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
                 agentHandouts: [],
                 externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
                 handoutAcks: [],
+                handoutAckTimes: [],
                 handoutReceipts: [],
                 staleDisposition: false,
                 disposedAt: null,
@@ -2739,6 +2956,7 @@ export async function markPrFixItem(
     data.agentHandouts = [];
     data.handoutReceipts = [];
     data.handoutAcks = [];
+    data.handoutAckTimes = [];
     // #1430: record who started this wait, atomically with the transition.
     // A scoped worker records its bound identity so its own same-generation
     // retry keeps the #1231 idempotent answer; an unscoped (maintainer/
@@ -2830,6 +3048,7 @@ export async function markPrFixItem(
           agentHandouts: [],
           externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
           handoutAcks: [],
+          handoutAckTimes: [],
           handoutReceipts: [],
           attemptEvidenceWatermark: null,
         }
@@ -2848,6 +3067,7 @@ export async function markPrFixItem(
           agentHandouts: [],
           externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
           handoutAcks: [],
+          handoutAckTimes: [],
           handoutReceipts: [],
         };
     const { count } = await tx.prFixQueueItem.updateMany({
@@ -2999,6 +3219,7 @@ export async function markPrFixItem(
       data.agentHandouts = [];
       data.handoutReceipts = [];
       data.handoutAcks = [];
+      data.handoutAckTimes = [];
       // #1430: the recorded waiter belongs to the dead attempt's wait; a
       // fresh attempt never inherits it.
       data.externalWaitBy = null;
@@ -3071,6 +3292,7 @@ export async function markPrFixItem(
             agentHandouts: [],
             externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
             handoutAcks: [],
+            handoutAckTimes: [],
             handoutReceipts: [],
             attemptEvidenceWatermark: null,
           }
@@ -3090,6 +3312,7 @@ export async function markPrFixItem(
             agentHandouts: [],
             externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
             handoutAcks: [],
+            handoutAckTimes: [],
             handoutReceipts: [],
           };
       const refusal = await client.$transaction(async (tx) => {
@@ -3368,6 +3591,7 @@ export async function markPrFixItem(
         agentHandouts: [],
         externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
         handoutAcks: [],
+        handoutAckTimes: [],
         handoutReceipts: [],
         attemptEvidenceWatermark: null,
       }
@@ -3386,6 +3610,7 @@ export async function markPrFixItem(
         agentHandouts: [],
         externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
         handoutAcks: [],
+        handoutAckTimes: [],
         handoutReceipts: [],
       };
   const forced = await client.$transaction(async (tx) => {
@@ -3791,6 +4016,9 @@ export async function releaseAgentHandout(
       const receipts: string[] = Array.isArray(fresh.handoutReceipts) ? fresh.handoutReceipts : [];
       const handouts: string[] = Array.isArray(fresh.agentHandouts) ? fresh.agentHandouts : [];
       const acks: string[] = Array.isArray(fresh.handoutAcks) ? fresh.handoutAcks : [];
+      // #1419: the ack timestamps are handoutAcks' parallel array — filtered
+      // by the same index so a released ack's timestamp dies with it.
+      const ackTimes: string[] = Array.isArray(fresh.handoutAckTimes) ? fresh.handoutAckTimes : [];
       const isOwnToken = (entry: unknown): boolean => {
         const parsed = parseAgentHandoutToken(entry);
         return parsed !== null && parsed.agentName === agent && parsed.generation === generation;
@@ -3803,6 +4031,7 @@ export async function releaseAgentHandout(
       const remainingReceipts = receipts.filter((entry) => entry !== owned);
       const remainingHandouts = handouts.filter((entry) => !isOwnToken(entry));
       const remainingAcks = acks.filter((entry) => !isOwnToken(entry));
+      const remainingAckTimes = ackTimes.filter((_, index) => !isOwnToken(acks[index]));
       // Nothing for this agent at this generation (or a malformed row) — no
       // write.
       if (
@@ -3824,6 +4053,7 @@ export async function releaseAgentHandout(
           handoutReceipts: remainingReceipts,
           agentHandouts: remainingHandouts,
           handoutAcks: remainingAcks,
+          handoutAckTimes: remainingAckTimes,
           ...(remainingHandouts.length === 0
             ? {
                 dispatchedGeneration: null,
@@ -3839,6 +4069,47 @@ export async function releaseAgentHandout(
   } catch (error) {
     console.error(`pr-fix-queue handout release failed for ${itemId}:`, error);
   }
+}
+
+/**
+ * Wall-clock idle reason for a QUEUED PR-fix item's current generation
+ * (#1419): why the stamped hand-out has not been handed out again or settled.
+ * Derived from row fields only (no DB reads, no liveness probes): a stamped
+ * generation older than the unacknowledged hand-out timeout reports whether
+ * it is still waiting on an acknowledgement or already acked and awaiting
+ * dead-owner recovery. Null whenever the item is not in that stuck shape.
+ */
+function deriveIdleReason(item: any): string | null {
+  if (item.status !== "QUEUED") return null;
+  if (item.dispatchedGeneration == null || item.dispatchedGeneration !== item.generation) return null;
+  if (item.dispatchedAt == null) return null;
+  const dispatchedMs = new Date(item.dispatchedAt).getTime();
+  if (Number.isNaN(dispatchedMs)) return null;
+  const acks: string[] = Array.isArray(item.handoutAcks) ? item.handoutAcks : [];
+  const acked = acks.some((entry) => {
+    const parsed = parseAgentHandoutToken(entry);
+    return parsed !== null && parsed.generation === item.generation;
+  });
+  // Two different clocks, matching the two recovery ladders (#1419): an
+  // unacked hand-out is stale past PR_FIX_HANDOUT_TIMEOUT_MS; an acked one
+  // only counts as stuck past PR_FIX_ACK_LIVENESS_MS (dated by the parallel
+  // ack timestamp, or the dispatch stamp for legacy acks) — a fresh ack on
+  // an old dispatch is a healthy long run, not a stuck generation.
+  if (!acked) {
+    if (!(dispatchedMs < Date.now() - prFixHandoutTimeoutMs())) return null;
+    return "stale-unacknowledged-handout";
+  }
+  const ackTimes: string[] = Array.isArray(item.handoutAckTimes) ? item.handoutAckTimes : [];
+  let ackMs: number | null = null;
+  acks.forEach((entry, index) => {
+    const parsed = parseAgentHandoutToken(entry);
+    if (parsed === null || parsed.generation !== item.generation) return;
+    const t = Date.parse(ackTimes[index] ?? "");
+    if (!Number.isNaN(t) && (ackMs === null || t > ackMs)) ackMs = t;
+  });
+  const effectiveAckMs = ackMs ?? dispatchedMs; // legacy ack: dispatch-stamp lower bound
+  if (!(effectiveAckMs < Date.now() - prFixAckLivenessMs())) return null;
+  return "stale-acknowledged-handout";
 }
 
 export function toAgentQueuePrFixItem(item: any) {
@@ -3873,6 +4144,14 @@ export function toAgentQueuePrFixItem(item: any) {
     // Per-agent hand-out records for the current generation (#1133); the
     // next-task route reads these to skip items this agent already has.
     agentHandouts: item.agentHandouts ?? [],
+    // #1419 exposure: the current hand-out stamp and its acks, plus a
+    // wall-clock idle reason so operators and pollers can see WHY a QUEUED
+    // item is not being handed out. Wall-clock only — never a liveness
+    // decision; the reclaim ladder's probes decide that.
+    dispatchedAt: item.dispatchedAt ?? null,
+    dispatchedGeneration: item.dispatchedGeneration ?? null,
+    handoutAcks: item.handoutAcks ?? [],
+    idleReason: deriveIdleReason(item),
     // #1253: fresh actionable evidence arrived while the item sat in a
     // disposition evidence must not override — operator-visible on queue
     // listings, cleared on reactivation or operator requeue.
@@ -3953,6 +4232,7 @@ export async function requeuePrFixItem(client: PrFixQueueClient, rawInput: Reque
         agentHandouts: [],
         externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
         handoutAcks: [],
+        handoutAckTimes: [],
         handoutReceipts: [],
         handoutReclaims: 0,
       },
@@ -4293,6 +4573,7 @@ export async function resolvePrFixFromAgentReport(
       const receipts: string[] = Array.isArray(live.handoutReceipts) ? live.handoutReceipts : [];
       const handouts: string[] = Array.isArray(live.agentHandouts) ? live.agentHandouts : [];
       const acks: string[] = Array.isArray(live.handoutAcks) ? live.handoutAcks : [];
+      const ackTimes: string[] = Array.isArray(live.handoutAckTimes) ? live.handoutAckTimes : [];
       // Exact source-owner authorization: agent + generation + issued token
       // must all match a live receipt. An unknown or rotated token (the
       // hand-out was already released, reclaimed, or re-issued to this same
@@ -4312,6 +4593,11 @@ export async function resolvePrFixFromAgentReport(
       const ownEntry = agentHandoutToken(reportingAgent, expectedGeneration);
       const remainingHandouts = handouts.filter((h) => h !== ownEntry);
       const remainingAcks = acks.filter((a) => a !== ownEntry);
+      // Keep the parallel ack-timestamp array index-aligned with the filtered
+      // ack list (#1419): the released agent's ack timestamp dies with its
+      // ack token, so the surviving agents' timestamps keep mapping to their
+      // own acks and the reclaimer never reads a stale age for a live ack.
+      const remainingAckTimes = ackTimes.filter((_, index) => acks[index] !== ownEntry);
       // The dispatch stamps survive while ANY other agent's hand-out at this
       // generation is still live (#1119: clearing them would reclassify
       // mid-run evidence as pre-dispatch for the surviving workers). Only the
@@ -4337,6 +4623,7 @@ export async function resolvePrFixFromAgentReport(
           handoutReceipts: remainingReceipts,
           agentHandouts: remainingHandouts,
           handoutAcks: remainingAcks,
+          handoutAckTimes: remainingAckTimes,
           ...(lastHandout
             ? {
                 postDispatchEvidenceKeys: [],
@@ -4523,6 +4810,7 @@ export async function resolvePrFixFromAgentReport(
             agentHandouts: [],
             externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
             handoutAcks: [],
+            handoutAckTimes: [],
             handoutReceipts: [],
           }
         : {
@@ -4543,6 +4831,7 @@ export async function resolvePrFixFromAgentReport(
             agentHandouts: [],
             externalWaitBy: null, // #1430: the wait this generation recorded died with these hand-out records
             handoutAcks: [],
+            handoutAckTimes: [],
             handoutReceipts: [],
           };
       // The head-snapshot pin guards the fresh-attempt branch's baseline on

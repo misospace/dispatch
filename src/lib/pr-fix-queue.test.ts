@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { createLinkedPrFixItem, enqueuePrFixItem, hasInFlightRebaseHandout, withRebaseLaneAdmission, REBASE_LANE_ADVISORY_LOCK_KEY, normalizeQueueRepo, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, parseMarkPrFixInput, parseEnqueuePrFixInput, resolvePrFixFromAgentReport, ackPrFixHandout, parseAckPrFixHandoutInput, reclaimStalePrFixHandouts, prFixHandoutTimeoutMs, maxPrFixReclaims, agentAlreadyHanded, isRebaseLaneAgent, parseRebaseAgentPool, DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS, DEFAULT_PR_FIX_MAX_RECLAIMS, PrFixQueueClient, type MarkPrFixResult } from "./pr-fix-queue";
+import { createLinkedPrFixItem, enqueuePrFixItem, hasInFlightRebaseHandout, withRebaseLaneAdmission, REBASE_LANE_ADVISORY_LOCK_KEY, normalizeQueueRepo, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, parseMarkPrFixInput, parseEnqueuePrFixInput, resolvePrFixFromAgentReport, ackPrFixHandout, parseAckPrFixHandoutInput, reclaimStalePrFixHandouts, prFixHandoutTimeoutMs, maxPrFixReclaims, prFixAckLivenessMs, DEFAULT_PR_FIX_ACK_LIVENESS_MS, agentAlreadyHanded, isRebaseLaneAgent, parseRebaseAgentPool, DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS, DEFAULT_PR_FIX_MAX_RECLAIMS, PrFixQueueClient, type MarkPrFixResult } from "./pr-fix-queue";
 
 function mutatedItem(result: MarkPrFixResult): any {
   if (!result.mutated) throw new Error(`expected mutation, got ${result.reason}`);
@@ -68,6 +68,7 @@ function makeClient(): PrFixQueueClient & {
   items: any[];
   history: any[];
   handoffs: any[];
+  agentRuns: any[];
   inTransaction: boolean;
   hooks: {
     beforeUpdateMany: (() => void) | null;
@@ -78,11 +79,33 @@ function makeClient(): PrFixQueueClient & {
   const history: any[] = [];
   // #1256: capacity-scoped cooldown rows.
   const handoffs: any[] = [];
+  // #1419: agent-run liveness ledger rows for the reclaimer's dead-owner
+  // probes (agentName/createdAt and item/generation/finishedAt filters).
+  const agentRuns: any[] = [];
   let seq = 0;
   const client: any = {
     items,
     history,
     handoffs,
+    agentRuns,
+    // #1419: agent liveness ledger read model for the reclaimer's probes.
+    agentRun: {
+      findFirst: async ({ where }: any) => {
+        const w = where ?? {};
+        return (
+          agentRuns.find(
+            (r) =>
+              (w.agentName === undefined || r.agentName === w.agentName) &&
+              (w.createdAt?.gt === undefined ||
+                new Date(r.createdAt).getTime() > new Date(w.createdAt.gt).getTime()) &&
+              (w.prFixQueueItemId === undefined || r.prFixQueueItemId === w.prFixQueueItemId) &&
+              (w.prFixGeneration === undefined || r.prFixGeneration === w.prFixGeneration) &&
+              (w.finishedAt === undefined ||
+                (w.finishedAt === null ? r.finishedAt == null : r.finishedAt === w.finishedAt)),
+          ) ?? null
+        );
+      },
+    },
     capacityHandoff: {
       create: async ({ data }: any) => {
         const row = { id: `handoff-${handoffs.length + 1}`, createdAt: new Date(), ...data };
@@ -163,6 +186,7 @@ function makeClient(): PrFixQueueClient & {
           // #1211 hand-out ack/reclaim columns: default to their schema values
           // so a freshly created row reads back as "no ack, never reclaimed".
           handoutAcks: [], // mirrors the column's @default([])
+          handoutAckTimes: [], // mirrors the column's @default([]) — parallel ack timestamps (#1419)
           agentHandouts: [], // mirrors the column's @default([])
           // #1256 review: per-hand-out receipts (bijection with agentHandouts).
           handoutReceipts: [], // mirrors the column's @default([])
@@ -223,6 +247,10 @@ function makeClient(): PrFixQueueClient & {
             (where.handoutAcks === undefined ||
               JSON.stringify(i.handoutAcks ?? []) ===
                 JSON.stringify(where.handoutAcks.equals ?? [])) &&
+            // #1419: parallel ack-timestamp pin (same CAS as the ack list).
+            (where.handoutAckTimes === undefined ||
+              JSON.stringify(i.handoutAckTimes ?? []) ===
+                JSON.stringify(where.handoutAckTimes.equals ?? [])) &&
             // #1256 review: receipt/hand-out list pins (exact-owner CAS).
             (where.handoutReceipts === undefined ||
               JSON.stringify(i.handoutReceipts ?? []) ===
@@ -657,6 +685,40 @@ describe("work generation identity (#1044)", () => {
     expect(toAgentQueuePrFixItem(client.items[0]).generation).toBe(1);
   });
 
+  it("exposes stuck-generation idle reasons on the agent queue listing (#1419)", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 12, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k12",
+    });
+    const row = client.items[0];
+    row.status = "QUEUED";
+    row.dispatchedGeneration = row.generation;
+    row.dispatchedAt = new Date(Date.now() - 2 * 60 * 60 * 1000); // 2h ago — past the 30m hand-out timeout
+    row.agentHandouts = ["courier@1"];
+    // Freshly stamped, never acked: still inside the timeout → no reason.
+    row.dispatchedAt = new Date(Date.now() - 5 * 60 * 1000);
+    expect(toAgentQueuePrFixItem(row).idleReason).toBeNull();
+    // Stale and unacked (past PR_FIX_HANDOUT_TIMEOUT_MS).
+    row.dispatchedAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    expect(toAgentQueuePrFixItem(row).idleReason).toBe("stale-unacknowledged-handout");
+    // Acked 2h ago on a 2h-old dispatch: a fresh ack is a healthy long run —
+    // NOT stuck; the acknowledged reason keys on PR_FIX_ACK_LIVENESS_MS.
+    row.handoutAcks = ["courier@1"];
+    row.handoutAckTimes = [new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString()];
+    expect(toAgentQueuePrFixItem(row).idleReason).toBeNull();
+    // Acked 30h ago (legacy row: no timestamp → dispatch-stamp lower bound):
+    // stuck acknowledged generation awaiting dead-owner recovery.
+    row.handoutAckTimes = [];
+    row.dispatchedAt = new Date(Date.now() - 30 * 60 * 60 * 1000);
+    expect(toAgentQueuePrFixItem(row).idleReason).toBe("stale-acknowledged-handout");
+    expect(toAgentQueuePrFixItem(row).handoutAcks).toEqual(["courier@1"]);
+    expect(toAgentQueuePrFixItem(row).dispatchedGeneration).toBe(row.generation);
+    // A fresh QUEUED item with no stamp has no idle reason.
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 13, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k13",
+    });
+    expect(toAgentQueuePrFixItem(client.items[1]).idleReason).toBeNull();
+  });
+
   it("bumps generation on explicit requeue from BLOCKED, and again from FIXED", async () => {
     await enqueuePrFixItem(client, {
       repo: "org/repo", pr: 11, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k1",
@@ -915,6 +977,39 @@ describe("reconcileStalePrFixItems", () => {
     // note keeps the true upstream state rather than the "merged" fallback.
     // history[0] is the enqueue row; the mark row is last.
     expect(client.history[client.history.length - 1].note).toContain("state=merged");
+  });
+
+  it("keeps handoutAckTimes index-aligned with handoutAcks and clears both on settlement (#1419)", async () => {
+    const client = makeClient();
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 225, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k225",
+    });
+    const row = client.items[0];
+    row.dispatchedGeneration = row.generation;
+    row.dispatchedAt = new Date("2026-01-01T00:00:00Z");
+    row.agentHandouts = ["courier@1", "beta@1"];
+    const first = await ackPrFixHandout(client, { repo: "org/repo", pr: 225, generation: 1, agentName: "courier" });
+    expect(first.acknowledged).toBe(true);
+    const second = await ackPrFixHandout(client, { repo: "org/repo", pr: 225, generation: 1, agentName: "beta" });
+    expect(second.acknowledged).toBe(true);
+    const acked = client.items[0];
+    expect(acked.handoutAcks).toEqual(["courier@1", "beta@1"]);
+    expect(acked.handoutAckTimes).toHaveLength(2);
+    for (const t of acked.handoutAckTimes) expect(Number.isNaN(Date.parse(t))).toBe(false);
+    // The reclaimer's terminal paths clear BOTH parallel arrays together:
+    // a dead-acked item on a merged/closed PR reaps to STALE with both wiped.
+    // Age the acks past the liveness window (the acks above used the real clock).
+    const aged = client.items[0];
+    aged.handoutAckTimes = aged.handoutAckTimes.map((_t: string, i: number) =>
+      new Date(Date.now() - 48 * 60 * 60 * 1000 - i * 1000).toISOString(),
+    );
+    await reclaimStalePrFixHandouts(client, {
+      ackLivenessMs: 30 * 60 * 1000,
+      isPrMergedOrClosed: async () => true,
+    });
+    expect(client.items[0].status).toBe("STALE");
+    expect(client.items[0].handoutAcks).toEqual([]);
+    expect(client.items[0].handoutAckTimes).toEqual([]);
   });
 });
 
@@ -3687,9 +3782,17 @@ describe("reclaim stale hand-outs (#1211)", () => {
     expect(client.items[0].agentHandouts).toEqual([]);
   });
 
-  it("never reclaims a generation a live worker acknowledged", async () => {
+  it("never reclaims a generation a live worker acknowledged (#1419)", async () => {
+    // Acked 48h ago — past the default 24h ack-liveness window — but the
+    // agent still shows recent AgentRun activity (heartbeat/report): live.
     const row = await seedStaleUnacked(203);
     row.handoutAcks = ["courier@1"];
+    row.handoutAckTimes = ["2025-12-30T01:00:00Z"];
+    client.agentRuns.push({
+      agentName: "courier",
+      createdAt: new Date("2026-01-01T00:45:00Z"), // 15m before STALE_NOW
+      finishedAt: null,
+    });
     const report = await reclaimStalePrFixHandouts(client, {
       now: STALE_NOW,
       isPrMergedOrClosed: async () => false,
@@ -3698,6 +3801,187 @@ describe("reclaim stale hand-outs (#1211)", () => {
     expect(report.reclaimed).toBe(0);
     expect(client.items[0].generation).toBe(1);
     expect(client.items[0].handoutAcks).toEqual(["courier@1"]);
+  });
+
+  it("never reclaims a generation with an open associated AgentRun (#1419)", async () => {
+    // Acked past the liveness window with no recent agent-wide activity, but
+    // an AgentRun row is durably associated with the attempt and still open —
+    // live execution evidence protects the acked generation.
+    const row = await seedStaleUnacked(216);
+    row.handoutAcks = ["courier@1"];
+    row.handoutAckTimes = ["2025-12-30T01:00:00Z"];
+    client.agentRuns.push({
+      agentName: "other-worker",
+      createdAt: new Date("2025-12-31T00:00:00Z"), // old agent-wide activity
+      prFixQueueItemId: row.id,
+      prFixGeneration: row.generation,
+      finishedAt: null,
+    });
+    const report = await reclaimStalePrFixHandouts(client, {
+      now: STALE_NOW,
+      isPrMergedOrClosed: async () => false,
+    });
+    expect(report.skipped).toBe(1);
+    expect(report.reclaimed).toBe(0);
+    expect(client.items[0].handoutAcks).toEqual(["courier@1"]);
+  });
+
+  it("never reclaims an acked generation whose ack timestamp is inside the liveness window (#1419)", async () => {
+    const row = await seedStaleUnacked(219);
+    row.handoutAcks = ["courier@1"];
+    row.handoutAckTimes = [new Date(STALE_NOW.getTime() - 60 * 60 * 1000).toISOString()]; // 1h old < 24h window
+    const report = await reclaimStalePrFixHandouts(client, {
+      now: STALE_NOW,
+      isPrMergedOrClosed: async () => false,
+    });
+    expect(report.skipped).toBe(1);
+    expect(report.reclaimed).toBe(0);
+    expect(client.items[0].generation).toBe(1);
+  });
+
+  it("dates a legacy ack without a timestamp by its dispatch stamp inside the window (fail-closed, #1419)", async () => {
+    // Pre-#1419 rows carry acks with no parallel timestamp; the ack is dated
+    // by the dispatch stamp, which here is only 1h old — inside the 24h
+    // default window, so the generation stays protected.
+    const row = await seedStaleUnacked(220);
+    row.handoutAcks = ["courier@1"];
+    row.handoutAckTimes = [];
+    const report = await reclaimStalePrFixHandouts(client, {
+      now: STALE_NOW,
+      isPrMergedOrClosed: async () => false,
+    });
+    expect(report.skipped).toBe(1);
+    expect(report.reclaimed).toBe(0);
+  });
+
+  it("recovers a legacy acked row once its dispatch-aged ack is past the window (#1419)", async () => {
+    // The already-stranded population: acked before #1419 shipped (no
+    // timestamp), dispatch far in the past, acking agent dead (no activity).
+    const row = await seedStaleUnacked(226);
+    row.dispatchedAt = new Date("2025-12-28T01:00:00Z"); // ~3 days before STALE_NOW
+    row.handoutAcks = ["courier@1"];
+    row.handoutAckTimes = [];
+    const report = await reclaimStalePrFixHandouts(client, {
+      now: STALE_NOW,
+      isPrMergedOrClosed: async () => false,
+    });
+    expect(report.reclaimed).toBe(1);
+    expect(client.items[0].generation).toBe(2);
+    expect(client.items[0].handoutAcks).toEqual([]);
+    expect(client.items[0].handoutAckTimes).toEqual([]);
+  });
+
+  it("never reclaims an acked generation when the client lacks the agentRun surface (fail-closed, #1419)", async () => {
+    // Production-shaped regression guard (#1419 review): the sweep route
+    // hands the reclaimer an asPrFixQueueClient client. A client without the
+    // agentRun delegate must fail closed (live), never TypeError-reclaim.
+    const row = await seedStaleUnacked(227);
+    row.handoutAcks = ["courier@1"];
+    row.handoutAckTimes = ["2025-12-30T01:00:00Z"]; // past the default 24h window
+    const bare: any = { ...client };
+    delete bare.agentRun;
+    const report = await reclaimStalePrFixHandouts(bare, {
+      now: STALE_NOW,
+      isPrMergedOrClosed: async () => false,
+    });
+    expect(report.skipped).toBe(1);
+    expect(report.reclaimed).toBe(0);
+    expect(report.errors).toEqual([]);
+  });
+
+  it("never reclaims an acked generation when the liveness probe errors (fail-closed, #1419)", async () => {
+    const row = await seedStaleUnacked(221);
+    row.handoutAcks = ["courier@1"];
+    row.handoutAckTimes = ["2025-12-30T01:00:00Z"]; // past the default 24h window
+    const report = await reclaimStalePrFixHandouts(client, {
+      now: STALE_NOW,
+      isPrMergedOrClosed: async () => false,
+      agentHasRecentActivity: async () => {
+        throw new Error("ledger unavailable");
+      },
+    });
+    // The probe error is live evidence at the call site, not a report error.
+    expect(report.skipped).toBe(1);
+    expect(report.reclaimed).toBe(0);
+    expect(report.errors).toEqual([]);
+  });
+
+  it("recovers a single-agent ack+crash hand-out once all liveness evidence is dead (#1419)", async () => {
+    const row = await seedStaleUnacked(222);
+    row.handoutAcks = ["courier@1"];
+    row.handoutAckTimes = ["2026-01-01T00:05:00Z"]; // 55m before STALE_NOW
+    const historyBefore = client.history.length;
+    const report = await reclaimStalePrFixHandouts(client, {
+      now: STALE_NOW,
+      ackLivenessMs: 30 * 60 * 1000, // 30m window: the ack is provably past it, no agent activity at all
+      isPrMergedOrClosed: async () => false,
+    });
+    expect(report.reclaimed).toBe(1);
+    expect(report.skipped).toBe(0);
+    const after = client.items[0];
+    expect(after.generation).toBe(2);
+    expect(after.agentHandouts).toEqual([]);
+    expect(after.handoutAcks).toEqual([]);
+    expect(after.handoutAckTimes).toEqual([]);
+    expect(after.handoutReceipts).toEqual([]);
+    expect(after.handoutReclaims).toBe(1);
+    expect(after.dispatchedGeneration).toBeNull();
+    expect(after.fixAttempts).toBe(1);
+    const last = client.history.at(-1);
+    expect(last.action).toBe("reclaim");
+    expect(last.note).toContain("#1419");
+    expect(client.history.length).toBe(historyBefore + 1);
+  });
+
+  it("parks a dead-acknowledged item at the reclaim cap (no_progress, #1419)", async () => {
+    const row = await seedStaleUnacked(223);
+    row.handoutAcks = ["courier@1"];
+    row.handoutAckTimes = ["2026-01-01T00:05:00Z"];
+    row.handoutReclaims = 3;
+    const prevMaxReclaims = process.env.PR_FIX_MAX_RECLAIMS;
+    process.env.PR_FIX_MAX_RECLAIMS = "3";
+    try {
+      surfacingMocks.surfacePrFixParked.mockClear();
+      const report = await reclaimStalePrFixHandouts(client, {
+        now: STALE_NOW,
+        ackLivenessMs: 30 * 60 * 1000,
+        isPrMergedOrClosed: async () => false,
+      });
+      expect(report.parked).toBe(1);
+      expect(report.blocked).toBe(1);
+      expect(report.reclaimed).toBe(0);
+      const after = client.items[0];
+      expect(after.status).toBe("PARKED");
+      expect(after.lane).toBe("NORMAL");
+      expect(after.outcome).toBe("no_progress");
+      expect(after.handoutAckTimes).toEqual([]);
+      expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledTimes(1);
+      const last = client.history.at(-1);
+      expect(last.note).toContain("#1419");
+    } finally {
+      if (prevMaxReclaims === undefined) delete process.env.PR_FIX_MAX_RECLAIMS;
+      else process.env.PR_FIX_MAX_RECLAIMS = prevMaxReclaims;
+    }
+  });
+
+  it("does not reclaim while ANY acking agent of the generation is live (#1419)", async () => {
+    const row = await seedStaleUnacked(224);
+    row.agentHandouts = ["alpha@1", "beta@1"];
+    row.handoutAcks = ["alpha@1", "beta@1"];
+    row.handoutAckTimes = ["2026-01-01T00:05:00Z", "2026-01-01T00:05:00Z"];
+    client.agentRuns.push({
+      agentName: "beta", // beta is still alive
+      createdAt: new Date("2026-01-01T00:45:00Z"),
+      finishedAt: null,
+    });
+    const report = await reclaimStalePrFixHandouts(client, {
+      now: STALE_NOW,
+      ackLivenessMs: 30 * 60 * 1000,
+      isPrMergedOrClosed: async () => false,
+    });
+    expect(report.skipped).toBe(1);
+    expect(report.reclaimed).toBe(0);
+    expect(client.items[0].generation).toBe(1);
   });
 
   it("a late ack for generation N cannot touch N+1 (generation-mismatch)", async () => {
@@ -3937,6 +4221,9 @@ describe("reclaim stale hand-outs (#1211)", () => {
     expect(first.acknowledged).toBe(true);
     if (!first.acknowledged) throw new Error("expected ack");
     expect(first.item.handoutAcks).toEqual(["courier@1"]);
+    // #1419: the ack records a parallel landing timestamp.
+    expect(first.item.handoutAckTimes).toHaveLength(1);
+    expect(Number.isNaN(Date.parse(first.item.handoutAckTimes[0]))).toBe(false);
     const ackHistory = client.history.at(-1);
     expect(ackHistory).toMatchObject({ action: "ack", status: "QUEUED" });
     expect(ackHistory.note).toContain("generation 1");
@@ -4243,21 +4530,36 @@ describe("reclaim stale hand-outs (#1211)", () => {
   it("exposes the env-bounded defaults and getters", () => {
     expect(DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS).toBe(30 * 60 * 1000);
     expect(DEFAULT_PR_FIX_MAX_RECLAIMS).toBe(3);
+    expect(DEFAULT_PR_FIX_ACK_LIVENESS_MS).toBe(24 * 60 * 60 * 1000);
     const prevTimeout = process.env.PR_FIX_HANDOUT_TIMEOUT_MS;
     const prevReclaims = process.env.PR_FIX_MAX_RECLAIMS;
+    const prevAckLiveness = process.env.PR_FIX_ACK_LIVENESS_MS;
     try {
       delete process.env.PR_FIX_HANDOUT_TIMEOUT_MS;
       delete process.env.PR_FIX_MAX_RECLAIMS;
+      delete process.env.PR_FIX_ACK_LIVENESS_MS;
       expect(prFixHandoutTimeoutMs()).toBe(DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS);
       expect(maxPrFixReclaims()).toBe(DEFAULT_PR_FIX_MAX_RECLAIMS);
+      expect(prFixAckLivenessMs()).toBe(DEFAULT_PR_FIX_ACK_LIVENESS_MS);
       process.env.PR_FIX_HANDOUT_TIMEOUT_MS = "1000";
       process.env.PR_FIX_MAX_RECLAIMS = "7";
+      process.env.PR_FIX_ACK_LIVENESS_MS = String(48 * 60 * 60 * 1000);
       expect(prFixHandoutTimeoutMs()).toBe(1000);
       expect(maxPrFixReclaims()).toBe(7);
+      expect(prFixAckLivenessMs()).toBe(48 * 60 * 60 * 1000);
+      // #1419 review: the ack-liveness knob is clamped 1h–7d — a value below
+      // the floor would make every acked generation near-immediately
+      // reclaimable (and shrink the agent-activity horizon with it).
+      process.env.PR_FIX_ACK_LIVENESS_MS = "1000";
+      expect(prFixAckLivenessMs()).toBe(60 * 60 * 1000);
+      process.env.PR_FIX_ACK_LIVENESS_MS = String(30 * 24 * 60 * 60 * 1000);
+      expect(prFixAckLivenessMs()).toBe(7 * 24 * 60 * 60 * 1000);
       process.env.PR_FIX_HANDOUT_TIMEOUT_MS = "0";
       process.env.PR_FIX_MAX_RECLAIMS = "nope";
+      process.env.PR_FIX_ACK_LIVENESS_MS = "nope";
       expect(prFixHandoutTimeoutMs()).toBe(DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS);
       expect(maxPrFixReclaims()).toBe(DEFAULT_PR_FIX_MAX_RECLAIMS);
+      expect(prFixAckLivenessMs()).toBe(DEFAULT_PR_FIX_ACK_LIVENESS_MS);
     } finally {
       if (prevTimeout === undefined) delete process.env.PR_FIX_HANDOUT_TIMEOUT_MS;
       else process.env.PR_FIX_HANDOUT_TIMEOUT_MS = prevTimeout;

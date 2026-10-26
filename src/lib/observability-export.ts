@@ -163,6 +163,7 @@ export function observabilityMetricFamilies(): string[] {
     "dispatch_pr_fix_oldest_human_decision_seconds",
     "dispatch_pr_fix_oldest_queued_seconds",
     "dispatch_pr_fix_oldest_unacked_handout_seconds",
+    "dispatch_pr_fix_overdue_acked",
     "dispatch_pr_fix_overdue_unacked",
     "dispatch_pr_fix_parked",
     "dispatch_pr_fix_reclaims_in_window",
@@ -232,6 +233,7 @@ export function exportObservabilityMetrics(snapshot: ObservabilitySnapshot): str
   families.push(scalar("dispatch_pr_fix_oldest_queued_seconds", "Age of the oldest QUEUED PR-fix item (A8).", snapshot.prFix.oldestQueuedAgeSeconds));
   families.push(scalar("dispatch_pr_fix_unacked_handouts", "QUEUED items with a current-generation hand-out and no ack, any age. Dashboard aggregate — never alert on it.", snapshot.prFix.handouts.unackedAggregate));
   families.push(scalar("dispatch_pr_fix_overdue_unacked", "Unacked hand-outs past the ack timeout (age-tied; A7).", snapshot.prFix.handouts.overdueUnacked));
+  families.push(scalar("dispatch_pr_fix_overdue_acked", "Acknowledged hand-outs stuck past PR_FIX_ACK_LIVENESS_MS — the dead-owner recovery population (#1419).", snapshot.prFix.handouts.overdueAcked));
   families.push(scalar("dispatch_pr_fix_oldest_unacked_handout_seconds", "Age of the oldest unacknowledged hand-out.", snapshot.prFix.handouts.oldestUnackedHandoutAgeSeconds));
   families.push(windowed("dispatch_pr_fix_reclaims_in_window", "PR-fix reclaim history rows per failure window (as-of-scrape gauge).", snapshot.prFix.handouts.reclaimHistoryInWindow));
   families.push(scalar("dispatch_pr_fix_human_decisions", "BLOCKED PR-fix items: genuine human decisions awaiting a call.", snapshot.prFix.settlement.humanDecisionsBlocked));

@@ -766,6 +766,7 @@ describe("resolvePrFixFromAgentReport", () => {
       handoutReceipts: [],
       agentHandouts: ["other@1"],
       handoutAcks: [],
+      handoutAckTimes: [],
     });
   });
 
@@ -811,6 +812,7 @@ describe("resolvePrFixFromAgentReport", () => {
       handoutReceipts: [],
       agentHandouts: [],
       handoutAcks: [],
+      handoutAckTimes: [],
       dispatchedGeneration: null,
       dispatchedAt: null,
       attemptEvidenceWatermark: null,
@@ -892,6 +894,7 @@ describe("resolvePrFixFromAgentReport", () => {
       handoutReceipts: [],
       agentHandouts: [],
       handoutAcks: [],
+      handoutAckTimes: [],
       dispatchedGeneration: null,
       dispatchedAt: null,
       attemptEvidenceWatermark: null,
@@ -943,6 +946,7 @@ describe("resolvePrFixFromAgentReport", () => {
       handoutReceipts: ["hnd_112233445566@other@1"],
       agentHandouts: ["other@1"],
       handoutAcks: [],
+      handoutAckTimes: [],
     });
   });
 
@@ -1022,6 +1026,7 @@ describe("resolvePrFixFromAgentReport", () => {
       handoutReceipts: ["hnd_112233445566@other@1"],
       agentHandouts: ["other@1"],
       handoutAcks: [],
+      handoutAckTimes: [],
     });
   });
 

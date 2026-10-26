@@ -246,6 +246,7 @@ function emptySnapshot(): ObservabilitySnapshot {
       schedulerEnabled: true,
       syncIntervalMs: 900_000,
       prFixHandoutTimeoutMs: 1_800_000,
+      prFixAckLivenessMs: 24 * 60 * 60 * 1000,
       strandedAssignmentThresholdMs: 1_800_000,
       syncPipeline: "auto",
     },
@@ -287,6 +288,7 @@ function emptySnapshot(): ObservabilitySnapshot {
       handouts: {
         unackedAggregate: 0,
         overdueUnacked: 0,
+        overdueAcked: 0,
         oldestUnackedHandoutAgeSeconds: null,
         reclaimHistoryInWindow: { 900: 0, 3600: 0 },
       },

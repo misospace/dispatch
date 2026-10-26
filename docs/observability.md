@@ -245,6 +245,7 @@ are independent.
 | `dispatch_pr_fix_handout_age_seconds` | histogram | seconds | `now - dispatchedAt` for stamped `QUEUED` | `lane` | Unacknowledged hand-out age |
 | `dispatch_pr_fix_unacked_handouts` | gauge | count | `QUEUED`, `dispatchedGeneration = generation`, no matching ack | `lane` | Hand-outs that may be stranded (aggregate, includes both fresh and overdue) |
 | `dispatch_pr_fix_overdue_unacked` | gauge | count | subset of unacked where `now - dispatchedAt > PR_FIX_HANDOUT_TIMEOUT_MS` | `lane` | **Age-tied** overdue hand-outs: items past the configured timeout still waiting on an ack. Use this for A7 ([§6](#6-alert-catalogue)) — the aggregate `dispatch_pr_fix_unacked_handouts` is intended for the dashboard view, not for firing alerts, because steady churn keeps it above zero indefinitely even when every hand-out is acknowledged quickly |
+| `dispatch_pr_fix_overdue_acked` | gauge | count | QUEUED, current-generation ack present, newest current-generation ack time (dispatch stamp for legacy acks) older than `PR_FIX_ACK_LIVENESS_MS` | — | Stuck acknowledged hand-outs (#1419): the population the dead-owner recovery ladder evaluates. Deliberately NOT an alert — a 24h ack-age window tolerates legitimate long runs, and liveness probes decide the actual reclaim |
 | `dispatch_pr_fix_reclaims_total` | gauge | count | `PrFixHistory.action = reclaim` | — | Reopens of stamped-unacked hand-outs |
 | `dispatch_pr_fix_handout_reclaims` | histogram | count | `PrFixQueueItem.handoutReclaims` | — | Per-item reclaim count vs cap |
 

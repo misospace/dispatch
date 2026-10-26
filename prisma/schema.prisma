@@ -254,6 +254,13 @@ model PrFixQueueItem {
   // generation any agent acknowledged; entries for older generations are inert
   // and every fresh attempt clears the list.
   handoutAcks              String[]        @default([])
+  // Parallel ISO-8601 timestamps for `handoutAcks` (#1419): entry i records
+  // when the ack at handoutAcks[i] landed, so the reclaimer can require an
+  // acked owner to re-evidence liveness instead of staying authoritative
+  // forever. Every site that clears or filters `handoutAcks` must treat
+  // `handoutAckTimes` as its parallel array — cleared together, appended
+  // together in the same atomic write, and index-matched on removal.
+  handoutAckTimes          String[]        @default([])
   // Bounded automatic reclamations of stale unacknowledged hand-outs (#1211):
   // counts how many times the reclaimer has reopened this item because a
   // stamped hand-out was never acknowledged. Past PR_FIX_MAX_RECLAIMS the item

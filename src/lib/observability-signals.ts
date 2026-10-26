@@ -285,6 +285,7 @@ export interface ObservabilityPrFixRow {
   dispatchedGeneration: number | null;
   generation: number;
   handoutAcks: string[];
+  handoutAckTimes: string[];
   outcome: string | null;
 }
 
@@ -374,6 +375,8 @@ export interface ObservabilitySnapshotInputs {
     assignmentEvidenceLookbackMs: number;
     /** PR_FIX_HANDOUT_TIMEOUT_MS: age-tied overdue boundary for A7. */
     prFixHandoutTimeoutMs: number;
+    /** PR_FIX_ACK_LIVENESS_MS: age-tied boundary for stuck acknowledged hand-outs (#1419). */
+    prFixAckLivenessMs: number;
   };
 }
 
@@ -400,6 +403,7 @@ export interface ObservabilitySnapshot {
     schedulerEnabled: boolean;
     syncIntervalMs: number;
     prFixHandoutTimeoutMs: number;
+    prFixAckLivenessMs: number;
     strandedAssignmentThresholdMs: number;
     /** The operator's raw sync-pipeline declaration. */
     syncPipeline: SyncPipelineDeclaration;
@@ -465,6 +469,8 @@ export interface ObservabilitySnapshot {
       /** Age-tied subset past prFixHandoutTimeoutMs — the alertable signal. */
       overdueUnacked: number;
       oldestUnackedHandoutAgeSeconds: number | null;
+      /** QUEUED items with a current-generation ack past prFixAckLivenessMs (#1419): stuck acknowledged hand-outs eligible for dead-owner recovery. */
+      overdueAcked: number;
       reclaimHistoryInWindow: ObservabilityWindowedCount;
     };
     settlement: {
@@ -650,6 +656,42 @@ function ackedGenerations(handoutAcks: string[]): Set<number> {
     if (Number.isInteger(gen) && gen >= 1) acked.add(gen);
   }
   return acked;
+}
+
+/**
+ * Whether a QUEUED item's current generation is an ACKNOWLEDGED hand-out
+ * stuck past the ack-liveness window (#1419). Keyed on the ack timestamp —
+ * the same fact the reclaim ladder keys on — not the dispatch stamp: an
+ * attempt dispatched long ago but acked minutes ago is a healthy long run,
+ * not a stuck generation. A legacy ack without a parallel timestamp is dated
+ * by the dispatch stamp (the ack-time lower bound the ladder uses), so the
+ * counter never under-reports the already-stranded population.
+ */
+function isOverdueAckedHandout(
+  item: ObservabilityPrFixRow,
+  ackLivenessMs: number,
+  now: Date,
+): boolean {
+  if (item.status !== "QUEUED") return false;
+  if (item.dispatchedAt === null || item.dispatchedGeneration === null) return false;
+  if (item.dispatchedGeneration !== item.generation) return false;
+  if (!ackedGenerations(item.handoutAcks).has(item.generation)) return false;
+  // Newest current-generation ack time (parallel to handoutAcks by index):
+  // ANY fresh ack proves the attempt was recently alive, so the newest one
+  // decides "stuck"; a legacy ack with no parseable timestamp falls back to
+  // the dispatch stamp (the ack-time lower bound the reclaim ladder uses).
+  const fallbackMs = item.dispatchedAt.getTime();
+  let ackMs: number | null = null;
+  let sawCurrentGenerationAck = false;
+  item.handoutAcks.forEach((entry, index) => {
+    const at = entry.lastIndexOf("@");
+    if (at <= 0 || Number(entry.slice(at + 1)) !== item.generation) return;
+    sawCurrentGenerationAck = true;
+    const parsed = Date.parse(item.handoutAckTimes[index] ?? "");
+    if (!Number.isNaN(parsed) && (ackMs === null || parsed > ackMs)) ackMs = parsed;
+  });
+  if (!sawCurrentGenerationAck) return false;
+  return now.getTime() - (ackMs ?? fallbackMs) > ackLivenessMs;
 }
 
 // ─── Admission evaluation (reuses the canonical rule, no reimplementation) ──
@@ -886,12 +928,14 @@ export function computeObservabilitySnapshot(
   let unackedAggregate = 0;
   let overdueUnacked = 0;
   let oldestUnackedHandout: number | null = null;
+  let overdueAcked = 0;
   let humanDecisions = 0;
   let oldestHumanDecision: number | null = null;
   const parkedByOutcome: CountMap = {};
   let prStale = 0;
   let waitingExternal = 0;
   const timeoutMs = inputs.thresholds.prFixHandoutTimeoutMs;
+  const ackLivenessMs = inputs.thresholds.prFixAckLivenessMs;
 
   for (const item of inputs.prFixItems) {
     bump(prByStatus, bucket(item.status, PR_FIX_STATUSES));
@@ -912,6 +956,11 @@ export function computeObservabilitySnapshot(
             oldestUnackedHandout = handoutAge;
           }
           if (now.getTime() - item.dispatchedAt.getTime() > timeoutMs) overdueUnacked += 1;
+        } else if (isOverdueAckedHandout(item, ackLivenessMs, now)) {
+          // #1419: an acknowledged current generation stuck past the
+          // ack-liveness window — the population the dead-owner recovery
+          // ladder evaluates (liveness probes decide the actual reclaim).
+          overdueAcked += 1;
         }
       }
     } else if (item.status === "BLOCKED") {
@@ -1076,6 +1125,7 @@ export function computeObservabilitySnapshot(
       schedulerEnabled: inputs.scheduler.enabled,
       syncIntervalMs: inputs.scheduler.syncIntervalMs,
       prFixHandoutTimeoutMs: timeoutMs,
+    prFixAckLivenessMs: ackLivenessMs,
       strandedAssignmentThresholdMs: inputs.thresholds.strandedAssignmentMs,
       syncPipeline: inputs.syncPipeline,
     },
@@ -1119,6 +1169,7 @@ export function computeObservabilitySnapshot(
         unackedAggregate,
         overdueUnacked,
         oldestUnackedHandoutAgeSeconds: oldestUnackedHandout,
+        overdueAcked,
         reclaimHistoryInWindow: windowedCount(reclaimTimes, now, OBSERVABILITY_FAILURE_WINDOWS_SECONDS),
       },
       settlement: {

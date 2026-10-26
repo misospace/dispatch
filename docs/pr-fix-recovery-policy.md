@@ -359,7 +359,7 @@ cooldown is named.
 | 20 | any | operator requeue | `QUEUED` fresh attempt; budgets reset | +1 | reset | — | `requeuePrFixItem` (`:2511`). |
 | 21 | any | maintainer mark `QUEUED` | `QUEUED` fresh attempt | +1 | +1 | — | `markPrFixItem` QUEUED path (`:1803`). |
 | 22 | dispatched, unacked, stale | reclaim | `QUEUED` fresh generation | +1 | — | `PR_FIX_MAX_RECLAIMS` → `PARKED` | Hand-out never reached a worker (`#1211`). |
-| 23 | dispatched, **acked**, stale | reclaim attempt | never reclaimed | — | — | — | Live owner's lease is protected (`:893`). |
+| 23 | dispatched, **acked**, stale | reclaim attempt | never reclaimed unless every acking agent is dead | — | — | `PR_FIX_MAX_RECLAIMS` → `PARKED` | Durable ack is separated from enduring liveness (#1419): an acked generation is recoverable only when its ack is older than `PR_FIX_ACK_LIVENESS_MS` (default 24h) AND the acking agent produced no recent `AgentRun` activity, plus a defensive open-run probe. Any live evidence or probe error fails closed and keeps the protection. A legacy ack without a timestamp is dated by the dispatch stamp, so pre-#1419 stranded rows stay recoverable. |
 | 24 | any | old-worker settle at stale generation | no-op (`skipped`) | — | — | — | Settlement token fencing (`:2765`, `:2774`). |
 
 Row 12 vs row 14: a wait that ends because its dependency resolved is an
@@ -455,6 +455,43 @@ reaping closed PRs.
 - **Generation bump** gives each reactivation a new `(id, generation)`, so
   already-consumed worker identities cannot suppress or double-run it.
 
+### Dead-owner recovery for acknowledged hand-outs (#1419)
+
+A durable ack previously pinned a generation against reclamation forever, so a
+worker that acked (durably created its run) and then crashed stranded the item
+in a single-agent lane indefinitely. The ack is now separated from enduring
+liveness:
+
+- `handoutAckTimes` (parallel to `handoutAcks`) records when each ack landed.
+- An acked generation becomes recoverable through the SAME reclaim ladder
+  (merged/closed → `STALE`, cap → `PARKED`, else fresh generation) only when
+  EVERY acking agent of the current generation is dead: its ack is older than
+  `PR_FIX_ACK_LIVENESS_MS` (default 24 h — far longer than legitimate model
+  runs) and the agent produced no `AgentRun` row after `now − window`
+  (heartbeat, report, or legacy ingestion). An additional defensive probe
+  checks for an open `AgentRun` associated with the `(item, generation)`
+  attempt; today attempt-scoped runs are only recorded at report time, so
+  the agent-activity probe is the operative guard and the association probe
+  is forward defense for any future writer that records in-flight runs.
+- All liveness probes fail closed: an unreadable ledger or a live signal
+  keeps the protection. A legacy ack recorded before this shipped carries no
+  timestamp and is dated by the dispatch stamp (an ack cannot predate its
+  dispatch), so already-stranded rows stay recoverable rather than being
+  fenced forever by the missing timestamp. A live worker keeps
+  heartbeating, so a live long-running Courier attempt is never reclaimed
+  by the operative guard; a worker that stays silent past the 24 h window
+  without any run evidence is treated as dead — the deliberate, bounded
+  trade the window encodes. Note the guard is agent-wide: an agent that
+  keeps working on OTHER items keeps a dead single attempt protected
+  (fail-closed direction); such an item is recoverable by operator requeue.
+- The reclaim count is shared with the unacked path; past
+  `PR_FIX_MAX_RECLAIMS` the item parks as `no_progress`, never `needs-human`.
+- Exposure: agent queue listings carry `handoutAcks`, `dispatchedAt`,
+  `dispatchedGeneration`, and a derived `idleReason`
+  (`stale-acknowledged-handout` / `stale-unacknowledged-handout`); the
+  observability snapshot counts `overdueAcked` stuck generations. The
+  scheduled sweep remains default-disabled.
+
 ### Audit trail
 
 Every transition appends an immutable `PrFixHistory` row. **Proposed** fields
@@ -526,10 +563,12 @@ Rules:
   a concurrent requeue can be clobbered. **Proposed:** make the reaps
   generation-pinned, or scope this invariant to settlement/reclaim/enqueue
   writes and document the reap exception.
-- **Hand-out ownership.** An acked attempt is never reclaimed, even when stale
-  by wall-clock; reclamation targets only unacked stamped hand-outs and counts
-  toward `PR_FIX_MAX_RECLAIMS` (`:822`–`:1076`). Reactivation must not clear a
-  healthy owner's ack or duplicate an active hand-out.
+- **Hand-out ownership.** An acked attempt is protected unless every acking
+  agent is provably dead (#1419: ack age past `PR_FIX_ACK_LIVENESS_MS` plus no
+  recent agent activity); reclamation otherwise targets only unacked stamped
+  hand-outs and counts toward `PR_FIX_MAX_RECLAIMS` (`:822`–`:1076`).
+  Reactivation must not clear a healthy owner's ack or duplicate an active
+  hand-out.
 - **Generation bump on every reactivation** is what makes old-worker settling
   safe: the consumed identity is no longer current.
 
