@@ -88,7 +88,9 @@ identify specific aged items, with the age evidence made explicit:
 
 The same age-tied rule governs PR-fix hand-outs: `unackedAggregate` is
 dashboard-only; `overdueUnacked` and `oldestUnackedHandoutAgeSeconds` are the
-alertable, per-item evidence for A7.
+alertable, per-item evidence for A7. `overdueAcked` (#1419) counts stuck
+acknowledged generations past `PR_FIX_ACK_LIVENESS_MS` — dashboard-only by
+design, since liveness probes decide the actual reclaim.
 
 ## Environment
 
