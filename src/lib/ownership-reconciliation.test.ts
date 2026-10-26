@@ -1403,6 +1403,141 @@ describe("ownership reconciliation (#1254)", () => {
       expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-live"]);
     });
 
+    it("enforce prunes a window of ONLY dead tombstones (GC runs before the empty-candidate return)", async () => {
+      // The housekeeping delete must run even when nothing survives the scan:
+      // a pure-dead window that returns early without pruning never shrinks.
+      const now = new Date();
+      const fixture = buildFixture(now);
+      for (let i = 0; i < 3; i++) {
+        fixture.tables.issue.push(closedIssueRow(`issue-closed-${i}`, 90 + i));
+      }
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-dead-0", issueId: "issue-closed-0", expiredMinutesAgo: 300 }),
+        tombstoneLease(now, { id: "tomb-dead-1", issueId: "issue-closed-1", expiredMinutesAgo: 200 }),
+        tombstoneLease(now, { id: "tomb-dead-2", issueId: "issue-closed-2", expiredMinutesAgo: 100 }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+
+      const report = await runReconcile(fixture, now, "enforce");
+      expect(report.examined).toBe(0);
+      expect(fixture.tables.lease).toHaveLength(0);
+    });
+
+    it("audit pages ACROSS 50-row pages to reach a valid candidate", async () => {
+      // >50 dead tombstones force skip-based multi-page reads: page 1 is pure
+      // dead rows, the candidate sits on page 2. Audit must still examine it
+      // with zero mutations.
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.lease.length = 0;
+      for (let i = 0; i < 60; i++) {
+        fixture.tables.issue.push(closedIssueRow(`issue-closed-${i}`, 100 + i));
+        fixture.tables.lease.push(
+          tombstoneLease(now, { id: `tomb-dead-${i}`, issueId: `issue-closed-${i}`, expiredMinutesAgo: 660 - i }),
+        );
+      }
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-live", issueId: ISSUE_ID, expiredMinutesAgo: 50 }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+
+      const report = await runReconcile(fixture, now, "audit");
+      expect(report.examined).toBe(1);
+      expect(fixture.tables.lease).toHaveLength(61);
+    });
+
+    it("the id tiebreak pages tombstones sharing one expiredAt deterministically", async () => {
+      // 55 dead tombstones with an IDENTICAL expiredAt straddle the page
+      // boundary: without the `id` tiebreak the skip-offset order is unstable
+      // and rows can be double-read or skipped forever. Enforce must examine
+      // the candidate and prune every dead row in one pass.
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.lease.length = 0;
+      for (let i = 0; i < 55; i++) {
+        fixture.tables.issue.push(closedIssueRow(`issue-closed-${i}`, 100 + i));
+        fixture.tables.lease.push(
+          tombstoneLease(now, { id: `tomb-dead-${String(i).padStart(2, "0")}`, issueId: `issue-closed-${i}`, expiredMinutesAgo: 200 }),
+        );
+      }
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-live", issueId: ISSUE_ID, expiredMinutesAgo: 50 }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+
+      const report = await runReconcile(fixture, now, "enforce");
+      expect(report.examined).toBe(1);
+      expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-live"]);
+    });
+
+    it("protected non-candidate rows (intent/receipt/park) do not consume the window", async () => {
+      // The reviewer's re-starvation shape: parked-intent, receipt and park
+      // rows can never be candidates but are never prunable — they must be
+      // paged past, not counted, or a cluster of them re-blocks the window.
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.issue.push(
+        closedIssueRow("issue-held", 90),
+        closedIssueRow("issue-receipt", 91),
+        {
+          id: "issue-parked",
+          number: 92,
+          state: "closed",
+          labels: ["status/done"],
+          blockedReason: null,
+          linkedPrNumber: null,
+          linkedPrMergeState: null,
+          repository: { fullName: REPO },
+        },
+      );
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-held", issueId: "issue-held", expiredMinutesAgo: 300 }),
+        tombstoneLease(now, {
+          id: "tomb-receipt",
+          issueId: "issue-receipt",
+          expiredMinutesAgo: -20, // still-live receipt
+          disposition: "released",
+        }),
+        tombstoneLease(now, {
+          id: "tomb-park",
+          issueId: "issue-parked",
+          expiredMinutesAgo: 200,
+          retryAfter: new Date(now.getTime() + 30 * MIN),
+        }),
+        tombstoneLease(now, { id: "tomb-live", issueId: ISSUE_ID, expiredMinutesAgo: 50 }),
+      );
+      fixture.tables.ownershipReleaseIntent.push({
+        id: "intent-1",
+        issueId: "issue-held",
+        agentName: "alpha",
+        agentLabel: "agent/alpha",
+        attemptToken: "tok-held",
+        phase: "pending",
+        attempts: 1,
+        parkedAt: minutesAgo(now, 5),
+      });
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+
+      // Replay is skipped for parked intents, so the candidate scan sees the
+      // protected cluster ahead of the live candidate.
+      const report = await runReconcile(fixture, now, "audit");
+      expect(report.examined).toBe(1);
+      // Nothing mutated in audit: protected rows AND the dead-free table intact.
+      expect(fixture.tables.lease.map((r) => r.id).sort()).toEqual(
+        ["tomb-held", "tomb-live", "tomb-park", "tomb-receipt"].sort(),
+      );
+    });
+
     it("audit mode prunes nothing (read-only contract)", async () => {
       const now = new Date();
       const fixture = buildFixture(now);

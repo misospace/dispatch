@@ -291,21 +291,25 @@ Retention needs a candidate-safe exit or it starves the scan it feeds: a
 single oldest-`take` lease batch is taken *before* the open/label filters, so
 tombstones whose issue closed or whose `agent/*` label moved on would
 permanently occupy the bounded window — in `audit` too, where nothing prunes
-(#1417 review round 3). `selectCandidates` therefore PAGES the lease source and
-counts only rows that can still matter toward the window: rows on open
-agent-labeled issues, rows whose issue holds an `OwnershipReleaseIntent` (the
-§8.7 Phase C settle re-check reads exactly that row), still-live receipts
-(`expiredAt` elapsed is required, so a terminal disposition on a non-expired
-lease stays the worker's resume proof), and still-running parks (`retryAfter`
-elapsed — the stale-work sweep keeps that fenced delete). Dead tombstones are
-paged past in every mode, so `audit` reaches valid candidates with zero
-mutations; under `enforce` they are additionally deleted with the same CAS
-fence as the stamp, converging the table. Paging reads at most a fixed budget
-per pass (`LEASE_SCAN_MAX_ROWS`), bounding read cost; a settled release deletes
-the lease row directly, so under `enforce` tombstones stay bounded. Under the
-default `off` mode the reconciler scans nothing at all — tombstones keep
-accumulating from the claim path as inert storage growth, with no bounded
-window to starve until an operator enables a mode.
+(#1417 review round 3). `selectCandidates` therefore PAGES the lease source;
+the window holds only the first `batchSize` rows whose issue is open and
+carries an `agent/*` label. Rows that can never become candidates but must
+never be destroyed are paged past without consuming window budget: rows whose
+issue holds an `OwnershipReleaseIntent` (the §8.7 Phase C settle re-check
+reads exactly that row), still-live receipts (`expiredAt` elapsed is required,
+so a terminal disposition on a non-expired lease stays the worker's resume
+proof), and still-running parks (`retryAfter` elapsed — the stale-work sweep
+keeps that fenced delete). Dead tombstones are paged past in every mode, so
+`audit` reaches valid candidates with zero mutations; under `enforce` they are
+additionally deleted with the same CAS fence as the stamp, converging the
+table. A pass reads at most `LEASE_SCAN_MAX_ROWS` lease rows: that bounds
+read cost, and under `audit` it is also the residual starvation bound — more
+than that many dead tombstones older than every valid candidate would hide it
+until `enforce` (or an operator) prunes. A settled release deletes the lease
+row directly, so under `enforce` tombstones stay bounded. Under the default
+`off` mode the reconciler scans nothing at all — tombstones keep accumulating
+from the claim path as inert storage growth, with no bounded window to starve
+until an operator enables a mode.
 
 ## 4. Ownership state model
 

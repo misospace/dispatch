@@ -1207,13 +1207,16 @@ export async function replayPendingOwnershipReleases(
 
 // ─── Candidate selection ─────────────────────────────────────────────────────
 
-// Lease-scan paging budget (#1417 round 3): the window counts only rows that
-// can still matter, so dead tombstones are paged past instead of occupying it.
-// The budget keeps a single pass bounded against pathological accumulation:
-// pages read at least this many rows, and the pass reads at most this many
-// lease rows total. Under `enforce` the housekeeping delete converges the
-// table anyway; the budget only caps read amplification while tombstones
-// linger (audit's read-only contract, or a backlog accumulated under `off`).
+// Lease-scan paging budget (#1417 round 3): the window counts only rows whose
+// issue can still become a candidate, so dead tombstones are paged past
+// instead of occupying it. Pages read at least this many rows, and a pass
+// reads at most `LEASE_SCAN_MAX_ROWS` lease rows total. The budget is both a
+// read-cost cap AND a scan-depth bound: under `audit` (which never prunes),
+// more than `LEASE_SCAN_MAX_ROWS` dead tombstones older than every valid
+// candidate would hide that candidate again — documented residual bound in
+// docs/ownership-reconciliation.md §3.10. `enforce` converges the table via
+// the housekeeping delete, so the bound only matters while tombstones linger
+// (audit's read-only contract, or a backlog accumulated under `off`).
 const LEASE_SCAN_MIN_PAGE_ROWS = 50;
 const LEASE_SCAN_MAX_ROWS = 5000;
 
@@ -1227,10 +1230,12 @@ const LEASE_SCAN_MAX_ROWS = 5000;
  * `readOnly` (audit mode) makes the scan pure: both housekeeping deletes
  * (dead-ladder rows, dead tombstone leases) are skipped, because audit mode
  * promises no persisted mutation at all. Skipping does not mean audit can
- * starve (#1417 round 3): the lease source PAGES PAST rows that can never
- * become candidates — the window holds the first `batchSize` rows that are
- * live evidence or protected, not the first `batchSize` rows written. The
- * delete stays an `enforce`-only convergence mechanism.
+ * starve (#1417 round 3): the lease source PAGES PAST rows whose issue can
+ * never become a candidate — the window holds the first `batchSize` rows on
+ * open agent-labeled issues, not the first `batchSize` rows written, and
+ * protected non-candidate rows (intents, receipts, running parks) are paged
+ * past too without consuming budget. The delete stays an `enforce`-only
+ * convergence mechanism, bounded per pass by `LEASE_SCAN_MAX_ROWS`.
  */
 async function selectCandidates(
   client: OwnershipReconcileClient,
@@ -1252,14 +1257,16 @@ async function selectCandidates(
   // label moved on can never become candidates; a single pre-filter batch
   // would let them occupy the window forever and starve exactly the dead-claim
   // evidence the tombstone exists to preserve. So each page is classified as
-  // it is read, and only rows that can still matter count toward the window:
-  // rows on open agent-labeled issues, rows whose issue holds an intent (the
-  // §8.7 Phase C settle re-check reads exactly that lease row), still-live
-  // receipts (`expiredAt` in the future — a terminal disposition on a
-  // non-expired lease stays the worker's resume proof), and still-running
-  // parks (#1316/#1334, `retryAfter` in the future — the stale-work sweep's
-  // fenced delete remains their reclaimer). Everything else is a dead
-  // tombstone: skipped in every mode, deleted under `enforce` (below).
+  // it is read: the window holds only the first `batchSize` rows whose issue
+  // is open AND carries an `agent/*` label. Rows that can never become
+  // candidates but must never be destroyed are paged past WITHOUT consuming
+  // window budget: rows whose issue holds an intent (the §8.7 Phase C settle
+  // re-check reads exactly that lease row), still-live receipts (`expiredAt`
+  // in the future — a terminal disposition on a non-expired lease stays the
+  // worker's resume proof), and still-running parks (#1316/#1334,
+  // `retryAfter` in the future — the stale-work sweep's fenced delete remains
+  // their reclaimer). Everything else is a dead tombstone: skipped in every
+  // mode, deleted under `enforce` (below).
   // `id`/`expiredAt`/`retryAfter` must be loaded: the cleanup fences on them,
   // same projection lesson as `reclaimCount` above.
   const leaseScanWhere = {
@@ -1303,13 +1310,17 @@ async function selectCandidates(
     });
     const pageIntentIds = new Set(pageIntents.map((intent: any) => intent.issueId));
     for (const row of page) {
-      const isDeadTombstone =
-        !pageCandidateIds.has(row.issueId) &&
-        !pageIntentIds.has(row.issueId) &&
-        !(row.expiredAt && row.expiredAt > now) &&
-        !(row.retryAfter && row.retryAfter > now);
-      if (isDeadTombstone) deadTombstoneRows.push(row);
-      else if (leaseRows.length < batchSize) leaseRows.push(row);
+      if (pageCandidateIds.has(row.issueId)) {
+        if (leaseRows.length < batchSize) leaseRows.push(row);
+        continue;
+      }
+      // Never a candidate, but never prunable either: skip without charging
+      // the window, so a cluster of parked-intent / receipt / running-park
+      // rows cannot re-form the starvation shape this loop removes.
+      if (pageIntentIds.has(row.issueId)) continue;
+      if (row.expiredAt && row.expiredAt > now) continue;
+      if (row.retryAfter && row.retryAfter > now) continue;
+      deadTombstoneRows.push(row);
     }
     if (page.length < leaseScanPageRows) break;
   }
