@@ -207,6 +207,13 @@ describe("buildWorkItemDeliveryChain", () => {
       reasoningEffort: null,
       runtimeRevision: null,
       cohortLabel: null,
+      distinctValues: {
+        workerProduct: [],
+        model: [],
+        reasoningEffort: [],
+        runtimeRevision: [],
+        cohortLabel: [],
+      },
     });
     expect(result.attempts[0].startedAt).toBe("2026-10-01T10:05:00.000Z");
     expect(result.attempts[0].endedAt).toBe("2026-10-01T11:00:00.000Z");
@@ -857,7 +864,49 @@ describe("buildWorkItemDeliveryChain", () => {
       reasoningEffort: null,
       runtimeRevision: null,
       cohortLabel: "exp-42",
+      distinctValues: {
+        workerProduct: ["courier"],
+        model: ["claude-opus", "gpt-5.5"],
+        reasoningEffort: [],
+        runtimeRevision: [],
+        cohortLabel: ["exp-42"],
+      },
     });
+  });
+
+  it("surfaces intra-attempt metadata changes as distinct value sets (#1423)", () => {
+    const build = (swappedRuns: boolean) => {
+      const runs = [
+        run({
+          id: "run-a",
+          startedAt: "2026-10-01T10:05:00.000Z",
+          finishedAt: "2026-10-01T10:20:00.000Z",
+          executionMetadata: { worker: "courier", model: "gpt-5.5", reasoningEffort: "medium" },
+        }),
+        run({
+          id: "run-b",
+          startedAt: "2026-10-01T10:20:00.000Z",
+          finishedAt: "2026-10-01T10:40:00.000Z",
+          executionMetadata: { worker: "courier", model: "claude-opus", reasoningEffort: "xhigh" },
+        }),
+      ];
+      return chain({
+        events: [event({ kind: "claim", agentName: "alpha", occurredAt: "2026-10-01T10:00:00.000Z" })],
+        runs: swappedRuns ? [...runs].reverse() : runs,
+      }).attempts[0].executionMetadata;
+    };
+
+    const metadata = build(false);
+    // #1183 contract: scalars stay first-non-null in (deterministic) run order.
+    expect(metadata.model).toBe("gpt-5.5");
+    expect(metadata.reasoningEffort).toBe("medium");
+    // #1423: the distinct sets expose that BOTH settings changed mid-attempt.
+    expect(metadata.distinctValues.model).toEqual(["claude-opus", "gpt-5.5"]);
+    expect(metadata.distinctValues.reasoningEffort).toEqual(["medium", "xhigh"]);
+    expect(metadata.distinctValues.workerProduct).toEqual(["courier"]);
+    expect(metadata.distinctValues.runtimeRevision).toEqual([]);
+    // Order-invariant: the sorted sets do not depend on row arrival order.
+    expect(build(true).distinctValues).toEqual(metadata.distinctValues);
   });
 
   it("skips unparseable timestamps with a note, never fatally", () => {

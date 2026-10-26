@@ -172,6 +172,8 @@ interface AttemptExecutionMetadata {
   reasoningEffort: string | null;
   runtimeRevision: string | null;
   cohortLabel: string | null;
+  /** Per-field distinct values across the attempt's runs (#1423); >1 means the setting changed inside the attempt. */
+  distinctValues?: Partial<Record<"workerProduct" | "model" | "reasoningEffort" | "runtimeRevision" | "cohortLabel", string[]>>;
 }
 
 interface WorkItemAttempt {

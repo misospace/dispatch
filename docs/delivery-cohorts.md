@@ -40,9 +40,10 @@ because the path is not on the worker allowlist); errors are `401` / `403` /
   zero**, but stay in `sampleCount`, the completion-rate denominator and the
   `openAges` statistics.
 - **Mixed-settings rule**: cohort keys and mixed flags are derived across
-  **all** of an item's attempts; a lifecycle spanning more than one value on a
-  settings dimension is `mixed` and is **never attributed to the setting
-  active at merge time**.
+  **all** of an item's attempts **and each attempt's distinct per-field
+  value sets**; a lifecycle spanning more than one value on a settings
+  dimension is `mixed` and is **never attributed to the setting active at
+  merge time**.
 - **Observed waits only.** The `waiting` split shows queue/pickup, review,
   blocked and fix-queued time **separately only where an existing observation
   evidences it** (status-label intervals, run starts, queue rows). An interval
@@ -52,10 +53,11 @@ because the path is not on the worker allowlist); errors are `401` / `403` /
 - Merge evidence is only authoritative `pr_merged` lifecycle events — never a
   worker's success report. A merge preceding the first observed claim yields a
   negative `claimToMergeMs` — reported, not hidden.
-- Setting changes are observed **per attempt**: an attempt whose runs restart
-  under a different runtime/model keeps its first observed value, so an
-  intra-attempt config change is not detected (the mixed rule works at
-  attempt granularity).
+- Setting changes are observed **per distinct value, per attempt** (#1423):
+  each attempt's chain metadata carries `distinctValues` per field, so an
+  attempt whose runs restart under a different runtime/model marks that
+  dimension `mixed`; the per-attempt scalar still reports the first observed
+  value (never the setting active at merge).
 
 ## Response (`dispatch.delivery-cohorts/v1`)
 
