@@ -688,8 +688,14 @@ async function driveReleaseIntent(
                 if (lease.claimToken === intent.attemptToken) return false;
               } else {
                 // Intent-only release: a lease appearing after the decision is
-                // a fresh claim — never destroy it (§8.7 fail-closed).
-                return false;
+                // a fresh claim — never destroy it (§8.7 fail-closed) — EXCEPT
+                // a tombstoned ("expired") lease (#1417): the disposition is
+                // stamped only on an attempt whose TTL already elapsed with no
+                // renewal, and a re-claim clears it atomically with the token
+                // rotation, so a live attempt can never present "expired". The
+                // tombstone is dead-claim evidence; leaving it would hold the
+                // pending intent (and the claim barrier) open forever.
+                if (lease.disposition !== "expired") return false;
               }
             } else if (intent.attemptToken != null) {
               // No lease at all: another writer (operator release, stale-work

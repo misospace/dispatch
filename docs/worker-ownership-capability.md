@@ -33,14 +33,18 @@ re-dispatch.
 
 **A park owns its lease's survival (#1334).** The claim path's
 `releaseExpiredLeases` (the expired-lease cleanup every claim attempt runs)
-deletes leases past their `expiredAt`; a park recorded in this PR's sense —
-`retryAfter` — outlives that TTL, so without a guard the cleanup could erase
-the park evidence (`retryAfter`/`waitReason`, the `EXTERNAL_WAIT` read-model
-signal) while the park is still running, leaving the settled `BLOCKED` row
-parked next to a vanished receipt. The decided option is (b): the cleanup
-**skips** a lease whose `retryAfter` is still in the future and otherwise
-reclaims it as soon as the expired `expiredAt` *or* the elapsed `retryAfter`
-qualifies it — whichever comes first. This deliberately does **not** touch the
+no longer deletes leases past their `expiredAt`: since #1417 it **tombstones**
+them (a system-stamped `disposition: "expired"`) so the dead claim's evidence
+survives for the ownership reconciler instead of stranding the issue behind
+the queue's agent-label filter. A park recorded in this PR's sense —
+`retryAfter` — outlives that TTL, so without a guard the cleanup could stamp
+over the park evidence (`retryAfter`/`waitReason`, the `EXTERNAL_WAIT`
+read-model signal) while the park is still running, leaving the settled
+`BLOCKED` row next to a consumed receipt. The decided option is (b): the
+cleanup **skips** a lease whose `retryAfter` is still in the future and
+otherwise tombstones it as soon as the elapsed `expiredAt` *or* the elapsed
+`retryAfter` qualifies it — whichever comes first — and never re-stamps a row
+that already carries any disposition. This deliberately does **not** touch the
 claim-epoch fence fields (`expiredAt` is moved only by (re-)claims and
 renewals, #1317): the skip is evaluated per cleanup call, never parked forward,
 and the stale-work sweep remains the fenced reclaimer when the park deadline

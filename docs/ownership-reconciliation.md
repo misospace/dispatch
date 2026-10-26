@@ -257,6 +257,36 @@ trust anchor any ownership record must key on.
    status-preserving policy but no notion of selecting the *next eligible
    state* from an explicit hold/external-wait/review taxonomy.
 
+### 3.10 Expired-claim evidence retention (#1417)
+
+Gap 1's sharpest form (audit F1): a canonical worker claims — a `Lease` row
+plus the `agent/<name>` label, and **no `AgentWork` row until agent-work/start**
+— and crashes. The lease expires, and expired-lease cleanup used to **delete**
+the row, destroying the only Dispatch-side evidence. The stale-work sweep sees
+only AgentWork rows and the candidate scan has no lease row left to select, so
+the stranded claim became permanently invisible: derivation falls to UNKNOWN
+(`owner_unverified_no_dispatch_evidence`), the queue keeps filtering on the
+label, and nothing can ever recover it.
+
+Expired-lease cleanup (`releaseExpiredLeases`) therefore **tombstones** instead
+of deleting: the row survives with a system-stamped
+`disposition: "expired"` (never worker-supplied — `OWNERSHIP_DISPOSITIONS` is
+unchanged). The stamp is CAS-fenced on `expiredAt <= now`, `disposition: null`
+and a spent `retryAfter`, so a renewal that wins the window is never stamped
+and a running park (#1316/#1334) is never consumed. `claimToken`, `expiredAt`
+and renewal provenance are untouched, so the §8.7 Phase A epoch CAS still
+matches the tombstone, and a legitimate re-claim reactivates the row through
+`upsertLease`'s disposed-row path (token rotated, #1256).
+
+The tombstone is deliberately **not** a terminal disposition: derivation adds
+the non-terminal `disposition_expired` reason code and the claim continues down
+the ordinary liveness ladder, so release still requires the §8.2 confirmation
+ladder (liveness evidence older than the long-run grace, two spaced
+observations, commit-time re-checks) plus §8.7 fencing. The lease TTL alone
+never releases anything — a healthy long-running execution that renews (or a
+claim-once worker inside the grace window) cannot be stolen at 30 minutes;
+the tombstone only makes the evidence *survive* for the reconciler to judge.
+
 ## 4. Ownership state model
 
 Ownership is **derived**, never stored as a single truth. Two layers:

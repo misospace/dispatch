@@ -53,6 +53,11 @@ import { AGENT_PREFIX } from "@/types";
  * Non-short-circuiting cases: a `blocked` disposition without a future
  * `retryAfter` (the future case returns above as EXTERNAL_WAIT) continues
  * down the ladder with the added reason `disposition_blocked_no_retry_after`.
+ * An `expired` disposition — the system-stamped tombstone lease cleanup leaves
+ * behind (#1417) — is likewise non-terminal: it is stale-claim evidence, not
+ * positive gone-evidence, and continues down the ladder with the added reason
+ * `disposition_expired`, so release stays gated by the liveness windows and a
+ * healthy claim-once worker keeps its long-run grace.
  * When `labelSource` is `unavailable` but first-party evidence (lease /
  * active AgentWork) exists, the ladder continues with the added reason
  * `labels_unverified` — lease/AgentWork are first-party evidence even when
@@ -82,7 +87,7 @@ export interface OwnershipLeaseEvidence {
   lastRenewalObservedAt: Date | null;
   lastRenewalOccurredAt: Date | null;
   retryAfter: Date | null;
-  /** "completed" | "released" | "blocked" | "handed_off" | null. */
+  /** "completed" | "released" | "blocked" | "handed_off" | "expired" (system-stamped TTL tombstone, #1417) | null. */
   disposition: string | null;
 }
 
@@ -308,6 +313,15 @@ export function deriveOwnershipState(
     // Not a short-circuit: with no future retryAfter (that case returned
     // above as EXTERNAL_WAIT) the block stays unverified and continues.
     reasonCodes.push("disposition_blocked_no_retry_after");
+  }
+  if (disposition === "expired") {
+    // Not a short-circuit (#1417): the system-stamped expiry tombstone says
+    // the claim's lease TTL elapsed with no renewal, which is stale-claim
+    // evidence — not the positive gone-evidence a terminal disposition is.
+    // Release stays gated by the liveness ladder below, exactly as for a
+    // surviving un-dispositioned expired lease; the reason code keeps audit
+    // annotations honest about WHY the lease is dead.
+    reasonCodes.push("disposition_expired");
   }
 
   // 9. Labels unverifiable but first-party evidence exists: the ladder

@@ -913,6 +913,164 @@ describe("ownership reconciliation (#1254)", () => {
     });
   });
 
+  describe("expired-lease tombstone recovery (#1417)", () => {
+    // The F1 evidence shape: a canonical worker claimed (lease + `agent/*`
+    // label) but crashed before agent-work/start, so NO AgentWork row exists.
+    // Lease cleanup tombstoned the expired lease (#1417) instead of deleting
+    // it — the surviving row is the only Dispatch-side evidence, and it is
+    // exactly what the candidate scan + evidence ladder consume here.
+    function buildTombstoneFixture(now: Date) {
+      const fixture = buildFixture(now);
+      fixture.tables.agentWork.length = 0;
+      Object.assign(fixture.tables.lease[0], {
+        expiredAt: minutesAgo(now, 50),
+        disposition: "expired",
+        dispositionNote: "lease TTL elapsed with no renewal; expired claim evidence retained for ownership reconciliation (#1417)",
+        dispositionObservedAt: minutesAgo(now, 50),
+        renewedAt: minutesAgo(now, 75),
+        registeredAt: null,
+        registrationOccurredAt: null,
+        renewCount: 0,
+        lastRenewalObservedAt: null,
+        lastRenewalOccurredAt: null,
+      });
+      return fixture;
+    }
+
+    it("audit mode surfaces the tombstoned claim as an ABANDONED_CANDIDATE annotation with zero mutations", async () => {
+      const now = new Date();
+      const fixture = buildTombstoneFixture(now);
+      const report = await runReconcile(fixture, now, "audit");
+
+      expect(report.examined).toBe(1);
+      expect(report.released).toBe(0);
+      expect(forgeShared.removeCalls).toHaveLength(0);
+      expect(fixture.tables.ownershipReleaseIntent).toHaveLength(0);
+      // The tombstone row survives audit untouched (read-only mode).
+      expect(fixture.tables.lease[0].disposition).toBe("expired");
+      expect(fixture.tables.lease[0].claimToken).toBe("tok-g");
+      const candidateNotes = fixture.tables.auditLog
+        .filter((r) => r.action === "ownership_reconcile_candidate")
+        .map((r) => r.notes);
+      expect(candidateNotes.some((n: string) => n.includes("state=ABANDONED_CANDIDATE"))).toBe(true);
+      expect(candidateNotes.some((n: string) => n.includes("disposition_expired"))).toBe(true);
+      expect(candidateNotes.some((n: string) => n.includes("evidence_stale"))).toBe(true);
+    });
+
+    it("enforce mode ladders the tombstoned claim and releases it through the §8.7 protocol", async () => {
+      const now = new Date();
+      const fixture = buildTombstoneFixture(now);
+
+      // First observation: retained, ladder at 1.
+      const first = await runReconcile(fixture, now, "enforce");
+      expect(first.retained).toBe(1);
+      expect(first.released).toBe(0);
+      expect(forgeShared.removeCalls).toHaveLength(0);
+      expect(fixture.tables.ownershipReconcileCandidate[0].staleCount).toBe(1);
+
+      // Second observation after the re-check interval: the epoch CAS pins
+      // the tombstone (claimToken/expiredAt/disposition all still as
+      // observed), Phase B deletes exactly the claim label, Phase C settles.
+      const report = await runReconcile(fixture, new Date(now.getTime() + 10 * MIN), "enforce");
+      expect(report.released).toBe(1);
+      expect(agentRemoveCalls()).toEqual(["agent/alpha"]);
+      expect(fixture.tables.issue[0].labels).not.toContain("agent/alpha");
+      // §8.5: unexplained in-progress falls back to ready.
+      expect(fixture.tables.issue[0].labels).toContain("status/ready");
+      // The tombstone row is consumed by the settle — the claim is gone.
+      expect(fixture.tables.lease).toHaveLength(0);
+      const releases = fixture.tables.issueLifecycleEvent.filter((e: any) => e.kind === "claim_released");
+      expect(releases).toHaveLength(1);
+      expect(fixture.tables.ownershipReleaseIntent).toHaveLength(0);
+      // The churn bound survives the release (§8.2 item 4).
+      expect(fixture.tables.ownershipReconcileCandidate[0].reclaimCount).toBe(1);
+    });
+
+    it("a live renewal on the pair aborts candidacy — a tombstone never preempts a live owner", async () => {
+      const now = new Date();
+      const fixture = buildTombstoneFixture(now);
+      await runReconcile(fixture, now, "enforce");
+      // The same agent re-claims between observations: upsertLease's
+      // disposed-row reactivation clears the tombstone, rotates the token
+      // (#1256) and pushes the expiry forward — a live attempt again.
+      Object.assign(fixture.tables.lease[0], {
+        disposition: null,
+        dispositionNote: null,
+        dispositionObservedAt: null,
+        claimToken: "tok-fresh",
+        renewedAt: new Date(now.getTime() + 10 * MIN),
+        lastRenewalObservedAt: new Date(now.getTime() + 10 * MIN),
+        expiredAt: new Date(now.getTime() + 40 * MIN),
+      });
+      const report = await runReconcile(fixture, new Date(now.getTime() + 10 * MIN), "enforce");
+      expect(report.retained).toBe(1);
+      expect(report.released).toBe(0);
+      expect(fixture.tables.ownershipReconcileCandidate).toHaveLength(0);
+      expect(fixture.tables.issue[0].labels).toContain("agent/alpha");
+    });
+
+    it("a pre-#1256 tombstone with a NULL claimToken still settles — the pending intent must not wedge the claim barrier", async () => {
+      // The blocker this pins: a legacy lease row created before claimToken
+      // existed carries claimToken NULL. Tombstoned, it takes the epoch path
+      // (a row exists) but the intent carries attemptToken null, so Phase C
+      // hits the intent-only re-check. A surviving row there used to read as
+      // "a fresh claim — never destroy" and the settle never happened: the
+      // pending intent held the claim route's 409 barrier forever. A
+      // tombstone is dead-claim evidence, so the settle consumes it.
+      const now = new Date();
+      const fixture = buildTombstoneFixture(now);
+      fixture.tables.lease[0].claimToken = null;
+
+      await runReconcile(fixture, now, "enforce");
+      const report = await runReconcile(fixture, new Date(now.getTime() + 10 * MIN), "enforce");
+
+      expect(report.released).toBe(1);
+      expect(agentRemoveCalls()).toEqual(["agent/alpha"]);
+      expect(fixture.tables.lease).toHaveLength(0);
+      expect(fixture.tables.ownershipReleaseIntent).toHaveLength(0);
+      const releases = fixture.tables.issueLifecycleEvent.filter((e: any) => e.kind === "claim_released");
+      expect(releases).toHaveLength(1);
+    });
+
+    it("a NON-tombstoned lease behind a null-token intent still blocks the settle (fail-closed preserved)", async () => {
+      // The protection the #1417 exemption must not weaken: at Phase C, a
+      // lease row with any disposition other than "expired" behind a
+      // null-token intent is a claim the decision never saw — the replay
+      // refuses to settle and the intent stays pending (fail-closed). (The
+      // reconciler itself cannot commit an intent over a running park — the
+      // Phase A commit-time re-check withholds — so this shape is reached
+      // only via replay of an already-pending intent, which is exactly the
+      // surface this pin covers.)
+      const now = new Date();
+      const fixture = buildTombstoneFixture(now);
+      fixture.tables.lease[0].claimToken = null;
+      fixture.tables.lease[0].disposition = "blocked";
+      fixture.tables.lease[0].retryAfter = new Date(now.getTime() + 60 * MIN);
+      fixture.tables.ownershipReleaseIntent.push({
+        id: "intent-null-token",
+        issueId: ISSUE_ID,
+        agentName: "alpha",
+        agentLabel: "agent/alpha",
+        attemptToken: null,
+        phase: "pending",
+        attempts: 0,
+        parkedAt: null,
+      });
+
+      const { replayPendingOwnershipReleases } = await import("@/lib/ownership-reconciliation");
+      const replay = await replayPendingOwnershipReleases(
+        { prisma: fixture.client, forge: forgeShared, guard: fixture.guard.fake },
+        now,
+      );
+
+      expect(replay.released).toBe(0);
+      expect(replay.skipped).toBe(1);
+      expect(fixture.tables.lease).toHaveLength(1);
+      expect(fixture.tables.lease[0].disposition).toBe("blocked");
+      expect(fixture.tables.ownershipReleaseIntent).toHaveLength(1);
+    });
+  });
+
   describe("commit-time re-check (#1254 acceptance)", () => {
     // The ladder decision is made on one live read; Phase A must re-derive
     // the CAS-unpinnable facts (maintainer hold, review ownership, external
