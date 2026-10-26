@@ -286,7 +286,7 @@ or an operational failure and must not be presented as a decision
 | Signal | Kind | Unit | Source | Dimensions | Semantics |
 |---|---|---|---|---|---|
 | `dispatch_queue_withheld` | gauge | count | admission decision (`enforce`) | `reason` (12 reason codes) | Eligible `status/ready` issues withheld |
-| `dispatch_queue_withheld_grooming` | gauge | count | withheld issues with ≥1 grooming-evidence reason (#1420) | — | Ready issues impacted by grooming-evidence withholding (every reason code except `dependency_blocked`); the impacted-ready count A14 exposes |
+| `dispatch_queue_withheld_grooming` | gauge | count | withheld issues with ≥1 `grooming_*` reason (#1420) | — | Ready issues impacted by grooming-evidence withholding (only the `grooming_*` codes — `dependency_blocked`, `escalation_lane_mismatch` and the `unknown` fold stay out, so config starvation is never blamed on the groomer); the impacted-ready count A14 exposes |
 | `dispatch_queue_admission_mode` | gauge | 0/1 | `DISPATCH_QUEUE_ADMISSION_MODE` | `mode` (`off`,`audit`,`enforce`) | Which mode is active |
 | `dispatch_queue_withheld_oldest_seconds` | gauge | seconds | oldest withheld issue age | `reason` | How long work has been withheld |
 

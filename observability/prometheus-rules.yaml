@@ -226,13 +226,17 @@ groups:
         # some vmalert builds reject. A dead instance routes to A3 instead:
         # the withheld leg only exists while the scrape is live, so the
         # absent-baseline leg can never fire on a stale series set.
-        # Version skew: dispatch_grooming_stall_threshold_seconds ships with
-        # this file's exporter version; against an older Dispatch the stale
-        # arm is silently empty and only the never-groomed (absent-baseline)
-        # leg can fire — upgrade exporter and rules together, like A13.
+        # Both arms gate on dispatch_grooming_stall_threshold_seconds EXISTING
+        # (`absent(...) == 0`): with the groomer interval disabled (0) the
+        # stall is not evaluable — the portable evaluator and docs §6 say so,
+        # and the packaged rule must not disagree. VERSION SKEW: that gauge
+        # ships with this file's exporter version; against an older Dispatch
+        # the whole rule stays silent (no threshold series), so upgrade the
+        # exporter and these rules together, like A13.
         expr: >-
           dispatch_queue_admission_mode{mode="enforce"} == 1
           and on() dispatch_queue_withheld_grooming > 0
+          and on() absent(dispatch_grooming_stall_threshold_seconds) == 0
           and on() (
             (time() - dispatch_grooming_last_success_timestamp_seconds > dispatch_grooming_stall_threshold_seconds)
             or absent(dispatch_grooming_last_success_timestamp_seconds{job="dispatch"}) == 1

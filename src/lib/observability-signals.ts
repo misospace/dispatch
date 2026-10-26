@@ -482,9 +482,10 @@ export interface ObservabilitySnapshot {
     notAdmitted: null | {
       total: number;
       /**
-       * Subset withheld by at least one grooming-evidence reason (every reason
-       * code except `dependency_blocked`). #1420: the impacted-ready count the
-       * groomer-stall alert exposes.
+       * Subset withheld by at least one `grooming_*` reason code — the
+       * groomer-evidence attribution only (`dependency_blocked`,
+       * `escalation_lane_mismatch` and the `unknown` fold stay out). #1420:
+       * the impacted-ready count the groomer-stall alert exposes.
        */
       byGrooming: number;
       byReason: CountMap;
@@ -653,17 +654,28 @@ function ackedGenerations(handoutAcks: string[]): Set<number> {
 
 // ─── Admission evaluation (reuses the canonical rule, no reimplementation) ──
 
+/**
+ * The impacted set behind #1420's starvation signal: reason codes that
+ * attribute the withhold to the groomer's evidence. An explicit allowlist of
+ * the `grooming_*` codes rather than "everything except dependency_blocked":
+ * `escalation_lane_mismatch` is a lane-CONFIG withhold (a healthy groomer
+ * never clears it), and bucket()'s `unknown` fold must not be misattributed
+ * to a pipeline outage. Misclassifying these would blame config starvation
+ * on the groomer.
+ */
+const GROOMING_EVIDENCE_REASON_CODES: ReadonlySet<string> = new Set(
+  ADMISSION_REASON_CODES.filter((code) => code.startsWith("grooming_")),
+);
+
 interface WithheldInfo {
   reasons: string[];
-  /** Withheld by at least one grooming-evidence reason (#1420): every reason
-   *  code except `dependency_blocked` (a deterministic blocker is not the
-   *  groomer's absence). */
+  /** Withheld by at least one grooming-evidence reason (#1420). */
   groomingCaused: boolean;
   createdAt: Date;
 }
 
 function isGroomingCausedReason(code: string): boolean {
-  return code !== "dependency_blocked";
+  return GROOMING_EVIDENCE_REASON_CODES.has(code);
 }
 
 function evaluateAdmission(
@@ -1179,15 +1191,19 @@ export function computeObservabilitySnapshot(
       admissionWithholding:
         inputs.admissionMode === "off" ? null : withheld.length > 0,
       // A14 conjunction (#1420). Not evaluable (null) when enforcement is not
-      // on (nothing is withheld) or the groomer interval is undeclared (no
-      // stall window to judge) — never a silent false.
+      // on (nothing is withheld), the groomer interval is undeclared (no stall
+      // window to judge), or the baseline exists but its age does not (a
+      // corrupt completion time is unknown, never "not stalled") — never a
+      // silent false.
       groomingStalledWithholding:
         inputs.admissionMode !== "enforce" ||
         withheldByGrooming === null ||
-        stallThresholdSeconds === null
+        stallThresholdSeconds === null ||
+        (everGroomingSucceeded && secondsSinceGroomingSuccess === null)
           ? null
           : withheldByGrooming > 0 &&
-            (!everGroomingSucceeded || (secondsSinceGroomingSuccess ?? 0) > stallThresholdSeconds),
+            (!everGroomingSucceeded ||
+              secondsSinceGroomingSuccess! > stallThresholdSeconds),
     },
   };
   return snapshot;

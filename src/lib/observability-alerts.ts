@@ -204,7 +204,9 @@ export interface ObservabilityAlertThresholds {
    * A14: grooming-stall window override. Null (the default) uses the
    * snapshot's own `grooming.stallThresholdSeconds` — N groomer intervals as
    * configured — so the evaluator and the packaged rule track
-   * DISPATCH_GROOMER_INTERVAL_MS without a hard-coded number.
+   * DISPATCH_GROOMER_INTERVAL_MS without a hard-coded number. A non-positive
+   * or non-finite override is ignored (falls back to the snapshot value): it
+   * must never silently arm "any staleness".
    */
   groomingStallSeconds: number | null;
 }
@@ -399,7 +401,14 @@ function predicate(
       if (snapshot.admission.mode !== "enforce") {
         return { holds: false, evaluable: false };
       }
-      const stallSeconds = thresholds.groomingStallSeconds ?? snapshot.grooming.stallThresholdSeconds;
+      // The override is honoured only as a finite positive window; a
+      // non-positive/garbage override must not silently arm "any staleness"
+      // and falls back to the snapshot's own configured window.
+      const override = thresholds.groomingStallSeconds;
+      const stallSeconds =
+        override !== null && Number.isFinite(override) && override > 0
+          ? override
+          : snapshot.grooming.stallThresholdSeconds;
       if (stallSeconds === null) {
         return { holds: false, evaluable: false };
       }
@@ -407,12 +416,16 @@ function predicate(
       if (withheldByGrooming === 0) {
         return { holds: false, evaluable: true };
       }
+      // A success baseline that carries no age (corrupt completion time) is
+      // unknown, never "not stalled".
+      if (snapshot.grooming.everSucceeded && snapshot.grooming.secondsSinceLastSuccess === null) {
+        return { holds: false, evaluable: false };
+      }
       // The absent baseline (grooming has never succeeded) IS the firing
       // case — never coerced to healthy, the same rule as A2's absent series.
       const stalled =
         !snapshot.grooming.everSucceeded ||
-        (snapshot.grooming.secondsSinceLastSuccess !== null &&
-          snapshot.grooming.secondsSinceLastSuccess > stallSeconds);
+        snapshot.grooming.secondsSinceLastSuccess! > stallSeconds;
       return { holds: stalled, evaluable: true };
     }
     default:
