@@ -97,6 +97,9 @@ function baseInputs(
     auditFailures: [],
     assignmentAudit: [],
     groomingRuns: [],
+    lastGroomingSuccessAt: ago(120),
+    groomerIntervalMs: 600_000,
+    groomingStallIntervals: 2,
     sync: { lastSuccessAt: ago(120), running: 0, failed: [] },
     repoLastSyncedAt: [ago(120)],
     scheduler: {
@@ -289,6 +292,47 @@ describe("exportObservabilityMetrics", () => {
     expect(sampleLines(disabled, "dispatch_repo_stale_sync_threshold_seconds")).toEqual([
       "dispatch_repo_stale_sync_threshold_seconds 3600",
     ]);
+  });
+
+  it("declares the #1420 grooming-stall metric families in the contract", () => {
+    expect(observabilityMetricFamilies()).toEqual(
+      expect.arrayContaining([
+        "dispatch_queue_withheld_grooming",
+        "dispatch_grooming_last_success_timestamp_seconds",
+        "dispatch_grooming_stall_threshold_seconds",
+      ]),
+    );
+  });
+
+  it("exposes the grooming-withheld count in enforce mode, absent in off mode", () => {
+    const enforce = metrics({
+      admissionMode: "enforce",
+      issues: [makeIssue({ id: "i1" })],
+    });
+    expect(sampleLines(enforce, "dispatch_queue_withheld_grooming")).toEqual([
+      "dispatch_queue_withheld_grooming 1",
+    ]);
+    expect(sampleLines(metrics(), "dispatch_queue_withheld_grooming")).toEqual([]);
+  });
+
+  it("mirrors the sync absent-baseline: no last-success line until the first applied completion", () => {
+    const last = Math.floor(ago(120).getTime() / 1000);
+    const body = metrics();
+    expect(sampleLines(body, "dispatch_grooming_last_success_timestamp_seconds")).toEqual([
+      `dispatch_grooming_last_success_timestamp_seconds ${last}`,
+    ]);
+    expect(sampleLines(body, "dispatch_grooming_stall_threshold_seconds")).toEqual([
+      "dispatch_grooming_stall_threshold_seconds 1200",
+    ]);
+
+    const never = metrics({ lastGroomingSuccessAt: null });
+    expect(sampleLines(never, "dispatch_grooming_last_success_timestamp_seconds")).toEqual([]);
+    expect(sampleLines(never, "dispatch_grooming_stall_threshold_seconds")).toEqual([
+      "dispatch_grooming_stall_threshold_seconds 1200",
+    ]);
+
+    const groomerDisabled = metrics({ groomerIntervalMs: 0 });
+    expect(sampleLines(groomerDisabled, "dispatch_grooming_stall_threshold_seconds")).toEqual([]);
   });
 
   it("an unarmed in-process scheduler stays unknown even with sync history", () => {

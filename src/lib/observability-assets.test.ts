@@ -117,6 +117,13 @@ describe("optional assets match the shipped contracts (#1255)", () => {
         "dispatch_repo_stale_sync_threshold_seconds",
         "dispatch_grooming_backoff",
       ],
+      A14: [
+        'dispatch_queue_admission_mode{mode="enforce"}',
+        "dispatch_queue_withheld_grooming",
+        "absent(",
+        "dispatch_grooming_last_success_timestamp_seconds",
+        "dispatch_grooming_stall_threshold_seconds",
+      ],
     };
     const blocks = alertBlocks(rules);
     const problems: string[] = [];
@@ -293,7 +300,16 @@ function emptySnapshot(): ObservabilitySnapshot {
       },
     },
     admission: { mode: "off", notAdmitted: null },
-    grooming: { freshness: { fresh: 0, stale: 0, unknown: 0 }, backoff: 0, staleReasons: {}, runsInWindowByStatus: { 900: {}, 3600: {} } },
+    grooming: {
+      freshness: { fresh: 0, stale: 0, unknown: 0 },
+      backoff: 0,
+      staleReasons: {},
+      runsInWindowByStatus: { 900: {}, 3600: {} },
+      lastSuccessTimestampSeconds: Math.floor(ago(120).getTime() / 1000),
+      secondsSinceLastSuccess: 120,
+      everSucceeded: true,
+      stallThresholdSeconds: 1200,
+    },
     pipeline: {
       syncPipelineState: "armed",
       scheduler: {
@@ -320,6 +336,7 @@ function emptySnapshot(): ObservabilitySnapshot {
       syncDiscoveryFailing: false,
       schedulerOverdue: false,
       admissionWithholding: null,
+      groomingStalledWithholding: null,
     },
   };
 }

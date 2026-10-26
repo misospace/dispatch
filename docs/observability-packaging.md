@@ -150,7 +150,7 @@ assets reference anything outside it. Mapping notes against the §4 catalogue:
 ## The portable evaluator
 
 `evaluateObservabilityAlerts(snapshot, options)` evaluates the §6 catalogue
-(`A1…A13`) against one snapshot and returns a state per row:
+(`A1…A14`) against one snapshot and returns a state per row:
 `firing | pending | ok | disabled | not_evaluable`, plus `predicateHolds` and
 the `since` timestamp.
 

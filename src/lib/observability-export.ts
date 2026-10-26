@@ -143,8 +143,10 @@ export function observabilityMetricFamilies(): string[] {
     "dispatch_assignment_oldest_known_age_seconds",
     "dispatch_grooming_backoff",
     "dispatch_grooming_freshness",
+    "dispatch_grooming_last_success_timestamp_seconds",
     "dispatch_grooming_runs_in_window",
     "dispatch_grooming_stale_reasons",
+    "dispatch_grooming_stall_threshold_seconds",
     "dispatch_health_up",
     "dispatch_issue_assigned",
     "dispatch_issue_oldest_open_claimable_age_seconds",
@@ -170,6 +172,7 @@ export function observabilityMetricFamilies(): string[] {
     "dispatch_pr_fix_waiting_external",
     "dispatch_queue_admission_mode",
     "dispatch_queue_withheld",
+    "dispatch_queue_withheld_grooming",
     "dispatch_queue_withheld_oldest_seconds",
     "dispatch_repo_stale_sync_seconds",
     "dispatch_repo_stale_sync_threshold_seconds",
@@ -244,6 +247,9 @@ export function exportObservabilityMetrics(snapshot: ObservabilitySnapshot): str
       byDimension("dispatch_queue_withheld", "Ready issues withheld by admission, by reason code.", snapshot.admission.notAdmitted.byReason, "reason"),
     );
     families.push(
+      scalar("dispatch_queue_withheld_grooming", "Ready issues withheld by at least one grooming-evidence reason (#1420): the impacted-ready count the groomer-stall alert exposes.", snapshot.admission.notAdmitted.byGrooming),
+    );
+    families.push(
       scalar("dispatch_queue_withheld_oldest_seconds", "Age of the oldest admission-withheld issue.", snapshot.admission.notAdmitted.oldestAgeSeconds),
     );
   }
@@ -272,6 +278,20 @@ export function exportObservabilityMetrics(snapshot: ObservabilitySnapshot): str
   families.push(scalar("dispatch_grooming_backoff", "Open issues backing off after an unreadable upstream read (A11).", snapshot.grooming.backoff));
   families.push(byDimension("dispatch_grooming_stale_reasons", "Why grooming decisions went stale.", snapshot.grooming.staleReasons, "reason"));
   families.push(windowedByDimension("dispatch_grooming_runs_in_window", "Grooming runs per status and failure window (as-of-scrape gauge).", snapshot.grooming.runsInWindowByStatus, "status"));
+  families.push(
+    scalar(
+      "dispatch_grooming_last_success_timestamp_seconds",
+      "Last successful applied grooming run (status completed, not a dry run) as a unix timestamp. Absent until the first completion — the absent series is A14's firing baseline, never zero.",
+      snapshot.grooming.lastSuccessTimestampSeconds,
+    ),
+  );
+  families.push(
+    scalar(
+      "dispatch_grooming_stall_threshold_seconds",
+      "A14 grooming-stall threshold as configured: N groomer intervals (DISPATCH_GROOMER_INTERVAL_MS × DISPATCH_GROOMING_STALL_INTERVALS, N default 2). Absent when the groomer interval is disabled — the stall is then not evaluable, never healthy (mirrors the packaged rule comparing dispatch_repo_stale_sync_threshold_seconds).",
+      snapshot.grooming.stallThresholdSeconds,
+    ),
+  );
 
   // ── Pipeline (§4.9) ──
   const schedulerHealthy =

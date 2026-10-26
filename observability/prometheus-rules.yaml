@@ -212,3 +212,35 @@ groups:
           summary: "Upstream evidence unavailable"
           description: "Repo cache staleness past the configured threshold (two sync intervals; 3600 when the sync job is disabled) or grooming backoff; admission/settlement decisions lack current forge evidence."
           operator_action: "Check GitHub reachability/rate limits; treat unknown as unknown, never healthy."
+
+      - alert: A14
+        # Enforce-admission starvation (#1420): the gate deliberately never
+        # fails open, so ready work withheld by grooming evidence while the
+        # groomer has not completed an applied run for N intervals is a
+        # pipeline outage starving the fleet — not a healthy queue. The
+        # impacted-ready count is dispatch_queue_withheld_grooming.
+        # The inner `or` is PLAIN on purpose (mirrors A4): the two operands
+        # are mutually exclusive (the last-success series exists and is old,
+        # or it is absent), and the surrounding conjunctions are `and on()`,
+        # so label-insensitive matching holds without the empty-label `on()`
+        # some vmalert builds reject. A dead instance routes to A3 instead:
+        # the withheld leg only exists while the scrape is live, so the
+        # absent-baseline leg can never fire on a stale series set.
+        # Version skew: dispatch_grooming_stall_threshold_seconds ships with
+        # this file's exporter version; against an older Dispatch the stale
+        # arm is silently empty and only the never-groomed (absent-baseline)
+        # leg can fire — upgrade exporter and rules together, like A13.
+        expr: >-
+          dispatch_queue_admission_mode{mode="enforce"} == 1
+          and on() dispatch_queue_withheld_grooming > 0
+          and on() (
+            (time() - dispatch_grooming_last_success_timestamp_seconds > dispatch_grooming_stall_threshold_seconds)
+            or absent(dispatch_grooming_last_success_timestamp_seconds{job="dispatch"}) == 1
+          )
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Enforced admission starved by a grooming stall"
+          description: "DISPATCH_QUEUE_ADMISSION_MODE=enforce is withholding ready work on grooming evidence while no successful applied grooming run completed within N groomer intervals (or ever). Enforcement never fails open or bypasses silently — the starvation persists until the pipeline recovers."
+          operator_action: "Restore the groomer (job logs, DISPATCH_HOSTED_GROOMER_ENABLED, GitHub reachability, model provider); never relax enforcement blindly — a per-issue operator admission override is the surgical release."

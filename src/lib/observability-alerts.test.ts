@@ -100,6 +100,9 @@ function baseInputs(
     auditFailures: [],
     assignmentAudit: [],
     groomingRuns: [],
+    lastGroomingSuccessAt: ago(120),
+    groomerIntervalMs: 600_000,
+    groomingStallIntervals: 2,
     sync: { lastSuccessAt: ago(120), running: 0, failed: [] },
     repoLastSyncedAt: [ago(120)],
     scheduler: {
@@ -139,9 +142,9 @@ function auditRow(overrides: Partial<ObservabilityAssignmentAuditRow> & { issueI
 }
 
 describe("observability alert catalogue structure", () => {
-  it("defines A1–A13 exactly once with a duration for enabled rows", () => {
+  it("defines A1–A14 exactly once with a duration for enabled rows", () => {
     expect(OBSERVABILITY_ALERTS.map((a) => a.id)).toEqual(
-      Array.from({ length: 13 }, (_, i) => `A${i + 1}`),
+      Array.from({ length: 14 }, (_, i) => `A${i + 1}`),
     );
     for (const alert of OBSERVABILITY_ALERTS) {
       if (alert.enabled) expect(alert.forMs, `${alert.id} forMs`).toBeGreaterThan(0);
@@ -586,5 +589,79 @@ describe("evaluator for/pending semantics", () => {
   it("A3 fires only from an explicit failed probe", () => {
     expect(byId(states()).get("A3")?.state).toBe("ok");
     expect(byId(states({}, { healthUp: false })).get("A3")?.state).toBe("pending");
+  });
+});
+
+describe("A14 grooming-stall starvation (#1420)", () => {
+  function enforcing(
+    overrides: Partial<ObservabilitySnapshotInputs> = {},
+  ): Partial<ObservabilitySnapshotInputs> {
+    return {
+      admissionMode: "enforce",
+      // Ready issue with no freshness baseline: a grooming-caused withhold.
+      issues: [makeIssue({ id: "starved", number: 101, labels: ["status/ready"] })],
+      ...overrides,
+    };
+  }
+
+  it("admission off: not evaluable, never a silent ok", () => {
+    expect(byId(states()).get("A14")?.state).toBe("not_evaluable");
+  });
+
+  it("enforce + withheld + groomer stalled: pending, then firing past the 10m for", () => {
+    const stalled = enforcing({ lastGroomingSuccessAt: ago(7200) });
+    expect(snapshot(stalled).grooming.stallThresholdSeconds).toBe(1200);
+    expect(snapshot(stalled).admission.notAdmitted?.byGrooming).toBe(1);
+    const pending = byId(states(stalled)).get("A14");
+    expect(pending?.state).toBe("pending");
+    expect(pending?.predicateHolds).toBe(true);
+
+    const firing = byId(states(stalled, { prior: { A14: ago(11 * 60).toISOString() } })).get("A14");
+    expect(firing?.state).toBe("firing");
+    expect(firing?.predicateHolds).toBe(true);
+    expect(firing?.since).toBe(ago(11 * 60).toISOString());
+  });
+
+  it("healthy recovery: a success inside the stall window is ok", () => {
+    const recovered = enforcing({ lastGroomingSuccessAt: ago(120) });
+    const state = byId(states(recovered)).get("A14");
+    expect(state?.state).toBe("ok");
+    expect(state?.predicateHolds).toBe(false);
+  });
+
+  it("never succeeded: the absent baseline is the firing case", () => {
+    const neverSucceeded = enforcing({ lastGroomingSuccessAt: null });
+    expect(byId(states(neverSucceeded)).get("A14")?.state).toBe("pending");
+  });
+
+  it("enforce with no grooming-caused withholding is ok", () => {
+    // No ready issues at all: nothing is withheld, the predicate holds false.
+    const noReady = {
+      admissionMode: "enforce" as const,
+      issues: [makeIssue({ id: "busy", number: 102, labels: ["status/in-progress"] })],
+    };
+    expect(snapshot(noReady).admission.notAdmitted?.byGrooming).toBe(0);
+    expect(byId(states(noReady)).get("A14")?.state).toBe("ok");
+  });
+
+  it("groomer interval undeclared (0): not evaluable even with withholding", () => {
+    const noInterval = enforcing({ lastGroomingSuccessAt: ago(7200), groomerIntervalMs: 0 });
+    expect(snapshot(noInterval).grooming.stallThresholdSeconds).toBeNull();
+    expect(snapshot(noInterval).admission.notAdmitted?.byGrooming).toBe(1);
+    expect(byId(states(noInterval)).get("A14")?.state).toBe("not_evaluable");
+  });
+
+  it("thresholds.groomingStallSeconds overrides the snapshot's own window", () => {
+    const inputs = enforcing({ lastGroomingSuccessAt: ago(1800) });
+    // Default window 1200s: a 30m-old success is stalled.
+    expect(byId(states(inputs)).get("A14")?.state).toBe("pending");
+    // Widened window: 1800s < 3600s → healthy.
+    expect(
+      byId(states(inputs, { thresholds: { groomingStallSeconds: 3600 } })).get("A14")?.state,
+    ).toBe("ok");
+    // Narrowed window: 1800s > 600s → stalled.
+    expect(
+      byId(states(inputs, { thresholds: { groomingStallSeconds: 600 } })).get("A14")?.state,
+    ).toBe("pending");
   });
 });
