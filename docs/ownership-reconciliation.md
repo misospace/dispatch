@@ -287,6 +287,20 @@ never releases anything — a healthy long-running execution that renews (or a
 claim-once worker inside the grace window) cannot be stolen at 30 minutes;
 the tombstone only makes the evidence *survive* for the reconciler to judge.
 
+Retention needs a candidate-safe exit or it starves the scan it feeds: the
+lease source takes its oldest `take` batch *before* the open/label filters, so
+tombstones whose issue closed or whose `agent/*` label moved on would
+permanently occupy the bounded window. `selectCandidates` therefore runs
+housekeeping alongside the dead-ladder cleanup (#1254 precedent): a scanned
+lease row is deleted when its issue is closed/missing or carries no `agent/*`
+label, provided it is no longer a live receipt (`expiredAt` elapsed), no
+longer a running park (`retryAfter` elapsed — the stale-work sweep keeps that
+fenced delete), and its issue holds no `OwnershipReleaseIntent` (the §8.7
+Phase C settle re-check reads exactly that row). A settled release deletes
+the lease row directly, so under `enforce` tombstones are bounded; `audit`
+skips the delete like every other mutation and accepts the same
+staleness-for-purity trade as the ladder source.
+
 ## 4. Ownership state model
 
 Ownership is **derived**, never stored as a single truth. Two layers:

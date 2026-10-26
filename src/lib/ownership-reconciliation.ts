@@ -1214,15 +1214,16 @@ export async function replayPendingOwnershipReleases(
  * Label-only legacy claims (no Dispatch evidence at all) are never candidates
  * — they stay UNKNOWN for the operator (§5 tier 6).
  *
- * `readOnly` (audit mode) makes the scan pure: the dead-ladder housekeeping
- * delete is skipped, because audit mode promises no persisted
- * `OwnershipReconcileCandidate` mutation at all. The dead rows are harmless
- * there — they only make the bounded ladder source slightly less fresh, which
- * is exactly the trade `audit` accepts in exchange for touching nothing.
+ * `readOnly` (audit mode) makes the scan pure: both housekeeping deletes
+ * (dead-ladder rows, dead tombstone leases) are skipped, because audit mode
+ * promises no persisted mutation at all. The dead rows are harmless there —
+ * they only make the bounded sources slightly less fresh, which is exactly
+ * the trade `audit` accepts in exchange for touching nothing.
  */
 async function selectCandidates(
   client: OwnershipReconcileClient,
   graceCutoff: Date,
+  now: Date,
   batchSize: number,
   readOnly = false,
 ): Promise<any[]> {
@@ -1243,7 +1244,10 @@ async function selectCandidates(
     },
     orderBy: { expiredAt: "asc" },
     take: batchSize,
-    select: { issueId: true },
+    // `id`/`expiredAt`/`retryAfter` must be loaded: the dead-tombstone
+    // cleanup below fences on them, same projection lesson as
+    // `reclaimCount` above (#1417).
+    select: { id: true, issueId: true, expiredAt: true, retryAfter: true },
   });
   const workRows = await client.agentWork.findMany({
     where: {
@@ -1283,9 +1287,11 @@ async function selectCandidates(
   }
 
   // Issues already carrying an intent are replay's business (or parked for the
-  // operator) — never re-examined while an intent exists.
+  // operator) — never re-examined while an intent exists. Scoped to every
+  // scanned id, not just the open ones: the tombstone cleanup below must also
+  // protect rows whose issue closed while an intent was pending.
   const intents = await client.ownershipReleaseIntent.findMany({
-    where: { issueId: { in: issues.map((i) => i.id) } },
+    where: { issueId: { in: ids } },
     select: { issueId: true, phase: true, parkedAt: true },
   });
   const blockedIssues = new Set(
@@ -1293,6 +1299,38 @@ async function selectCandidates(
       .filter((i) => i.phase === "pending" || i.parkedAt != null)
       .map((i) => i.issueId),
   );
+
+  // #1417: a tombstone outlives the claim it describes — the issue gets
+  // closed, or the `agent/*` label moves on (operator release, human
+  // unassignment). The scan takes the OLDEST lease rows *before* the
+  // open/label filter, so retained dead rows would otherwise permanently
+  // occupy the bounded window and starve the very recovery candidates the
+  // tombstone exists to enable. Housekeeping mirrors the dead-ladder
+  // cleanup above: delete rows whose issue can never become a candidate.
+  // Guards: a still-live receipt (`expiredAt` in the future — a terminal
+  // disposition stamped on a non-expired lease stays the worker's resume
+  // proof) and a still-running park (`retryAfter` in the future, #1316/
+  // #1334 — the stale-work sweep's fenced delete remains its reclaimer)
+  // are kept, and so is any row on an issue holding an intent: the §8.7
+  // Phase C settle re-check reads exactly that lease row.
+  const candidateIssueIds = new Set(
+    issues
+      .filter((issue: any) => issue.labels.some((label: string) => label.startsWith(AGENT_PREFIX)))
+      .map((issue: any) => issue.id),
+  );
+  const intentIssueIds = new Set(intents.map((intent: any) => intent.issueId));
+  const deadTombstoneIds = leaseRows
+    .filter((row: any) => {
+      if (candidateIssueIds.has(row.issueId)) return false;
+      if (intentIssueIds.has(row.issueId)) return false;
+      if (row.expiredAt && row.expiredAt > now) return false;
+      if (row.retryAfter && row.retryAfter > now) return false;
+      return true;
+    })
+    .map((row: any) => row.id);
+  if (!readOnly && deadTombstoneIds.length > 0) {
+    await client.lease.deleteMany({ where: { id: { in: deadTombstoneIds } } });
+  }
 
   // Cap AFTER the label/intent filters: released or intent-held issues must
   // not consume the per-run quota and starve real candidates (§8.1).
@@ -1396,7 +1434,7 @@ export async function reconcileOwnership(
   //    the off-mode early-return).
   let candidates: any[];
   try {
-    candidates = await selectCandidates(client, graceCutoff, batchSize, mode === "audit");
+    candidates = await selectCandidates(client, graceCutoff, now, batchSize, mode === "audit");
   } catch (error) {
     report.errors.push(`candidate selection failed: ${error instanceof Error ? error.message : String(error)}`);
     return report;

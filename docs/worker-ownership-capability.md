@@ -42,9 +42,9 @@ over the park evidence (`retryAfter`/`waitReason`, the `EXTERNAL_WAIT`
 read-model signal) while the park is still running, leaving the settled
 `BLOCKED` row next to a consumed receipt. The decided option is (b): the
 cleanup **skips** a lease whose `retryAfter` is still in the future and
-otherwise tombstones it as soon as the elapsed `expiredAt` *or* the elapsed
-`retryAfter` qualifies it — whichever comes first — and never re-stamps a row
-that already carries any disposition. This deliberately does **not** touch the
+otherwise tombstones it once `expiredAt` has elapsed *and* any wait deadline
+`retryAfter` has also elapsed — both clocks, never either alone — and never
+re-stamps a row that already carries any disposition. This deliberately does **not** touch the
 claim-epoch fence fields (`expiredAt` is moved only by (re-)claims and
 renewals, #1317): the skip is evaluated per cleanup call, never parked forward,
 and the stale-work sweep remains the fenced reclaimer when the park deadline

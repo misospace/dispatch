@@ -1277,6 +1277,171 @@ describe("ownership reconciliation (#1254)", () => {
     });
   });
 
+  describe("dead-tombstone housekeeping (#1417)", () => {
+    // Full-shape lease so evidence assembly never trips on a missing field.
+    function tombstoneLease(now: Date, opts: {
+      id: string;
+      issueId: string;
+      expiredMinutesAgo: number;
+      disposition?: string;
+      retryAfter?: Date | null;
+    }) {
+      return {
+        id: opts.id,
+        agentName: "alpha",
+        issueId: opts.issueId,
+        claimToken: null,
+        expiredAt: minutesAgo(now, opts.expiredMinutesAgo),
+        renewedAt: minutesAgo(now, opts.expiredMinutesAgo + 40),
+        registeredAt: null,
+        registrationOccurredAt: null,
+        renewCount: 0,
+        lastRenewalObservedAt: null,
+        lastRenewalOccurredAt: null,
+        retryAfter: opts.retryAfter ?? null,
+        waitReason: null,
+        disposition: opts.disposition ?? "expired",
+      };
+    }
+    function closedIssueRow(id: string, number: number) {
+      return {
+        id,
+        number,
+        state: "closed",
+        labels: ["status/done", "agent/alpha"],
+        blockedReason: null,
+        linkedPrNumber: null,
+        linkedPrMergeState: null,
+        repository: { fullName: REPO },
+      };
+    }
+
+    it("a closed-issue tombstone is pruned so the live candidate reaches the window (batch 1)", async () => {
+      // The scan takes the OLDEST lease batch before the open/label filter:
+      // with a batch of one, an unpruned dead tombstone would permanently
+      // starve every younger recovery candidate.
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.issue.push(closedIssueRow("issue-closed", 90));
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-dead", issueId: "issue-closed", expiredMinutesAgo: 120 }),
+        tombstoneLease(now, { id: "tomb-live", issueId: ISSUE_ID, expiredMinutesAgo: 50 }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+
+      // Pass 1: the window holds only the dead tombstone → it is pruned, and
+      // nothing is examined.
+      const first = await runReconcile(fixture, now, "enforce");
+      expect(first.examined).toBe(0);
+      expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-live"]);
+
+      // Pass 2: the window is no longer blocked — the live tombstone selects
+      // its (open, agent-labeled) issue as a candidate.
+      const second = await runReconcile(fixture, now, "enforce");
+      expect(second.examined).toBe(1);
+      expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-live"]);
+    });
+
+    it("audit mode prunes nothing (read-only contract)", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.issue.push(closedIssueRow("issue-closed", 90));
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-dead", issueId: "issue-closed", expiredMinutesAgo: 120 }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+      const report = await runReconcile(fixture, now, "audit");
+      expect(report.examined).toBe(0);
+      expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-dead"]);
+    });
+
+    it("a tombstone on an issue holding a parked intent survives cleanup", async () => {
+      // Phase C's settle re-check reads exactly this lease row; deleting it
+      // would wedge the settlement. Parked intents stay out of the replay
+      // window, so this pass sees only the candidate scan.
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.issue.push(closedIssueRow("issue-closed", 90));
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-held", issueId: "issue-closed", expiredMinutesAgo: 120 }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      fixture.tables.ownershipReleaseIntent.push({
+        id: "intent-1",
+        issueId: "issue-closed",
+        agentName: "alpha",
+        agentLabel: "agent/alpha",
+        attemptToken: "tok-dead",
+        phase: "pending",
+        attempts: 1,
+        parkedAt: minutesAgo(now, 5),
+      });
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+      const report = await runReconcile(fixture, now, "enforce");
+      expect(report.examined).toBe(0);
+      expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-held"]);
+    });
+
+    it("a terminal disposition on a still-live lease is kept as the worker's receipt", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.issue.push(closedIssueRow("issue-closed", 90));
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, {
+          id: "lease-live",
+          issueId: "issue-closed",
+          expiredMinutesAgo: -20, // expiresAt in the future
+          disposition: "released",
+        }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+      const report = await runReconcile(fixture, now, "enforce");
+      expect(report.examined).toBe(0);
+      expect(fixture.tables.lease.map((r) => r.id)).toEqual(["lease-live"]);
+    });
+
+    it("a still-running park (future retryAfter) is left to the stale-work sweep", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.issue.push({
+        id: "issue-wait",
+        number: 91,
+        state: "open",
+        labels: ["status/blocked"], // no agent/* label: not a candidate
+        blockedReason: null,
+        linkedPrNumber: null,
+        linkedPrMergeState: null,
+        repository: { fullName: REPO },
+      });
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, {
+          id: "tomb-parked",
+          issueId: "issue-wait",
+          expiredMinutesAgo: 120,
+          retryAfter: new Date(now.getTime() + 30 * MIN),
+        }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+      const report = await runReconcile(fixture, now, "enforce");
+      expect(report.examined).toBe(0);
+      expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-parked"]);
+    });
+  });
+
   describe("§8.7 pinned negative controls", () => {
     it("control 1a: a renewed same-agent claim defeats the stale releaser (zero forge calls)", async () => {
       const now = new Date();
