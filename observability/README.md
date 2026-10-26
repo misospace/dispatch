@@ -67,7 +67,7 @@ Nothing in this directory is required to run Dispatch.
 
 3. Install the rules — copy `prometheus-rules.yaml` into your `rule_files`
    path (Prometheus) or feed it to `vmalert`. Alert names are the catalogue
-   ids `A1…A13` (A6 is deliberately absent — see the header of the rules
+   ids `A1…A14` (A6 is deliberately absent — see the header of the rules
    file). Tune the `3600`-second thresholds in A8/A9 to taste.
 
 4. Import `grafana-dashboard.json` (Grafana → Dashboards → Import) and pick

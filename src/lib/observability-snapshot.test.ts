@@ -27,7 +27,10 @@ const { mocks, writes } = vi.hoisted(() => {
     prFixHistory: delegate({ findMany: vi.fn().mockResolvedValue([]) }),
     agentRun: delegate({ findMany: vi.fn().mockResolvedValue([]) }),
     auditLog: delegate({ findMany: vi.fn().mockResolvedValue([]) }),
-    groomingRun: delegate({ findMany: vi.fn().mockResolvedValue([]) }),
+    groomingRun: delegate({
+      findMany: vi.fn().mockResolvedValue([]),
+      findFirst: vi.fn().mockResolvedValue(null),
+    }),
     issueSyncRun: delegate({
       findMany: vi.fn().mockResolvedValue([]),
       findFirst: vi.fn().mockResolvedValue(null),
@@ -40,7 +43,11 @@ const { mocks, writes } = vi.hoisted(() => {
 
 vi.mock("@/lib/prisma", () => ({ prisma: mocks }));
 
-import { collectObservabilitySnapshot, strandedAssignmentThresholdMs } from "./observability-snapshot";
+import {
+  collectObservabilitySnapshot,
+  groomingStallIntervals,
+  strandedAssignmentThresholdMs,
+} from "./observability-snapshot";
 
 const NOW = new Date("2026-01-02T03:04:05.000Z");
 
@@ -97,6 +104,26 @@ describe("strandedAssignmentThresholdMs", () => {
   });
 });
 
+describe("groomingStallIntervals", () => {
+  it("defaults to two groomer intervals", () => {
+    expect(groomingStallIntervals({})).toBe(2);
+  });
+
+  it("honours a valid env override, floored", () => {
+    expect(groomingStallIntervals({ DISPATCH_GROOMING_STALL_INTERVALS: "5" })).toBe(5);
+    expect(groomingStallIntervals({ DISPATCH_GROOMING_STALL_INTERVALS: "1.9" })).toBe(1);
+  });
+
+  it("falls back to the default for zero and non-numeric values", () => {
+    expect(groomingStallIntervals({ DISPATCH_GROOMING_STALL_INTERVALS: "0" })).toBe(2);
+    expect(groomingStallIntervals({ DISPATCH_GROOMING_STALL_INTERVALS: "abc" })).toBe(2);
+  });
+
+  it("clamps into the allowed range", () => {
+    expect(groomingStallIntervals({ DISPATCH_GROOMING_STALL_INTERVALS: "999" })).toBe(24);
+  });
+});
+
 describe("collectObservabilitySnapshot", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -111,6 +138,7 @@ describe("collectObservabilitySnapshot", () => {
     mocks.agentRun.findMany.mockResolvedValue([]);
     mocks.auditLog.findMany.mockResolvedValue([]);
     mocks.groomingRun.findMany.mockResolvedValue([]);
+    mocks.groomingRun.findFirst.mockResolvedValue(null);
     mocks.issueSyncRun.findMany.mockResolvedValue([]);
     mocks.issueSyncRun.findFirst.mockResolvedValue(null);
     mocks.issueSyncRun.count.mockResolvedValue(0);
@@ -161,6 +189,42 @@ describe("collectObservabilitySnapshot", () => {
     } finally {
       if (previous === undefined) delete process.env.DISPATCH_SYNC_PIPELINE;
       else process.env.DISPATCH_SYNC_PIPELINE = previous;
+    }
+  });
+
+  it("tracks the last successful applied grooming run as the stall baseline", async () => {
+    const previous = process.env.DISPATCH_GROOMER_INTERVAL_MS;
+    try {
+      process.env.DISPATCH_GROOMER_INTERVAL_MS = "300000";
+      const completedAt = new Date("2026-01-02T02:04:05.000Z");
+      mocks.groomingRun.findFirst.mockResolvedValue({ completedAt });
+
+      const snapshot = await collectObservabilitySnapshot(NOW);
+
+      expect(snapshot.grooming.lastSuccessTimestampSeconds).toBe(
+        Math.floor(completedAt.getTime() / 1000),
+      );
+      expect(snapshot.grooming.secondsSinceLastSuccess).toBe(3600);
+      expect(snapshot.grooming.everSucceeded).toBe(true);
+      // 300000ms × 2 intervals / 1000.
+      expect(snapshot.grooming.stallThresholdSeconds).toBe(600);
+      expect(mocks.groomingRun.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          // Canonical successful-applied state, exactly what
+          // evaluateQueueAdmission requires (queue-admission.ts): a run that
+          // completed as `stage: "skipped"` (busy/no-op outcome) or
+          // `dryRun: true` applied nothing and must not refresh the baseline
+          // or suppress A14.
+          where: expect.objectContaining({
+            status: "completed",
+            dryRun: false,
+            stage: "applied",
+          }),
+        }),
+      );
+    } finally {
+      if (previous === undefined) delete process.env.DISPATCH_GROOMER_INTERVAL_MS;
+      else process.env.DISPATCH_GROOMER_INTERVAL_MS = previous;
     }
   });
 });
