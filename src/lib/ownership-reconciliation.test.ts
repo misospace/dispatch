@@ -211,6 +211,9 @@ function makeFakePrisma() {
       findMany: async (args: any = {}) => {
         let found = rows().filter((r) => matchesWhere(r, args.where ?? {}));
         if (args.orderBy) found = orderRows(found, args.orderBy);
+        // Cursor-free paging needs a stable order; orderRows tiebreaks by id,
+        // mirroring the production scan's explicit `id` tiebreak (#1417).
+        if (args.skip) found = found.slice(args.skip);
         if (args.take !== undefined) found = found.slice(0, args.take);
         return CLONE(found.map((r) => projectRow(r, args.select)));
       },
@@ -1316,10 +1319,12 @@ describe("ownership reconciliation (#1254)", () => {
       };
     }
 
-    it("a closed-issue tombstone is pruned so the live candidate reaches the window (batch 1)", async () => {
-      // The scan takes the OLDEST lease batch before the open/label filter:
-      // with a batch of one, an unpruned dead tombstone would permanently
-      // starve every younger recovery candidate.
+    it("a closed-issue tombstone is pruned so the live candidate is examined (batch 1)", async () => {
+      // With a batch of one, a pre-filter batch scan would put only the dead
+      // tombstone in the window: the live candidate waits a pass and, without
+      // any pruning, forever. The paging scan classifies the whole tombstone
+      // prefix in one read, so `enforce` prunes the dead row AND examines the
+      // live candidate in the SAME pass.
       const now = new Date();
       const fixture = buildFixture(now);
       fixture.tables.issue.push(closedIssueRow("issue-closed", 90));
@@ -1332,16 +1337,69 @@ describe("ownership reconciliation (#1254)", () => {
       fixture.tables.ownershipReconcileCandidate.length = 0;
       vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
 
-      // Pass 1: the window holds only the dead tombstone → it is pruned, and
-      // nothing is examined.
       const first = await runReconcile(fixture, now, "enforce");
-      expect(first.examined).toBe(0);
+      expect(first.examined).toBe(1);
       expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-live"]);
 
-      // Pass 2: the window is no longer blocked — the live tombstone selects
-      // its (open, agent-labeled) issue as a candidate.
+      // Pass 2: the window is unblocked; the live tombstone stays a candidate.
       const second = await runReconcile(fixture, now, "enforce");
       expect(second.examined).toBe(1);
+      expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-live"]);
+    });
+
+    it("audit mode pages past more than batchSize dead tombstones to reach a valid candidate", async () => {
+      // #1417 round 3 hard-blocker: audit skips the prune (read-only contract),
+      // so a pre-filter batch let >batchSize retained tombstones permanently
+      // hide the one dead claim with real stale-owner evidence — the audit
+      // acceptance criterion died in exactly the mode meant to surface it.
+      // Paging must surface the candidate with ZERO mutations.
+      const now = new Date();
+      const fixture = buildFixture(now);
+      for (let i = 0; i < 4; i++) {
+        fixture.tables.issue.push(closedIssueRow(`issue-closed-${i}`, 90 + i));
+      }
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-dead-0", issueId: "issue-closed-0", expiredMinutesAgo: 400 }),
+        tombstoneLease(now, { id: "tomb-dead-1", issueId: "issue-closed-1", expiredMinutesAgo: 300 }),
+        tombstoneLease(now, { id: "tomb-dead-2", issueId: "issue-closed-2", expiredMinutesAgo: 200 }),
+        tombstoneLease(now, { id: "tomb-dead-3", issueId: "issue-closed-3", expiredMinutesAgo: 100 }),
+        // The valid dead-claim candidate sits behind ALL of them, oldest-last.
+        tombstoneLease(now, { id: "tomb-live", issueId: ISSUE_ID, expiredMinutesAgo: 50 }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+
+      const report = await runReconcile(fixture, now, "audit");
+      expect(report.examined).toBe(1);
+      // Read-only contract intact: nothing pruned.
+      expect(fixture.tables.lease.map((r) => r.id).sort()).toEqual(
+        ["tomb-dead-0", "tomb-dead-1", "tomb-dead-2", "tomb-dead-3", "tomb-live"].sort(),
+      );
+      const annotations = fixture.tables.auditLog.filter((r: any) => r.action === "ownership_reconcile_candidate");
+      expect(annotations.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("enforce prunes more than batchSize dead tombstones and examines the candidate in one pass", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      for (let i = 0; i < 3; i++) {
+        fixture.tables.issue.push(closedIssueRow(`issue-closed-${i}`, 90 + i));
+      }
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-dead-0", issueId: "issue-closed-0", expiredMinutesAgo: 300 }),
+        tombstoneLease(now, { id: "tomb-dead-1", issueId: "issue-closed-1", expiredMinutesAgo: 200 }),
+        tombstoneLease(now, { id: "tomb-dead-2", issueId: "issue-closed-2", expiredMinutesAgo: 100 }),
+        tombstoneLease(now, { id: "tomb-live", issueId: ISSUE_ID, expiredMinutesAgo: 50 }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+
+      const report = await runReconcile(fixture, now, "enforce");
+      expect(report.examined).toBe(1);
       expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-live"]);
     });
 

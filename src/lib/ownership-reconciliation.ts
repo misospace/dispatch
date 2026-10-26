@@ -1207,6 +1207,16 @@ export async function replayPendingOwnershipReleases(
 
 // ─── Candidate selection ─────────────────────────────────────────────────────
 
+// Lease-scan paging budget (#1417 round 3): the window counts only rows that
+// can still matter, so dead tombstones are paged past instead of occupying it.
+// The budget keeps a single pass bounded against pathological accumulation:
+// pages read at least this many rows, and the pass reads at most this many
+// lease rows total. Under `enforce` the housekeeping delete converges the
+// table anyway; the budget only caps read amplification while tombstones
+// linger (audit's read-only contract, or a backlog accumulated under `off`).
+const LEASE_SCAN_MIN_PAGE_ROWS = 50;
+const LEASE_SCAN_MAX_ROWS = 5000;
+
 /**
  * Bounded, evidence-driven candidate scan (§8.1). A candidate is an open issue
  * whose ownership evidence has gone quiet: persisted ladder rows, leases with
@@ -1216,9 +1226,11 @@ export async function replayPendingOwnershipReleases(
  *
  * `readOnly` (audit mode) makes the scan pure: both housekeeping deletes
  * (dead-ladder rows, dead tombstone leases) are skipped, because audit mode
- * promises no persisted mutation at all. The dead rows are harmless there —
- * they only make the bounded sources slightly less fresh, which is exactly
- * the trade `audit` accepts in exchange for touching nothing.
+ * promises no persisted mutation at all. Skipping does not mean audit can
+ * starve (#1417 round 3): the lease source PAGES PAST rows that can never
+ * become candidates — the window holds the first `batchSize` rows that are
+ * live evidence or protected, not the first `batchSize` rows written. The
+ * delete stays an `enforce`-only convergence mechanism.
  */
 async function selectCandidates(
   client: OwnershipReconcileClient,
@@ -1235,20 +1247,94 @@ async function selectCandidates(
     take: batchSize,
     select: { issueId: true, reclaimCount: true },
   });
-  const leaseRows = await client.lease.findMany({
-    where: {
-      OR: [
-        { disposition: { in: [...TERMINAL_DISPOSITIONS] } },
-        { expiredAt: { lte: graceCutoff } },
-      ],
-    },
-    orderBy: { expiredAt: "asc" },
-    take: batchSize,
-    // `id`/`expiredAt`/`retryAfter` must be loaded: the dead-tombstone
-    // cleanup below fences on them, same projection lesson as
-    // `reclaimCount` above (#1417).
-    select: { id: true, issueId: true, expiredAt: true, retryAfter: true },
-  });
+  // Lease source (#1417): bounded paging instead of a single oldest-`take`
+  // batch. Retained tombstones (#1417) whose issue closed or whose `agent/*`
+  // label moved on can never become candidates; a single pre-filter batch
+  // would let them occupy the window forever and starve exactly the dead-claim
+  // evidence the tombstone exists to preserve. So each page is classified as
+  // it is read, and only rows that can still matter count toward the window:
+  // rows on open agent-labeled issues, rows whose issue holds an intent (the
+  // §8.7 Phase C settle re-check reads exactly that lease row), still-live
+  // receipts (`expiredAt` in the future — a terminal disposition on a
+  // non-expired lease stays the worker's resume proof), and still-running
+  // parks (#1316/#1334, `retryAfter` in the future — the stale-work sweep's
+  // fenced delete remains their reclaimer). Everything else is a dead
+  // tombstone: skipped in every mode, deleted under `enforce` (below).
+  // `id`/`expiredAt`/`retryAfter` must be loaded: the cleanup fences on them,
+  // same projection lesson as `reclaimCount` above.
+  const leaseScanWhere = {
+    OR: [
+      { disposition: { in: [...TERMINAL_DISPOSITIONS] } },
+      { expiredAt: { lte: graceCutoff } },
+    ],
+  };
+  const leaseScanPageRows = Math.max(batchSize, LEASE_SCAN_MIN_PAGE_ROWS);
+  const leaseRows: any[] = [];
+  const deadTombstoneRows: any[] = [];
+  let leaseScanReads = 0;
+  while (leaseRows.length < batchSize && leaseScanReads < LEASE_SCAN_MAX_ROWS) {
+    const page = await client.lease.findMany({
+      where: leaseScanWhere,
+      // `id` tiebreak keeps skip-based paging stable across pages when many
+      // tombstones share an `expiredAt`. A concurrent re-claim moving a row
+      // out of the window shifts the offset forward and may skip a row this
+      // pass; the next pass reads it — the same tolerated staleness class as
+      // the batch scan it replaces.
+      orderBy: [{ expiredAt: "asc" }, { id: "asc" }],
+      take: leaseScanPageRows,
+      skip: leaseScanReads,
+      select: { id: true, issueId: true, expiredAt: true, retryAfter: true },
+    });
+    if (page.length === 0) break;
+    leaseScanReads += page.length;
+    const pageIssueIds = [...new Set(page.map((row: any) => row.issueId))];
+    const pageIssues = await client.issue.findMany({
+      where: { id: { in: pageIssueIds }, state: "open" },
+      select: { id: true, labels: true },
+    });
+    const pageCandidateIds = new Set(
+      pageIssues
+        .filter((issue: any) => issue.labels.some((label: string) => label.startsWith(AGENT_PREFIX)))
+        .map((issue: any) => issue.id),
+    );
+    const pageIntents = await client.ownershipReleaseIntent.findMany({
+      where: { issueId: { in: pageIssueIds } },
+      select: { issueId: true },
+    });
+    const pageIntentIds = new Set(pageIntents.map((intent: any) => intent.issueId));
+    for (const row of page) {
+      const isDeadTombstone =
+        !pageCandidateIds.has(row.issueId) &&
+        !pageIntentIds.has(row.issueId) &&
+        !(row.expiredAt && row.expiredAt > now) &&
+        !(row.retryAfter && row.retryAfter > now);
+      if (isDeadTombstone) deadTombstoneRows.push(row);
+      else if (leaseRows.length < batchSize) leaseRows.push(row);
+    }
+    if (page.length < leaseScanPageRows) break;
+  }
+
+  // Dead-tombstone housekeeping (#1417): `enforce` converges the table like
+  // the dead-ladder cleanup below does for ladder rows. Runs even when no
+  // candidate survives the scan — a window of pure dead tombstones must still
+  // shrink, or nothing would ever prune it.
+  const deadTombstoneIds = deadTombstoneRows.map((row: any) => row.id);
+  if (!readOnly && deadTombstoneIds.length > 0) {
+    // Fence the delete with the same CAS shape as releaseExpiredLeases's
+    // stamp (including its `retryAfter` 3VL handling): every classification
+    // above was evaluated at scan time, and a re-claim or renewal can
+    // reactivate the row in place (disposition cleared, `expiredAt` moved to
+    // the future) between the scan and this delete. The fence makes such a
+    // delete match zero rows instead of destroying the live receipt.
+    await client.lease.deleteMany({
+      where: {
+        id: { in: deadTombstoneIds },
+        expiredAt: { lte: now },
+        OR: [{ retryAfter: null }, { retryAfter: { lte: now } }],
+      },
+    });
+  }
+
   const workRows = await client.agentWork.findMany({
     where: {
       state: { in: [...ACTIVE_AGENT_WORK_STATES] },
@@ -1287,9 +1373,7 @@ async function selectCandidates(
   }
 
   // Issues already carrying an intent are replay's business (or parked for the
-  // operator) — never re-examined while an intent exists. Scoped to every
-  // scanned id, not just the open ones: the tombstone cleanup below must also
-  // protect rows whose issue closed while an intent was pending.
+  // operator) — never re-examined while an intent exists.
   const intents = await client.ownershipReleaseIntent.findMany({
     where: { issueId: { in: ids } },
     select: { issueId: true, phase: true, parkedAt: true },
@@ -1299,50 +1383,6 @@ async function selectCandidates(
       .filter((i) => i.phase === "pending" || i.parkedAt != null)
       .map((i) => i.issueId),
   );
-
-  // #1417: a tombstone outlives the claim it describes — the issue gets
-  // closed, or the `agent/*` label moves on (operator release, human
-  // unassignment). The scan takes the OLDEST lease rows *before* the
-  // open/label filter, so retained dead rows would otherwise permanently
-  // occupy the bounded window and starve the very recovery candidates the
-  // tombstone exists to enable. Housekeeping mirrors the dead-ladder
-  // cleanup above: delete rows whose issue can never become a candidate.
-  // Guards: a still-live receipt (`expiredAt` in the future — a terminal
-  // disposition stamped on a non-expired lease stays the worker's resume
-  // proof) and a still-running park (`retryAfter` in the future, #1316/
-  // #1334 — the stale-work sweep's fenced delete remains its reclaimer)
-  // are kept, and so is any row on an issue holding an intent: the §8.7
-  // Phase C settle re-check reads exactly that lease row.
-  const candidateIssueIds = new Set(
-    issues
-      .filter((issue: any) => issue.labels.some((label: string) => label.startsWith(AGENT_PREFIX)))
-      .map((issue: any) => issue.id),
-  );
-  const intentIssueIds = new Set(intents.map((intent: any) => intent.issueId));
-  const deadTombstoneIds = leaseRows
-    .filter((row: any) => {
-      if (candidateIssueIds.has(row.issueId)) return false;
-      if (intentIssueIds.has(row.issueId)) return false;
-      if (row.expiredAt && row.expiredAt > now) return false;
-      if (row.retryAfter && row.retryAfter > now) return false;
-      return true;
-    })
-    .map((row: any) => row.id);
-  if (!readOnly && deadTombstoneIds.length > 0) {
-    // Fence the delete with the same CAS shape as releaseExpiredLeases's
-    // stamp (including its `retryAfter` 3VL handling): every guard above was
-    // evaluated at scan time, and a re-claim or renewal can reactivate the
-    // row in place (disposition cleared, `expiredAt` moved to the future)
-    // between the scan and this delete. The fence makes such a delete match
-    // zero rows instead of destroying the live receipt.
-    await client.lease.deleteMany({
-      where: {
-        id: { in: deadTombstoneIds },
-        expiredAt: { lte: now },
-        OR: [{ retryAfter: null }, { retryAfter: { lte: now } }],
-      },
-    });
-  }
 
   // Cap AFTER the label/intent filters: released or intent-held issues must
   // not consume the per-run quota and starve real candidates (§8.1).
