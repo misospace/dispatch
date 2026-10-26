@@ -283,7 +283,7 @@ export function exportObservabilityMetrics(snapshot: ObservabilitySnapshot): str
   families.push(
     scalar(
       "dispatch_grooming_last_success_timestamp_seconds",
-      "Last successful applied grooming run (status completed, not a dry run) as a unix timestamp. Absent until the first completion — the absent series is A14's firing baseline, never zero.",
+      "Last successful applied grooming run (status completed, stage applied, not a dry run) as a unix timestamp. Absent until the first completion — the absent series is A14's firing baseline, never zero.",
       snapshot.grooming.lastSuccessTimestampSeconds,
     ),
   );

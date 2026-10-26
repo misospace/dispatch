@@ -165,9 +165,13 @@ export async function collectObservabilitySnapshot(
     // Groomer-stall baseline (#1420): the newest SUCCESSFUL applied grooming
     // run, never windowed — "has never succeeded" is a distinct firing state
     // from "recently succeeded" (same shape as the sync baseline above).
-    // `dryRun: false` keeps a dry-run scheduler from masking a dead applier.
+    // `dryRun: false` keeps a dry-run scheduler from masking a dead applier,
+    // and `stage: "applied"` is the same canonical successful-admission state
+    // `evaluateQueueAdmission` requires: a completed skipped/no-op run
+    // (`stage = "skipped"`, e.g. a busy lease) applied nothing and must not
+    // refresh liveness or suppress the stall alert.
     prisma.groomingRun.findFirst({
-      where: { status: "completed", dryRun: false, completedAt: { not: null } },
+      where: { status: "completed", dryRun: false, stage: "applied", completedAt: { not: null } },
       orderBy: { completedAt: "desc" },
       select: { completedAt: true },
     }),

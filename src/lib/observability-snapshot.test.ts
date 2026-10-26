@@ -210,7 +210,16 @@ describe("collectObservabilitySnapshot", () => {
       expect(snapshot.grooming.stallThresholdSeconds).toBe(600);
       expect(mocks.groomingRun.findFirst).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: expect.objectContaining({ status: "completed", dryRun: false }),
+          // Canonical successful-applied state, exactly what
+          // evaluateQueueAdmission requires (queue-admission.ts): a run that
+          // completed as `stage: "skipped"` (busy/no-op outcome) or
+          // `dryRun: true` applied nothing and must not refresh the baseline
+          // or suppress A14.
+          where: expect.objectContaining({
+            status: "completed",
+            dryRun: false,
+            stage: "applied",
+          }),
         }),
       );
     } finally {

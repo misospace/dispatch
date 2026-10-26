@@ -42,6 +42,13 @@ function alertBlocks(text: string): Map<string, string> {
   return blocks;
 }
 
+/** Expression text of an alert block: between `expr:` and `for:`. */
+function blockExpr(block: string): string {
+  const start = block.indexOf("expr:");
+  const end = block.indexOf("for:", start);
+  return start >= 0 && end > start ? block.slice(start + 5, end) : "";
+}
+
 describe("optional assets match the shipped contracts (#1255)", () => {
   it("the dashboard JSON parses and only queries exported metric families", () => {
     expect(dashboard.panels.length).toBeGreaterThan(20);
@@ -120,6 +127,9 @@ describe("optional assets match the shipped contracts (#1255)", () => {
       A14: [
         'dispatch_queue_admission_mode{mode="enforce"}',
         "dispatch_queue_withheld_grooming",
+        // The threshold-existence gate: a presence-yielding vector/scalar
+        // comparison on the threshold series itself (see the A14 gate test).
+        "dispatch_grooming_stall_threshold_seconds >= 0",
         "absent(",
         "dispatch_grooming_last_success_timestamp_seconds",
         "dispatch_grooming_stall_threshold_seconds",
@@ -185,6 +195,39 @@ describe("optional assets match the shipped contracts (#1255)", () => {
     }
 
     expect(problems, problems.join("\n")).toEqual([]);
+  });
+
+  it("gates A14's threshold leg on a presence-yielding existence predicate", () => {
+    // Regression (PR #1438 review): the gate was `absent(threshold) == 0`.
+    // absent() returns a 1-value sample only when its argument is ABSENT and
+    // an empty vector when the series exists, so `== 0` filters BOTH cases —
+    // the `and` leg was always empty and A14 could never fire, whether the
+    // threshold series was present or absent. The gate must be a
+    // presence-yielding comparison on the series itself: `threshold >= 0`
+    // propagates the threshold samples when the series exists (the stall
+    // arms evaluate against it) and yields nothing when it is absent (the
+    // stall is not evaluable — never healthy), matching the portable
+    // evaluator's not-evaluable rule in both cases. The absent-BASELINE arm
+    // keeps its `absent(...) == 1` form — that is the correct usage, where
+    // the sample is wanted for the absent case.
+    const expr = blockExpr(alertBlocks(rules).get("A14") ?? "");
+    expect(expr).toBeTruthy();
+    const flat = expr.replace(/\s+/g, " ");
+    // Present-threshold case: the gate yields the threshold samples.
+    expect(flat).toContain("dispatch_grooming_stall_threshold_seconds >= 0");
+    // The broken existence pattern must never come back: absent() == 0
+    // yields no matching vector in either direction.
+    expect(flat).not.toMatch(/absent\s*\(\s*dispatch_grooming_stall_threshold_seconds[^)]*\)\s*==\s*0/);
+    // Absent-threshold case: with the threshold series missing the gate leg
+    // is empty, so the whole conjunction is empty and A14 stays silent
+    // (not-evaluable) — pinned by requiring the gate be a direct comparison
+    // on the threshold series (no aggregation/function that could synthesize
+    // a sample when the series is missing).
+    expect(flat).toMatch(/and on\(\) dispatch_grooming_stall_threshold_seconds >= 0/);
+    // Absent-baseline firing arm stays intact (`absent(...) == 1`).
+    expect(flat).toContain(
+      'absent(dispatch_grooming_last_success_timestamp_seconds{job="dispatch"}) == 1',
+    );
   });
 
   it("renders exactly one active sync-pipeline arm state", () => {

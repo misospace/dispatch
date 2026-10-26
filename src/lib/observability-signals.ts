@@ -351,7 +351,9 @@ export interface ObservabilitySnapshotInputs {
   groomingRuns: ObservabilityGroomingRunRow[];
   /**
    * Newest GroomingRun that completed successfully and was applied
-   * (status "completed", not a dry run), regardless of window — #1420's
+   * (status "completed", stage "applied", not a dry run — the same canonical
+   * successful-admission state `evaluateQueueAdmission` requires), regardless
+   * of window — #1420's
    * groomer-stall baseline. Null when none has ever succeeded: an absent
    * baseline, not zero.
    */
