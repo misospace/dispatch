@@ -101,6 +101,9 @@ function baseInputs(
     auditFailures: [],
     assignmentAudit: [],
     groomingRuns: [],
+    lastGroomingSuccessAt: ago(120),
+    groomerIntervalMs: 600_000,
+    groomingStallIntervals: 2,
     sync: { lastSuccessAt: ago(120), running: 0, failed: [] },
     repoLastSyncedAt: [ago(120)],
     scheduler: {
@@ -724,6 +727,108 @@ describe("observability signal derivation", () => {
     });
   });
 
+  describe("groomer stall (#1420)", () => {
+    it("grooming fields derive from lastGroomingSuccessAt", () => {
+      const s = snapshot({ lastGroomingSuccessAt: ago(100) });
+      expect(s.grooming.lastSuccessTimestampSeconds).toBe(
+        Math.floor(ago(100).getTime() / 1000),
+      );
+      expect(s.grooming.secondsSinceLastSuccess).toBe(100);
+      expect(s.grooming.everSucceeded).toBe(true);
+      expect(s.grooming.stallThresholdSeconds).toBe(1200); // 10m interval × 2
+    });
+
+    it("a null baseline is an absent series: never succeeded, no timestamp, no age", () => {
+      const s = snapshot({ lastGroomingSuccessAt: null });
+      expect(s.grooming.lastSuccessTimestampSeconds).toBeNull();
+      expect(s.grooming.secondsSinceLastSuccess).toBeNull();
+      expect(s.grooming.everSucceeded).toBe(false);
+    });
+
+    it("stallThresholdSeconds is null when the stall window is undeclared", () => {
+      expect(snapshot({ groomerIntervalMs: 0 }).grooming.stallThresholdSeconds).toBeNull();
+      expect(snapshot({ groomingStallIntervals: 0 }).grooming.stallThresholdSeconds).toBeNull();
+    });
+
+    it("notAdmitted.byGrooming counts only grooming-caused withholding", async () => {
+      const { computeGroomingIssueFingerprint } = await import("@/lib/groomer/freshness");
+      const body = "Concrete task. Depends on #100.";
+      const issues = [
+        // Open blocker gating the dependency-blocked issue below.
+        makeIssue({ id: "blocker", number: 100, labels: ["status/in-progress"] }),
+        // Withheld on grooming evidence only: no freshness baseline.
+        makeIssue({ id: "g-unknown", number: 101, labels: ["status/ready"] }),
+        // Withheld on a deterministic blocker only: a current override
+        // baseline whose fingerprint matches the live issue.
+        makeIssue({
+          id: "dep-only",
+          number: 102,
+          labels: ["status/ready"],
+          body,
+          groomedRunId: "ovr-1",
+          admissionOverrideId: "ovr-1",
+          groomedIssueFingerprint: computeGroomingIssueFingerprint({
+            title: "issue dep-only",
+            body,
+            state: "open",
+            labels: ["status/ready"],
+          }),
+          groomedEvidenceScope: "none",
+        }),
+      ];
+      const s = snapshot({ admissionMode: "enforce", issues });
+      expect(s.admission.notAdmitted?.total).toBe(2);
+      expect(s.admission.notAdmitted?.byGrooming).toBe(1);
+      expect(s.admission.notAdmitted?.byReason).toEqual({
+        grooming_unknown: 1,
+        dependency_blocked: 1,
+      });
+      expect(s.workSupply.dependencyBlocked).toBe(1);
+    });
+
+    it("observations.groomingStalledWithholding distinguishes stall from recovery", () => {
+      const issues = [makeIssue({ id: "stalled-ready" })]; // null fingerprint → grooming-caused
+
+      const stalled = snapshot({
+        admissionMode: "enforce",
+        issues,
+        lastGroomingSuccessAt: ago(7200), // 2h > 20m stall window
+      });
+      expect(stalled.observations.groomingStalledWithholding).toBe(true);
+
+      const healthy = snapshot({
+        admissionMode: "enforce",
+        issues,
+        lastGroomingSuccessAt: ago(120), // recovered inside the window
+      });
+      expect(healthy.observations.groomingStalledWithholding).toBe(false);
+
+      expect(
+        snapshot({
+          admissionMode: "audit",
+          issues,
+          lastGroomingSuccessAt: ago(7200),
+        }).observations.groomingStalledWithholding,
+      ).toBeNull();
+
+      expect(
+        snapshot({
+          admissionMode: "enforce",
+          issues,
+          lastGroomingSuccessAt: ago(7200),
+          groomerIntervalMs: 0, // no declared interval → no stall window to judge
+        }).observations.groomingStalledWithholding,
+      ).toBeNull();
+
+      const neverSucceeded = snapshot({
+        admissionMode: "enforce",
+        issues,
+        lastGroomingSuccessAt: null, // absent baseline is the firing side
+      });
+      expect(neverSucceeded.observations.groomingStalledWithholding).toBe(true);
+    });
+  });
+
   describe("scenario distinguishability (acceptance matrix)", () => {
     function digest(s: ReturnType<typeof snapshot>): string {
       const { generatedAt: _omit, ...rest } = s;
@@ -790,6 +895,7 @@ describe("observability signal derivation", () => {
         syncDiscoveryFailing: false,
         schedulerOverdue: false,
         admissionWithholding: null,
+        groomingStalledWithholding: null,
       });
     });
 

@@ -176,6 +176,16 @@ export const OBSERVABILITY_ALERTS: readonly ObservabilityAlertDefinition[] = [
     operatorAction:
       "Check GitHub reachability/rate limits; treat unknown as unknown, never healthy.",
   },
+  {
+    id: "A14",
+    title: "Enforced admission starved by a grooming stall",
+    enabled: true,
+    severity: "warning",
+    forMs: 10 * 60 * 1000,
+    why: "Enforce admission is withholding ready work while the groomer has not completed a successful applied run within N groomer intervals (or never has). Enforcement deliberately never fails open, so a stalled pipeline starves the fleet silently — the impacted-ready count rides on dispatch_queue_withheld_grooming.",
+    operatorAction:
+      "Restore the groomer (job logs, DISPATCH_HOSTED_GROOMER_ENABLED, GitHub reachability, model provider); never relax enforcement blindly — a per-issue operator admission override is the surgical release.",
+  },
 ];
 
 export const OBSERVABILITY_ALERTS_BY_ID: ReadonlyMap<string, ObservabilityAlertDefinition> =
@@ -190,6 +200,15 @@ export interface ObservabilityAlertThresholds {
   humanDecisionWarningSeconds: number;
   /** A13: per-repo sync staleness past which upstream evidence is unavailable. */
   repoStaleSyncSeconds: number;
+  /**
+   * A14: grooming-stall window override. Null (the default) uses the
+   * snapshot's own `grooming.stallThresholdSeconds` — N groomer intervals as
+   * configured — so the evaluator and the packaged rule track
+   * DISPATCH_GROOMER_INTERVAL_MS without a hard-coded number. A non-positive
+   * or non-finite override is ignored (falls back to the snapshot value): it
+   * must never silently arm "any staleness".
+   */
+  groomingStallSeconds: number | null;
 }
 
 export interface EvaluateObservabilityAlertsOptions {
@@ -373,6 +392,42 @@ function predicate(
         snapshot.pipeline.maxRepoStaleSyncSeconds > thresholds.repoStaleSyncSeconds;
       return { holds: repoStale || snapshot.grooming.backoff > 0, evaluable: true };
     }
+    case "A14": {
+      // Starvation needs BOTH legs: enforcement actually withholding ready
+      // work, and the groomer stalled past its own declared window. Rows the
+      // state cannot speak to are not_evaluable, never a silent "ok":
+      // admission off/audit withholds nothing, and an undeclared groomer
+      // interval has no stall window to judge (mirrors A2/A4's guards).
+      if (snapshot.admission.mode !== "enforce") {
+        return { holds: false, evaluable: false };
+      }
+      // The override is honoured only as a finite positive window; a
+      // non-positive/garbage override must not silently arm "any staleness"
+      // and falls back to the snapshot's own configured window.
+      const override = thresholds.groomingStallSeconds;
+      const stallSeconds =
+        override !== null && Number.isFinite(override) && override > 0
+          ? override
+          : snapshot.grooming.stallThresholdSeconds;
+      if (stallSeconds === null) {
+        return { holds: false, evaluable: false };
+      }
+      const withheldByGrooming = snapshot.admission.notAdmitted?.byGrooming ?? 0;
+      if (withheldByGrooming === 0) {
+        return { holds: false, evaluable: true };
+      }
+      // A success baseline that carries no age (corrupt completion time) is
+      // unknown, never "not stalled".
+      if (snapshot.grooming.everSucceeded && snapshot.grooming.secondsSinceLastSuccess === null) {
+        return { holds: false, evaluable: false };
+      }
+      // The absent baseline (grooming has never succeeded) IS the firing
+      // case — never coerced to healthy, the same rule as A2's absent series.
+      const stalled =
+        !snapshot.grooming.everSucceeded ||
+        snapshot.grooming.secondsSinceLastSuccess! > stallSeconds;
+      return { holds: stalled, evaluable: true };
+    }
     default:
       return { holds: false, evaluable: false };
   }
@@ -392,6 +447,7 @@ export function evaluateObservabilityAlerts(
     headOfLineWarningSeconds: 3600,
     humanDecisionWarningSeconds: 3600,
     repoStaleSyncSeconds: defaultRepoStaleSyncThresholdSeconds(snapshot.config.syncIntervalMs),
+    groomingStallSeconds: null,
     ...options.thresholds,
   };
   const healthUp = options.healthUp ?? true;

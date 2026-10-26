@@ -26,6 +26,12 @@ const STRANDED_ASSIGNMENT_DEFAULT_MS = 30 * 60 * 1000;
 const STRANDED_ASSIGNMENT_MIN_MS = 60_000;
 const STRANDED_ASSIGNMENT_MAX_MS = 86_400_000;
 const LONG_WINDOW_MS = 3_600_000;
+// Groomer stall (#1420): N groomer intervals without a successful applied
+// run, while enforce admission withholds ready work, is the starvation the
+// dedicated alert names. 2 intervals mirrors the sync-freshness window.
+const GROOMING_STALL_INTERVALS_DEFAULT = 2;
+const GROOMING_STALL_INTERVALS_MIN = 1;
+const GROOMING_STALL_INTERVALS_MAX = 24;
 // Assignment age evidence horizon. Bounded on purpose; the horizon is
 // exported in the snapshot (`evidenceLookbackSeconds`) so assignments older
 // than it report as age-UNKNOWN (never aged) with the horizon visible,
@@ -38,6 +44,22 @@ export function strandedAssignmentThresholdMs(
   const parsed = Number(env.DISPATCH_OBSERVABILITY_STRANDED_ASSIGNMENT_MS);
   if (!Number.isFinite(parsed) || parsed <= 0) return STRANDED_ASSIGNMENT_DEFAULT_MS;
   return Math.min(STRANDED_ASSIGNMENT_MAX_MS, Math.max(STRANDED_ASSIGNMENT_MIN_MS, parsed));
+}
+
+/**
+ * How many groomer intervals without a successful applied run count as a
+ * grooming stall (#1420). Unset/invalid values fall back to 2; the value is
+ * clamped so a typo cannot arm an absurd window.
+ */
+export function groomingStallIntervals(
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const parsed = Number(env.DISPATCH_GROOMING_STALL_INTERVALS);
+  if (!Number.isFinite(parsed) || parsed <= 0) return GROOMING_STALL_INTERVALS_DEFAULT;
+  return Math.min(
+    GROOMING_STALL_INTERVALS_MAX,
+    Math.max(GROOMING_STALL_INTERVALS_MIN, Math.floor(parsed)),
+  );
 }
 
 export async function collectObservabilitySnapshot(
@@ -56,6 +78,7 @@ export async function collectObservabilitySnapshot(
     agentRunRows,
     auditFailureRows,
     groomingRunRows,
+    lastGroomingSuccessRun,
     lastSyncRun,
     runningSyncCount,
     failedSyncRows,
@@ -139,6 +162,19 @@ export async function collectObservabilitySnapshot(
       where: { createdAt: { gte: windowStart } },
       select: { status: true, createdAt: true },
     }),
+    // Groomer-stall baseline (#1420): the newest SUCCESSFUL applied grooming
+    // run, never windowed — "has never succeeded" is a distinct firing state
+    // from "recently succeeded" (same shape as the sync baseline above).
+    // `dryRun: false` keeps a dry-run scheduler from masking a dead applier,
+    // and `stage: "applied"` is the same canonical successful-admission state
+    // `evaluateQueueAdmission` requires: a completed skipped/no-op run
+    // (`stage = "skipped"`, e.g. a busy lease) applied nothing and must not
+    // refresh liveness or suppress the stall alert.
+    prisma.groomingRun.findFirst({
+      where: { status: "completed", dryRun: false, stage: "applied", completedAt: { not: null } },
+      orderBy: { completedAt: "desc" },
+      select: { completedAt: true },
+    }),
     prisma.issueSyncRun.findFirst({
       where: { status: "completed", completedAt: { not: null } },
       orderBy: { completedAt: "desc" },
@@ -186,6 +222,12 @@ export async function collectObservabilitySnapshot(
 
   const schedulerConfig = schedulerConfigFromEnv(process.env);
   const schedulerStateSummary = schedulerState();
+  // The groomer interval is read from the resolved job config regardless of
+  // whether the IN-PROCESS scheduler is enabled: an external cron/CronJob
+  // groomer declares its cadence through the same DISPATCH_GROOMER_INTERVAL_MS
+  // (mirrors how syncIntervalMs feeds the sync-freshness rows).
+  const groomerIntervalMs =
+    schedulerConfig.jobs.find((job) => job.name === "groomer")?.intervalMs ?? 0;
 
   const admissionRuns =
     admissionMode === "off"
@@ -247,6 +289,9 @@ export async function collectObservabilitySnapshot(
       status: row.status,
       createdAt: row.createdAt,
     })),
+    lastGroomingSuccessAt: lastGroomingSuccessRun?.completedAt ?? null,
+    groomerIntervalMs,
+    groomingStallIntervals: groomingStallIntervals(),
     sync: {
       lastSuccessAt: lastSyncRun?.completedAt ?? null,
       running: runningSyncCount,

@@ -30,7 +30,10 @@ const { mocks, writes } = vi.hoisted(() => {
     prFixHistory: delegate({ findMany: vi.fn().mockResolvedValue([]) }),
     agentRun: delegate({ findMany: vi.fn().mockResolvedValue([]) }),
     auditLog: delegate({ findMany: vi.fn().mockResolvedValue([]) }),
-    groomingRun: delegate({ findMany: vi.fn().mockResolvedValue([]) }),
+    groomingRun: delegate({
+      findMany: vi.fn().mockResolvedValue([]),
+      findFirst: vi.fn().mockResolvedValue(null),
+    }),
     issueSyncRun: delegate({
       findMany: vi.fn().mockResolvedValue([]),
       findFirst: vi.fn().mockResolvedValue(null),
@@ -58,6 +61,7 @@ describe("GET /api/observability", () => {
     mocks.agentRun.findMany.mockResolvedValue([]);
     mocks.auditLog.findMany.mockResolvedValue([]);
     mocks.groomingRun.findMany.mockResolvedValue([]);
+    mocks.groomingRun.findFirst.mockResolvedValue(null);
     mocks.issueSyncRun.findMany.mockResolvedValue([]);
     mocks.issueSyncRun.findFirst.mockResolvedValue(null);
     mocks.issueSyncRun.count.mockResolvedValue(0);

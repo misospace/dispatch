@@ -349,6 +349,19 @@ export interface ObservabilitySnapshotInputs {
   assignmentAudit: ObservabilityAssignmentAuditRow[];
   /** GroomingRun rows created within the longest window. */
   groomingRuns: ObservabilityGroomingRunRow[];
+  /**
+   * Newest GroomingRun that completed successfully and was applied
+   * (status "completed", stage "applied", not a dry run — the same canonical
+   * successful-admission state `evaluateQueueAdmission` requires), regardless
+   * of window — #1420's
+   * groomer-stall baseline. Null when none has ever succeeded: an absent
+   * baseline, not zero.
+   */
+  lastGroomingSuccessAt: Date | null;
+  /** Resolved groomer interval in ms (DISPATCH_GROOMER_INTERVAL_MS); 0 when disabled. */
+  groomerIntervalMs: number;
+  /** How many groomer intervals without a successful run count as stalled (#1420). */
+  groomingStallIntervals: number;
   sync: ObservabilitySyncRunSummary;
   repoLastSyncedAt: Date[];
   scheduler: ObservabilitySchedulerSummary;
@@ -476,6 +489,13 @@ export interface ObservabilitySnapshot {
     /** Null in `off` mode: nothing is evaluated, so the state is unknown. */
     notAdmitted: null | {
       total: number;
+      /**
+       * Subset withheld by at least one `grooming_*` reason code — the
+       * groomer-evidence attribution only (`dependency_blocked`,
+       * `escalation_lane_mismatch` and the `unknown` fold stay out). #1420:
+       * the impacted-ready count the groomer-stall alert exposes.
+       */
+      byGrooming: number;
       byReason: CountMap;
       oldestAgeSeconds: number | null;
     };
@@ -486,6 +506,18 @@ export interface ObservabilitySnapshot {
     backoff: number;
     staleReasons: CountMap;
     runsInWindowByStatus: ObservabilityWindowedByDimension;
+    /**
+     * Groomer liveness (#1420). `lastSuccessTimestampSeconds` mirrors the sync
+     * pattern: null = no successful applied grooming run has EVER completed —
+     * an absent baseline, not zero, and the firing side of the stall case.
+     * `stallThresholdSeconds` is `groomerIntervalMs × groomingStallIntervals`,
+     * null when the groomer interval is not declared (0): the stall is then
+     * not evaluable, never healthy.
+     */
+    lastSuccessTimestampSeconds: number | null;
+    secondsSinceLastSuccess: number | null;
+    everSucceeded: boolean;
+    stallThresholdSeconds: number | null;
   };
   pipeline: {
     scheduler: {
@@ -547,6 +579,16 @@ export interface ObservabilitySnapshot {
     schedulerOverdue: boolean;
     /** Admission is on and at least one ready issue is not admitted. */
     admissionWithholding: boolean | null;
+    /**
+     * A14 conjunction (#1420): enforcement is ON, at least one ready issue is
+     * withheld on grooming evidence, and the groomer has not completed a
+     * successful applied run within `grooming.stallThresholdSeconds` (or has
+     * never succeeded). `null` when not evaluable: admission not enforcing, or
+     * no declared groomer interval to measure stall against. The gate never
+     * fails open, so a sustained true means the pipeline — not enforcement —
+     * must be restored.
+     */
+    groomingStalledWithholding: boolean | null;
   };
 }
 
@@ -656,9 +698,28 @@ function isOverdueAckedHandout(
 
 // ─── Admission evaluation (reuses the canonical rule, no reimplementation) ──
 
+/**
+ * The impacted set behind #1420's starvation signal: reason codes that
+ * attribute the withhold to the groomer's evidence. An explicit allowlist of
+ * the `grooming_*` codes rather than "everything except dependency_blocked":
+ * `escalation_lane_mismatch` is a lane-CONFIG withhold (a healthy groomer
+ * never clears it), and bucket()'s `unknown` fold must not be misattributed
+ * to a pipeline outage. Misclassifying these would blame config starvation
+ * on the groomer.
+ */
+const GROOMING_EVIDENCE_REASON_CODES: ReadonlySet<string> = new Set(
+  ADMISSION_REASON_CODES.filter((code) => code.startsWith("grooming_")),
+);
+
 interface WithheldInfo {
   reasons: string[];
+  /** Withheld by at least one grooming-evidence reason (#1420). */
+  groomingCaused: boolean;
   createdAt: Date;
+}
+
+function isGroomingCausedReason(code: string): boolean {
+  return GROOMING_EVIDENCE_REASON_CODES.has(code);
 }
 
 function evaluateAdmission(
@@ -693,8 +754,10 @@ function evaluateAdmission(
       dependencyBlockReason: formatDependencyBlockReason(blockers, issue.repoFullName) || null,
     });
     if (!admission.admitted) {
+      const reasons = admission.reasons.map((r) => bucket(r.code, ADMISSION_REASON_CODES));
       withheld.push({
-        reasons: admission.reasons.map((r) => bucket(r.code, ADMISSION_REASON_CODES)),
+        reasons,
+        groomingCaused: reasons.some(isGroomingCausedReason),
         createdAt: issue.createdAt,
       });
     }
@@ -937,12 +1000,17 @@ export function computeObservabilitySnapshot(
       : (() => {
           const byReason: CountMap = {};
           let oldest: number | null = null;
+          let byGrooming = 0;
           for (const w of withheld) {
             for (const code of w.reasons) bump(byReason, code);
+            if (w.groomingCaused) byGrooming += 1;
             const age = ageSeconds(w.createdAt, now);
             if (age !== null && (oldest === null || age > oldest)) oldest = age;
           }
-          return { mode: inputs.admissionMode, notAdmitted: { total: withheld.length, byReason, oldestAgeSeconds: oldest } };
+          return {
+            mode: inputs.admissionMode,
+            notAdmitted: { total: withheld.length, byGrooming, byReason, oldestAgeSeconds: oldest },
+          };
         })();
 
   // ── Grooming freshness (persisted columns only; absent = unknown) ──
@@ -958,6 +1026,19 @@ export function computeObservabilitySnapshot(
       bump(staleReasons, bucket(reason, GROOMING_STALE_REASON_DIMS));
     }
   }
+
+  // ── Groomer stall (#1420) ──
+  // The stall window is the operator-declared groomer cadence times the stall
+  // interval count; an undeclared (0) interval makes it NOT evaluable — the
+  // same guard shape as the sync freshness rows, never a silent "healthy".
+  const secondsSinceGroomingSuccess = ageSeconds(inputs.lastGroomingSuccessAt, now);
+  const everGroomingSucceeded = inputs.lastGroomingSuccessAt !== null;
+  const stallThresholdSeconds =
+    inputs.groomerIntervalMs > 0 && inputs.groomingStallIntervals > 0
+      ? Math.floor((inputs.groomerIntervalMs / 1000) * inputs.groomingStallIntervals)
+      : null;
+  const withheldByGrooming =
+    admissionSection.notAdmitted === null ? null : admissionSection.notAdmitted.byGrooming;
 
   // ── Pipeline ──
   const jobs = inputs.scheduler.jobs.map((job) => {
@@ -1114,6 +1195,12 @@ export function computeObservabilitySnapshot(
         now,
         OBSERVABILITY_FAILURE_WINDOWS_SECONDS,
       ),
+      lastSuccessTimestampSeconds: inputs.lastGroomingSuccessAt
+        ? Math.floor(inputs.lastGroomingSuccessAt.getTime() / 1000)
+        : null,
+      secondsSinceLastSuccess: secondsSinceGroomingSuccess,
+      everSucceeded: everGroomingSucceeded,
+      stallThresholdSeconds,
     },
     pipeline: {
       scheduler: {
@@ -1156,6 +1243,20 @@ export function computeObservabilitySnapshot(
       schedulerOverdue: inputs.scheduler.enabled && overdueJobs > 0,
       admissionWithholding:
         inputs.admissionMode === "off" ? null : withheld.length > 0,
+      // A14 conjunction (#1420). Not evaluable (null) when enforcement is not
+      // on (nothing is withheld), the groomer interval is undeclared (no stall
+      // window to judge), or the baseline exists but its age does not (a
+      // corrupt completion time is unknown, never "not stalled") — never a
+      // silent false.
+      groomingStalledWithholding:
+        inputs.admissionMode !== "enforce" ||
+        withheldByGrooming === null ||
+        stallThresholdSeconds === null ||
+        (everGroomingSucceeded && secondsSinceGroomingSuccess === null)
+          ? null
+          : withheldByGrooming > 0 &&
+            (!everGroomingSucceeded ||
+              secondsSinceGroomingSuccess! > stallThresholdSeconds),
     },
   };
   return snapshot;

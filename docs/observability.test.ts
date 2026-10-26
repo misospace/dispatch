@@ -80,9 +80,9 @@ const DEFINED_SIGNALS = new Set(
 );
 
 describe("observability design doc: §6 alert catalogue structure", () => {
-  it("defines A1–A13 exactly once, each row complete", () => {
+  it("defines A1–A14 exactly once, each row complete", () => {
     const ids = ALERTS.map((cells) => cells[0]);
-    const expected = Array.from({ length: 13 }, (_, i) => `A${i + 1}`);
+    const expected = Array.from({ length: 14 }, (_, i) => `A${i + 1}`);
     expect(ids, `§6 alert IDs drifted; expected exactly ${expected.join(", ")}`).toEqual(expected);
     const missing = REQUIRED_CELLS.filter(([idx]) => idx === -1).map(([, label]) => label);
     expect(missing, `§6 table is missing the column(s): ${missing.join(", ")}`).toEqual([]);
