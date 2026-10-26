@@ -326,7 +326,15 @@ function statusLabelIntervals(
     if (occurredAtMs === null) continue;
     changes.push({ occurredAtMs, fromStatus: event.fromStatus, toStatus: event.toStatus });
   }
-  changes.sort((a, b) => a.occurredAtMs - b.occurredAtMs);
+  // Same-millisecond ties get a content tie-break so the open/close outcome
+  // never depends on the order rows arrived in (reproducible-read rule).
+  const changeKey = (c: { fromStatus: string | null; toStatus: string | null }) =>
+    `${c.fromStatus ?? ""}\u0000${c.toStatus ?? ""}`;
+  changes.sort(
+    (a, b) =>
+      a.occurredAtMs - b.occurredAtMs ||
+      (changeKey(a) < changeKey(b) ? -1 : changeKey(a) > changeKey(b) ? 1 : 0),
+  );
 
   const intervals: RunIntervalMs[] = [];
   let openStart: number | null = null;

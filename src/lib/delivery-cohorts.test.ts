@@ -974,6 +974,36 @@ describe("observed wait buckets", () => {
     expect(s.unclassifiedMs).toBe(5 * HOUR);
   });
 
+  it("derives identical wait buckets regardless of same-millisecond event order", () => {
+    const entry = event({
+      kind: "status_changed",
+      occurredAt: "2026-10-01T01:00:00.000Z",
+      toStatus: "status/in-review",
+    });
+    const blockedEntry = event({
+      kind: "status_changed",
+      occurredAt: "2026-10-01T01:00:00.000Z",
+      fromStatus: "status/in-review",
+      toStatus: "status/blocked",
+    });
+    const base = [
+      event({ kind: "claim", agentName: "alpha", occurredAt: "2026-10-01T00:00:00.000Z" }),
+      event({ kind: "completed", agentName: "alpha", occurredAt: "2026-10-01T02:00:00.000Z" }),
+    ];
+    const issueClosed = () =>
+      issue({ issueNumber: 18, state: "closed", closedAt: "2026-10-01T02:00:00.000Z" });
+    const a = deriveDeliverySample(
+      sample({ issue: issueClosed(), events: [...base, entry, blockedEntry] }),
+      NOW,
+    );
+    const b = deriveDeliverySample(
+      sample({ issue: issueClosed(), events: [...base, blockedEntry, entry] }),
+      NOW,
+    );
+    expect(b.observedWaits).toEqual(a.observedWaits);
+    expect(b.unclassifiedMs).toBe(a.unclassifiedMs);
+  });
+
   it("passes dbIssueId through for per-item drill-down links", () => {
     const s = deriveDeliverySample(
       sample({

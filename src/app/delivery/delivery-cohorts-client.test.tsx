@@ -15,7 +15,6 @@ import { authedFetch } from "@/lib/client-auth";
 
 const deliveryResponse = {
   schema: "dispatch.delivery-cohorts/v1",
-  units: { ms: "milliseconds", iso: "ISO-8601 UTC" },
   window: {
     since: "2026-06-01T00:00:00.000Z",
     until: "2026-07-01T00:00:00.000Z",
@@ -27,27 +26,23 @@ const deliveryResponse = {
     {
       key: "gpt-5.5",
       sampleCount: 1,
-      delivery: {
-        "done-and-merged": 1,
-        "done-only": 0,
-        "merged-only": 0,
-        "merged-then-closed": 0,
-        "still-open": 0,
-      },
+      delivery: { merged: 1, "closed-unmerged": 0, open: 0, unknown: 0 },
       completionRate: 1,
       claimToDone: {
-        n: 1,
-        medianMs: 3600000,
-        p90Ms: 3600000,
-        minMs: 3600000,
-        maxMs: 3600000,
+        samples: 1,
+        min: 3600000,
+        max: 3600000,
+        mean: 3600000,
+        p50: 3600000,
+        p90: 3600000,
       },
       claimToMerge: {
-        n: 1,
-        medianMs: 1800000,
-        p90Ms: 1800000,
-        minMs: 1800000,
-        maxMs: 1800000,
+        samples: 1,
+        min: 1800000,
+        max: 1800000,
+        mean: 1800000,
+        p50: 1800000,
+        p90: 1800000,
       },
       workerTimeMs: 600000,
       firstPass: { true: 1, false: 0, null: 0 },
@@ -73,15 +68,9 @@ const deliveryResponse = {
     },
   ],
   totals: {
-    key: "totals",
+    key: "all",
     sampleCount: 1,
-    delivery: {
-      "done-and-merged": 1,
-      "done-only": 0,
-      "merged-only": 0,
-      "merged-then-closed": 0,
-      "still-open": 0,
-    },
+    delivery: { merged: 1, "closed-unmerged": 0, open: 0, unknown: 0 },
     completionRate: 1,
     claimToDone: null,
     claimToMerge: null,
@@ -109,15 +98,15 @@ const deliveryResponse = {
   },
   samples: [
     {
-      issueId: "org/repo/7",
+      issueId: "org/repo#7",
       dbIssueId: "db-issue-1",
       repoFullName: "org/repo",
       issueNumber: 7,
-      delivery: "done-and-merged",
+      delivery: "merged",
       firstClaimAt: "2026-06-10T00:00:00.000Z",
       firstMergedAt: "2026-06-10T00:30:00.000Z",
       doneAt: "2026-06-10T01:00:00.000Z",
-      doneAtProvenance: "backfill",
+      doneAtProvenance: "backfilled",
       claimToDoneMs: 3600000,
       claimToMergeMs: 1800000,
       workerTimeMs: 600000,
@@ -132,14 +121,26 @@ const deliveryResponse = {
       executionAttempts: 1,
       failedAttempts: 0,
       fixRounds: 0,
+      cohortKeys: {
+        cohort: "c1",
+        model: "gpt-5.5",
+        worker: "alpha",
+        runtimeRevision: "a",
+        reasoningEffort: "unknown",
+        repository: "org/repo",
+        taskType: "feature",
+      },
       mixedSettings: false,
-      runtimeRevisions: ["a"],
-      models: ["gpt-5.5"],
-      workers: ["alpha"],
+      settings: {
+        worker: "alpha",
+        model: "gpt-5.5",
+        reasoningEffort: null,
+        runtimeRevision: "a",
+      },
       missing: [],
       excludedFromDurations: false,
       ageMs: null,
-      taskType: "type/feature",
+      taskType: "feature",
       runIntervalsMs: [
         { startMs: 1749000000000, endMs: 1749000600000 },
       ],
@@ -155,29 +156,38 @@ const lifecycleResponse = {
     id: "db-issue-1",
     repoFullName: "org/repo",
     issueNumber: 7,
-    state: "CLOSED",
+    state: "closed",
     url: "https://github.com/org/repo/issues/7",
   },
   timeline: {
-    schema: "dispatch.issue-lifecycle/v1",
-    units: { ms: "milliseconds", iso: "ISO-8601 UTC" },
-    claims: [],
+    schema: "dispatch.issue-lifecycle-timeline/v1",
+    units: "milliseconds",
+    claims: [
+      {
+        agentName: "alpha",
+        actor: "agent/alpha",
+        source: "api:claim",
+        at: "2026-06-10T00:00:00.000Z",
+        observedAt: "2026-06-10T00:00:00.000Z",
+        provenance: "backfilled",
+      },
+    ],
     firstClaim: {
       at: "2026-06-10T00:00:00.000Z",
-      provenance: "backfill",
-      via: ["issue-created"],
+      provenance: "backfilled",
+      via: ["claim"],
     },
     doneAt: {
       at: "2026-06-10T01:00:00.000Z",
-      provenance: "backfill",
-      via: ["issue-state-closed"],
+      provenance: "backfilled",
+      via: ["completed"],
     },
     closedAt: {
       at: "2026-06-10T01:30:00.000Z",
-      provenance: "backfill",
-      via: ["issue-state-closed"],
+      provenance: "observed",
+      via: ["issue_closed"],
     },
-    lastReopenAt: { at: null, provenance: "missing", via: [] },
+    lastReopenAt: { at: null, provenance: "unknown", via: [] },
     pullRequests: [
       {
         prNumber: 101,
@@ -185,25 +195,25 @@ const lifecycleResponse = {
         mergedAt: "2026-06-10T00:30:00.000Z",
         mergeCommitSha: "abc",
         headSha: "def",
-        linkSource: "pr-event",
-        provenance: "github-pr-merged",
+        linkSource: "sync",
+        provenance: "observed",
       },
     ],
     firstMergedAt: {
       at: "2026-06-10T00:30:00.000Z",
-      provenance: "github-pr-merged",
-      via: ["pr-101"],
+      provenance: "observed",
+      via: ["pr_merged"],
     },
-    delivery: "done-and-merged",
+    delivery: "merged",
     claimToDoneMs: 3600000,
     claimToMergeMs: 1800000,
-    notes: ["first claim backfilled from issue state history"],
+    notes: ["duplicate observation collapsed"],
   },
   events: [],
   truncated: false,
   attempts: {
-    schema: "dispatch.work-item-delivery-chain/v1",
-    units: { ms: "milliseconds", iso: "ISO-8601 UTC" },
+    schema: "dispatch.work-item-attempt-chain/v1",
+    units: "milliseconds",
     workItem: { repoFullName: "org/repo", issueNumber: 7 },
     attempts: [
       {
@@ -215,7 +225,7 @@ const lifecycleResponse = {
         endedAt: "2026-06-10T00:10:00.000Z",
         reportedAt: "2026-06-10T00:11:00.000Z",
         outcome: "success",
-        classification: "completed",
+        classification: "active-execution",
         executionMetadata: {
           workerProduct: "opencode",
           model: "gpt-5.5",
@@ -236,7 +246,7 @@ const lifecycleResponse = {
         endedAt: "2026-06-10T00:20:00.000Z",
         reportedAt: "2026-06-10T00:21:00.000Z",
         outcome: "superseded",
-        classification: "superseded",
+        classification: "waiting-review",
         executionMetadata: {
           workerProduct: "opencode",
           model: "gpt-5.5",
@@ -246,7 +256,7 @@ const lifecycleResponse = {
         },
         artifacts: { agentRunIds: ["run-2"], pullRequestNumbers: [] },
         wallTimeMs: 420000,
-        prFix: { itemId: "fix-1", repo: "org/repo", pr: 101, type: "review" },
+        prFix: { itemId: "fix-1", repo: "org/repo", pr: 101, type: "REVIEW_FEEDBACK" },
       },
     ],
     prFixEvents: [],
@@ -280,7 +290,7 @@ describe("DeliveryCohortsClient", () => {
     render(<DeliveryCohortsClient />);
 
     // Wait for the sample row to appear.
-    await screen.findByText("org/repo/7");
+    await screen.findByText("org/repo#7");
 
     // Sample-level observed wait buckets.
     expect(screen.getByText("pickup 4m")).toBeInTheDocument();
