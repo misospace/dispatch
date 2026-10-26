@@ -43,6 +43,12 @@ because the path is not on the worker allowlist); errors are `401` / `403` /
   **all** of an item's attempts; a lifecycle spanning more than one value on a
   settings dimension is `mixed` and is **never attributed to the setting
   active at merge time**.
+- **Observed waits only.** The `waiting` split shows queue/pickup, review,
+  blocked and fix-queued time **separately only where an existing observation
+  evidences it** (status-label intervals, run starts, queue rows). An interval
+  counts only when both boundaries are observed; anything without evidence —
+  CI waiting included — stays in `unclassifiedMs` instead of being attributed
+  to a named bucket. Nothing is ever manufactured.
 - Merge evidence is only authoritative `pr_merged` lifecycle events — never a
   worker's success report. A merge preceding the first observed claim yields a
   negative `claimToMergeMs` — reported, not hidden.
@@ -82,7 +88,16 @@ the window is degenerate); `denominators` (`sampleCount` is the total,
 `delivery` counts are per-type, duration stats are filtered subsets);
 `workerTime` (sum of samples' `workerTimeMs`, each the **union** of execution
 intervals — overlapping runs not double-counted, null with no run evidence);
-and `settings` (the mixed-settings rule above).
+`observedWaits` (per-bucket definitions: `pickupMs` = first claim → first
+observed execution-run start; `inReviewMs` = union of `status/in-review` label
+intervals from the lifecycle stream; `blockedMs` = union of `status/blocked`
+label intervals; `fixQueuedMs` = PR-fix queue time until the first fix-run
+start per queue item — null when no evidence, never zero); `unclassified`
+(`claimToDoneMs` minus worker time and the observed buckets, clamped at zero;
+waiting time without label/run/queue evidence — CI waiting included — stays
+here); `load` (`maxConcurrentRuns` = maximum number of overlapping
+positive-length run intervals observed inside the cohort — a load confounder,
+never a causal claim); and `settings` (the mixed-settings rule above).
 
 `CohortStats`: `key`, `sampleCount`, `delivery`
 (`{ merged, "closed-unmerged", open, unknown }`), `completionRate` (0..1,
@@ -92,21 +107,40 @@ null when no known values), `workerTimeMs` (ms, null when no run evidence),
 `firstPass` (`{ true, false, null }` counts), `mergedThroughputPerDay`,
 `openAges` (`{ count, medianOpenMs, oldestOpenMs }` — open/unknown-delivery
 items with a claim anchor), `fixRounds` (`{ total, itemsWithFixes }`),
-`waiting` (`{ activeExecutionMs, unclassifiedMs }` — execution vs. the
-remainder of claim→done; `activeExecutionMs` is null when no run evidence
-exists, never reported as zero) and
+`waiting` (`{ activeExecutionMs, pickupMs, inReviewMs, blockedMs,
+fixQueuedMs, unclassifiedMs }` — the observed-wait buckets summed across
+samples carrying evidence for each, each null when no sample in the cohort
+carries that evidence, never reported as zero; `unclassifiedMs` is the summed
+remainder) and
 `confounders` (`{ mixedSettings, missingMetadata, distinctRuntimeRevisions[],
-distinctModels[], distinctWorkers[] }`); a group with more than one model or
-revision is flagged so a row can never be read as single-setting evidence.
+distinctModels[], distinctWorkers[], maxConcurrentRuns }`); a group with more
+than one model or revision is flagged so a row can never be read as
+single-setting evidence, and `maxConcurrentRuns` (null when no positive-length
+run interval exists) surfaces available load as a confounder.
 
-`DeliverySample`: `issueId` (`"owner/repo#number"`), `repoFullName`,
-`issueNumber`, `delivery` (`merged` | `closed-unmerged` | `open` |
-`unknown`), `firstClaimAt` / `firstMergedAt` / `doneAt` (ISO or null),
-`doneAtProvenance` (`observed` / `backfilled` / `unknown`, or null — the only
-milestone carrying provenance), `claimToDoneMs` / `claimToMergeMs` (ms or
-null), `workerTimeMs` / `unclassifiedMs` (ms or null), `firstPass`
-(`true`/`false`/`null`), `executionAttempts` / `fixRounds` /
-`failedAttempts` (counts), `cohortKeys` (all seven group dimensions),
-`mixedSettings`, `settings` (single value per dimension, null when mixed /
-unknown), `missing` (`claim`/`done`/`merge`/`attempts`/`metadata`),
-`excludedFromDurations` (open / unknown-delivery) and `ageMs` (open items).
+`DeliverySample`: `issueId` (`"owner/repo#number"`), `dbIssueId` (cached
+`Issue.id` or null — what the per-item drill-down links against),
+`repoFullName`, `issueNumber`, `delivery` (`merged` | `closed-unmerged` |
+`open` | `unknown`), `firstClaimAt` / `firstMergedAt` / `doneAt` (ISO or
+null), `doneAtProvenance` (`observed` / `backfilled` / `unknown`, or null —
+the only milestone carrying provenance), `claimToDoneMs` / `claimToMergeMs`
+(ms or null), `workerTimeMs` (ms or null), `observedWaits`
+(`{ pickupMs, inReviewMs, blockedMs, fixQueuedMs }`, each the union of
+observed intervals or null), `unclassifiedMs` (claim→done minus worker time
+and the observed buckets, clamped at zero; null only when claim→done itself
+is unknown), `firstPass` (`true`/`false`/`null`), `executionAttempts` /
+`fixRounds` / `failedAttempts` (counts), `cohortKeys` (all seven group
+dimensions), `mixedSettings`, `settings` (single value per dimension, null
+when mixed / unknown), `missing` (`claim`/`done`/`merge`/`attempts`/
+`metadata`), `excludedFromDurations` (open / unknown-delivery), `ageMs`
+(open items) and `runIntervalsMs` (positive-length execution-run intervals
+feeding the cohort load confounder).
+
+## Per-work-item drill-down
+
+The per-work-item timeline through linked artifacts, all attempts/fix rounds,
+done and merge — with provenance and missing evidence — stays the existing
+`GET /api/issues/[issueId]/lifecycle` contract (#1203/#1183). The `/delivery`
+page links each sample to it (`dbIssueId`) and renders the timeline, linked
+PRs and attempt chain inline, so the cohort view and the per-item view cannot
+disagree: both consume the same projections.

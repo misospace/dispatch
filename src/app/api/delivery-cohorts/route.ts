@@ -232,7 +232,10 @@ export async function GET(request: NextRequest) {
     const eventsQuery = scopedIds.length > 0
       ? prisma.issueLifecycleEvent.findMany({
           where: { issueId: { in: scopedIds } },
-          orderBy: [{ occurredAt: "asc" }, { observedAt: "asc" }],
+          // Final `id` key: rows tied on both times at the cap boundary need
+          // a unique tie-break or WHICH rows survive is DB-nondeterministic,
+          // contradicting the reproducible-read claim (#1184 review).
+          orderBy: [{ occurredAt: "asc" }, { observedAt: "asc" }, { id: "asc" }],
           take: MAX_EVENTS_TOTAL + 1,
         })
       : Promise.resolve([]);
@@ -263,6 +266,10 @@ export async function GET(request: NextRequest) {
 
     let prFixTruncated = prFixRowsRaw.length > MAX_PRFIX_ITEMS_TOTAL;
     const prFixRows = prFixTruncated ? prFixRowsRaw.slice(0, MAX_PRFIX_ITEMS_TOTAL) : prFixRowsRaw;
+    // A per-item history cut at MAX_PRFIX_HISTORY_PER_ITEM is a partial read
+    // too: it must reach the response-level truncated flag and notes, not
+    // only the internal chain record (#1184 review).
+    let prFixHistoryTruncated = false;
 
     // Only keep PR-fix rows whose (normalized repo, issue) really belongs to a
     // scoped issue; the OR filter across repos can over-match shared numbers.
@@ -338,6 +345,8 @@ export async function GET(request: NextRequest) {
 
     const prFixByPair = new Map<string, WorkAttemptPrFixItemRecord[]>();
     for (const row of matchedPrFixRows) {
+      const historyTruncated = row.history.length > MAX_PRFIX_HISTORY_PER_ITEM;
+      if (historyTruncated) prFixHistoryTruncated = true;
       const list = prFixByPair.get(`${row.repo}#${row.issue}`) ?? [];
       list.push({
         id: row.id,
@@ -350,7 +359,7 @@ export async function GET(request: NextRequest) {
         outcome: row.outcome,
         type: row.type,
         queuedAt: row.queuedAt,
-        historyTruncated: row.history.length > MAX_PRFIX_HISTORY_PER_ITEM,
+        historyTruncated,
         history: row.history.slice(0, MAX_PRFIX_HISTORY_PER_ITEM).map((entry) => ({
           id: entry.id,
           at: entry.at,
@@ -384,6 +393,7 @@ export async function GET(request: NextRequest) {
           runs: itemRuns,
           prFixItems: prFixByPair.get(pairKey) ?? [],
           labels: issueRow.labels,
+          dbIssueId: issueRow.id,
         },
         nowMs,
       );
@@ -416,10 +426,12 @@ export async function GET(request: NextRequest) {
     }
     notes.push(
       "Setting changes observed only per attempt: an attempt that restarted under a different runtime keeps its first observed setting, so intra-attempt config changes are not detected.",
+      "Wait buckets (pickup, in-review, blocked, fix-queued) count only intervals with both boundaries observed from status labels, run starts, or queue rows; waiting time without such evidence (CI waiting included) stays unclassified, never attributed to a named bucket.",
     );
     if (eventsTruncated) notes.push("Event read hit its row cap; some items have partial event history.");
     if (runsTruncated) notes.push("Run read hit its row cap; some attempt chains have partial execution evidence.");
     if (prFixTruncated) notes.push("PR-fix queue read hit its row cap; some fix-round evidence is partial.");
+    if (prFixHistoryTruncated) notes.push("At least one PR-fix item's status history exceeded its per-item cap; its fix-round evidence is partial.");
     if (issuesTruncated) notes.push("Candidate issue read hit its cap; the cohort covers only part of the window.");
 
     const orderedSamples = [...samples].sort((a, b) => {
@@ -442,7 +454,11 @@ export async function GET(request: NextRequest) {
       samples: includeSamples ? orderedSamples.slice(0, sampleLimit) : undefined,
       sampleCount: samples.length,
       truncated:
-        issuesTruncated || eventsTruncated || runsTruncated || prFixTruncated,
+        issuesTruncated ||
+        eventsTruncated ||
+        runsTruncated ||
+        prFixTruncated ||
+        prFixHistoryTruncated,
       notes,
     }, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {

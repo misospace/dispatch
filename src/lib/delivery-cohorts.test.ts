@@ -92,6 +92,7 @@ function sample(
     runs: overrides.runs ?? [],
     prFixItems: overrides.prFixItems ?? [],
     labels: overrides.labels,
+    dbIssueId: overrides.dbIssueId,
   };
 }
 
@@ -133,7 +134,20 @@ describe("deriveDeliverySample", () => {
     expect(s.claimToMergeMs).toBe(2 * HOUR);
     expect(s.claimToDoneMs).toBe(2 * HOUR);
     expect(s.workerTimeMs).toBe(20 * MIN);
-    expect(s.unclassifiedMs).toBe(2 * HOUR - 20 * MIN);
+    // Claim 00:00 → run start 00:10 is an observed pickup wait; the rest of
+    // the claim→done span stays unclassified.
+    expect(s.observedWaits.pickupMs).toBe(10 * MIN);
+    expect(s.observedWaits.inReviewMs).toBeNull();
+    expect(s.observedWaits.blockedMs).toBeNull();
+    expect(s.observedWaits.fixQueuedMs).toBeNull();
+    expect(s.unclassifiedMs).toBe(2 * HOUR - 20 * MIN - 10 * MIN);
+    expect(s.runIntervalsMs).toEqual([
+      {
+        startMs: Date.parse("2026-10-01T00:10:00.000Z"),
+        endMs: Date.parse("2026-10-01T00:30:00.000Z"),
+      },
+    ]);
+    expect(s.dbIssueId).toBeNull();
     expect(s.mixedSettings).toBe(false);
     expect(s.cohortKeys.model).toBe("gpt-5");
     expect(s.cohortKeys.worker).toBe("unknown");
@@ -755,8 +769,18 @@ describe("aggregateDeliveryCohorts extended aggregates", () => {
     expect(a!.fixRounds).toEqual({ total: 1, itemsWithFixes: 1 });
     // active = 1h (issue 1) + 2h10m (issue 2 execution run + fix run union)
     expect(a!.waiting.activeExecutionMs).toBe(HOUR + (2 * HOUR + 10 * MIN));
-    // unclassified: issue1 2h-1h=1h; issue2 claimToDone 4h - workerTime 2h10m = 1h50m
-    expect(a!.waiting.unclassifiedMs).toBe(HOUR + (4 * HOUR - (2 * HOUR + 10 * MIN)));
+    // Observed waits: both items show a 10m claim→run-start pickup; issue 2's
+    // fix round was queued 00:45 and handed off at its first fix run 02:30.
+    expect(a!.waiting.pickupMs).toBe(20 * MIN);
+    expect(a!.waiting.fixQueuedMs).toBe(105 * MIN);
+    expect(a!.waiting.inReviewMs).toBeNull();
+    expect(a!.waiting.blockedMs).toBeNull();
+    // unclassified: issue1 2h−1h run−10m pickup = 50m; issue2's bucket
+    // evidence overlaps its run interval, so its remainder clamps at zero —
+    // overlapping observations never go negative.
+    expect(a!.waiting.unclassifiedMs).toBe(50 * MIN);
+    // run-1 and run-2 overlap inside cohort A.
+    expect(a!.confounders.maxConcurrentRuns).toBe(2);
     expect(a!.confounders.mixedSettings).toBe(0);
     expect(a!.confounders.missingMetadata).toBe(0);
     expect(a!.confounders.distinctModels).toEqual(["gpt-5"]);
@@ -770,6 +794,10 @@ describe("aggregateDeliveryCohorts extended aggregates", () => {
     expect(b!.openAges.medianOpenMs).toBe(NOW - T0);
     expect(b!.waiting.activeExecutionMs).toBe(30 * MIN);
     expect(b!.waiting.unclassifiedMs).toBe(0);
+    // The run starts exactly at the claim instant — no observed pickup wait.
+    expect(b!.waiting.pickupMs).toBeNull();
+    expect(b!.waiting.fixQueuedMs).toBeNull();
+    expect(b!.confounders.maxConcurrentRuns).toBe(1);
 
     // Totals: open items stay in the completion denominator and ages.
     expect(report.totals.sampleCount).toBe(4);
@@ -781,6 +809,12 @@ describe("aggregateDeliveryCohorts extended aggregates", () => {
     expect(report.totals.confounders.missingMetadata).toBe(1);
     expect(report.totals.confounders.distinctModels).toEqual(["gpt-5", "opus"]);
     expect(report.totals.confounders.distinctWorkers).toEqual([]);
+    // Totals pool every cohort: run-1 + run-2 + openB's run all overlap at
+    // 00:10–00:30.
+    expect(report.totals.confounders.maxConcurrentRuns).toBe(3);
+    expect(report.totals.waiting.pickupMs).toBe(20 * MIN);
+    expect(report.totals.waiting.fixQueuedMs).toBe(105 * MIN);
+    expect(report.totals.waiting.unclassifiedMs).toBe(50 * MIN);
 
     // Per-sample execution attempt counts ride on the samples.
     const [mergedA, closedWithFixA, openB, openNoMeta] = extendedSamples();
@@ -792,5 +826,189 @@ describe("aggregateDeliveryCohorts extended aggregates", () => {
     expect(openNoMeta.executionAttempts).toBe(1);
     expect(openNoMeta.workerTimeMs).toBeNull();
     expect(openNoMeta.missing).toContain("metadata");
+  });
+});
+
+// ── 13. observed wait buckets (#1184 review) ────────────────────────────────
+
+describe("observed wait buckets", () => {
+  it("splits in-review and blocked label intervals from the event stream", () => {
+    const s = deriveDeliverySample(
+      sample({
+        issue: issue({ issueNumber: 10, state: "closed", closedAt: "2026-10-01T02:00:00.000Z" }),
+        events: [
+          event({ kind: "claim", agentName: "alpha", occurredAt: "2026-10-01T00:00:00.000Z" }),
+          event({
+            kind: "status_changed",
+            occurredAt: "2026-10-01T00:30:00.000Z",
+            toStatus: "status/in-review",
+          }),
+          event({
+            kind: "status_changed",
+            occurredAt: "2026-10-01T01:30:00.000Z",
+            fromStatus: "status/in-review",
+            toStatus: "status/blocked",
+          }),
+          event({
+            kind: "status_changed",
+            occurredAt: "2026-10-01T02:00:00.000Z",
+            fromStatus: "status/blocked",
+            toStatus: "status/done",
+          }),
+          event({ kind: "completed", agentName: "alpha", occurredAt: "2026-10-01T02:00:00.000Z" }),
+        ],
+        runs: [
+          run({
+            id: "run-10",
+            startedAt: "2026-10-01T00:05:00.000Z",
+            finishedAt: "2026-10-01T00:20:00.000Z",
+          }),
+        ],
+      }),
+      NOW,
+    );
+    expect(s.observedWaits.pickupMs).toBe(5 * MIN);
+    expect(s.observedWaits.inReviewMs).toBe(HOUR);
+    expect(s.observedWaits.blockedMs).toBe(30 * MIN);
+    expect(s.observedWaits.fixQueuedMs).toBeNull();
+    // 2h − 15m run − 5m pickup − 60m review − 30m blocked = 10m.
+    expect(s.unclassifiedMs).toBe(10 * MIN);
+  });
+
+  it("closes an open label interval on an observed terminal milestone", () => {
+    const s = deriveDeliverySample(
+      sample({
+        issue: issue({ issueNumber: 11, state: "closed", closedAt: "2026-10-01T02:00:00.000Z" }),
+        events: [
+          event({ kind: "claim", agentName: "alpha", occurredAt: "2026-10-01T00:00:00.000Z" }),
+          event({
+            kind: "status_changed",
+            occurredAt: "2026-10-01T01:00:00.000Z",
+            toStatus: "status/in-review",
+          }),
+          event({
+            kind: "pr_merged",
+            source: "reconciler",
+            sourceEventId: "pr-11",
+            occurredAt: "2026-10-01T02:00:00.000Z",
+            metadata: { pullRequestNumber: 11 },
+          }),
+        ],
+      }),
+      NOW,
+    );
+    expect(s.observedWaits.inReviewMs).toBe(HOUR);
+    expect(s.observedWaits.pickupMs).toBeNull();
+  });
+
+  it("drops an unclosed label interval — its time stays unclassified", () => {
+    const s = deriveDeliverySample(
+      sample({
+        issue: issue({ issueNumber: 12, state: "open" }),
+        events: [
+          event({ kind: "claim", agentName: "alpha", occurredAt: iso(T0) }),
+          event({
+            kind: "status_changed",
+            occurredAt: iso(T0 + HOUR),
+            toStatus: "status/in-review",
+          }),
+        ],
+      }),
+      NOW,
+    );
+    // Still open, no terminal milestone: the interval end is unobserved.
+    expect(s.observedWaits.inReviewMs).toBeNull();
+    expect(s.unclassifiedMs).toBeNull();
+  });
+
+  it("attributes fix-round wait to fixQueuedMs, not pickup", () => {
+    const s = deriveDeliverySample(
+      sample({
+        issue: issue({ issueNumber: 13, state: "closed", closedAt: "2026-10-01T03:00:00.000Z" }),
+        events: [
+          event({ kind: "claim", agentName: "alpha", occurredAt: "2026-10-01T00:00:00.000Z" }),
+          event({ kind: "completed", agentName: "alpha", occurredAt: "2026-10-01T03:00:00.000Z" }),
+        ],
+        runs: [
+          run({
+            id: "run-13",
+            startedAt: "2026-10-01T00:10:00.000Z",
+            finishedAt: "2026-10-01T00:40:00.000Z",
+          }),
+          run({
+            id: "run-fix-13",
+            startedAt: "2026-10-01T02:00:00.000Z",
+            finishedAt: "2026-10-01T02:05:00.000Z",
+            prFixQueueItemId: "fi-13",
+          }),
+        ],
+        prFixItems: [
+          prFixItem({ id: "fi-13", queuedAt: "2026-10-01T01:00:00.000Z" }),
+        ],
+      }),
+      NOW,
+    );
+    // Pickup stops at the first EXECUTION run; the fix queue wait is separate.
+    expect(s.observedWaits.pickupMs).toBe(10 * MIN);
+    expect(s.observedWaits.fixQueuedMs).toBe(HOUR);
+  });
+
+  it("leaves every bucket null when no evidence exists", () => {
+    const s = deriveDeliverySample(
+      sample({
+        issue: issue({ issueNumber: 14, state: "closed", closedAt: "2026-10-01T05:00:00.000Z" }),
+        events: [
+          event({ kind: "claim", agentName: "alpha", occurredAt: "2026-10-01T00:00:00.000Z" }),
+          event({ kind: "completed", agentName: "alpha", occurredAt: "2026-10-01T05:00:00.000Z" }),
+        ],
+      }),
+      NOW,
+    );
+    expect(s.observedWaits).toEqual({
+      pickupMs: null,
+      inReviewMs: null,
+      blockedMs: null,
+      fixQueuedMs: null,
+    });
+    // The whole 5h span is known and wholly unclassified — never zeroed.
+    expect(s.unclassifiedMs).toBe(5 * HOUR);
+  });
+
+  it("passes dbIssueId through for per-item drill-down links", () => {
+    const s = deriveDeliverySample(
+      sample({
+        issue: issue({ issueNumber: 15 }),
+        dbIssueId: "clx-123",
+      }),
+      NOW,
+    );
+    expect(s.dbIssueId).toBe("clx-123");
+  });
+
+  it("does not count touching run intervals as concurrent", () => {
+    const first = deriveDeliverySample(
+      sample({
+        issue: issue({ issueNumber: 16 }),
+        events: [event({ kind: "claim", occurredAt: iso(T0) })],
+        runs: [run({ id: "ra", startedAt: iso(T0), finishedAt: iso(T0 + HOUR) })],
+      }),
+      NOW,
+    );
+    const second = deriveDeliverySample(
+      sample({
+        issue: issue({ issueNumber: 17 }),
+        events: [event({ kind: "claim", occurredAt: iso(T0 + HOUR) })],
+        runs: [
+          run({ id: "rb", startedAt: iso(T0 + HOUR), finishedAt: iso(T0 + 2 * HOUR) }),
+        ],
+      }),
+      NOW,
+    );
+    const report = aggregateDeliveryCohorts([first, second], {
+      dimension: "repository",
+      windowSinceMs: null,
+      windowUntilMs: null,
+    });
+    expect(report.totals.confounders.maxConcurrentRuns).toBe(1);
   });
 });

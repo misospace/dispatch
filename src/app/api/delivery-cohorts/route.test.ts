@@ -370,4 +370,65 @@ describe("GET /api/delivery-cohorts", () => {
     );
     expect(body.totals.sampleCount).toBe(400);
   });
+
+  it("orders the bulk event read with a unique id tie-break (#1184 review)", async () => {
+    installMergedCohort();
+    await get();
+
+    const bulkCall = mocks.eventsFindMany.mock.calls
+      .map((call) => call[0] as any)
+      .find((args) => args?.where?.issueId);
+    expect(bulkCall).toBeDefined();
+    expect(bulkCall.orderBy).toEqual([
+      { occurredAt: "asc" },
+      { observedAt: "asc" },
+      { id: "asc" },
+    ]);
+  });
+
+  it("surfaces a per-item PR-fix history cap hit in truncated and notes (#1184 review)", async () => {
+    installMergedCohort();
+    mocks.prFixItemFindMany.mockResolvedValue([
+      {
+        id: "fi-1",
+        repo: "org/repo",
+        pr: 101,
+        issue: 42,
+        generation: 1,
+        fixAttempts: 1,
+        status: "FIXED",
+        outcome: null,
+        type: "CI_FAILURE",
+        queuedAt: new Date("2026-10-01T11:30:00.000Z"),
+        history: Array.from({ length: 101 }, (_, i) => ({
+          id: `h-${i}`,
+          at: new Date("2026-10-01T11:30:00.000Z"),
+          action: "state",
+          status: "FIXING",
+          outcome: null,
+          evidenceKey: null,
+        })),
+      },
+    ]);
+
+    const res = await get();
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body.truncated).toBe(true);
+    expect(body.notes).toContain(
+      "At least one PR-fix item's status history exceeded its per-item cap; its fix-round evidence is partial.",
+    );
+  });
+
+  it("carries dbIssueId on samples for per-item lifecycle drill-down", async () => {
+    installMergedCohort();
+
+    const res = await get();
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body.samples).toHaveLength(1);
+    expect(body.samples[0].dbIssueId).toBe("issue-1");
+  });
 });

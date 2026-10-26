@@ -1,0 +1,327 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+
+vi.mock("@/lib/client-auth", () => ({
+  authedFetch: vi.fn(),
+}));
+
+vi.mock("@/lib/version", () => ({
+  getVersion: vi.fn(() => "1.0.0"),
+}));
+
+import { DeliveryCohortsClient } from "./delivery-cohorts-client";
+import { authedFetch } from "@/lib/client-auth";
+
+const deliveryResponse = {
+  schema: "dispatch.delivery-cohorts/v1",
+  units: { ms: "milliseconds", iso: "ISO-8601 UTC" },
+  window: {
+    since: "2026-06-01T00:00:00.000Z",
+    until: "2026-07-01T00:00:00.000Z",
+  },
+  groupBy: "model",
+  repo: null,
+  definitions: {},
+  cohorts: [
+    {
+      key: "gpt-5.5",
+      sampleCount: 1,
+      delivery: {
+        "done-and-merged": 1,
+        "done-only": 0,
+        "merged-only": 0,
+        "merged-then-closed": 0,
+        "still-open": 0,
+      },
+      completionRate: 1,
+      claimToDone: {
+        n: 1,
+        medianMs: 3600000,
+        p90Ms: 3600000,
+        minMs: 3600000,
+        maxMs: 3600000,
+      },
+      claimToMerge: {
+        n: 1,
+        medianMs: 1800000,
+        p90Ms: 1800000,
+        minMs: 1800000,
+        maxMs: 1800000,
+      },
+      workerTimeMs: 600000,
+      firstPass: { true: 1, false: 0, null: 0 },
+      mergedThroughputPerDay: 1,
+      openAges: { count: 0, medianOpenMs: null, oldestOpenMs: null },
+      fixRounds: { total: 0, itemsWithFixes: 0 },
+      waiting: {
+        activeExecutionMs: 600000,
+        pickupMs: 60000,
+        inReviewMs: null,
+        blockedMs: 900000,
+        fixQueuedMs: null,
+        unclassifiedMs: 0,
+      },
+      confounders: {
+        mixedSettings: 0,
+        missingMetadata: 0,
+        distinctRuntimeRevisions: ["a"],
+        distinctModels: ["gpt-5.5"],
+        distinctWorkers: ["alpha"],
+        maxConcurrentRuns: 2,
+      },
+    },
+  ],
+  totals: {
+    key: "totals",
+    sampleCount: 1,
+    delivery: {
+      "done-and-merged": 1,
+      "done-only": 0,
+      "merged-only": 0,
+      "merged-then-closed": 0,
+      "still-open": 0,
+    },
+    completionRate: 1,
+    claimToDone: null,
+    claimToMerge: null,
+    workerTimeMs: null,
+    firstPass: { true: 0, false: 0, null: 1 },
+    mergedThroughputPerDay: 0,
+    openAges: { count: 0, medianOpenMs: null, oldestOpenMs: null },
+    fixRounds: { total: 0, itemsWithFixes: 0 },
+    waiting: {
+      activeExecutionMs: null,
+      pickupMs: null,
+      inReviewMs: null,
+      blockedMs: null,
+      fixQueuedMs: null,
+      unclassifiedMs: 1000,
+    },
+    confounders: {
+      mixedSettings: 0,
+      missingMetadata: 0,
+      distinctRuntimeRevisions: [],
+      distinctModels: [],
+      distinctWorkers: [],
+      maxConcurrentRuns: null,
+    },
+  },
+  samples: [
+    {
+      issueId: "org/repo/7",
+      dbIssueId: "db-issue-1",
+      repoFullName: "org/repo",
+      issueNumber: 7,
+      delivery: "done-and-merged",
+      firstClaimAt: "2026-06-10T00:00:00.000Z",
+      firstMergedAt: "2026-06-10T00:30:00.000Z",
+      doneAt: "2026-06-10T01:00:00.000Z",
+      doneAtProvenance: "backfill",
+      claimToDoneMs: 3600000,
+      claimToMergeMs: 1800000,
+      workerTimeMs: 600000,
+      observedWaits: {
+        pickupMs: 240000,
+        inReviewMs: 300000,
+        blockedMs: null,
+        fixQueuedMs: 60000,
+      },
+      unclassifiedMs: 0,
+      firstPass: true,
+      executionAttempts: 1,
+      failedAttempts: 0,
+      fixRounds: 0,
+      mixedSettings: false,
+      runtimeRevisions: ["a"],
+      models: ["gpt-5.5"],
+      workers: ["alpha"],
+      missing: [],
+      excludedFromDurations: false,
+      ageMs: null,
+      taskType: "type/feature",
+      runIntervalsMs: [
+        { startMs: 1749000000000, endMs: 1749000600000 },
+      ],
+    },
+  ],
+  sampleCount: 1,
+  truncated: false,
+  notes: [],
+};
+
+const lifecycleResponse = {
+  issue: {
+    id: "db-issue-1",
+    repoFullName: "org/repo",
+    issueNumber: 7,
+    state: "CLOSED",
+    url: "https://github.com/org/repo/issues/7",
+  },
+  timeline: {
+    schema: "dispatch.issue-lifecycle/v1",
+    units: { ms: "milliseconds", iso: "ISO-8601 UTC" },
+    claims: [],
+    firstClaim: {
+      at: "2026-06-10T00:00:00.000Z",
+      provenance: "backfill",
+      via: ["issue-created"],
+    },
+    doneAt: {
+      at: "2026-06-10T01:00:00.000Z",
+      provenance: "backfill",
+      via: ["issue-state-closed"],
+    },
+    closedAt: {
+      at: "2026-06-10T01:30:00.000Z",
+      provenance: "backfill",
+      via: ["issue-state-closed"],
+    },
+    lastReopenAt: { at: null, provenance: "missing", via: [] },
+    pullRequests: [
+      {
+        prNumber: 101,
+        prUrl: "https://github.com/org/repo/pull/101",
+        mergedAt: "2026-06-10T00:30:00.000Z",
+        mergeCommitSha: "abc",
+        headSha: "def",
+        linkSource: "pr-event",
+        provenance: "github-pr-merged",
+      },
+    ],
+    firstMergedAt: {
+      at: "2026-06-10T00:30:00.000Z",
+      provenance: "github-pr-merged",
+      via: ["pr-101"],
+    },
+    delivery: "done-and-merged",
+    claimToDoneMs: 3600000,
+    claimToMergeMs: 1800000,
+    notes: ["first claim backfilled from issue state history"],
+  },
+  events: [],
+  truncated: false,
+  attempts: {
+    schema: "dispatch.work-item-delivery-chain/v1",
+    units: { ms: "milliseconds", iso: "ISO-8601 UTC" },
+    workItem: { repoFullName: "org/repo", issueNumber: 7 },
+    attempts: [
+      {
+        attemptId: "attempt-1",
+        kind: "execution",
+        agentName: "alpha",
+        claimedAt: { at: "2026-06-10T00:00:00.000Z", provenance: "observed" },
+        startedAt: "2026-06-10T00:02:00.000Z",
+        endedAt: "2026-06-10T00:10:00.000Z",
+        reportedAt: "2026-06-10T00:11:00.000Z",
+        outcome: "success",
+        classification: "completed",
+        executionMetadata: {
+          workerProduct: "opencode",
+          model: "gpt-5.5",
+          reasoningEffort: "high",
+          runtimeRevision: "a",
+          cohortLabel: "c1",
+        },
+        artifacts: { agentRunIds: ["run-1"], pullRequestNumbers: [101] },
+        wallTimeMs: 480000,
+        prFix: null,
+      },
+      {
+        attemptId: "attempt-2",
+        kind: "fix-round",
+        agentName: "alpha",
+        claimedAt: { at: "2026-06-10T00:12:00.000Z", provenance: "observed" },
+        startedAt: "2026-06-10T00:13:00.000Z",
+        endedAt: "2026-06-10T00:20:00.000Z",
+        reportedAt: "2026-06-10T00:21:00.000Z",
+        outcome: "superseded",
+        classification: "superseded",
+        executionMetadata: {
+          workerProduct: "opencode",
+          model: "gpt-5.5",
+          reasoningEffort: null,
+          runtimeRevision: "a",
+          cohortLabel: "c1",
+        },
+        artifacts: { agentRunIds: ["run-2"], pullRequestNumbers: [] },
+        wallTimeMs: 420000,
+        prFix: { itemId: "fix-1", repo: "org/repo", pr: 101, type: "review" },
+      },
+    ],
+    prFixEvents: [],
+    prFixEventsTruncated: false,
+    totalExecutionWallTimeMs: 900000,
+    notes: [],
+  },
+  attemptsTruncated: false,
+};
+
+function jsonResponse(body: unknown): Response {
+  return {
+    ok: true,
+    status: 200,
+    json: async () => body,
+  } as unknown as Response;
+}
+
+describe("DeliveryCohortsClient", () => {
+  beforeEach(() => {
+    vi.mocked(authedFetch).mockReset();
+    vi.mocked(authedFetch).mockImplementation(async (url: string) => {
+      if (url.includes("/lifecycle")) {
+        return jsonResponse(lifecycleResponse);
+      }
+      return jsonResponse(deliveryResponse);
+    });
+  });
+
+  it("renders cohorts and samples with observed wait buckets", async () => {
+    render(<DeliveryCohortsClient />);
+
+    // Wait for the sample row to appear.
+    await screen.findByText("org/repo/7");
+
+    // Sample-level observed wait buckets.
+    expect(screen.getByText("pickup 4m")).toBeInTheDocument();
+    expect(screen.getByText("in review 5m")).toBeInTheDocument();
+    expect(screen.getByText("fix queued 1m")).toBeInTheDocument();
+
+    // Cohort-level observed wait buckets (distinct values so they are unique).
+    expect(screen.getByText("pickup 1m")).toBeInTheDocument();
+    expect(screen.getByText("blocked 15m")).toBeInTheDocument();
+
+    // Cohort confounder badge for concurrent runs.
+    expect(screen.getByText("2 concurrent runs")).toBeInTheDocument();
+
+    // The all-null totals bucket renders the muted "waits unknown" line.
+    expect(screen.getByText("waits unknown")).toBeInTheDocument();
+  });
+
+  it("expands the per-sample lifecycle drill-down from the Timeline button", async () => {
+    const user = userEvent.setup();
+    render(<DeliveryCohortsClient />);
+
+    const timelineButton = await screen.findByRole("button", { name: "Timeline" });
+    await user.click(timelineButton);
+
+    // The lifecycle route is fetched for the sample's dbIssueId.
+    expect(authedFetch).toHaveBeenCalledWith("/api/issues/db-issue-1/lifecycle");
+
+    // Merged pull request is linked.
+    const prLink = await screen.findByText("#101");
+    expect(prLink).toHaveAttribute("href", "https://github.com/org/repo/pull/101");
+
+    // Attempt outcomes (execution success + fix-round superseded) are present.
+    expect(screen.getAllByText(/success/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/superseded/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/fix-round/).length).toBeGreaterThan(0);
+
+    // Milestone labels render.
+    expect(screen.getAllByText(/first merge/).length).toBeGreaterThan(0);
+
+    // Issue link points at the GitHub issue.
+    const issueLink = screen.getByRole("link", { name: "Issue" });
+    expect(issueLink).toHaveAttribute("href", "https://github.com/org/repo/issues/7");
+  });
+});

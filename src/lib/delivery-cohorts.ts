@@ -46,6 +46,31 @@ export interface DeliverySampleInput {
   runs: readonly WorkAttemptRunRecord[];
   prFixItems: readonly WorkAttemptPrFixItemRecord[];
   labels?: readonly string[];
+  /** Cached `Issue.id` for drill-down links to the per-item lifecycle route. */
+  dbIssueId?: string | null;
+}
+
+/**
+ * Waiting time that an existing observation actually evidences (#1184:
+ * "show queue, active work and review/CI/human waiting separately where
+ * observed"). Each bucket is the union of intervals with BOTH boundaries
+ * observed; a bucket with no evidence stays null and its time remains in
+ * `unclassifiedMs` — no breakdown is ever manufactured.
+ */
+export interface ObservedWaitMs {
+  /** First claim → first observed execution-run start (queue/pickup wait). */
+  pickupMs: number | null;
+  /** Union of observed `status/in-review` label intervals (#1203 stream). */
+  inReviewMs: number | null;
+  /** Union of observed `status/blocked` label intervals (human wait). */
+  blockedMs: number | null;
+  /** Union of PR-fix queue → first fix-run hand-off waits per queue item. */
+  fixQueuedMs: number | null;
+}
+
+export interface RunIntervalMs {
+  startMs: number;
+  endMs: number;
 }
 
 export interface DurationStats {
@@ -69,10 +94,17 @@ export interface CohortConfounders {
   distinctRuntimeRevisions: string[];
   distinctModels: string[];
   distinctWorkers: string[];
+  /**
+   * Load confounder (#1184): the maximum number of execution runs observed
+   * overlapping inside this cohort. A load signal only — never a causal
+   * claim. Null when the cohort has no positive-length run interval.
+   */
+  maxConcurrentRuns: number | null;
 }
 
 export interface DeliverySample {
   issueId: string;
+  dbIssueId: string | null;
   repoFullName: string;
   issueNumber: number;
   delivery: LifecycleDelivery;
@@ -83,6 +115,12 @@ export interface DeliverySample {
   claimToDoneMs: number | null;
   claimToMergeMs: number | null;
   workerTimeMs: number | null;
+  observedWaits: ObservedWaitMs;
+  /**
+   * claim→done minus worker time and the observed wait buckets, clamped at
+   * zero. Null only when claim→done itself is unknown — known span time that
+   * no bucket evidences stays visible here, never dropped.
+   */
   unclassifiedMs: number | null;
   firstPass: boolean | null;
   executionAttempts: number;
@@ -100,6 +138,8 @@ export interface DeliverySample {
   excludedFromDurations: boolean;
   ageMs: number | null;
   taskType: string;
+  /** Positive-length execution-run intervals for the cohort load confounder. */
+  runIntervalsMs: RunIntervalMs[];
 }
 
 export interface CohortStats {
@@ -115,8 +155,17 @@ export interface CohortStats {
   openAges: OpenAgeStats;
   fixRounds: { total: number; itemsWithFixes: number };
   // activeExecutionMs stays null (unknown) when no sample carries run
-  // evidence — an unobserved worker time never renders as zero.
-  waiting: { activeExecutionMs: number | null; unclassifiedMs: number };
+  // evidence — an unobserved worker time never renders as zero. The wait
+  // buckets follow the same rule: null when no sample in the cohort carries
+  // evidence for that wait, the summed observation otherwise.
+  waiting: {
+    activeExecutionMs: number | null;
+    pickupMs: number | null;
+    inReviewMs: number | null;
+    blockedMs: number | null;
+    fixQueuedMs: number | null;
+    unclassifiedMs: number;
+  };
   confounders: CohortConfounders;
 }
 
@@ -162,6 +211,9 @@ export const COHORT_DEFINITIONS: Readonly<Record<string, string>> = Object.freez
   throughput: "mergedThroughputPerDay = merged count / window days (0 when window <= 0)",
   denominators: "sampleCount is the total; delivery counts are per-type; claimToDone/claimToMerge are filtered subsets",
   workerTime: "sum of workerTimeMs across the cohort's samples; workerTimeMs is the union of execution intervals (overlapping runs are not double-counted) and stays null when no run interval evidence exists",
+  observedWaits: "waiting buckets shown separately ONLY where observed: pickupMs = first claim → first observed execution-run start (queue/pickup); inReviewMs = union of status/in-review label intervals from the lifecycle event stream; blockedMs = union of status/blocked label intervals (human wait); fixQueuedMs = PR-fix queue time until the first fix-run start per queue item. An interval counts only when both boundaries are observed; a bucket with no evidence is null, never zero",
+  unclassified: "claimToDoneMs minus worker time and the observed wait buckets, clamped at zero; waiting time without label/run/queue evidence (for example CI waiting with no status label or queue row) stays unclassified instead of being attributed to a named bucket",
+  load: "maxConcurrentRuns = maximum number of overlapping positive-length execution-run intervals observed inside the cohort; a load confounder surfaced alongside cohort stats, never a causal claim",
   settings: "cohort keys and mixed labels are derived across ALL attempts; a lifecycle spanning settings is mixed, never attributed to the setting active at merge",
 });
 
@@ -208,6 +260,103 @@ function deriveTaskType(labels: readonly string[]): string {
     }
   }
   return "unknown";
+}
+
+/** Union length of closed intervals (overlapping counted once). Null when no
+ * interval exists — an unobserved span is unknown, never zero. */
+function unionLengthMs(intervals: readonly RunIntervalMs[]): number | null {
+  if (intervals.length === 0) return null;
+  const sorted = [...intervals].sort(
+    (a, b) => a.startMs - b.startMs || a.endMs - b.endMs,
+  );
+  let total = 0;
+  let currentStart = sorted[0].startMs;
+  let currentEnd = sorted[0].endMs;
+  for (const interval of sorted.slice(1)) {
+    if (interval.startMs > currentEnd) {
+      total += currentEnd - currentStart;
+      currentStart = interval.startMs;
+      currentEnd = interval.endMs;
+    } else if (interval.endMs > currentEnd) {
+      currentEnd = interval.endMs;
+    }
+  }
+  return total + (currentEnd - currentStart);
+}
+
+/** Maximum number of intervals overlapping at any instant (a sweep-line).
+ * Touching endpoints do not overlap. Null when no interval exists. */
+function maxOverlap(intervals: readonly RunIntervalMs[]): number | null {
+  if (intervals.length === 0) return null;
+  const points: Array<{ at: number; delta: 1 | -1 }> = [];
+  for (const interval of intervals) {
+    points.push({ at: interval.startMs, delta: 1 });
+    points.push({ at: interval.endMs, delta: -1 });
+  }
+  // Ends before starts at the same instant: touching intervals never count
+  // as concurrent.
+  points.sort((a, b) => a.at - b.at || a.delta - b.delta);
+  let current = 0;
+  let max = 0;
+  for (const point of points) {
+    current += point.delta;
+    if (current > max) max = current;
+  }
+  return max;
+}
+
+/**
+ * Union of observed intervals during which an issue carried a given status
+ * label, derived from the `status_changed` rows of the lifecycle stream
+ * (#1203). An interval opens on a move INTO the label and closes on the
+ * first later move OUT of it, or on an observed terminal milestone (done /
+ * close / merge) — whichever comes first. An interval whose end is never
+ * observed is dropped entirely: its time stays unclassified rather than
+ * being extended to "now" on an assumption.
+ */
+function statusLabelIntervals(
+  events: readonly LifecycleEventRecord[],
+  label: string,
+  terminalMs: readonly number[],
+): RunIntervalMs[] {
+  const changes: Array<{ occurredAtMs: number; fromStatus: string | null; toStatus: string | null }> = [];
+  for (const event of events) {
+    if (event.kind !== "status_changed") continue;
+    const occurredAtMs = toMillis(event.occurredAt);
+    if (occurredAtMs === null) continue;
+    changes.push({ occurredAtMs, fromStatus: event.fromStatus, toStatus: event.toStatus });
+  }
+  changes.sort((a, b) => a.occurredAtMs - b.occurredAtMs);
+
+  const intervals: RunIntervalMs[] = [];
+  let openStart: number | null = null;
+  for (const change of changes) {
+    if (openStart === null) {
+      if (change.toStatus === label) openStart = change.occurredAtMs;
+      continue;
+    }
+    if (change.fromStatus === label || change.toStatus !== label) {
+      // Any later status move leaves the label's interval.
+      if (change.occurredAtMs > openStart) {
+        intervals.push({ startMs: openStart, endMs: change.occurredAtMs });
+      }
+      openStart = change.toStatus === label ? change.occurredAtMs : null;
+    }
+  }
+  if (openStart !== null) {
+    // The label is still carried at the read time. Only an OBSERVED terminal
+    // milestone closes the interval; otherwise it is dropped (unclassified).
+    let closeMs: number | null = null;
+    for (const terminal of terminalMs) {
+      if (terminal >= openStart && (closeMs === null || terminal < closeMs)) {
+        closeMs = terminal;
+      }
+    }
+    if (closeMs !== null && closeMs > openStart) {
+      intervals.push({ startMs: openStart, endMs: closeMs });
+    }
+  }
+  return intervals;
 }
 
 /**
@@ -325,9 +474,77 @@ export function deriveDeliverySample(
   const hasRunInterval = executionAttempts.some((a) => a.wallTimeMs !== null);
   const workerTimeMs = hasRunInterval ? chain.totalExecutionWallTimeMs : null;
 
+  // Observed wait buckets (#1184): only intervals whose BOTH boundaries come
+  // from existing evidence count; everything else stays unclassified.
+  const terminalMs: number[] = [];
+  if (doneAtMs !== null) terminalMs.push(doneAtMs);
+  if (timeline.firstMergedAt.at !== null) terminalMs.push(Date.parse(timeline.firstMergedAt.at));
+  if (timeline.closedAt.at !== null) terminalMs.push(Date.parse(timeline.closedAt.at));
+
+  const inReviewIntervals = statusLabelIntervals(events, "status/in-review", terminalMs);
+  const blockedIntervals = statusLabelIntervals(events, "status/blocked", terminalMs);
+
+  let pickupMs: number | null = null;
+  if (firstClaimMs !== null) {
+    let firstExecutionStart: number | null = null;
+    for (const run of runs) {
+      // Pickup covers claim → first EXECUTION run; fix-round runs are
+      // attributed to fixQueuedMs instead.
+      if (run.prFixQueueItemId) continue;
+      const startedMs = toMillis(run.startedAt);
+      if (startedMs === null || startedMs < firstClaimMs) continue;
+      if (firstExecutionStart === null || startedMs < firstExecutionStart) {
+        firstExecutionStart = startedMs;
+      }
+    }
+    if (firstExecutionStart !== null && firstExecutionStart > firstClaimMs) {
+      pickupMs = firstExecutionStart - firstClaimMs;
+    }
+  }
+
+  const fixQueuedIntervals: RunIntervalMs[] = [];
+  for (const item of prFixItems) {
+    const queuedMs = toMillis(item.queuedAt);
+    if (queuedMs === null) continue;
+    let handoffMs: number | null = null;
+    for (const run of runs) {
+      if (run.prFixQueueItemId !== item.id) continue;
+      const startedMs = toMillis(run.startedAt);
+      if (startedMs === null || startedMs < queuedMs) continue;
+      if (handoffMs === null || startedMs < handoffMs) handoffMs = startedMs;
+    }
+    if (handoffMs !== null && handoffMs > queuedMs) {
+      fixQueuedIntervals.push({ startMs: queuedMs, endMs: handoffMs });
+    }
+  }
+
+  const observedWaits: ObservedWaitMs = {
+    pickupMs,
+    inReviewMs: unionLengthMs(inReviewIntervals),
+    blockedMs: unionLengthMs(blockedIntervals),
+    fixQueuedMs: unionLengthMs(fixQueuedIntervals),
+  };
+
+  const runIntervalsMs: RunIntervalMs[] = [];
+  for (const run of runs) {
+    const startMs = toMillis(run.startedAt);
+    const endMs = toMillis(run.finishedAt);
+    if (startMs === null || endMs === null || endMs <= startMs) continue;
+    runIntervalsMs.push({ startMs, endMs });
+  }
+
+  const observedWaitSum =
+    (observedWaits.pickupMs ?? 0) +
+    (observedWaits.inReviewMs ?? 0) +
+    (observedWaits.blockedMs ?? 0) +
+    (observedWaits.fixQueuedMs ?? 0);
+
+  // The known claim→done span that no evidence attributes to a named phase
+  // stays visible as unclassified — minus worker time AND the observed
+  // waits. Only an unknown claim→done span makes it null.
   const unclassifiedMs =
-    claimToDoneMs !== null && workerTimeMs !== null
-      ? Math.max(0, claimToDoneMs - workerTimeMs)
+    claimToDoneMs !== null
+      ? Math.max(0, claimToDoneMs - (workerTimeMs ?? 0) - observedWaitSum)
       : null;
 
   const fixRounds = fixRoundAttempts.length;
@@ -382,6 +599,7 @@ export function deriveDeliverySample(
 
   return {
     issueId: `${issue.repoFullName}#${issue.issueNumber}`,
+    dbIssueId: input.dbIssueId ?? null,
     repoFullName: issue.repoFullName,
     issueNumber: issue.issueNumber,
     delivery: timeline.delivery,
@@ -392,6 +610,7 @@ export function deriveDeliverySample(
     claimToDoneMs,
     claimToMergeMs: timeline.claimToMergeMs,
     workerTimeMs,
+    observedWaits,
     unclassifiedMs,
     firstPass,
     executionAttempts: executionAttempts.length,
@@ -404,6 +623,7 @@ export function deriveDeliverySample(
     excludedFromDurations,
     ageMs,
     taskType,
+    runIntervalsMs,
   };
 }
 
@@ -469,15 +689,27 @@ function computeStats(
   let unclassifiedMs = 0;
   let mixedSettings = 0;
   let missingMetadata = 0;
+  let pickupSum: number | null = null;
+  let inReviewSum: number | null = null;
+  let blockedSum: number | null = null;
+  let fixQueuedSum: number | null = null;
+  const cohortRunIntervals: RunIntervalMs[] = [];
   const distinctRuntimeRevisions = new Set<string>();
   const distinctModels = new Set<string>();
   const distinctWorkers = new Set<string>();
+  const addBucket = (current: number | null, value: number | null): number | null =>
+    value === null ? current : (current ?? 0) + value;
   for (const s of members) {
     fixRoundsTotal += s.fixRounds;
     if (s.fixRounds > 0) itemsWithFixes += 1;
     if (s.unclassifiedMs !== null) unclassifiedMs += s.unclassifiedMs;
     if (s.mixedSettings) mixedSettings += 1;
     if (s.missing.includes("metadata")) missingMetadata += 1;
+    pickupSum = addBucket(pickupSum, s.observedWaits.pickupMs);
+    inReviewSum = addBucket(inReviewSum, s.observedWaits.inReviewMs);
+    blockedSum = addBucket(blockedSum, s.observedWaits.blockedMs);
+    fixQueuedSum = addBucket(fixQueuedSum, s.observedWaits.fixQueuedMs);
+    cohortRunIntervals.push(...s.runIntervalsMs);
     if (s.settings.runtimeRevision !== null)
       distinctRuntimeRevisions.add(s.settings.runtimeRevision);
     if (s.settings.model !== null) distinctModels.add(s.settings.model);
@@ -498,6 +730,10 @@ function computeStats(
     fixRounds: { total: fixRoundsTotal, itemsWithFixes },
     waiting: {
       activeExecutionMs: totalWorkerTimeMs,
+      pickupMs: pickupSum,
+      inReviewMs: inReviewSum,
+      blockedMs: blockedSum,
+      fixQueuedMs: fixQueuedSum,
       unclassifiedMs,
     },
     confounders: {
@@ -506,6 +742,7 @@ function computeStats(
       distinctRuntimeRevisions: [...distinctRuntimeRevisions].sort(),
       distinctModels: [...distinctModels].sort(),
       distinctWorkers: [...distinctWorkers].sort(),
+      maxConcurrentRuns: maxOverlap(cohortRunIntervals),
     },
   };
 }

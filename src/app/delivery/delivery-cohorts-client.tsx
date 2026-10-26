@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { Fragment, useCallback, useEffect, useState } from "react";
 import { authedFetch } from "@/lib/client-auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -36,6 +36,18 @@ interface DurationStats {
   p90: number;
 }
 
+interface ObservedWaitMs {
+  pickupMs: number | null;
+  inReviewMs: number | null;
+  blockedMs: number | null;
+  fixQueuedMs: number | null;
+}
+
+interface RunIntervalMs {
+  startMs: number;
+  endMs: number;
+}
+
 interface CohortStats {
   key: string;
   sampleCount: number;
@@ -48,18 +60,27 @@ interface CohortStats {
   mergedThroughputPerDay: number;
   openAges: { count: number; medianOpenMs: number | null; oldestOpenMs: number | null };
   fixRounds: { total: number; itemsWithFixes: number };
-  waiting: { activeExecutionMs: number | null; unclassifiedMs: number };
+  waiting: {
+    activeExecutionMs: number | null;
+    pickupMs: number | null;
+    inReviewMs: number | null;
+    blockedMs: number | null;
+    fixQueuedMs: number | null;
+    unclassifiedMs: number;
+  };
   confounders: {
     mixedSettings: number;
     missingMetadata: number;
     distinctRuntimeRevisions: string[];
     distinctModels: string[];
     distinctWorkers: string[];
+    maxConcurrentRuns: number | null;
   };
 }
 
 interface DeliverySample {
   issueId: string;
+  dbIssueId: string | null;
   repoFullName: string;
   issueNumber: number;
   delivery: Delivery;
@@ -70,6 +91,7 @@ interface DeliverySample {
   claimToDoneMs: number | null;
   claimToMergeMs: number | null;
   workerTimeMs: number | null;
+  observedWaits: ObservedWaitMs;
   unclassifiedMs: number | null;
   firstPass: boolean | null;
   executionAttempts: number;
@@ -95,6 +117,7 @@ interface DeliverySample {
   excludedFromDurations: boolean;
   ageMs: number | null;
   taskType: string;
+  runIntervalsMs: RunIntervalMs[];
 }
 
 interface DeliveryCohortsResponse {
@@ -110,6 +133,87 @@ interface DeliveryCohortsResponse {
   truncated: boolean;
   notes: string[];
 }
+
+interface LifecycleTimestamp {
+  at: string | null;
+  provenance: Provenance;
+  via: string[];
+}
+
+interface LifecyclePullRequest {
+  prNumber: number;
+  prUrl: string | null;
+  mergedAt: string;
+  mergeCommitSha: string | null;
+  headSha: string | null;
+  linkSource: string | null;
+  provenance: Provenance;
+}
+
+interface IssueLifecycleTimeline {
+  schema: string;
+  units: string;
+  claims: unknown[];
+  firstClaim: LifecycleTimestamp;
+  doneAt: LifecycleTimestamp;
+  closedAt: LifecycleTimestamp;
+  lastReopenAt: LifecycleTimestamp;
+  pullRequests: LifecyclePullRequest[];
+  firstMergedAt: LifecycleTimestamp;
+  delivery: Delivery;
+  claimToDoneMs: number | null;
+  claimToMergeMs: number | null;
+  notes: string[];
+}
+
+interface AttemptExecutionMetadata {
+  workerProduct: string | null;
+  model: string | null;
+  reasoningEffort: string | null;
+  runtimeRevision: string | null;
+  cohortLabel: string | null;
+}
+
+interface WorkItemAttempt {
+  attemptId: string;
+  kind: "execution" | "fix-round";
+  agentName: string | null;
+  claimedAt: { at: string | null; provenance: Provenance };
+  startedAt: string | null;
+  endedAt: string | null;
+  reportedAt: string | null;
+  outcome: string;
+  classification: string;
+  executionMetadata: AttemptExecutionMetadata;
+  artifacts: { agentRunIds: string[]; pullRequestNumbers: number[] };
+  wallTimeMs: number | null;
+  prFix: { itemId: string; repo: string; pr: number; type: string } | null;
+}
+
+interface WorkItemDeliveryChain {
+  schema: string;
+  units: string;
+  workItem: { repoFullName: string; issueNumber: number };
+  attempts: WorkItemAttempt[];
+  prFixEvents: unknown[];
+  prFixEventsTruncated: boolean;
+  totalExecutionWallTimeMs: number | null;
+  notes: string[];
+}
+
+interface IssueLifecycleResponse {
+  issue: { id: string; repoFullName: string; issueNumber: number; state: string; url: string };
+  timeline: IssueLifecycleTimeline;
+  events: unknown[];
+  truncated: boolean;
+  attempts: WorkItemDeliveryChain;
+  attemptsTruncated: boolean;
+}
+
+type LifecycleState =
+  | { status: "loading" }
+  | { status: "ready"; data: IssueLifecycleResponse }
+  | { status: "error"; error: string };
 
 function formatMs(ms: number | null | undefined): string {
   if (ms == null) return "unknown";
@@ -135,6 +239,30 @@ function msTitle(parts: (string | number | null | undefined)[]): string {
   return parts
     .map((p) => (p == null ? "unknown" : String(p)))
     .join(" · ");
+}
+
+function waitBucketLines(w: ObservedWaitMs) {
+  const lines = [
+    { label: "pickup", ms: w.pickupMs },
+    { label: "in review", ms: w.inReviewMs },
+    { label: "blocked", ms: w.blockedMs },
+    { label: "fix queued", ms: w.fixQueuedMs },
+  ];
+  const present = lines.filter((l) => l.ms != null);
+  if (present.length === 0) {
+    return (
+      <span className="block text-xs font-normal text-muted-foreground">waits unknown</span>
+    );
+  }
+  return (
+    <>
+      {present.map((l) => (
+        <span key={l.label} className="block text-xs font-normal text-muted-foreground">
+          {l.label} {formatMs(l.ms)}
+        </span>
+      ))}
+    </>
+  );
 }
 
 function DurationCell({ d, unknown }: { d: DurationStats | null; unknown: number }) {
@@ -169,6 +297,8 @@ function ConfoundersCell({ c }: { c: CohortStats["confounders"] }) {
   if (c.distinctRuntimeRevisions.length > 1)
     badges.push({ label: `${c.distinctRuntimeRevisions.length} revisions`, amber: false });
   if (c.distinctWorkers.length > 1) badges.push({ label: `${c.distinctWorkers.length} workers`, amber: false });
+  if (c.maxConcurrentRuns !== null)
+    badges.push({ label: `${c.maxConcurrentRuns} concurrent runs`, amber: false });
   if (badges.length === 0) return <span className="text-muted-foreground">—</span>;
   return (
     <span className="flex flex-wrap gap-1">
@@ -307,12 +437,125 @@ function CohortRow({ c, keyLabel }: { c: CohortStats; keyLabel: string }) {
               : formatMs(c.waiting.activeExecutionMs)}{" "}
             · unclassified {formatMs(c.waiting.unclassifiedMs)}
           </span>
+          {waitBucketLines(c.waiting)}
         </span>
       </TableCell>
       <TableCell>
         <ConfoundersCell c={c.confounders} />
       </TableCell>
     </TableRow>
+  );
+}
+
+function attemptMetaLine(m: AttemptExecutionMetadata): string | null {
+  const parts: string[] = [];
+  if (m.model) parts.push(m.model);
+  if (m.reasoningEffort) parts.push(m.reasoningEffort);
+  if (m.runtimeRevision) parts.push(m.runtimeRevision);
+  if (m.cohortLabel) parts.push(m.cohortLabel);
+  return parts.length > 0 ? parts.join(" · ") : null;
+}
+
+function LifecycleDrilldown({ sample, state }: { sample: DeliverySample; state: LifecycleState }) {
+  if (state.status === "error") {
+    return <p className="text-sm text-destructive">{state.error}</p>;
+  }
+  if (state.status === "loading") {
+    return <p className="text-sm text-muted-foreground">Loading…</p>;
+  }
+  const { timeline, attempts, truncated, attemptsTruncated, issue } = state.data;
+  const milestones: { label: string; ts: LifecycleTimestamp; done?: boolean }[] = [
+    { label: "first claim", ts: timeline.firstClaim },
+    { label: "done", ts: timeline.doneAt, done: true },
+    { label: "closed", ts: timeline.closedAt },
+    { label: "last reopen", ts: timeline.lastReopenAt },
+    { label: "first merge", ts: timeline.firstMergedAt },
+  ];
+  return (
+    <div className="space-y-4 text-sm">
+      <div>
+        <h4 className="mb-1 font-medium">Milestones</h4>
+        <dl className="space-y-1">
+          {milestones.map((m) => (
+            <div key={m.label} className="flex gap-2">
+              <dt className="w-28 shrink-0 text-muted-foreground">{m.label}</dt>
+              <dd className="min-w-0">
+                {m.ts.at === null ? (
+                  <span className="text-muted-foreground">unknown</span>
+                ) : (
+                  formatTimestamp(m.ts.at)
+                )}
+                {m.done && <ProvenanceBadge p={m.ts.provenance} />}
+              </dd>
+            </div>
+          ))}
+        </dl>
+      </div>
+      <div>
+        <h4 className="mb-1 font-medium">Linked pull requests</h4>
+        {timeline.pullRequests.length === 0 ? (
+          <p className="text-muted-foreground">none observed</p>
+        ) : (
+          <ul className="space-y-1">
+            {timeline.pullRequests.map((pr) => (
+              <li key={pr.prNumber}>
+                {pr.prUrl ? (
+                  <a href={pr.prUrl} className="underline underline-offset-2">
+                    {`#${pr.prNumber}`}
+                  </a>
+                ) : (
+                  <span>{`#${pr.prNumber}`}</span>
+                )}{" "}
+                · merged {formatTimestamp(pr.mergedAt)} <ProvenanceBadge p={pr.provenance} />
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+      <div>
+        <h4 className="mb-1 font-medium">Attempts &amp; fix rounds</h4>
+        {attempts.attempts.length === 0 ? (
+          <p className="text-muted-foreground">none observed</p>
+        ) : (
+          <ol className="list-decimal space-y-1 pl-5">
+            {attempts.attempts.map((a, i) => {
+              const meta = attemptMetaLine(a.executionMetadata);
+              return (
+                <li key={a.attemptId}>
+                  {`#${i + 1} ${a.kind} · ${a.outcome} (${a.classification}) · ${a.agentName ?? "unknown"}`}{" "}
+                  <span className="text-muted-foreground">
+                    {`${formatTimestamp(a.startedAt)} → ${formatTimestamp(a.endedAt)}`}
+                  </span>
+                  {meta && <span className="block text-xs text-muted-foreground">{meta}</span>}
+                </li>
+              );
+            })}
+          </ol>
+        )}
+      </div>
+      {(truncated || attemptsTruncated) && (
+        <p className="text-xs text-amber-700">
+          Partial evidence:{" "}
+          {[truncated ? "event history" : null, attemptsTruncated ? "attempt chain" : null]
+            .filter(Boolean)
+            .join(" and ")}{" "}
+          exceeded the bounded read.
+        </p>
+      )}
+      {timeline.notes.length > 0 && (
+        <ul className="list-disc space-y-1 pl-5 text-muted-foreground">
+          {timeline.notes.map((n) => (
+            <li key={n}>{n}</li>
+          ))}
+        </ul>
+      )}
+      {sample.missing.length > 0 && (
+        <p className="text-xs text-muted-foreground">Missing: {sample.missing.join(", ")}</p>
+      )}
+      <a href={issue.url} className="underline underline-offset-2">
+        Issue
+      </a>
+    </div>
   );
 }
 
@@ -325,11 +568,55 @@ export function DeliveryCohortsClient() {
   const [data, setData] = useState<DeliveryCohortsResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [lifecycle, setLifecycle] = useState<Record<string, LifecycleState>>({});
 
   useEffect(() => {
     const t = setTimeout(() => setRepo(repoInput.trim()), 500);
     return () => clearTimeout(t);
   }, [repoInput]);
+
+  const loadLifecycle = useCallback(async (dbIssueId: string) => {
+    setLifecycle((prev) => ({ ...prev, [dbIssueId]: { status: "loading" } }));
+    try {
+      const res = await authedFetch(`/api/issues/${dbIssueId}/lifecycle`);
+      const raw: unknown = await res.json().catch(() => null);
+      if (!res.ok) {
+        const msg =
+          raw !== null &&
+          typeof raw === "object" &&
+          "error" in raw &&
+          typeof (raw as { error?: unknown }).error === "string"
+            ? (raw as { error: string }).error
+            : `Failed to load lifecycle (HTTP ${res.status})`;
+        throw new Error(msg);
+      }
+      if (raw === null || typeof raw !== "object") throw new Error("Failed to load lifecycle");
+      setLifecycle((prev) => ({
+        ...prev,
+        [dbIssueId]: { status: "ready", data: raw as IssueLifecycleResponse },
+      }));
+    } catch (err) {
+      setLifecycle((prev) => ({
+        ...prev,
+        [dbIssueId]: {
+          status: "error",
+          error: err instanceof Error ? err.message : "Failed to load lifecycle",
+        },
+      }));
+    }
+  }, []);
+
+  const toggleTimeline = useCallback(
+    (s: DeliverySample) => {
+      if (s.dbIssueId === null) return;
+      const dbIssueId = s.dbIssueId;
+      const willExpand = !expanded[dbIssueId];
+      setExpanded((prev) => ({ ...prev, [dbIssueId]: !prev[dbIssueId] }));
+      if (willExpand && lifecycle[dbIssueId] === undefined) loadLifecycle(dbIssueId);
+    },
+    [expanded, lifecycle, loadLifecycle],
+  );
 
   const fetchData = useCallback(async () => {
     setLoading(true);
@@ -568,70 +855,94 @@ export function DeliveryCohortsClient() {
                 <TableBody>
                   {samples.map((s) => {
                     const excluded = exclusionNote(s);
+                    const dbIssueId = s.dbIssueId;
+                    const isExpanded = dbIssueId !== null && !!expanded[dbIssueId];
+                    const lifecycleState = dbIssueId !== null ? lifecycle[dbIssueId] : undefined;
                     return (
-                      <TableRow key={s.issueId}>
-                        <TableCell>
-                          <div className="font-medium text-sm">{s.issueId}</div>
-                          <div className="text-xs text-muted-foreground">{s.taskType}</div>
-                          {s.mixedSettings && (
-                            <Badge className="mt-1 bg-amber-100 text-amber-800">mixed</Badge>
-                          )}
-                        </TableCell>
-                        <TableCell>
-                          <DeliveryBadge d={s.delivery} />
-                        </TableCell>
-                        <TableCell className="text-sm">
-                          <div>{formatTimestamp(s.firstClaimAt)}</div>
-                          <div>
-                            {formatTimestamp(s.doneAt)}
-                            <ProvenanceBadge p={s.doneAtProvenance} />
-                          </div>
-                          <div>{formatTimestamp(s.firstMergedAt)}</div>
-                          {excluded && (
-                            <div className="text-xs text-muted-foreground">{excluded}</div>
-                          )}
-                        </TableCell>
-                        <TableCell>
-                          <span title={s.claimToDoneMs != null ? `${s.claimToDoneMs} ms` : undefined}>
-                            {formatMs(s.claimToDoneMs)}
-                          </span>
-                        </TableCell>
-                        <TableCell>
-                          <span title={s.claimToMergeMs != null ? `${s.claimToMergeMs} ms` : undefined}>
-                            {formatMs(s.claimToMergeMs)}
-                          </span>
-                        </TableCell>
-                        <TableCell>
-                          {s.executionAttempts} exec, {s.failedAttempts} failed/superseded
-                        </TableCell>
-                        <TableCell>{s.fixRounds}</TableCell>
-                        <TableCell>
-                          <FirstPassCell v={s.firstPass} />
-                        </TableCell>
-                        <TableCell>
-                          <span title={s.workerTimeMs != null ? `${s.workerTimeMs} ms` : undefined}>
-                            {formatMs(s.workerTimeMs)}
-                          </span>
-                          {s.unclassifiedMs != null && s.unclassifiedMs > 0 && (
-                            <span className="block text-xs text-muted-foreground">
-                              unclassified {formatMs(s.unclassifiedMs)}
-                            </span>
-                          )}
-                        </TableCell>
-                        <TableCell>
-                          <span className="flex flex-wrap gap-1">
-                            {s.missing.length === 0 ? (
-                              <span className="text-muted-foreground">—</span>
-                            ) : (
-                              s.missing.map((f) => (
-                                <Badge key={f} variant="outline" className="px-1.5 py-0">
-                                  {f}
-                                </Badge>
-                              ))
+                      <Fragment key={s.issueId}>
+                        <TableRow>
+                          <TableCell>
+                            <div className="font-medium text-sm">{s.issueId}</div>
+                            <div className="text-xs text-muted-foreground">{s.taskType}</div>
+                            {s.mixedSettings && (
+                              <Badge className="mt-1 bg-amber-100 text-amber-800">mixed</Badge>
                             )}
-                          </span>
-                        </TableCell>
-                      </TableRow>
+                            {dbIssueId !== null && (
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="mt-2 h-6 px-2 text-xs"
+                                aria-expanded={isExpanded}
+                                onClick={() => toggleTimeline(s)}
+                              >
+                                Timeline
+                              </Button>
+                            )}
+                          </TableCell>
+                          <TableCell>
+                            <DeliveryBadge d={s.delivery} />
+                          </TableCell>
+                          <TableCell className="text-sm">
+                            <div>{formatTimestamp(s.firstClaimAt)}</div>
+                            <div>
+                              {formatTimestamp(s.doneAt)}
+                              <ProvenanceBadge p={s.doneAtProvenance} />
+                            </div>
+                            <div>{formatTimestamp(s.firstMergedAt)}</div>
+                            {excluded && (
+                              <div className="text-xs text-muted-foreground">{excluded}</div>
+                            )}
+                          </TableCell>
+                          <TableCell>
+                            <span title={s.claimToDoneMs != null ? `${s.claimToDoneMs} ms` : undefined}>
+                              {formatMs(s.claimToDoneMs)}
+                            </span>
+                          </TableCell>
+                          <TableCell>
+                            <span title={s.claimToMergeMs != null ? `${s.claimToMergeMs} ms` : undefined}>
+                              {formatMs(s.claimToMergeMs)}
+                            </span>
+                          </TableCell>
+                          <TableCell>
+                            {s.executionAttempts} exec, {s.failedAttempts} failed/superseded
+                          </TableCell>
+                          <TableCell>{s.fixRounds}</TableCell>
+                          <TableCell>
+                            <FirstPassCell v={s.firstPass} />
+                          </TableCell>
+                          <TableCell>
+                            <span title={s.workerTimeMs != null ? `${s.workerTimeMs} ms` : undefined}>
+                              {formatMs(s.workerTimeMs)}
+                            </span>
+                            {s.unclassifiedMs != null && s.unclassifiedMs > 0 && (
+                              <span className="block text-xs text-muted-foreground">
+                                unclassified {formatMs(s.unclassifiedMs)}
+                              </span>
+                            )}
+                            {waitBucketLines(s.observedWaits)}
+                          </TableCell>
+                          <TableCell>
+                            <span className="flex flex-wrap gap-1">
+                              {s.missing.length === 0 ? (
+                                <span className="text-muted-foreground">—</span>
+                              ) : (
+                                s.missing.map((f) => (
+                                  <Badge key={f} variant="outline" className="px-1.5 py-0">
+                                    {f}
+                                  </Badge>
+                                ))
+                              )}
+                            </span>
+                          </TableCell>
+                        </TableRow>
+                        {isExpanded && lifecycleState !== undefined ? (
+                          <TableRow>
+                            <TableCell colSpan={10} className="bg-muted/30">
+                              <LifecycleDrilldown sample={s} state={lifecycleState} />
+                            </TableCell>
+                          </TableRow>
+                        ) : null}
+                      </Fragment>
                     );
                   })}
                 </TableBody>
