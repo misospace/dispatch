@@ -163,9 +163,11 @@ export async function upsertLease(params: {
   //
   // #1256: creation mints the opaque claim token that fences later
   // capacity-handoff releases to THIS exact claim. Renewals deliberately keep
-  // the token (a heartbeating worker must not lose its receipt); a released or
-  // expired lease that is re-claimed is a NEW row with a NEW token, so old
-  // tokens are inert against new claims.
+  // the token (a heartbeating worker must not lose its receipt). #1417: an
+  // expired lease is no longer deleted by cleanup — it survives as a
+  // tombstone — so a re-claim REACTIVATES the surviving row through the
+  // disposed-row renewal path above (disposition cleared, token rotated),
+  // and old tokens stay inert against the new attempt.
   try {
     const lease = await prisma.lease.create({
       data: {
@@ -255,7 +257,33 @@ export async function releaseLeaseIfUnchanged(receipt: {
 }
 
 /**
- * Release all expired leases for a given issue. Returns count of released leases.
+ * Tombstone all expired leases for a given issue. Returns count of leases
+ * tombstoned by this call.
+ *
+ * #1417 (audit F1): this cleanup used to DELETE the expired row, which
+ * destroyed the only Dispatch-side liveness evidence a claim without an
+ * AgentWork row has. A claim whose lease row is deleted while its `agent/*`
+ * label remains is invisible to the ownership reconciler forever — the
+ * stale-work sweep sees only AgentWork rows, and `selectCandidates` has no
+ * lease row left to select — so the work strands indefinitely behind the
+ * queue's agent-label filter with zero recoverable evidence. The cleanup now
+ * TOMBSTONES instead: the row survives with a system-stamped
+ * `disposition: "expired"` (never worker-supplied — `OWNERSHIP_DISPOSITIONS`
+ * does not include it), so the reconciler's candidate scan
+ * (`expiredAt <= graceCutoff`) still finds it and `deriveOwnershipState`
+ * still ladders it on its renewal evidence. Release stays gated by the §8.2
+ * confirmation ladder and the §8.7 protocol — the lease TTL alone never
+ * releases anything, so a healthy long-running worker that claims once is
+ * protected by the long-run grace exactly as before.
+ *
+ * The stamp is CAS-fenced on `disposition: null`: a row that a concurrent
+ * re-claim reactivated (disposition cleared, token rotated) or that already
+ * carries any disposition is never stamped, and the stamp is idempotent (a
+ * second call counts 0). `claimToken`, `expiredAt` and the renewal
+ * provenance are deliberately untouched — the reconciler's Phase A epoch CAS
+ * must still match the tombstoned row, and `upsertLease`'s disposed-row
+ * reactivation (which rotates the token, #1256) is what consumes the
+ * tombstone on a legitimate re-claim.
  *
  * A lease carrying a `retryAfter` still in the future is a RUNNING park (#1316):
  * the wait deadline was recorded on purpose, so this abandoned-lease cleanup
@@ -270,23 +298,27 @@ export async function releaseLeaseIfUnchanged(receipt: {
  */
 export async function releaseExpiredLeases(issueId: string): Promise<number> {
   const now = new Date();
-  const expired = await prisma.lease.findMany({
+  const result = await prisma.lease.updateMany({
     where: {
       issueId,
       expiredAt: { lte: now },
+      // Never stamp a row that already carries a disposition: the tombstone
+      // is idempotent, and a row whose disposition a re-claim just cleared
+      // describes a live attempt that must not be re-tombstoned.
+      disposition: null,
       // Skip a park that is still running: `retryAfter IS NULL` (no wait
       // marker — SQL 3VL: a NULL `retryAfter` makes `retryAfter <= now`
       // UNKNOWN, never TRUE) or a `retryAfter` already in the past.
       OR: [{ retryAfter: null }, { retryAfter: { lte: now } }],
     },
-    select: { id: true },
+    data: {
+      disposition: "expired",
+      dispositionNote:
+        "lease TTL elapsed with no renewal; expired claim evidence retained for ownership reconciliation (#1417)",
+      dispositionObservedAt: now,
+    },
   });
-  if (expired.length === 0) return 0;
-
-  await prisma.lease.deleteMany({
-    where: { id: { in: expired.map((l: any) => l.id) } },
-  });
-  return expired.length;
+  return result.count;
 }
 
 // ─── Active work resolution ──────────────────────────────────────────────────

@@ -129,7 +129,7 @@ const FAILURE_META: Record<OwnershipOpCode, { httpStatus: number; message: strin
   issue_not_found: { httpStatus: 404, message: "Issue not found in local cache" },
   no_active_claim: { httpStatus: 409, message: "No lease exists for this agent on this issue; claim the issue first" },
   stale_claim_token: { httpStatus: 409, message: "claimToken does not match the current claim; this attempt is fenced out" },
-  disposed: { httpStatus: 409, message: "Ownership already carries a terminal disposition" },
+  disposed: { httpStatus: 409, message: "Ownership already carries a disposition (terminal, or the #1417 expiry tombstone); re-claim the issue to reactivate" },
   disposition_conflict: { httpStatus: 409, message: "Ownership already carries a different terminal disposition" },
   mutation_busy: { httpStatus: 409, message: "Issue mutation is in progress; retry shortly" },
 };

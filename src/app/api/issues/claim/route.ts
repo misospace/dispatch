@@ -213,10 +213,13 @@ export async function POST(request: Request) {
       return errorResponse(`Issue is actively leased to ${otherAgentLeases[0].agentName}. Use force=true to override.`, 409);
     }
 
-    // Always clean up expired leases (stale recovery)
+    // Always clean up expired leases (stale recovery). #1417: cleanup
+    // TOMBSTONES the expired rows (system-stamped `disposition: "expired"`)
+    // instead of deleting them, so the claim's liveness evidence survives for
+    // the ownership reconciler instead of stranding the issue forever.
     const expiredCount = await releaseExpiredLeases(issueId as string);
     if (expiredCount > 0) {
-      console.warn(`Released ${expiredCount} expired lease(s) for issue #${issueNumber}`);
+      console.warn(`Tombstoned ${expiredCount} expired lease(s) for issue #${issueNumber}`);
     }
 
     // Clean up stale AgentWork records (no matching active Lease).

@@ -257,6 +257,77 @@ trust anchor any ownership record must key on.
    status-preserving policy but no notion of selecting the *next eligible
    state* from an explicit hold/external-wait/review taxonomy.
 
+### 3.10 Expired-claim evidence retention (#1417)
+
+Gap 1's sharpest form (audit F1): a canonical worker claims — a `Lease` row
+plus the `agent/<name>` label, and **no `AgentWork` row until agent-work/start**
+— and crashes. The lease expires, and expired-lease cleanup used to **delete**
+the row, destroying the only Dispatch-side evidence. The stale-work sweep sees
+only AgentWork rows and the candidate scan has no lease row left to select, so
+the stranded claim became permanently invisible: derivation falls to UNKNOWN
+(`owner_unverified_no_dispatch_evidence`), the queue keeps filtering on the
+label, and nothing can ever recover it.
+
+Expired-lease cleanup (`releaseExpiredLeases`) therefore **tombstones** instead
+of deleting: the row survives with a system-stamped
+`disposition: "expired"` (never worker-supplied — `OWNERSHIP_DISPOSITIONS` is
+unchanged). The stamp is CAS-fenced on `expiredAt <= now`, `disposition: null`
+and a spent `retryAfter`, so a renewal that wins the window is never stamped
+and a running park (#1316/#1334) is never consumed. `claimToken`, `expiredAt`
+and renewal provenance are untouched, so the §8.7 Phase A epoch CAS still
+matches the tombstone, and a legitimate re-claim reactivates the row through
+`upsertLease`'s disposed-row path (token rotated, #1256).
+
+The tombstone is deliberately **not** a terminal disposition: derivation adds
+the non-terminal `disposition_expired` reason code and the claim continues down
+the ordinary liveness ladder, so release still requires the §8.2 confirmation
+ladder (liveness evidence older than the long-run grace, two spaced
+observations, commit-time re-checks) plus §8.7 fencing. The lease TTL alone
+never releases anything — a healthy long-running execution that renews (or a
+claim-once worker inside the grace window) cannot be stolen at 30 minutes;
+the tombstone only makes the evidence *survive* for the reconciler to judge.
+
+Retention needs a candidate-safe exit or it starves the scan it feeds: a
+single oldest-`take` lease batch is taken *before* the open/label filters, so
+tombstones whose issue closed or whose `agent/*` label moved on would
+permanently occupy the bounded window — in `audit` too, where nothing prunes
+(#1417 review round 3). `selectCandidates` therefore PAGES the lease source;
+the window holds only the first `batchSize` rows whose issue is open and
+carries an `agent/*` label. Rows that can never become candidates but must
+never be destroyed are paged past without consuming window budget: rows whose
+issue holds an `OwnershipReleaseIntent` (the §8.7 Phase C settle re-check
+reads exactly that row), still-live receipts (`expiredAt` elapsed is required,
+so a terminal disposition on a non-expired lease stays the worker's resume
+proof), and still-running parks (`retryAfter` elapsed — the stale-work sweep
+keeps that fenced delete). Dead tombstones are paged past in every mode, so
+`audit` reaches valid candidates with zero mutations; under `enforce` they are
+additionally deleted with the same CAS fence as the stamp, converging the
+table — but only after **authoritative proof the claim is gone** (#1417 review
+round 4): the cached `Issue.labels` mirror is non-authoritative (the claim
+route writes GitHub before the local mirror transaction, so a failed mirror
+leaves the live `agent/<name>` label invisible to the cache), so a tombstone
+on an OPEN issue is deleted only after a live forge label read confirms no
+`agent/*` label; a forge failure or an exhausted per-pass verification budget
+(`LEASE_TOMBSTONE_VERIFY_BUDGET`) fails closed and the row stays for a later
+pass. Tombstones on closed (or cache-missing) issues need no forge read —
+closure itself is treated as the claim being gone (GitHub retains labels
+across close→reopen, so a tombstone deleted on a later-reopened issue leaves
+a tier-6 label-only claim with no Dispatch evidence — the pre-existing
+label-only handling, not a new gap). The live read also cannot eliminate
+every race: a claim landing on GitHub between the read and the delete, with
+a failed mirror transaction, is a milliseconds-wide residual window the CAS
+fence (DB-state only) cannot see. Deleting on cache evidence alone
+would destroy the only Dispatch-side evidence behind a live claim and strand
+it — the exact failure this section exists to prevent. A pass reads at most
+`LEASE_SCAN_MAX_ROWS` lease rows: that bounds
+read cost, and under `audit` it is also the residual starvation bound — more
+than that many dead tombstones older than every valid candidate would hide it
+until `enforce` (or an operator) prunes. A settled release deletes the lease
+row directly, so under `enforce` tombstones stay bounded. Under the default
+`off` mode the reconciler scans nothing at all — tombstones keep accumulating
+from the claim path as inert storage growth, with no bounded window to starve
+until an operator enables a mode.
+
 ## 4. Ownership state model
 
 Ownership is **derived**, never stored as a single truth. Two layers:

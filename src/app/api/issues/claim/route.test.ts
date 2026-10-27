@@ -28,7 +28,7 @@ const { mocks } = vi.hoisted(() => ({
     createLifecycleEvent: vi.fn().mockResolvedValue({ id: "evt-1" }),
     upsertLifecycleEvent: vi.fn().mockResolvedValue({ id: "evt-1" }),
     addIssueLabel: vi.fn(), removeIssueLabel: vi.fn(),
-    leaseFindMany: vi.fn(), leaseDeleteMany: vi.fn(),
+    leaseFindMany: vi.fn(), leaseDeleteMany: vi.fn(), leaseUpdateMany: vi.fn(async () => ({ count: 0 })),
     leaseFindUnique: vi.fn(), leaseFindUniqueOrThrow: vi.fn(),
     leaseCreate: vi.fn(), leaseUpdate: vi.fn(), leaseDelete: vi.fn(), leaseFindFirst: vi.fn(),
     intentFindFirst: vi.fn(async (): Promise<Record<string, unknown> | null> => null),
@@ -76,6 +76,7 @@ vi.mock("@/lib/prisma", () => ({
     lease: { 
       findMany: mocks.leaseFindMany, 
       deleteMany: mocks.leaseDeleteMany, 
+      updateMany: mocks.leaseUpdateMany,
       findUnique: mocks.leaseFindUnique,
       findUniqueOrThrow: mocks.leaseFindUniqueOrThrow,
       create: mocks.leaseCreate,
@@ -1240,6 +1241,23 @@ describe("POST /api/issues/claim — parked claims (#1316, #1334)", () => {
     expect(res.status).toBe(200);
     // The park's lease row is never deleted, by any cleanup call the route makes.
     expect(mocks.leaseDeleteMany).not.toHaveBeenCalled();
+    // The #1417 tombstone cleanup ran, but its CAS clause cannot consume the
+    // park: `disposition: null` keeps it idempotent, and a still-running
+    // wait marker matches neither OR arm — the park's receipt survives.
+    expect(mocks.leaseUpdateMany).toHaveBeenCalledTimes(1);
+    const casWhere = (mocks.leaseUpdateMany.mock.calls[0] as any)[0].where;
+    expect(casWhere.disposition).toBeNull();
+    expect(casWhere.expiredAt.lte.getTime()).toBeLessThanOrEqual(Date.now());
+    const matchesParked = casWhere.OR.some((arm: any) =>
+      (Object.entries(arm) as [string, any][]).every(([field, cond]) =>
+        cond === null
+          ? (parked as Record<string, any>)[field] === null || (parked as Record<string, any>)[field] === undefined
+          : typeof cond === "object" && cond !== null && cond.lte !== undefined
+            ? (parked as Record<string, any>)[field].getTime() <= (cond as { lte: Date }).lte.getTime()
+            : false,
+      ),
+    );
+    expect(matchesParked).toBe(false);
     // The claim is its own row (the park row is keyed to another agent and is
     // never mutated by a different agent's claim).
     expect(mocks.leaseUpdate).not.toHaveBeenCalled();

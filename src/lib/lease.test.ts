@@ -9,6 +9,7 @@ const { mocks } = vi.hoisted(() => ({
     leaseDeleteMany: vi.fn(),
     leaseFindFirst: vi.fn(),
     leaseFindMany: vi.fn(),
+    leaseUpdateMany: vi.fn(),
     issueFindUnique: vi.fn(),
     auditLogCreate: vi.fn(),
   },
@@ -24,6 +25,7 @@ vi.mock("@/lib/prisma", () => ({
       deleteMany: mocks.leaseDeleteMany,
       findFirst: mocks.leaseFindFirst,
       findMany: mocks.leaseFindMany,
+      updateMany: mocks.leaseUpdateMany,
     },
     issue: {
       findUnique: mocks.issueFindUnique,
@@ -489,20 +491,24 @@ describe("releaseLeaseIfUnchanged", () => {
 });
 
 /**
- * SQL three-valued evaluation of the `releaseExpiredLeases` cleanup clause
- * against one lease row, so the park-skip guard is behavioral rather than a
- * where-shape snapshot. The clause selects leases whose `expiredAt` has
- * elapsed AND whose wait marker is gone: `retryAfter IS NULL` (unknown-safe:
- * the NULL arm is literal null equality) or `retryAfter` already elapsed (a
- * NULL column makes the `lte` comparison UNKNOWN, never a match).
+ * SQL three-valued evaluation of the `releaseExpiredLeases` tombstone CAS
+ * against one lease row, so the park-skip and already-dispositioned guards
+ * are behavioral rather than a where-shape snapshot. The clause stamps
+ * leases whose `expiredAt` has elapsed, whose wait marker is gone
+ * (`retryAfter IS NULL` — unknown-safe: the NULL arm is literal null
+ * equality — or `retryAfter` already elapsed) and that carry no disposition
+ * yet: a tombstoned row is skipped by idempotency, a reactivated row
+ * (disposition cleared by a re-claim) is skipped while its new epoch lives.
  */
 function matchesReleaseExpiredWhere(
   lease: Record<string, unknown>,
-  where: { expiredAt: { lte: Date }; OR: Array<Record<string, unknown>> },
+  where: { expiredAt: { lte: Date }; disposition: null; OR: Array<Record<string, unknown>> },
 ): boolean {
   const expiredAt = lease.expiredAt as Date;
   const retryAfter = (lease.retryAfter ?? null) as Date | null;
+  const disposition = (lease.disposition ?? null) as string | null;
   if (expiredAt.getTime() > where.expiredAt.lte.getTime()) return false;
+  if (disposition !== where.disposition) return false;
   for (const arm of where.OR) {
     if (arm.retryAfter === null) {
       if (retryAfter === null) return true;
@@ -514,33 +520,45 @@ function matchesReleaseExpiredWhere(
   return false;
 }
 
-describe("releaseExpiredLeases", () => {
-  it("deletes all expired leases for an issue and returns count", async () => {
-    mocks.leaseFindMany.mockImplementation(() => Promise.resolve([{ id: "l-1" }, { id: "l-2" }]));
-    mocks.leaseDeleteMany.mockImplementation(() => Promise.resolve({ count: 2 }));
+describe("releaseExpiredLeases (#1417 tombstone)", () => {
+  it("tombstones expired leases with a system-stamped disposition and returns the count", async () => {
+    mocks.leaseUpdateMany.mockImplementation(() => Promise.resolve({ count: 2 }));
 
     const result = await releaseExpiredLeases("i-1");
 
     expect(result).toBe(2);
-    expect(mocks.leaseDeleteMany).toHaveBeenCalledWith({
-      where: { id: { in: ["l-1", "l-2"] } },
+    // The cleanup must never delete: a deleted row is destroyed evidence
+    // (#1417), and the park/epoch guards below are only meaningful while the
+    // row survives.
+    expect(mocks.leaseDeleteMany).not.toHaveBeenCalled();
+    const call = (mocks.leaseUpdateMany.mock.calls[0] as any)[0];
+    // The tombstone write touches ONLY the disposition marker fields: the
+    // claim-epoch fence (claimToken/expiredAt) and the renewal provenance
+    // must survive untouched for the reconciler's Phase A epoch CAS.
+    expect(call.data).toEqual({
+      disposition: "expired",
+      dispositionNote: expect.stringContaining("#1417"),
+      dispositionObservedAt: expect.any(Date),
     });
+    expect(call.where.issueId).toBe("i-1");
+    expect(call.where.disposition).toBeNull();
+    expect(call.where.expiredAt).toBeDefined();
+    expect(call.where.OR).toBeDefined();
   });
 
-  it("returns 0 and skips delete when no expired leases exist", async () => {
-    mocks.leaseFindMany.mockImplementation(() => Promise.resolve([]));
+  it("returns 0 when no expired lease matches", async () => {
+    mocks.leaseUpdateMany.mockImplementation(() => Promise.resolve({ count: 0 }));
 
     const result = await releaseExpiredLeases("i-99");
 
     expect(result).toBe(0);
-    expect(mocks.leaseDeleteMany).not.toHaveBeenCalled();
   });
 
   it("does not select a lease whose retryAfter park is still running, so cleanup cannot erase the park evidence (#1316, #1334)", async () => {
-    let capturedWhere: { expiredAt: { lte: Date }; OR: Array<Record<string, unknown>> } | undefined;
-    mocks.leaseFindMany.mockImplementation(async (args: any) => {
+    let capturedWhere: { expiredAt: { lte: Date }; disposition: null; OR: Array<Record<string, unknown>> } | undefined;
+    mocks.leaseUpdateMany.mockImplementation(async (args: any) => {
       capturedWhere = args.where;
-      return [];
+      return { count: 0 };
     });
 
     const result = await releaseExpiredLeases("i-1");
@@ -575,10 +593,10 @@ describe("releaseExpiredLeases", () => {
   });
 
   it("selects an expired lease once its retryAfter has elapsed (park over)", async () => {
-    let capturedWhere: { expiredAt: { lte: Date }; OR: Array<Record<string, unknown>> } | undefined;
-    mocks.leaseFindMany.mockImplementation(async (args: any) => {
+    let capturedWhere: { expiredAt: { lte: Date }; disposition: null; OR: Array<Record<string, unknown>> } | undefined;
+    mocks.leaseUpdateMany.mockImplementation(async (args: any) => {
       capturedWhere = args.where;
-      return [];
+      return { count: 0 };
     });
 
     await releaseExpiredLeases("i-1");
@@ -598,6 +616,41 @@ describe("releaseExpiredLeases", () => {
         capturedWhere!,
       ),
     ).toBe(true);
+  });
+
+  it("is idempotent and never re-stamps a row that already carries a disposition", async () => {
+    let capturedWhere: { expiredAt: { lte: Date }; disposition: null; OR: Array<Record<string, unknown>> } | undefined;
+    mocks.leaseUpdateMany.mockImplementation(async (args: any) => {
+      capturedWhere = args.where;
+      return { count: 0 };
+    });
+
+    await releaseExpiredLeases("i-1");
+
+    expect(capturedWhere).toBeDefined();
+    // A row this call already tombstoned (disposition "expired") or a row
+    // with any terminal disposition does not match the CAS again…
+    expect(
+      matchesReleaseExpiredWhere(
+        makeLease({ expiredAt: new Date(Date.now() - 5 * 60_000), disposition: "expired" }),
+        capturedWhere!,
+      ),
+    ).toBe(false);
+    expect(
+      matchesReleaseExpiredWhere(
+        makeLease({ expiredAt: new Date(Date.now() - 5 * 60_000), disposition: "completed" }),
+        capturedWhere!,
+      ),
+    ).toBe(false);
+    // …and neither does a row a concurrent re-claim just reactivated: the
+    // reactivation pushed `expiredAt` forward (a fresh TTL), so the expiry
+    // predicate — not the disposition — is what protects the live attempt.
+    expect(
+      matchesReleaseExpiredWhere(
+        makeLease({ expiredAt: new Date(Date.now() + 5 * 60_000), disposition: null, renewedAt: new Date() }),
+        capturedWhere!,
+      ),
+    ).toBe(false);
   });
 });
 
