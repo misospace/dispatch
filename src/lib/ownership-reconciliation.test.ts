@@ -211,6 +211,9 @@ function makeFakePrisma() {
       findMany: async (args: any = {}) => {
         let found = rows().filter((r) => matchesWhere(r, args.where ?? {}));
         if (args.orderBy) found = orderRows(found, args.orderBy);
+        // Cursor-free paging needs a stable order; orderRows tiebreaks by id,
+        // mirroring the production scan's explicit `id` tiebreak (#1417).
+        if (args.skip) found = found.slice(args.skip);
         if (args.take !== undefined) found = found.slice(0, args.take);
         return CLONE(found.map((r) => projectRow(r, args.select)));
       },
@@ -913,6 +916,164 @@ describe("ownership reconciliation (#1254)", () => {
     });
   });
 
+  describe("expired-lease tombstone recovery (#1417)", () => {
+    // The F1 evidence shape: a canonical worker claimed (lease + `agent/*`
+    // label) but crashed before agent-work/start, so NO AgentWork row exists.
+    // Lease cleanup tombstoned the expired lease (#1417) instead of deleting
+    // it — the surviving row is the only Dispatch-side evidence, and it is
+    // exactly what the candidate scan + evidence ladder consume here.
+    function buildTombstoneFixture(now: Date) {
+      const fixture = buildFixture(now);
+      fixture.tables.agentWork.length = 0;
+      Object.assign(fixture.tables.lease[0], {
+        expiredAt: minutesAgo(now, 50),
+        disposition: "expired",
+        dispositionNote: "lease TTL elapsed with no renewal; expired claim evidence retained for ownership reconciliation (#1417)",
+        dispositionObservedAt: minutesAgo(now, 50),
+        renewedAt: minutesAgo(now, 75),
+        registeredAt: null,
+        registrationOccurredAt: null,
+        renewCount: 0,
+        lastRenewalObservedAt: null,
+        lastRenewalOccurredAt: null,
+      });
+      return fixture;
+    }
+
+    it("audit mode surfaces the tombstoned claim as an ABANDONED_CANDIDATE annotation with zero mutations", async () => {
+      const now = new Date();
+      const fixture = buildTombstoneFixture(now);
+      const report = await runReconcile(fixture, now, "audit");
+
+      expect(report.examined).toBe(1);
+      expect(report.released).toBe(0);
+      expect(forgeShared.removeCalls).toHaveLength(0);
+      expect(fixture.tables.ownershipReleaseIntent).toHaveLength(0);
+      // The tombstone row survives audit untouched (read-only mode).
+      expect(fixture.tables.lease[0].disposition).toBe("expired");
+      expect(fixture.tables.lease[0].claimToken).toBe("tok-g");
+      const candidateNotes = fixture.tables.auditLog
+        .filter((r) => r.action === "ownership_reconcile_candidate")
+        .map((r) => r.notes);
+      expect(candidateNotes.some((n: string) => n.includes("state=ABANDONED_CANDIDATE"))).toBe(true);
+      expect(candidateNotes.some((n: string) => n.includes("disposition_expired"))).toBe(true);
+      expect(candidateNotes.some((n: string) => n.includes("evidence_stale"))).toBe(true);
+    });
+
+    it("enforce mode ladders the tombstoned claim and releases it through the §8.7 protocol", async () => {
+      const now = new Date();
+      const fixture = buildTombstoneFixture(now);
+
+      // First observation: retained, ladder at 1.
+      const first = await runReconcile(fixture, now, "enforce");
+      expect(first.retained).toBe(1);
+      expect(first.released).toBe(0);
+      expect(forgeShared.removeCalls).toHaveLength(0);
+      expect(fixture.tables.ownershipReconcileCandidate[0].staleCount).toBe(1);
+
+      // Second observation after the re-check interval: the epoch CAS pins
+      // the tombstone (claimToken/expiredAt/disposition all still as
+      // observed), Phase B deletes exactly the claim label, Phase C settles.
+      const report = await runReconcile(fixture, new Date(now.getTime() + 10 * MIN), "enforce");
+      expect(report.released).toBe(1);
+      expect(agentRemoveCalls()).toEqual(["agent/alpha"]);
+      expect(fixture.tables.issue[0].labels).not.toContain("agent/alpha");
+      // §8.5: unexplained in-progress falls back to ready.
+      expect(fixture.tables.issue[0].labels).toContain("status/ready");
+      // The tombstone row is consumed by the settle — the claim is gone.
+      expect(fixture.tables.lease).toHaveLength(0);
+      const releases = fixture.tables.issueLifecycleEvent.filter((e: any) => e.kind === "claim_released");
+      expect(releases).toHaveLength(1);
+      expect(fixture.tables.ownershipReleaseIntent).toHaveLength(0);
+      // The churn bound survives the release (§8.2 item 4).
+      expect(fixture.tables.ownershipReconcileCandidate[0].reclaimCount).toBe(1);
+    });
+
+    it("a live renewal on the pair aborts candidacy — a tombstone never preempts a live owner", async () => {
+      const now = new Date();
+      const fixture = buildTombstoneFixture(now);
+      await runReconcile(fixture, now, "enforce");
+      // The same agent re-claims between observations: upsertLease's
+      // disposed-row reactivation clears the tombstone, rotates the token
+      // (#1256) and pushes the expiry forward — a live attempt again.
+      Object.assign(fixture.tables.lease[0], {
+        disposition: null,
+        dispositionNote: null,
+        dispositionObservedAt: null,
+        claimToken: "tok-fresh",
+        renewedAt: new Date(now.getTime() + 10 * MIN),
+        lastRenewalObservedAt: new Date(now.getTime() + 10 * MIN),
+        expiredAt: new Date(now.getTime() + 40 * MIN),
+      });
+      const report = await runReconcile(fixture, new Date(now.getTime() + 10 * MIN), "enforce");
+      expect(report.retained).toBe(1);
+      expect(report.released).toBe(0);
+      expect(fixture.tables.ownershipReconcileCandidate).toHaveLength(0);
+      expect(fixture.tables.issue[0].labels).toContain("agent/alpha");
+    });
+
+    it("a pre-#1256 tombstone with a NULL claimToken still settles — the pending intent must not wedge the claim barrier", async () => {
+      // The blocker this pins: a legacy lease row created before claimToken
+      // existed carries claimToken NULL. Tombstoned, it takes the epoch path
+      // (a row exists) but the intent carries attemptToken null, so Phase C
+      // hits the intent-only re-check. A surviving row there used to read as
+      // "a fresh claim — never destroy" and the settle never happened: the
+      // pending intent held the claim route's 409 barrier forever. A
+      // tombstone is dead-claim evidence, so the settle consumes it.
+      const now = new Date();
+      const fixture = buildTombstoneFixture(now);
+      fixture.tables.lease[0].claimToken = null;
+
+      await runReconcile(fixture, now, "enforce");
+      const report = await runReconcile(fixture, new Date(now.getTime() + 10 * MIN), "enforce");
+
+      expect(report.released).toBe(1);
+      expect(agentRemoveCalls()).toEqual(["agent/alpha"]);
+      expect(fixture.tables.lease).toHaveLength(0);
+      expect(fixture.tables.ownershipReleaseIntent).toHaveLength(0);
+      const releases = fixture.tables.issueLifecycleEvent.filter((e: any) => e.kind === "claim_released");
+      expect(releases).toHaveLength(1);
+    });
+
+    it("a NON-tombstoned lease behind a null-token intent still blocks the settle (fail-closed preserved)", async () => {
+      // The protection the #1417 exemption must not weaken: at Phase C, a
+      // lease row with any disposition other than "expired" behind a
+      // null-token intent is a claim the decision never saw — the replay
+      // refuses to settle and the intent stays pending (fail-closed). (The
+      // reconciler itself cannot commit an intent over a running park — the
+      // Phase A commit-time re-check withholds — so this shape is reached
+      // only via replay of an already-pending intent, which is exactly the
+      // surface this pin covers.)
+      const now = new Date();
+      const fixture = buildTombstoneFixture(now);
+      fixture.tables.lease[0].claimToken = null;
+      fixture.tables.lease[0].disposition = "blocked";
+      fixture.tables.lease[0].retryAfter = new Date(now.getTime() + 60 * MIN);
+      fixture.tables.ownershipReleaseIntent.push({
+        id: "intent-null-token",
+        issueId: ISSUE_ID,
+        agentName: "alpha",
+        agentLabel: "agent/alpha",
+        attemptToken: null,
+        phase: "pending",
+        attempts: 0,
+        parkedAt: null,
+      });
+
+      const { replayPendingOwnershipReleases } = await import("@/lib/ownership-reconciliation");
+      const replay = await replayPendingOwnershipReleases(
+        { prisma: fixture.client, forge: forgeShared, guard: fixture.guard.fake },
+        now,
+      );
+
+      expect(replay.released).toBe(0);
+      expect(replay.skipped).toBe(1);
+      expect(fixture.tables.lease).toHaveLength(1);
+      expect(fixture.tables.lease[0].disposition).toBe("blocked");
+      expect(fixture.tables.ownershipReleaseIntent).toHaveLength(1);
+    });
+  });
+
   describe("commit-time re-check (#1254 acceptance)", () => {
     // The ladder decision is made on one live read; Phase A must re-derive
     // the CAS-unpinnable facts (maintainer hold, review ownership, external
@@ -1116,6 +1277,499 @@ describe("ownership reconciliation (#1254)", () => {
       const report = await runReconcile(fixture, now, "enforce");
       expect(report.examined).toBe(0);
       expect(fixture.tables.ownershipReconcileCandidate).toHaveLength(0);
+    });
+  });
+
+  describe("dead-tombstone housekeeping (#1417)", () => {
+    // Full-shape lease so evidence assembly never trips on a missing field.
+    function tombstoneLease(now: Date, opts: {
+      id: string;
+      issueId: string;
+      expiredMinutesAgo: number;
+      disposition?: string;
+      retryAfter?: Date | null;
+    }) {
+      return {
+        id: opts.id,
+        agentName: "alpha",
+        issueId: opts.issueId,
+        claimToken: null,
+        expiredAt: minutesAgo(now, opts.expiredMinutesAgo),
+        renewedAt: minutesAgo(now, opts.expiredMinutesAgo + 40),
+        registeredAt: null,
+        registrationOccurredAt: null,
+        renewCount: 0,
+        lastRenewalObservedAt: null,
+        lastRenewalOccurredAt: null,
+        retryAfter: opts.retryAfter ?? null,
+        waitReason: null,
+        disposition: opts.disposition ?? "expired",
+      };
+    }
+    function closedIssueRow(id: string, number: number) {
+      return {
+        id,
+        number,
+        state: "closed",
+        labels: ["status/done", "agent/alpha"],
+        blockedReason: null,
+        linkedPrNumber: null,
+        linkedPrMergeState: null,
+        repository: { fullName: REPO },
+      };
+    }
+
+    it("a closed-issue tombstone is pruned so the live candidate is examined (batch 1)", async () => {
+      // With a batch of one, a pre-filter batch scan would put only the dead
+      // tombstone in the window: the live candidate waits a pass and, without
+      // any pruning, forever. The paging scan classifies the whole tombstone
+      // prefix in one read, so `enforce` prunes the dead row AND examines the
+      // live candidate in the SAME pass.
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.issue.push(closedIssueRow("issue-closed", 90));
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-dead", issueId: "issue-closed", expiredMinutesAgo: 120 }),
+        tombstoneLease(now, { id: "tomb-live", issueId: ISSUE_ID, expiredMinutesAgo: 50 }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+
+      const first = await runReconcile(fixture, now, "enforce");
+      expect(first.examined).toBe(1);
+      expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-live"]);
+
+      // Pass 2: the window is unblocked; the live tombstone stays a candidate.
+      const second = await runReconcile(fixture, now, "enforce");
+      expect(second.examined).toBe(1);
+      expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-live"]);
+    });
+
+    it("audit mode pages past more than batchSize dead tombstones to reach a valid candidate", async () => {
+      // #1417 round 3 hard-blocker: audit skips the prune (read-only contract),
+      // so a pre-filter batch let >batchSize retained tombstones permanently
+      // hide the one dead claim with real stale-owner evidence — the audit
+      // acceptance criterion died in exactly the mode meant to surface it.
+      // Paging must surface the candidate with ZERO mutations.
+      const now = new Date();
+      const fixture = buildFixture(now);
+      for (let i = 0; i < 4; i++) {
+        fixture.tables.issue.push(closedIssueRow(`issue-closed-${i}`, 90 + i));
+      }
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-dead-0", issueId: "issue-closed-0", expiredMinutesAgo: 400 }),
+        tombstoneLease(now, { id: "tomb-dead-1", issueId: "issue-closed-1", expiredMinutesAgo: 300 }),
+        tombstoneLease(now, { id: "tomb-dead-2", issueId: "issue-closed-2", expiredMinutesAgo: 200 }),
+        tombstoneLease(now, { id: "tomb-dead-3", issueId: "issue-closed-3", expiredMinutesAgo: 100 }),
+        // The valid dead-claim candidate sits behind ALL of them, oldest-last.
+        tombstoneLease(now, { id: "tomb-live", issueId: ISSUE_ID, expiredMinutesAgo: 50 }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+
+      const report = await runReconcile(fixture, now, "audit");
+      expect(report.examined).toBe(1);
+      // Read-only contract intact: nothing pruned.
+      expect(fixture.tables.lease.map((r) => r.id).sort()).toEqual(
+        ["tomb-dead-0", "tomb-dead-1", "tomb-dead-2", "tomb-dead-3", "tomb-live"].sort(),
+      );
+      const annotations = fixture.tables.auditLog.filter((r: any) => r.action === "ownership_reconcile_candidate");
+      expect(annotations.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("enforce prunes more than batchSize dead tombstones and examines the candidate in one pass", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      for (let i = 0; i < 3; i++) {
+        fixture.tables.issue.push(closedIssueRow(`issue-closed-${i}`, 90 + i));
+      }
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-dead-0", issueId: "issue-closed-0", expiredMinutesAgo: 300 }),
+        tombstoneLease(now, { id: "tomb-dead-1", issueId: "issue-closed-1", expiredMinutesAgo: 200 }),
+        tombstoneLease(now, { id: "tomb-dead-2", issueId: "issue-closed-2", expiredMinutesAgo: 100 }),
+        tombstoneLease(now, { id: "tomb-live", issueId: ISSUE_ID, expiredMinutesAgo: 50 }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+
+      const report = await runReconcile(fixture, now, "enforce");
+      expect(report.examined).toBe(1);
+      expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-live"]);
+    });
+
+    it("enforce prunes a window of ONLY dead tombstones (GC runs before the empty-candidate return)", async () => {
+      // The housekeeping delete must run even when nothing survives the scan:
+      // a pure-dead window that returns early without pruning never shrinks.
+      const now = new Date();
+      const fixture = buildFixture(now);
+      for (let i = 0; i < 3; i++) {
+        fixture.tables.issue.push(closedIssueRow(`issue-closed-${i}`, 90 + i));
+      }
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-dead-0", issueId: "issue-closed-0", expiredMinutesAgo: 300 }),
+        tombstoneLease(now, { id: "tomb-dead-1", issueId: "issue-closed-1", expiredMinutesAgo: 200 }),
+        tombstoneLease(now, { id: "tomb-dead-2", issueId: "issue-closed-2", expiredMinutesAgo: 100 }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+
+      const report = await runReconcile(fixture, now, "enforce");
+      expect(report.examined).toBe(0);
+      expect(fixture.tables.lease).toHaveLength(0);
+    });
+
+    it("audit pages ACROSS 50-row pages to reach a valid candidate", async () => {
+      // >50 dead tombstones force skip-based multi-page reads: page 1 is pure
+      // dead rows, the candidate sits on page 2. Audit must still examine it
+      // with zero mutations.
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.lease.length = 0;
+      for (let i = 0; i < 60; i++) {
+        fixture.tables.issue.push(closedIssueRow(`issue-closed-${i}`, 100 + i));
+        fixture.tables.lease.push(
+          tombstoneLease(now, { id: `tomb-dead-${i}`, issueId: `issue-closed-${i}`, expiredMinutesAgo: 660 - i }),
+        );
+      }
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-live", issueId: ISSUE_ID, expiredMinutesAgo: 50 }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+
+      const report = await runReconcile(fixture, now, "audit");
+      expect(report.examined).toBe(1);
+      expect(fixture.tables.lease).toHaveLength(61);
+    });
+
+    it("the id tiebreak pages tombstones sharing one expiredAt deterministically", async () => {
+      // 55 dead tombstones with an IDENTICAL expiredAt straddle the page
+      // boundary: without the `id` tiebreak the skip-offset order is unstable
+      // and rows can be double-read or skipped forever. Enforce must examine
+      // the candidate and prune every dead row in one pass.
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.lease.length = 0;
+      for (let i = 0; i < 55; i++) {
+        fixture.tables.issue.push(closedIssueRow(`issue-closed-${i}`, 100 + i));
+        fixture.tables.lease.push(
+          tombstoneLease(now, { id: `tomb-dead-${String(i).padStart(2, "0")}`, issueId: `issue-closed-${i}`, expiredMinutesAgo: 200 }),
+        );
+      }
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-live", issueId: ISSUE_ID, expiredMinutesAgo: 50 }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+
+      const report = await runReconcile(fixture, now, "enforce");
+      expect(report.examined).toBe(1);
+      expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-live"]);
+    });
+
+    it("protected non-candidate rows (intent/receipt/park) do not consume the window", async () => {
+      // The reviewer's re-starvation shape: parked-intent, receipt and park
+      // rows can never be candidates but are never prunable — they must be
+      // paged past, not counted, or a cluster of them re-blocks the window.
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.issue.push(
+        closedIssueRow("issue-held", 90),
+        closedIssueRow("issue-receipt", 91),
+        {
+          id: "issue-parked",
+          number: 92,
+          state: "closed",
+          labels: ["status/done"],
+          blockedReason: null,
+          linkedPrNumber: null,
+          linkedPrMergeState: null,
+          repository: { fullName: REPO },
+        },
+      );
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-held", issueId: "issue-held", expiredMinutesAgo: 300 }),
+        tombstoneLease(now, {
+          id: "tomb-receipt",
+          issueId: "issue-receipt",
+          expiredMinutesAgo: -20, // still-live receipt
+          disposition: "released",
+        }),
+        tombstoneLease(now, {
+          id: "tomb-park",
+          issueId: "issue-parked",
+          expiredMinutesAgo: 200,
+          retryAfter: new Date(now.getTime() + 30 * MIN),
+        }),
+        tombstoneLease(now, { id: "tomb-live", issueId: ISSUE_ID, expiredMinutesAgo: 50 }),
+      );
+      fixture.tables.ownershipReleaseIntent.push({
+        id: "intent-1",
+        issueId: "issue-held",
+        agentName: "alpha",
+        agentLabel: "agent/alpha",
+        attemptToken: "tok-held",
+        phase: "pending",
+        attempts: 1,
+        parkedAt: minutesAgo(now, 5),
+      });
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+
+      // Replay is skipped for parked intents, so the candidate scan sees the
+      // protected cluster ahead of the live candidate.
+      const report = await runReconcile(fixture, now, "audit");
+      expect(report.examined).toBe(1);
+      // Nothing mutated in audit: protected rows AND the dead-free table intact.
+      expect(fixture.tables.lease.map((r) => r.id).sort()).toEqual(
+        ["tomb-held", "tomb-live", "tomb-park", "tomb-receipt"].sort(),
+      );
+    });
+
+    it("audit mode prunes nothing (read-only contract)", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.issue.push(closedIssueRow("issue-closed", 90));
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-dead", issueId: "issue-closed", expiredMinutesAgo: 120 }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+      const report = await runReconcile(fixture, now, "audit");
+      expect(report.examined).toBe(0);
+      expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-dead"]);
+    });
+
+    it("enforce preserves a tombstone whose cached labels lost the agent label while the forge still carries it (#1417 review round 4)", async () => {
+      // The claim route writes GitHub BEFORE the local mirror transaction; a
+      // failed mirror leaves the live `agent/alpha` label invisible to the
+      // cached labels. Deleting the tombstone on that stale cache would
+      // destroy the only Dispatch-side evidence and strand the live claim —
+      // the #1417 failure mode again. The delete requires a LIVE forge read.
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.issue[0].labels = ["status/in-progress"]; // cache: pre-claim
+      forgeShared.setLabels(REPO, 42, ["status/in-progress", "agent/alpha"]); // forge: claimed
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-cache-stale", issueId: ISSUE_ID, expiredMinutesAgo: 120 }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+
+      const report = await runReconcile(fixture, now, "enforce");
+      // The live read ran, saw the claim, and the evidence survived.
+      expect(forgeShared.liveReads).toBeGreaterThanOrEqual(1);
+      expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-cache-stale"]);
+      // The stale cache is not a candidate source: nothing examined.
+      expect(report.examined).toBe(0);
+
+      // Recoverable: once sync reflects the live label, the SAME tombstone
+      // becomes candidate evidence and is examined — never destroyed.
+      fixture.tables.issue[0].labels = ["status/in-progress", "agent/alpha"];
+      const second = await runReconcile(fixture, now, "enforce");
+      expect(second.examined).toBe(1);
+      expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-cache-stale"]);
+    });
+
+    it("enforce deletes an open-issue tombstone once the live forge read confirms the claim is gone", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.issue[0].labels = ["status/in-progress"]; // cache: no claim
+      forgeShared.setLabels(REPO, 42, ["status/in-progress"]); // forge: no claim either
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-genuinely-dead", issueId: ISSUE_ID, expiredMinutesAgo: 120 }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+
+      const report = await runReconcile(fixture, now, "enforce");
+      expect(report.examined).toBe(0);
+      expect(fixture.tables.lease).toHaveLength(0);
+    });
+
+    it("a failed live forge read fails closed: the open-issue tombstone survives for a later pass", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.issue[0].labels = ["status/in-progress"];
+      forgeShared.labels.delete(`${REPO}#42`); // getLiveIssueLabels throws
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-unverifiable", issueId: ISSUE_ID, expiredMinutesAgo: 120 }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+
+      const report = await runReconcile(fixture, now, "enforce");
+      expect(report.examined).toBe(0);
+      expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-unverifiable"]);
+    });
+
+    it("a tombstone on an issue holding a parked intent survives cleanup", async () => {
+      // Phase C's settle re-check reads exactly this lease row; deleting it
+      // would wedge the settlement. Parked intents stay out of the replay
+      // window, so this pass sees only the candidate scan.
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.issue.push(closedIssueRow("issue-closed", 90));
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-held", issueId: "issue-closed", expiredMinutesAgo: 120 }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      fixture.tables.ownershipReleaseIntent.push({
+        id: "intent-1",
+        issueId: "issue-closed",
+        agentName: "alpha",
+        agentLabel: "agent/alpha",
+        attemptToken: "tok-dead",
+        phase: "pending",
+        attempts: 1,
+        parkedAt: minutesAgo(now, 5),
+      });
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+      const report = await runReconcile(fixture, now, "enforce");
+      expect(report.examined).toBe(0);
+      expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-held"]);
+    });
+
+    it("a terminal disposition on a still-live lease is kept as the worker's receipt", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.issue.push(closedIssueRow("issue-closed", 90));
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, {
+          id: "lease-live",
+          issueId: "issue-closed",
+          expiredMinutesAgo: -20, // expiresAt in the future
+          disposition: "released",
+        }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+      const report = await runReconcile(fixture, now, "enforce");
+      expect(report.examined).toBe(0);
+      expect(fixture.tables.lease.map((r) => r.id)).toEqual(["lease-live"]);
+    });
+
+    it("a still-running park (future retryAfter) is left to the stale-work sweep", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.issue.push({
+        id: "issue-wait",
+        number: 91,
+        state: "open",
+        labels: ["status/blocked"], // no agent/* label: not a candidate
+        blockedReason: null,
+        linkedPrNumber: null,
+        linkedPrMergeState: null,
+        repository: { fullName: REPO },
+      });
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, {
+          id: "tomb-parked",
+          issueId: "issue-wait",
+          expiredMinutesAgo: 120,
+          retryAfter: new Date(now.getTime() + 30 * MIN),
+        }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+      const report = await runReconcile(fixture, now, "enforce");
+      expect(report.examined).toBe(0);
+      expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-parked"]);
+    });
+
+    it("an open issue whose agent label moved on (park spent) is pruned too", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.issue.push(
+        closedIssueRow("issue-closed", 90),
+        {
+          id: "issue-reassigned",
+          number: 92,
+          state: "open",
+          labels: ["status/ready"], // the claim moved on: no agent/* label left
+          blockedReason: null,
+          linkedPrNumber: null,
+          linkedPrMergeState: null,
+          repository: { fullName: REPO },
+        },
+      );
+      // Round 4: the open-issue prune requires LIVE proof the claim is gone,
+      // so the forge must agree with the cache here.
+      forgeShared.setLabels(REPO, 92, ["status/ready"]);
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-dead", issueId: "issue-closed", expiredMinutesAgo: 120 }),
+        tombstoneLease(now, { id: "tomb-moved", issueId: "issue-reassigned", expiredMinutesAgo: 110 }),
+        tombstoneLease(now, { id: "tomb-live", issueId: ISSUE_ID, expiredMinutesAgo: 50 }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "3");
+      const report = await runReconcile(fixture, now, "enforce");
+      expect(report.examined).toBe(1);
+      expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-live"]);
+    });
+
+    it("a reactivation committed between the scan and the delete survives the fence", async () => {
+      // The guards are evaluated on the scan read; the DELETE must be
+      // CAS-fenced so a claim that reactivates the row in place (disposed-row
+      // path: disposition cleared, token rotated, expiredAt pushed forward)
+      // between the two is never destroyed.
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.issue.push(closedIssueRow("issue-closed", 90));
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-dead", issueId: "issue-closed", expiredMinutesAgo: 120 }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+      const baseDeleteMany = fixture.client.lease.deleteMany;
+      let reactivated = false;
+      fixture.client.lease.deleteMany = async (args: any) => {
+        if (!reactivated && args?.where?.id) {
+          reactivated = true;
+          const row = fixture.tables.lease.find((r) => r.id === "tomb-dead");
+          if (row) {
+            row.disposition = null;
+            row.claimToken = "tok-rotated";
+            row.expiredAt = new Date(now.getTime() + 30 * MIN);
+          }
+        }
+        return baseDeleteMany(args);
+      };
+      const report = await runReconcile(fixture, now, "enforce");
+      expect(report.examined).toBe(0);
+      expect(reactivated).toBe(true);
+      expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-dead"]);
+      expect(fixture.tables.lease[0].claimToken).toBe("tok-rotated");
     });
   });
 

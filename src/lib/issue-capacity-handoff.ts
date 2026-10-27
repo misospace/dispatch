@@ -206,7 +206,7 @@ type ReplayOutcome =
 async function replayIssueHandoffSettlement(
   client: IssueCapacityHandoffClient,
   input: IssueCapacityHandoffInput,
-  lease?: { claimToken: string | null } | null,
+  lease?: { claimToken: string | null; disposition?: string | null } | null,
   now: Date = new Date(),
 ): Promise<ReplayOutcome> {
   if (!input.settlementKey) return null;
@@ -231,7 +231,13 @@ async function replayIssueHandoffSettlement(
       return null;
     }
   }
-  if (leaseRow) return null;
+  // A tombstoned ("expired") lease (#1417) is dead-claim evidence, not a live
+  // claim: the disposition is stamped only on an attempt whose TTL elapsed
+  // with no renewal, and a re-claim clears it atomically with the token
+  // rotation, so a live attempt can never present "expired". The recorded
+  // settlement is a report of a past release; the tombstone left behind by
+  // cleanup must not un-prove it for the retrying worker.
+  if (leaseRow && leaseRow.disposition !== "expired") return null;
   if (lookup.state !== "found") return null;
   if (lookup.record.claimToken !== claimToken) return { kind: "foreign" };
   try {

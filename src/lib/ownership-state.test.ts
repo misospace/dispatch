@@ -587,6 +587,65 @@ describe("deriveOwnershipState", () => {
     );
   });
 
+  describe("expired disposition tombstone (#1417)", () => {
+    // The F1 evidence shape: a claim whose lease TTL elapsed with no renewal
+    // and that has no AgentWork row. Lease cleanup tombstones the row
+    // (disposition "expired") instead of deleting it; the tombstone is
+    // stale-claim evidence, so the LADDER — never the disposition — decides.
+    it("ladders a stale tombstoned expired lease to ABANDONED_CANDIDATE with disposition_expired and evidence_stale", () => {
+      const result = deriveOwnershipState(
+        makeEvidence({
+          labels: ["agent/alice", "status/in-progress"],
+          lease: makeLease({
+            disposition: "expired",
+            renewedAt: ago(90 * 60_000),
+            lastRenewalObservedAt: ago(90 * 60_000),
+            expiredAt: ago(60 * 60_000),
+          }),
+        }),
+        WINDOWS,
+        NOW,
+      );
+      expect(result.state).toBe("ABANDONED_CANDIDATE");
+      expect(result.reasonCodes).toEqual(["disposition_expired", "evidence_stale"]);
+      expect(result.ownerAgent).toBe("alice");
+    });
+
+    it("keeps a fresh renewal on a tombstoned expired lease CLAIMED_ACTIVE — expiry is not a terminal disposition", () => {
+      const result = deriveOwnershipState(
+        makeEvidence({
+          labels: ["agent/alice", "status/in-progress"],
+          lease: makeLease({
+            disposition: "expired",
+            lastRenewalObservedAt: ago(60_000),
+            expiredAt: ago(30_000),
+          }),
+        }),
+        WINDOWS,
+        NOW,
+      );
+      expect(result.state).toBe("CLAIMED_ACTIVE");
+      expect(result.reasonCodes).toEqual(["disposition_expired", "evidence_recent"]);
+    });
+
+    it("keeps a mid-grace tombstoned expired lease CLAIMED_LONG_RUNNING", () => {
+      const result = deriveOwnershipState(
+        makeEvidence({
+          labels: ["agent/alice", "status/in-progress"],
+          lease: makeLease({
+            disposition: "expired",
+            renewedAt: ago(20 * 60_000),
+            expiredAt: ago(5 * 60_000),
+          }),
+        }),
+        WINDOWS,
+        NOW,
+      );
+      expect(result.state).toBe("CLAIMED_LONG_RUNNING");
+      expect(result.reasonCodes).toEqual(["disposition_expired", "long_run_grace"]);
+    });
+  });
+
   describe("liveness ladder (step 8)", () => {
     it("returns CLAIMED_ACTIVE when the freshest evidence is within the active window", () => {
       const result = deriveOwnershipState(
