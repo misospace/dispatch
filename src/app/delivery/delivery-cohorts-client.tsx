@@ -60,6 +60,7 @@ interface CohortStats {
   mergedThroughputPerDay: number;
   openAges: { count: number; medianOpenMs: number | null; oldestOpenMs: number | null };
   fixRounds: { total: number; itemsWithFixes: number };
+  failures: { itemsWithFailedAttempts: number; totalFailedAttempts: number };
   waiting: {
     activeExecutionMs: number | null;
     pickupMs: number | null;
@@ -411,6 +412,10 @@ function CohortRow({ c, keyLabel }: { c: CohortStats; keyLabel: string }) {
         <div className="text-xs font-normal text-muted-foreground">
           {c.delivery.merged} merged · {c.delivery["closed-unmerged"]} closed-unmerged
         </div>
+        <div className="text-xs font-normal text-muted-foreground">
+          {c.failures.itemsWithFailedAttempts} with failed attempts ·{" "}
+          {c.failures.totalFailedAttempts} failed attempts
+        </div>
       </TableCell>
       <TableCell>
         {rateText(c.completionRate)}
@@ -488,9 +493,9 @@ function LifecycleDrilldown({ sample, state }: { sample: DeliverySample; state: 
     return <p className="text-sm text-muted-foreground">Loading…</p>;
   }
   const { timeline, attempts, truncated, attemptsTruncated, issue } = state.data;
-  const milestones: { label: string; ts: LifecycleTimestamp; done?: boolean }[] = [
+  const milestones: { label: string; ts: LifecycleTimestamp }[] = [
     { label: "first claim", ts: timeline.firstClaim },
-    { label: "done", ts: timeline.doneAt, done: true },
+    { label: "done", ts: timeline.doneAt },
     { label: "closed", ts: timeline.closedAt },
     { label: "last reopen", ts: timeline.lastReopenAt },
     { label: "first merge", ts: timeline.firstMergedAt },
@@ -511,9 +516,15 @@ function LifecycleDrilldown({ sample, state }: { sample: DeliverySample; state: 
                 {m.ts.at === null ? (
                   <span className="text-muted-foreground">unknown</span>
                 ) : (
-                  formatTimestamp(m.ts.at)
+                  // #1184: provenance belongs to every observed milestone,
+                  // not just done — first claim, close, reopen and merge all
+                  // carry observed/backfilled/unknown evidence in the
+                  // lifecycle route response.
+                  <>
+                    {formatTimestamp(m.ts.at)}
+                    <ProvenanceBadge p={m.ts.provenance} />
+                  </>
                 )}
-                {m.done && <ProvenanceBadge p={m.ts.provenance} />}
               </dd>
             </div>
           ))}

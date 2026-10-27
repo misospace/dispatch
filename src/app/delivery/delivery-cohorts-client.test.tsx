@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 vi.mock("@/lib/client-auth", () => ({
@@ -49,6 +49,7 @@ const deliveryResponse = {
       mergedThroughputPerDay: 1,
       openAges: { count: 0, medianOpenMs: null, oldestOpenMs: null },
       fixRounds: { total: 0, itemsWithFixes: 0 },
+      failures: { itemsWithFailedAttempts: 1, totalFailedAttempts: 2 },
       waiting: {
         activeExecutionMs: 600000,
         pickupMs: 60000,
@@ -79,6 +80,7 @@ const deliveryResponse = {
     mergedThroughputPerDay: 0,
     openAges: { count: 0, medianOpenMs: null, oldestOpenMs: null },
     fixRounds: { total: 0, itemsWithFixes: 0 },
+    failures: { itemsWithFailedAttempts: 0, totalFailedAttempts: 0 },
     waiting: {
       activeExecutionMs: null,
       pickupMs: null,
@@ -304,6 +306,16 @@ describe("DeliveryCohortsClient", () => {
     // Cohort confounder badge for concurrent runs.
     expect(screen.getByText("2 concurrent runs")).toBeInTheDocument();
 
+    // Cohort-overview failure visibility (#1184): the cohort row surfaces
+    // items with failed attempts and the summed failed attempts; the clean
+    // totals row reports zero without inventing any new population.
+    expect(
+      screen.getByText("1 with failed attempts · 2 failed attempts"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("0 with failed attempts · 0 failed attempts"),
+    ).toBeInTheDocument();
+
     // The all-null totals bucket renders the muted "waits unknown" line.
     expect(screen.getByText("waits unknown")).toBeInTheDocument();
   });
@@ -332,6 +344,15 @@ expect(screen.getAllByText(/first merge/).length).toBeGreaterThan(0);
 // Provenance badges render every observed value, not just backfilled (#1184 review).
 expect(screen.getAllByText("backfilled").length).toBeGreaterThan(0);
 expect(screen.getAllByText("observed").length).toBeGreaterThan(0);
+// Every NON-NULL milestone row carries its own provenance, not just done
+// (#1184 round 5): first claim is a backfilled non-done milestone, closed an
+// observed one.
+const firstClaimMilestone = screen.getByText("first claim").closest("div");
+expect(firstClaimMilestone).not.toBeNull();
+expect(within(firstClaimMilestone as HTMLElement).getByText("backfilled")).toBeInTheDocument();
+const closedMilestone = screen.getByText("closed").closest("div");
+expect(closedMilestone).not.toBeNull();
+expect(within(closedMilestone as HTMLElement).getByText("observed")).toBeInTheDocument();
 // Drill-down discloses that the lifecycle read is on demand, not a cohort snapshot.
 expect(
   screen.getByText(

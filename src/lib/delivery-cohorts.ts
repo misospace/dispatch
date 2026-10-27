@@ -157,6 +157,15 @@ export interface CohortStats {
   mergedThroughputPerDay: number;
   openAges: OpenAgeStats;
   fixRounds: { total: number; itemsWithFixes: number };
+  /**
+   * Cohort-level failure visibility (#1184: "Include open, failed and
+   * abandoned items in the cohort overview"). Derived from the same #1183
+   * attempt-chain evidence as the per-sample `failedAttempts` — an attempt
+   * whose outcome is failed, abandoned or superseded. Failed work always
+   * stays inside the cohort population (closed-unmerged remains the
+   * abandoned/closed population); no lifecycle state is invented.
+   */
+  failures: { itemsWithFailedAttempts: number; totalFailedAttempts: number };
   // activeExecutionMs stays null (unknown) when no sample carries run
   // evidence — an unobserved worker time never renders as zero. The wait
   // buckets follow the same rule: null when no sample in the cohort carries
@@ -217,6 +226,7 @@ export const COHORT_DEFINITIONS: Readonly<Record<string, string>> = Object.freez
   observedWaits: "waiting buckets shown separately ONLY where observed: pickupMs = first claim → first observed execution-run start (queue/pickup); inReviewMs = union of status/in-review label intervals from the lifecycle event stream; blockedMs = union of status/blocked label intervals (human wait); fixQueuedMs = PR-fix queue time until the first fix-run start per queue item. An interval counts only when both boundaries are observed; a bucket with no evidence is null, never zero",
   unclassified: "claimToDoneMs minus the union of all classified intervals (the item's observed run intervals plus the observed wait buckets, clipped to the claim→done window), clamped at zero; overlapping classifications subtract once, and the per-bucket totals stay per-category for presentation only; waiting time without label/run/queue evidence (for example CI waiting with no status label or queue row) stays unclassified instead of being attributed to a named bucket",
   load: "maxConcurrentRuns = maximum number of overlapping positive-length execution-run intervals observed inside the cohort; a load confounder surfaced alongside cohort stats, never a causal claim",
+  failures: "itemsWithFailedAttempts = samples with at least one attempt whose outcome is failed, abandoned or superseded; totalFailedAttempts = the summed count of such attempts across the cohort's samples. Derived from the same #1183 attempt-chain evidence as the per-sample failedAttempts; failed items stay inside the cohort population (closed-unmerged remains the abandoned/closed population) — no lifecycle state is invented",
   settings: "cohort keys and mixed labels are derived across ALL attempts and each attempt's distinct per-field value sets (a setting that changed inside one attempt counts); a lifecycle spanning settings is mixed, never attributed to the setting active at merge",
 });
 
@@ -737,6 +747,8 @@ function computeStats(
 
   let fixRoundsTotal = 0;
   let itemsWithFixes = 0;
+  let itemsWithFailedAttempts = 0;
+  let totalFailedAttempts = 0;
   let unclassifiedMs = 0;
   let mixedSettings = 0;
   let missingMetadata = 0;
@@ -753,6 +765,8 @@ function computeStats(
   for (const s of members) {
     fixRoundsTotal += s.fixRounds;
     if (s.fixRounds > 0) itemsWithFixes += 1;
+    totalFailedAttempts += s.failedAttempts;
+    if (s.failedAttempts > 0) itemsWithFailedAttempts += 1;
     if (s.unclassifiedMs !== null) unclassifiedMs += s.unclassifiedMs;
     if (s.mixedSettings) mixedSettings += 1;
     if (s.missing.includes("metadata")) missingMetadata += 1;
@@ -779,6 +793,7 @@ function computeStats(
     mergedThroughputPerDay,
     openAges,
     fixRounds: { total: fixRoundsTotal, itemsWithFixes },
+    failures: { itemsWithFailedAttempts, totalFailedAttempts },
     waiting: {
       activeExecutionMs: totalWorkerTimeMs,
       pickupMs: pickupSum,

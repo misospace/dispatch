@@ -1202,3 +1202,158 @@ describe("observed wait buckets", () => {
     expect(report.totals.confounders.maxConcurrentRuns).toBe(2);
   });
 });
+
+// ── 14. cohort failure visibility (#1184 review round 5) ────────────────────
+
+describe("cohort failure visibility", () => {
+  function supersededThenMerged(): ReturnType<typeof deriveDeliverySample> {
+    // Alpha's attempt is superseded by bravo's re-claim; bravo merges.
+    return deriveDeliverySample(
+      sample({
+        issue: issue({ issueNumber: 21, state: "closed", closedAt: "2026-10-01T04:00:00.000Z" }),
+        events: [
+          event({ kind: "claim", agentName: "alpha", occurredAt: "2026-10-01T00:00:00.000Z" }),
+          event({ kind: "claim", agentName: "bravo", occurredAt: "2026-10-01T01:00:00.000Z" }),
+          event({
+            kind: "pr_merged",
+            source: "reconciler",
+            sourceEventId: "pr-21",
+            occurredAt: "2026-10-01T03:00:00.000Z",
+            metadata: { pullRequestNumber: 21 },
+          }),
+        ],
+        runs: [
+          run({
+            id: "run-f1",
+            agentName: "alpha",
+            startedAt: "2026-10-01T00:10:00.000Z",
+            finishedAt: "2026-10-01T00:50:00.000Z",
+            executionMetadata: { cohortLabel: "A", model: "m" },
+          }),
+          run({
+            id: "run-s1",
+            agentName: "bravo",
+            startedAt: "2026-10-01T01:10:00.000Z",
+            finishedAt: "2026-10-01T02:00:00.000Z",
+            executionMetadata: { cohortLabel: "A", model: "m" },
+          }),
+        ],
+      }),
+      NOW,
+    );
+  }
+
+  function cleanMerged(issueNumber: number, cohortLabel: string): ReturnType<typeof deriveDeliverySample> {
+    return deriveDeliverySample(
+      sample({
+        issue: issue({
+          issueNumber,
+          state: "closed",
+          closedAt: "2026-10-01T02:00:00.000Z",
+        }),
+        events: [
+          event({ kind: "claim", agentName: "carla", occurredAt: "2026-10-01T00:00:00.000Z" }),
+          event({ kind: "completed", agentName: "carla", occurredAt: "2026-10-01T02:00:00.000Z" }),
+          event({
+            kind: "pr_merged",
+            source: "reconciler",
+            sourceEventId: `pr-${issueNumber}`,
+            occurredAt: "2026-10-01T02:00:00.000Z",
+            metadata: { pullRequestNumber: issueNumber },
+          }),
+        ],
+        runs: [
+          run({
+            id: `run-c${issueNumber}`,
+            agentName: "carla",
+            startedAt: "2026-10-01T00:10:00.000Z",
+            finishedAt: "2026-10-01T00:20:00.000Z",
+            executionMetadata: { cohortLabel, model: "m" },
+          }),
+        ],
+      }),
+      NOW,
+    );
+  }
+
+  it("surfaces items with failed attempts and the summed failed attempts per cohort", () => {
+    const failed = supersededThenMerged();
+    expect(failed.failedAttempts).toBe(1);
+    const clean = cleanMerged(22, "A");
+    expect(clean.failedAttempts).toBe(0);
+
+    const report = aggregateDeliveryCohorts([failed, clean], {
+      dimension: "cohort",
+      windowSinceMs: null,
+      windowUntilMs: null,
+    });
+
+    const cohortA = report.cohorts.find((c) => c.key === "A");
+    expect(cohortA).toBeDefined();
+    // The failed item stays inside the cohort population (delivery merged):
+    // the failure summary makes it identifiable in the overview, not only
+    // per sample.
+    expect(cohortA!.failures).toEqual({ itemsWithFailedAttempts: 1, totalFailedAttempts: 1 });
+    expect(report.totals.failures).toEqual({ itemsWithFailedAttempts: 1, totalFailedAttempts: 1 });
+  });
+
+  it("sums multiple failed attempts on one item and reports zero for a clean cohort", () => {
+    // Two superseded claims before the merging one: 2 failed attempts on ONE item.
+    const twiceFailed = deriveDeliverySample(
+      sample({
+        issue: issue({ issueNumber: 23, state: "closed", closedAt: "2026-10-01T05:00:00.000Z" }),
+        events: [
+          event({ kind: "claim", agentName: "alpha", occurredAt: "2026-10-01T00:00:00.000Z" }),
+          event({ kind: "claim", agentName: "bravo", occurredAt: "2026-10-01T01:00:00.000Z" }),
+          event({ kind: "claim", agentName: "carla", occurredAt: "2026-10-01T02:00:00.000Z" }),
+          event({
+            kind: "pr_merged",
+            source: "reconciler",
+            sourceEventId: "pr-23",
+            occurredAt: "2026-10-01T04:00:00.000Z",
+            metadata: { pullRequestNumber: 23 },
+          }),
+        ],
+        runs: [
+          run({
+            id: "run-t1",
+            agentName: "alpha",
+            startedAt: "2026-10-01T00:10:00.000Z",
+            finishedAt: "2026-10-01T00:50:00.000Z",
+            executionMetadata: { cohortLabel: "A", model: "m" },
+          }),
+          run({
+            id: "run-t2",
+            agentName: "bravo",
+            startedAt: "2026-10-01T01:10:00.000Z",
+            finishedAt: "2026-10-01T01:50:00.000Z",
+            executionMetadata: { cohortLabel: "A", model: "m" },
+          }),
+          run({
+            id: "run-t3",
+            agentName: "carla",
+            startedAt: "2026-10-01T02:10:00.000Z",
+            finishedAt: "2026-10-01T03:00:00.000Z",
+            executionMetadata: { cohortLabel: "A", model: "m" },
+          }),
+        ],
+      }),
+      NOW,
+    );
+    expect(twiceFailed.failedAttempts).toBe(2);
+
+    const report = aggregateDeliveryCohorts([twiceFailed], {
+      dimension: "cohort",
+      windowSinceMs: null,
+      windowUntilMs: null,
+    });
+    expect(report.totals.failures).toEqual({ itemsWithFailedAttempts: 1, totalFailedAttempts: 2 });
+
+    const cleanOnly = aggregateDeliveryCohorts([cleanMerged(24, "B")], {
+      dimension: "cohort",
+      windowSinceMs: null,
+      windowUntilMs: null,
+    });
+    expect(cleanOnly.totals.failures).toEqual({ itemsWithFailedAttempts: 0, totalFailedAttempts: 0 });
+  });
+});

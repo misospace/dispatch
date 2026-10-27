@@ -103,7 +103,13 @@ the per-bucket totals stay per-category for presentation only; waiting time
 without label/run/queue evidence — CI waiting included — stays here);
 `load` (`maxConcurrentRuns` = maximum number of overlapping
 positive-length run intervals observed inside the cohort — a load confounder,
-never a causal claim); and `settings` (the mixed-settings rule above).
+never a causal claim); `failures` (`itemsWithFailedAttempts` = samples with at
+least one attempt whose outcome is `failed`, `abandoned` or `superseded`;
+`totalFailedAttempts` = the summed count of such attempts across the cohort —
+derived from the same #1183 attempt-chain evidence as the per-sample
+`failedAttempts`; failed items stay inside the cohort population,
+closed-unmerged remains the abandoned/closed population, no lifecycle state is
+invented); and `settings` (the mixed-settings rule above).
 
 `CohortStats`: `key`, `sampleCount`, `delivery`
 (`{ merged, "closed-unmerged", open, unknown }`), `completionRate` (0..1,
@@ -113,6 +119,10 @@ null when no known values), `workerTimeMs` (ms, null when no run evidence),
 `firstPass` (`{ true, false, null }` counts), `mergedThroughputPerDay`,
 `openAges` (`{ count, medianOpenMs, oldestOpenMs }` — open/unknown-delivery
 items with a claim anchor), `fixRounds` (`{ total, itemsWithFixes }`),
+`failures` (`{ itemsWithFailedAttempts, totalFailedAttempts }` — the
+cohort-overview failure summary over the same #1183 attempt-chain outcomes as
+the per-sample `failedAttempts`, so failed work is visible in the overview and
+not only per sample),
 `waiting` (`{ activeExecutionMs, pickupMs, inReviewMs, blockedMs,
 fixQueuedMs, unclassifiedMs }` — the observed-wait buckets summed across
 samples carrying evidence for each, each null when no sample in the cohort
@@ -129,7 +139,8 @@ run interval exists) surfaces available load as a confounder.
 `repoFullName`, `issueNumber`, `delivery` (`merged` | `closed-unmerged` |
 `open` | `unknown`), `firstClaimAt` / `firstMergedAt` / `doneAt` (ISO or
 null), `doneAtProvenance` (`observed` / `backfilled` / `unknown`, or null —
-the only milestone carrying provenance), `claimToDoneMs` / `claimToMergeMs`
+the only milestone provenance the sample row itself carries; the drill-down
+below renders the provenance of every milestone from the lifecycle route), `claimToDoneMs` / `claimToMergeMs`
 (ms or null), `workerTimeMs` (ms or null), `observedWaits`
 (`{ pickupMs, inReviewMs, blockedMs, fixQueuedMs }`, each the union of
 observed intervals or null), `unclassifiedMs` (claim→done minus the union of
@@ -151,7 +162,11 @@ done and merge — with provenance and missing evidence — stays the existing
 `GET /api/issues/[issueId]/lifecycle` contract (#1203/#1183). The `/delivery`
 page links each sample to it (`dbIssueId`) and renders the timeline, linked
 PRs and attempt chain inline, so the cohort view and the per-item view cannot
-disagree: both consume the same projections. The drill-down is fetched on
+disagree: both consume the same projections. Every milestone with an observed
+timestamp (first claim, done, closed, last reopen, first merge) and every
+linked PR renders with its provenance badge (`observed` / `backfilled` /
+`unknown`); a milestone without evidence stays "unknown", never a manufactured
+badge. The drill-down is fetched on
 demand when a sample row is expanded — it is a separate read of that route and
 may therefore reflect a later database state than the cohort snapshot; it is
 not an atomic snapshot of the cohort request.
