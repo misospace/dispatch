@@ -93,8 +93,9 @@ observed execution-run start; `inReviewMs` = union of `status/in-review` label
 intervals from the lifecycle stream; `blockedMs` = union of `status/blocked`
 label intervals; `fixQueuedMs` = PR-fix queue time until the first fix-run
 start per queue item — null when no evidence, never zero); `unclassified`
-(`claimToDoneMs` minus the **union** of all classified intervals — worker run
-intervals plus the observed wait buckets, clipped to the claim→done window —
+(`claimToDoneMs` minus the **union** of all classified intervals — the item's
+observed run intervals plus the observed wait buckets, clipped to the
+claim→done window —
 clamped at zero, so overlapping observations subtract once and never twice;
 the per-bucket totals stay per-category for presentation only; waiting time
 without label/run/queue evidence — CI waiting included — stays here);
@@ -130,7 +131,8 @@ the only milestone carrying provenance), `claimToDoneMs` / `claimToMergeMs`
 (ms or null), `workerTimeMs` (ms or null), `observedWaits`
 (`{ pickupMs, inReviewMs, blockedMs, fixQueuedMs }`, each the union of
 observed intervals or null), `unclassifiedMs` (claim→done minus the union of
-all classified intervals — worker runs plus the observed buckets, clipped to
+all classified intervals — the item's observed run intervals plus the observed
+buckets, clipped to
 the claim→done window — clamped at zero; null only when claim→done itself
 is unknown), `firstPass` (`true`/`false`/`null`), `executionAttempts` /
 `fixRounds` / `failedAttempts` (counts), `cohortKeys` (all seven group

@@ -117,9 +117,9 @@ export interface DeliverySample {
   workerTimeMs: number | null;
   observedWaits: ObservedWaitMs;
   /**
-   * claim→done minus the UNION of all classified intervals (worker run
-   * intervals and the observed wait buckets, clipped to the claim→done
-   * window), clamped at zero — overlapping observations subtract once, never
+   * claim→done minus the UNION of all classified intervals (the item's
+   * observed run intervals and the observed wait buckets, clipped to the
+   * claim→done window), clamped at zero — overlapping observations subtract once, never
    * twice. Null only when claim→done itself is unknown — known span time that
    * no bucket evidences stays visible here, never dropped.
    */
@@ -214,7 +214,7 @@ export const COHORT_DEFINITIONS: Readonly<Record<string, string>> = Object.freez
   denominators: "sampleCount is the total; delivery counts are per-type; claimToDone/claimToMerge are filtered subsets",
   workerTime: "sum of workerTimeMs across the cohort's samples; workerTimeMs is the union of execution intervals (overlapping runs are not double-counted) and stays null when no run interval evidence exists",
   observedWaits: "waiting buckets shown separately ONLY where observed: pickupMs = first claim → first observed execution-run start (queue/pickup); inReviewMs = union of status/in-review label intervals from the lifecycle event stream; blockedMs = union of status/blocked label intervals (human wait); fixQueuedMs = PR-fix queue time until the first fix-run start per queue item. An interval counts only when both boundaries are observed; a bucket with no evidence is null, never zero",
-  unclassified: "claimToDoneMs minus the union of all classified intervals (worker run intervals plus the observed wait buckets, clipped to the claim→done window), clamped at zero; overlapping classifications subtract once, and the per-bucket totals stay per-category for presentation only; waiting time without label/run/queue evidence (for example CI waiting with no status label or queue row) stays unclassified instead of being attributed to a named bucket",
+  unclassified: "claimToDoneMs minus the union of all classified intervals (the item's observed run intervals plus the observed wait buckets, clipped to the claim→done window), clamped at zero; overlapping classifications subtract once, and the per-bucket totals stay per-category for presentation only; waiting time without label/run/queue evidence (for example CI waiting with no status label or queue row) stays unclassified instead of being attributed to a named bucket",
   load: "maxConcurrentRuns = maximum number of overlapping positive-length execution-run intervals observed inside the cohort; a load confounder surfaced alongside cohort stats, never a causal claim",
   settings: "cohort keys and mixed labels are derived across ALL attempts; a lifecycle spanning settings is mixed, never attributed to the setting active at merge",
 });
