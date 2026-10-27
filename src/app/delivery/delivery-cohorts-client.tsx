@@ -572,10 +572,14 @@ function LifecycleDrilldown({ sample, state }: { sample: DeliverySample; state: 
           </ol>
         )}
       </div>
-      {(truncated || attemptsTruncated) && (
+      {(truncated || attemptsTruncated || attempts.prFixEventsTruncated) && (
         <p className="text-xs text-amber-700">
           Partial evidence:{" "}
-          {[truncated ? "event history" : null, attemptsTruncated ? "attempt chain" : null]
+          {[
+            truncated ? "event history" : null,
+            attemptsTruncated ? "attempt chain" : null,
+            attempts.prFixEventsTruncated ? "PR-fix event history" : null,
+          ]
             .filter(Boolean)
             .join(" and ")}{" "}
           exceeded the bounded read.

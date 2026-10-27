@@ -375,4 +375,37 @@ expect(
     const issueLink = screen.getByRole("link", { name: "Issue" });
     expect(issueLink).toHaveAttribute("href", "https://github.com/org/repo/issues/7");
   });
+
+  it("includes PR-fix event truncation in the partial-evidence warning", async () => {
+    const user = userEvent.setup();
+    // A capped PR-fix event read must be disclosed even when the event
+    // history and attempt chain themselves are complete (#1184 round 7):
+    // the attempt chain contract carries its own prFixEventsTruncated flag.
+    vi.mocked(authedFetch).mockImplementation(async (url: string) => {
+      if (url.includes("/lifecycle")) {
+        return jsonResponse({
+          ...lifecycleResponse,
+          attempts: {
+            ...lifecycleResponse.attempts,
+            prFixEventsTruncated: true,
+          },
+        });
+      }
+      return jsonResponse(deliveryResponse);
+    });
+    render(<DeliveryCohortsClient />);
+
+    const timelineButton = await screen.findByRole("button", { name: "Timeline" });
+    await user.click(timelineButton);
+
+    const warning = await screen.findByText(/Partial evidence:/);
+    expect(warning).toHaveTextContent("PR-fix event history");
+    expect(warning).toHaveTextContent("exceeded the bounded read.");
+    // No other truncation flags are set in this fixture, so the warning
+    // names exactly the capped read.
+    expect(warning).toHaveTextContent(
+      "Partial evidence: PR-fix event history exceeded the bounded read.",
+    );
+    expect(warning).not.toHaveTextContent("attempt chain");
+  });
 });
