@@ -1,0 +1,978 @@
+# Semantic execution contract for observability/prometheus-rules.yaml (#1434).
+#
+# The structural drift contract lives in src/lib/observability-assets.test.ts
+# (which legs exist, severities, for-windows). THIS suite executes the shipped
+# expressions with a PromQL engine so a rule that is structurally faithful but
+# semantically dead — an operand that is empty in the very state it should
+# fire — fails here instead of silently. If a rule expression is rewritten,
+# both suites must be updated.
+#
+#   promtool test rules observability/prometheus-rules.test.yaml
+#
+# Conventions, and why:
+# - Series carry POST-SCRAPE labels: the exporter's own dimensions plus the
+#   scrape's {job="dispatch", instance="dispatch:3000"} — exactly one target
+#   under the job, as the rules file's header requires (the A2/A4 conjunctions
+#   match label-insensitively, so the label sets here are part of the
+#   contract). dispatch_scheduler_job_overdue additionally carries
+#   exported_job="sync": the exporter labels it per scheduled job, and the
+#   default honor_labels=false scrape renames that to exported_job.
+# - The test clock is 0-based (time() evaluates to the eval_time), so a
+#   "fresh" timestamp is modeled by a constant whose only job is to exist;
+#   freshness itself is carried by the exported dispatch_sync_stale flag,
+#   exactly as the packaged rules consume it. Where a timestamp VALUE feeds a
+#   rule (A14), the comment states the intended wall-clock story.
+# - Firing is proven twice: alert_rule_test pins the rendered labels and
+#   annotations; ALERTS{alertstate="firing"} pins the state. Silence is proven
+#   with ALERTS{alertname=...} == [] at an eval_time past the row's for
+#   window, so a rule that is "pending forever" cannot pass as silent.
+# - A6 is deliberately absent from the rules file (the one disabled catalogue
+#   row, §6/§8.7) and therefore from this suite. A14 post-dates this issue but
+#   is an armed row with the most intricate predicate in the file — it is
+#   covered like the rest, including the not-evaluable threshold case.
+
+rule_files:
+  - prometheus-rules.yaml
+
+evaluation_interval: 30s
+
+tests:
+  # ── Healthy idle: silent everywhere ────────────────────────────────────────
+  # A completely idle, healthy, armed fleet must render zero alerts — nothing
+  # pending, nothing firing, at an eval_time past every for window (the longest
+  # is A9/A10 at 1h). This is the packaged mirror of §6 "Normal inactivity must
+  # NOT alert" and the structural suite's healthy-idle evaluator test.
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_sync_pipeline_state{state="armed",job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x124"
+      - series: 'dispatch_sync_pipeline_state{state="off",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x124"
+      - series: 'dispatch_sync_pipeline_state{state="unknown",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x124"
+      - series: 'up{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x124"
+      - series: 'dispatch_sync_last_success_timestamp_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "100+0x124"
+      - series: 'dispatch_sync_stale{job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x124"
+      - series: 'dispatch_scheduler_job_overdue{exported_job="sync",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x124"
+      - series: 'dispatch_scheduler_up{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x124"
+      - series: 'dispatch_scheduler_healthy{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x124"
+      - series: 'dispatch_issues_open_claimable{job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x124"
+      - series: 'dispatch_execution_active{job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x124"
+      - series: 'dispatch_work_pickups_in_window{window="1800",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x124"
+      - series: 'dispatch_agent_runs_reported_in_window{window="1800",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x124"
+      - series: 'dispatch_leases_expired{job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x124"
+      - series: 'dispatch_agent_work{state="STALE",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x124"
+      - series: 'dispatch_pr_fix_overdue_unacked{job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x124"
+      - series: 'dispatch_pr_fix_oldest_queued_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x124"
+      - series: 'dispatch_pr_fix_human_decisions{job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x124"
+      - series: 'dispatch_pr_fix_oldest_human_decision_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x124"
+      - series: 'dispatch_grooming_backoff{job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x124"
+      - series: 'dispatch_audit_failures_in_window{window="900",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x124"
+      - series: 'dispatch_repo_stale_sync_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "120+0x124"
+      - series: 'dispatch_repo_stale_sync_threshold_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "3600+0x124"
+      - series: 'dispatch_queue_admission_mode{mode="off",job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x124"
+      - series: 'dispatch_queue_admission_mode{mode="audit",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x124"
+      - series: 'dispatch_queue_admission_mode{mode="enforce",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x124"
+      - series: 'dispatch_grooming_stall_threshold_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "1200+0x124"
+      - series: 'dispatch_grooming_last_success_timestamp_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "100+0x124"
+    promql_expr_test:
+      # No withheld-work series at all: admission is off, so the exporter emits
+      # none (notAdmitted is null) — the absence must silence A10 and A14.
+      - expr: ALERTS
+        eval_time: 62m
+        exp_samples: []
+
+  # ── A2 — no successful sync (critical, for 5m) ────────────────────────────
+  # Fires on the ABSENT-SERIES case of an armed pipeline: a Dispatch that has
+  # never completed a sync emits no
+  # dispatch_sync_last_success_timestamp_seconds, and absent() must turn that
+  # into a firing input. The stale flag is absent too (the exporter omits it
+  # until the first completion) — the absent arm must fire on its own.
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_sync_pipeline_state{state="armed",job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x16"
+      - series: 'dispatch_sync_pipeline_state{state="off",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x16"
+      - series: 'dispatch_sync_pipeline_state{state="unknown",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x16"
+      - series: 'up{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x16"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: A2
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              state: armed
+              job: dispatch
+              instance: dispatch:3000
+            exp_annotations:
+              summary: "No successful issue sync"
+              description: "No IssueSyncRun has ever completed (absent series), or the last completion is older than two sync intervals. Gated on the sync pipeline's arm state (dispatch_sync_pipeline_state{state=\"armed\"}) and the scrape itself succeeding: an opted-out or indeterminate pipeline is not a fault, and a dead instance routes to A3 instead."
+              operator_action: "Check IssueSyncRun errors and GitHub reachability."
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A2",alertstate="firing"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="A2",alertstate="firing",instance="dispatch:3000",job="dispatch",severity="critical",state="armed"}'
+            value: 1
+
+  # A2 fires on dispatch_sync_stale == 1: the last completion is older than two
+  # sync intervals. The last-success series exists, so this exercises the stale
+  # arm, not the absent arm.
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_sync_pipeline_state{state="armed",job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x16"
+      - series: 'dispatch_sync_pipeline_state{state="off",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x16"
+      - series: 'dispatch_sync_pipeline_state{state="unknown",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x16"
+      - series: 'up{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x16"
+      - series: 'dispatch_sync_last_success_timestamp_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "100+0x16"
+      - series: 'dispatch_sync_stale{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x16"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: A2
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              state: armed
+              job: dispatch
+              instance: dispatch:3000
+            exp_annotations:
+              summary: "No successful issue sync"
+              description: "No IssueSyncRun has ever completed (absent series), or the last completion is older than two sync intervals. Gated on the sync pipeline's arm state (dispatch_sync_pipeline_state{state=\"armed\"}) and the scrape itself succeeding: an opted-out or indeterminate pipeline is not a fault, and a dead instance routes to A3 instead."
+              operator_action: "Check IssueSyncRun errors and GitHub reachability."
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A2",alertstate="firing"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="A2",alertstate="firing",instance="dispatch:3000",job="dispatch",severity="critical",state="armed"}'
+            value: 1
+
+  # A2 silent when the pipeline is `off`: an operator opt-out is not a fault.
+  # Adverse input on purpose: dispatch_sync_stale == 1 is not a state the
+  # exporter produces while unarmed — the arm gate alone must silence the rule.
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_sync_pipeline_state{state="armed",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x16"
+      - series: 'dispatch_sync_pipeline_state{state="off",job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x16"
+      - series: 'dispatch_sync_pipeline_state{state="unknown",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x16"
+      - series: 'up{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x16"
+      - series: 'dispatch_sync_stale{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x16"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A2"}'
+        eval_time: 6m
+        exp_samples: []
+
+  # A2 silent when the pipeline state is `unknown`: it cannot be told, and
+  # unknown is never healthy and never stale.
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_sync_pipeline_state{state="armed",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x16"
+      - series: 'dispatch_sync_pipeline_state{state="off",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x16"
+      - series: 'dispatch_sync_pipeline_state{state="unknown",job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x16"
+      - series: 'up{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x16"
+      - series: 'dispatch_sync_stale{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x16"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A2"}'
+        eval_time: 6m
+        exp_samples: []
+
+  # A dead instance routes to A3 instead: with the scrape failing, A2's
+  # observation-is-live leg (up{job="dispatch"} == 1) is empty and even the
+  # absent-series arm must not fire.
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_sync_pipeline_state{state="armed",job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x16"
+      - series: 'dispatch_sync_pipeline_state{state="off",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x16"
+      - series: 'dispatch_sync_pipeline_state{state="unknown",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x16"
+      - series: 'up{job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x16"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: A3
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: dispatch
+              instance: dispatch:3000
+            exp_annotations:
+              summary: "Dispatch health/DB down"
+              description: "The metrics scrape is failing; the service cannot serve work."
+              operator_action: "Check DB connectivity; /api/health returns 503."
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A3",alertstate="firing"}'
+        eval_time: 3m
+        exp_samples:
+          - labels: 'ALERTS{alertname="A3",alertstate="firing",instance="dispatch:3000",job="dispatch",severity="critical"}'
+            value: 1
+      - expr: 'ALERTS{alertname="A2"}'
+        eval_time: 6m
+        exp_samples: []
+
+  # ── A1 — scheduler job overdue (critical, for 10m) ────────────────────────
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_scheduler_job_overdue{exported_job="sync",job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x26"
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: A1
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              exported_job: sync
+              job: dispatch
+              instance: dispatch:3000
+            exp_annotations:
+              # {{ $labels.job }} is the scrape job ("dispatch"); the per-job
+              # dimension arrives as exported_job under honor_labels=false.
+              summary: "Scheduler job overdue (dispatch)"
+              description: "A scheduled job has not run within two intervals; every queue is fed by these jobs."
+              operator_action: "Inspect logs; restart/verify DISPATCH_SCHEDULER_ENABLED."
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A1",alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="A1",alertstate="firing",exported_job="sync",instance="dispatch:3000",job="dispatch",severity="critical"}'
+            value: 1
+
+  # ── A4 — eligible work not handed out (warning, for 30m) ──────────────────
+  # Fires for an armed, sync-fresh pipeline with claimable work and a healthy
+  # in-process scheduler. The alert's labels ride on the leftmost operand
+  # (dispatch_issues_open_claimable) because every conjunction is `and on()`.
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_issues_open_claimable{job="dispatch",instance="dispatch:3000"}'
+        values: "3+0x66"
+      - series: 'dispatch_execution_active{job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_work_pickups_in_window{window="1800",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_agent_runs_reported_in_window{window="1800",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_sync_pipeline_state{state="armed",job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x66"
+      - series: 'dispatch_sync_pipeline_state{state="off",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_sync_pipeline_state{state="unknown",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_sync_stale{job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_sync_last_success_timestamp_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "100+0x66"
+      - series: 'dispatch_scheduler_up{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x66"
+      - series: 'dispatch_scheduler_healthy{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x66"
+      - series: 'up{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x66"
+    alert_rule_test:
+      - eval_time: 32m
+        alertname: A4
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: dispatch
+              instance: dispatch:3000
+            exp_annotations:
+              summary: "Eligible work not handed out"
+              description: "Work exists, nothing executes, nothing was picked up or reported in 30m, and the sync pipeline is armed and sync-fresh. The 'every scheduled job is ticking' leg applies only when the in-process scheduler runs — an external driver has no in-process job that can be overdue."
+              operator_action: "Check worker availability/credentials; confirm next-task returns work."
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A4",alertstate="firing"}'
+        eval_time: 32m
+        exp_samples:
+          - labels: 'ALERTS{alertname="A4",alertstate="firing",instance="dispatch:3000",job="dispatch",severity="warning"}'
+            value: 1
+      # The fresh sync keeps A2 quiet while A4 fires: this group is the
+      # A2-suppresses-A4 sanity direction of the stale group below.
+      - expr: 'ALERTS{alertname="A2"}'
+        eval_time: 7m
+        exp_samples: []
+
+  # The guard's other arm: an external driver has no in-process scheduler
+  # (dispatch_scheduler_up == 0) and that must not block A4 — the pipeline is
+  # still armed and the work is still stranded.
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_issues_open_claimable{job="dispatch",instance="dispatch:3000"}'
+        values: "3+0x66"
+      - series: 'dispatch_execution_active{job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_work_pickups_in_window{window="1800",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_agent_runs_reported_in_window{window="1800",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_sync_pipeline_state{state="armed",job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x66"
+      - series: 'dispatch_sync_pipeline_state{state="off",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_sync_pipeline_state{state="unknown",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_sync_stale{job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_sync_last_success_timestamp_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "100+0x66"
+      - series: 'dispatch_scheduler_up{job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_scheduler_healthy{job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'up{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x66"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A4",alertstate="firing"}'
+        eval_time: 32m
+        exp_samples:
+          - labels: 'ALERTS{alertname="A4",alertstate="firing",instance="dispatch:3000",job="dispatch",severity="warning"}'
+            value: 1
+
+  # A4 silent when the in-process scheduler runs with an OVERDUE job: both
+  # operands of the guard's `or` are empty (not up==0, not healthy==1), and A1
+  # owns that case. Also proves the overdue job does not leak into A4's guard
+  # as "not running".
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_issues_open_claimable{job="dispatch",instance="dispatch:3000"}'
+        values: "3+0x66"
+      - series: 'dispatch_execution_active{job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_work_pickups_in_window{window="1800",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_agent_runs_reported_in_window{window="1800",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_sync_pipeline_state{state="armed",job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x66"
+      - series: 'dispatch_sync_pipeline_state{state="off",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_sync_pipeline_state{state="unknown",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_sync_stale{job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_sync_last_success_timestamp_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "100+0x66"
+      - series: 'dispatch_scheduler_up{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x66"
+      - series: 'dispatch_scheduler_healthy{job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_scheduler_job_overdue{exported_job="sync",job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x26"
+      - series: 'up{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x66"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A4"}'
+        eval_time: 32m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="A1",alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="A1",alertstate="firing",exported_job="sync",instance="dispatch:3000",job="dispatch",severity="critical"}'
+            value: 1
+
+  # A4 silent when the sync is stale — A2 suppresses A4, and here A2 is the
+  # alert that carries the fault.
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_issues_open_claimable{job="dispatch",instance="dispatch:3000"}'
+        values: "3+0x66"
+      - series: 'dispatch_execution_active{job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_work_pickups_in_window{window="1800",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_agent_runs_reported_in_window{window="1800",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_sync_pipeline_state{state="armed",job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x66"
+      - series: 'dispatch_sync_pipeline_state{state="off",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_sync_pipeline_state{state="unknown",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_sync_stale{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x66"
+      - series: 'dispatch_sync_last_success_timestamp_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "100+0x66"
+      - series: 'dispatch_scheduler_up{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x66"
+      - series: 'dispatch_scheduler_healthy{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x66"
+      - series: 'up{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x66"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A4"}'
+        eval_time: 32m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="A2",alertstate="firing"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="A2",alertstate="firing",instance="dispatch:3000",job="dispatch",severity="critical",state="armed"}'
+            value: 1
+
+  # A4 silent when the sync has never completed: the stale flag is absent
+  # (the exporter omits it until the first completion), so the fresh-sync
+  # leg `dispatch_sync_stale == 0` is empty and the guard cannot pass —
+  # §6 spells this out as the A2-suppresses-A4 absent-series direction.
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_issues_open_claimable{job="dispatch",instance="dispatch:3000"}'
+        values: "3+0x66"
+      - series: 'dispatch_execution_active{job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_work_pickups_in_window{window="1800",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_agent_runs_reported_in_window{window="1800",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_sync_pipeline_state{state="armed",job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x66"
+      - series: 'dispatch_sync_pipeline_state{state="off",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_sync_pipeline_state{state="unknown",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_scheduler_up{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x66"
+      - series: 'dispatch_scheduler_healthy{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x66"
+      - series: 'up{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x66"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A4"}'
+        eval_time: 32m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="A2",alertstate="firing"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="A2",alertstate="firing",instance="dispatch:3000",job="dispatch",severity="critical",state="armed"}'
+            value: 1
+
+  # A4 silent when the pipeline is not armed: one manual sync happened (the
+  # last-success series exists) but sync history is never evidence of a
+  # pipeline — the arm gate silences both A4 and (via the off state, like the
+  # dedicated A2 groups above) A2.
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_issues_open_claimable{job="dispatch",instance="dispatch:3000"}'
+        values: "3+0x66"
+      - series: 'dispatch_execution_active{job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_work_pickups_in_window{window="1800",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_agent_runs_reported_in_window{window="1800",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_sync_pipeline_state{state="armed",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_sync_pipeline_state{state="off",job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x66"
+      - series: 'dispatch_sync_pipeline_state{state="unknown",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x66"
+      - series: 'dispatch_sync_last_success_timestamp_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "100+0x66"
+      - series: 'dispatch_scheduler_up{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x66"
+      - series: 'dispatch_scheduler_healthy{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x66"
+      - series: 'up{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x66"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A4"}'
+        eval_time: 32m
+        exp_samples: []
+
+  # ── A5 — stale ownership (warning, for 15m) ───────────────────────────────
+  # Two arms of a plain `or`; each fires with the arm's own labels.
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_leases_expired{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x36"
+      - series: 'dispatch_agent_work{state="STALE",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x36"
+    alert_rule_test:
+      - eval_time: 17m
+        alertname: A5
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: dispatch
+              instance: dispatch:3000
+            exp_annotations:
+              summary: "Stale ownership"
+              description: "Expired leases or STALE AgentWork exist; an issue may be stuck in-progress."
+              operator_action: "The stale sweep releases it; if it persists, inspect the sweep job (A1)."
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A5",alertstate="firing"}'
+        eval_time: 17m
+        exp_samples:
+          - labels: 'ALERTS{alertname="A5",alertstate="firing",instance="dispatch:3000",job="dispatch",severity="warning"}'
+            value: 1
+
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_leases_expired{job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x36"
+      - series: 'dispatch_agent_work{state="STALE",job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x36"
+    alert_rule_test:
+      - eval_time: 17m
+        alertname: A5
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              state: STALE
+              job: dispatch
+              instance: dispatch:3000
+            exp_annotations:
+              summary: "Stale ownership"
+              description: "Expired leases or STALE AgentWork exist; an issue may be stuck in-progress."
+              operator_action: "The stale sweep releases it; if it persists, inspect the sweep job (A1)."
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A5",alertstate="firing"}'
+        eval_time: 17m
+        exp_samples:
+          - labels: 'ALERTS{alertname="A5",alertstate="firing",instance="dispatch:3000",job="dispatch",severity="warning",state="STALE"}'
+            value: 1
+
+  # ── A7 — overdue unacked PR-fix hand-outs (warning, for 35m) ──────────────
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_pr_fix_overdue_unacked{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x74"
+    alert_rule_test:
+      - eval_time: 36m
+        alertname: A7
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: dispatch
+              instance: dispatch:3000
+            exp_annotations:
+              summary: "PR-fix hand-outs stranded (overdue unacked)"
+              description: "A hand-out has waited past the ack timeout without an acknowledgement; the worker may have died."
+              operator_action: "Enable the reclaim sweep (pr-fix-sweep) or requeue as operator."
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A7",alertstate="firing"}'
+        eval_time: 36m
+        exp_samples:
+          - labels: 'ALERTS{alertname="A7",alertstate="firing",instance="dispatch:3000",job="dispatch",severity="warning"}'
+            value: 1
+
+  # ── A8 — PR-fix head-of-line (warning, for 30m) ───────────────────────────
+  # Fires past the 3600s threshold…
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_pr_fix_oldest_queued_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "4000+0x66"
+    alert_rule_test:
+      - eval_time: 32m
+        alertname: A8
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: dispatch
+              instance: dispatch:3000
+            exp_annotations:
+              summary: "PR-fix head-of-line stuck"
+              description: "The oldest queued PR-fix item has waited past the threshold."
+              operator_action: "Check worker concurrency, lane routing, and fixAttempts saturation."
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A8",alertstate="firing"}'
+        eval_time: 32m
+        exp_samples:
+          - labels: 'ALERTS{alertname="A8",alertstate="firing",instance="dispatch:3000",job="dispatch",severity="warning"}'
+            value: 1
+
+  # …and stays silent EXACTLY AT the threshold: the predicate is a strict `>`.
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_pr_fix_oldest_queued_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "3600+0x66"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A8"}'
+        eval_time: 32m
+        exp_samples: []
+
+  # ── A9 — human decisions piling up (info, for 1h) ─────────────────────────
+  # Both conjuncts must hold: decisions exist AND the oldest one is past the
+  # threshold.
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_pr_fix_human_decisions{job="dispatch",instance="dispatch:3000"}'
+        values: "2+0x124"
+      - series: 'dispatch_pr_fix_oldest_human_decision_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "4000+0x124"
+    alert_rule_test:
+      - eval_time: 62m
+        alertname: A9
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              job: dispatch
+              instance: dispatch:3000
+            exp_annotations:
+              summary: "Human decisions piling up"
+              description: "BLOCKED (human_decision) items are aging past the threshold; PARKED is excluded."
+              operator_action: "Review the BLOCKED item's decision context and act."
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A9",alertstate="firing"}'
+        eval_time: 62m
+        exp_samples:
+          - labels: 'ALERTS{alertname="A9",alertstate="firing",instance="dispatch:3000",job="dispatch",severity="info"}'
+            value: 1
+
+  # Decisions exist but are young: no page.
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_pr_fix_human_decisions{job="dispatch",instance="dispatch:3000"}'
+        values: "2+0x124"
+      - series: 'dispatch_pr_fix_oldest_human_decision_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "100+0x124"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A9"}'
+        eval_time: 62m
+        exp_samples: []
+
+  # ── A10 — admission withholding (warning, for 1h) ─────────────────────────
+  # Fires on each grooming-evidence reason…
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_queue_withheld{reason="grooming_unknown",job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x124"
+    alert_rule_test:
+      - eval_time: 62m
+        alertname: A10
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: grooming_unknown
+              job: dispatch
+              instance: dispatch:3000
+            exp_annotations:
+              summary: "Admission withholding (grooming_unknown)"
+              description: "The admission gate is starving the queue on missing/stale grooming."
+              operator_action: "Fix the grooming pipeline; or apply a per-issue admission override."
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A10",alertstate="firing"}'
+        eval_time: 62m
+        exp_samples:
+          - labels: 'ALERTS{alertname="A10",alertstate="firing",instance="dispatch:3000",job="dispatch",reason="grooming_unknown",severity="warning"}'
+            value: 1
+
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_queue_withheld{reason="grooming_stale",job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x124"
+    alert_rule_test:
+      - eval_time: 62m
+        alertname: A10
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: grooming_stale
+              job: dispatch
+              instance: dispatch:3000
+            exp_annotations:
+              summary: "Admission withholding (grooming_stale)"
+              description: "The admission gate is starving the queue on missing/stale grooming."
+              operator_action: "Fix the grooming pipeline; or apply a per-issue admission override."
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A10",alertstate="firing"}'
+        eval_time: 62m
+        exp_samples:
+          - labels: 'ALERTS{alertname="A10",alertstate="firing",instance="dispatch:3000",job="dispatch",reason="grooming_stale",severity="warning"}'
+            value: 1
+
+  # …and stays silent on any other reason: the regex is the contract — an
+  # operator_override withholding is not a grooming outage.
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_queue_withheld{reason="grooming_unknown",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x124"
+      - series: 'dispatch_queue_withheld{reason="grooming_stale",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x124"
+      - series: 'dispatch_queue_withheld{reason="operator_override",job="dispatch",instance="dispatch:3000"}'
+        values: "3+0x124"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A10"}'
+        eval_time: 62m
+        exp_samples: []
+
+  # ── A11 — grooming backoff (warning, for 30m) ─────────────────────────────
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_grooming_backoff{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x66"
+    alert_rule_test:
+      - eval_time: 32m
+        alertname: A11
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: dispatch
+              instance: dispatch:3000
+            exp_annotations:
+              summary: "Grooming backoff"
+              description: "Issues are backing off after unreadable upstream reads; grooming cannot proceed."
+              operator_action: "Check GitHub reachability/rate limits."
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A11",alertstate="firing"}'
+        eval_time: 32m
+        exp_samples:
+          - labels: 'ALERTS{alertname="A11",alertstate="firing",instance="dispatch:3000",job="dispatch",severity="warning"}'
+            value: 1
+
+  # ── A12 — audit failures (warning, for 5m) ────────────────────────────────
+  # The windowed gauge is evaluated DIRECTLY via sum() — and sum() strips all
+  # labels, so the alert carries nothing but the rule's severity.
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_audit_failures_in_window{window="900",job="dispatch",instance="dispatch:3000"}'
+        values: "2+0x16"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: A12
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Audit failures in the last 15 minutes"
+              description: "Mutations are failing. Direct evaluation of the as-of-scrape windowed gauge — a rate-style function over the rolling count could read zero when an old failure expires as a new one arrives."
+              operator_action: "Inspect AuditLog.errorMessage for the action; do not label by error string."
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A12",alertstate="firing"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="A12",alertstate="firing",severity="warning"}'
+            value: 1
+
+  # ── A13 — upstream evidence unavailable (warning, for 15m) ────────────────
+  # Fires when the repo staleness passes the EXPORTED threshold (identical
+  # label sets, so the vector-to-vector comparison matches)…
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_repo_stale_sync_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "7200+0x36"
+      - series: 'dispatch_repo_stale_sync_threshold_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "3600+0x36"
+    alert_rule_test:
+      - eval_time: 17m
+        alertname: A13
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: dispatch
+              instance: dispatch:3000
+            exp_annotations:
+              summary: "Upstream evidence unavailable"
+              description: "Repo cache staleness past the configured threshold (two sync intervals; 3600 when the sync job is disabled) or grooming backoff; admission/settlement decisions lack current forge evidence."
+              operator_action: "Check GitHub reachability/rate limits; treat unknown as unknown, never healthy."
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A13",alertstate="firing"}'
+        eval_time: 17m
+        exp_samples:
+          - labels: 'ALERTS{alertname="A13",alertstate="firing",instance="dispatch:3000",job="dispatch",severity="warning"}'
+            value: 1
+
+  # …or on grooming backoff alone, with staleness below threshold…
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_repo_stale_sync_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "120+0x36"
+      - series: 'dispatch_repo_stale_sync_threshold_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "3600+0x36"
+      - series: 'dispatch_grooming_backoff{job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x36"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A13",alertstate="firing"}'
+        eval_time: 17m
+        exp_samples:
+          - labels: 'ALERTS{alertname="A13",alertstate="firing",instance="dispatch:3000",job="dispatch",severity="warning"}'
+            value: 1
+
+  # …and stays silent when staleness is within threshold and there is no
+  # backoff.
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_repo_stale_sync_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "120+0x36"
+      - series: 'dispatch_repo_stale_sync_threshold_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "3600+0x36"
+      - series: 'dispatch_grooming_backoff{job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x36"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A13"}'
+        eval_time: 17m
+        exp_samples: []
+
+  # ── A14 — enforced admission starved by a grooming stall (warning, 10m) ───
+  # Fires on the STALLED baseline: a groomer success 100s before the window
+  # opens (the test clock is 0-based, so time() - 100 > 1200 first holds at
+  # t=1320s), enforce admission actively withholding ready work, and an
+  # evaluable stall threshold.
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_queue_admission_mode{mode="enforce",job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x70"
+      - series: 'dispatch_queue_admission_mode{mode="audit",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x70"
+      - series: 'dispatch_queue_admission_mode{mode="off",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x70"
+      - series: 'dispatch_queue_withheld_grooming{job="dispatch",instance="dispatch:3000"}'
+        values: "5+0x70"
+      - series: 'dispatch_grooming_stall_threshold_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "1200+0x70"
+      - series: 'dispatch_grooming_last_success_timestamp_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "100+0x70"
+    alert_rule_test:
+      - eval_time: 34m
+        alertname: A14
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              mode: enforce
+              job: dispatch
+              instance: dispatch:3000
+            exp_annotations:
+              summary: "Enforced admission starved by a grooming stall"
+              description: "DISPATCH_QUEUE_ADMISSION_MODE=enforce is withholding ready work on grooming evidence while no successful applied grooming run completed within N groomer intervals (or ever). Enforcement never fails open or bypasses silently — the starvation persists until the pipeline recovers."
+              operator_action: "Restore the groomer (job logs, DISPATCH_HOSTED_GROOMER_ENABLED, GitHub reachability, model provider); never relax enforcement blindly — a per-issue operator admission override is the surgical release."
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A14",alertstate="firing"}'
+        eval_time: 34m
+        exp_samples:
+          - labels: 'ALERTS{alertname="A14",alertstate="firing",instance="dispatch:3000",job="dispatch",mode="enforce",severity="warning"}'
+            value: 1
+
+  # Fires on the ABSENT baseline: the groomer has never completed an applied
+  # run — absent() turns that into a firing input, exactly like A2's absent
+  # sync series.
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_queue_admission_mode{mode="enforce",job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x26"
+      - series: 'dispatch_queue_admission_mode{mode="audit",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x26"
+      - series: 'dispatch_queue_admission_mode{mode="off",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x26"
+      - series: 'dispatch_queue_withheld_grooming{job="dispatch",instance="dispatch:3000"}'
+        values: "5+0x26"
+      - series: 'dispatch_grooming_stall_threshold_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "1200+0x26"
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: A14
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              mode: enforce
+              job: dispatch
+              instance: dispatch:3000
+            exp_annotations:
+              summary: "Enforced admission starved by a grooming stall"
+              description: "DISPATCH_QUEUE_ADMISSION_MODE=enforce is withholding ready work on grooming evidence while no successful applied grooming run completed within N groomer intervals (or ever). Enforcement never fails open or bypasses silently — the starvation persists until the pipeline recovers."
+              operator_action: "Restore the groomer (job logs, DISPATCH_HOSTED_GROOMER_ENABLED, GitHub reachability, model provider); never relax enforcement blindly — a per-issue operator admission override is the surgical release."
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A14",alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="A14",alertstate="firing",instance="dispatch:3000",job="dispatch",mode="enforce",severity="warning"}'
+            value: 1
+
+  # Silent when the stall threshold is NOT evaluable (groomer interval
+  # disabled — the exporter omits the series): the presence-yielding gate
+  # `dispatch_grooming_stall_threshold_seconds >= 0` is empty, so the whole
+  # conjunction is empty even though the absent-baseline arm would be true.
+  # This is the semantic pin for the #1438 regression: a rule that "evaluates"
+  # an unevaluable stall as firing (or as healthy) must fail here.
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_queue_admission_mode{mode="enforce",job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x26"
+      - series: 'dispatch_queue_admission_mode{mode="audit",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x26"
+      - series: 'dispatch_queue_admission_mode{mode="off",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x26"
+      - series: 'dispatch_queue_withheld_grooming{job="dispatch",instance="dispatch:3000"}'
+        values: "5+0x26"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A14"}'
+        eval_time: 12m
+        exp_samples: []
+
+  # Silent when admission is not enforce: the gate leg is empty, whatever the
+  # stall state — an operator opt-out is not a stall.
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_queue_admission_mode{mode="enforce",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x26"
+      - series: 'dispatch_queue_admission_mode{mode="audit",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x26"
+      - series: 'dispatch_queue_admission_mode{mode="off",job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x26"
+      - series: 'dispatch_queue_withheld_grooming{job="dispatch",instance="dispatch:3000"}'
+        values: "5+0x26"
+      - series: 'dispatch_grooming_stall_threshold_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "1200+0x26"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A14"}'
+        eval_time: 12m
+        exp_samples: []
+
+  # Silent while nothing is withheld on grooming evidence: the starvation
+  # count is the impacted-ready leg, not a constant.
+  - interval: 30s
+    input_series:
+      - series: 'dispatch_queue_admission_mode{mode="enforce",job="dispatch",instance="dispatch:3000"}'
+        values: "1+0x26"
+      - series: 'dispatch_queue_admission_mode{mode="audit",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x26"
+      - series: 'dispatch_queue_admission_mode{mode="off",job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x26"
+      - series: 'dispatch_queue_withheld_grooming{job="dispatch",instance="dispatch:3000"}'
+        values: "0+0x26"
+      - series: 'dispatch_grooming_stall_threshold_seconds{job="dispatch",instance="dispatch:3000"}'
+        values: "1200+0x26"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="A14"}'
+        eval_time: 12m
+        exp_samples: []
