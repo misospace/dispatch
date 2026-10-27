@@ -65,6 +65,30 @@ jobs:
       - name: Run tests
         run: npm run test
 
+  promtool:
+    name: Promtool rules
+    runs-on: ubuntu-latest
+    env:
+      # The version + tarball digest are pinned so the rules check does not
+      # depend on the runner image or on a mutable download (#1434).
+      PROMETHEUS_VERSION: "3.15.1"
+      PROMETHEUS_LINUX_AMD64_SHA256: "6a726885328ad9efebbf36e876ce2fb6225468a71fd1e7ce3ba666d5f4d97a84"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install promtool from the pinned Prometheus release
+        run: |
+          curl -fsSLo /tmp/prometheus.tar.gz \
+            "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz"
+          echo "${PROMETHEUS_LINUX_AMD64_SHA256}  /tmp/prometheus.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/prometheus.tar.gz -C /tmp "prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool"
+          sudo install -m 0755 "/tmp/prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
+          promtool --version
+      - name: Check the packaged rules
+        run: promtool check rules observability/prometheus-rules.yaml
+      - name: Execute the packaged rules
+        run: promtool test rules observability/prometheus-rules.test.yaml
+
   database-migrations:
     name: Database migrations
     runs-on: ubuntu-latest
