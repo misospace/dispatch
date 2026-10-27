@@ -916,6 +916,10 @@ model GroomingRun {
   @@index([issueId, createdAt])
   @@index([repoId, status, createdAt])
   @@index([issueId, status])
+  // Groomer-stall baseline (#1420/#1437): newest applied completed run seeked
+  // by the observability collector on every snapshot; predicate matches
+  // status + dryRun + stage, sort stays on completedAt DESC.
+  @@index([status, dryRun, stage, completedAt(sort: Desc)])
 }
 
 // One logical application of a grooming plan (#1063), keyed by
