@@ -68,7 +68,7 @@ because the path is not on the worker allowlist); errors are `401` / `403` /
   cohorts: CohortStats[],             // one per distinct group key
   samples?: DeliverySample[],         // omitted when includeSamples=0; capped by limit
   sampleCount,                        // total samples before the sample cap
-  truncated,                          // any bounded read hit its cap (see notes)
+  truncated,                          // any bounded read OR the sample cap hit (see notes)
   notes                               // machine-emitted caveats, always rendered
 }
 ```
@@ -93,9 +93,12 @@ observed execution-run start; `inReviewMs` = union of `status/in-review` label
 intervals from the lifecycle stream; `blockedMs` = union of `status/blocked`
 label intervals; `fixQueuedMs` = PR-fix queue time until the first fix-run
 start per queue item — null when no evidence, never zero); `unclassified`
-(`claimToDoneMs` minus worker time and the observed buckets, clamped at zero;
-waiting time without label/run/queue evidence — CI waiting included — stays
-here); `load` (`maxConcurrentRuns` = maximum number of overlapping
+(`claimToDoneMs` minus the **union** of all classified intervals — worker run
+intervals plus the observed wait buckets, clipped to the claim→done window —
+clamped at zero, so overlapping observations subtract once and never twice;
+the per-bucket totals stay per-category for presentation only; waiting time
+without label/run/queue evidence — CI waiting included — stays here);
+`load` (`maxConcurrentRuns` = maximum number of overlapping
 positive-length run intervals observed inside the cohort — a load confounder,
 never a causal claim); and `settings` (the mixed-settings rule above).
 
@@ -126,8 +129,9 @@ null), `doneAtProvenance` (`observed` / `backfilled` / `unknown`, or null —
 the only milestone carrying provenance), `claimToDoneMs` / `claimToMergeMs`
 (ms or null), `workerTimeMs` (ms or null), `observedWaits`
 (`{ pickupMs, inReviewMs, blockedMs, fixQueuedMs }`, each the union of
-observed intervals or null), `unclassifiedMs` (claim→done minus worker time
-and the observed buckets, clamped at zero; null only when claim→done itself
+observed intervals or null), `unclassifiedMs` (claim→done minus the union of
+all classified intervals — worker runs plus the observed buckets, clipped to
+the claim→done window — clamped at zero; null only when claim→done itself
 is unknown), `firstPass` (`true`/`false`/`null`), `executionAttempts` /
 `fixRounds` / `failedAttempts` (counts), `cohortKeys` (all seven group
 dimensions), `mixedSettings`, `settings` (single value per dimension, null

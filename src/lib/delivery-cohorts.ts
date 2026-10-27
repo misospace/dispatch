@@ -117,8 +117,10 @@ export interface DeliverySample {
   workerTimeMs: number | null;
   observedWaits: ObservedWaitMs;
   /**
-   * claim→done minus worker time and the observed wait buckets, clamped at
-   * zero. Null only when claim→done itself is unknown — known span time that
+   * claim→done minus the UNION of all classified intervals (worker run
+   * intervals and the observed wait buckets, clipped to the claim→done
+   * window), clamped at zero — overlapping observations subtract once, never
+   * twice. Null only when claim→done itself is unknown — known span time that
    * no bucket evidences stays visible here, never dropped.
    */
   unclassifiedMs: number | null;
@@ -212,7 +214,7 @@ export const COHORT_DEFINITIONS: Readonly<Record<string, string>> = Object.freez
   denominators: "sampleCount is the total; delivery counts are per-type; claimToDone/claimToMerge are filtered subsets",
   workerTime: "sum of workerTimeMs across the cohort's samples; workerTimeMs is the union of execution intervals (overlapping runs are not double-counted) and stays null when no run interval evidence exists",
   observedWaits: "waiting buckets shown separately ONLY where observed: pickupMs = first claim → first observed execution-run start (queue/pickup); inReviewMs = union of status/in-review label intervals from the lifecycle event stream; blockedMs = union of status/blocked label intervals (human wait); fixQueuedMs = PR-fix queue time until the first fix-run start per queue item. An interval counts only when both boundaries are observed; a bucket with no evidence is null, never zero",
-  unclassified: "claimToDoneMs minus worker time and the observed wait buckets, clamped at zero; waiting time without label/run/queue evidence (for example CI waiting with no status label or queue row) stays unclassified instead of being attributed to a named bucket",
+  unclassified: "claimToDoneMs minus the union of all classified intervals (worker run intervals plus the observed wait buckets, clipped to the claim→done window), clamped at zero; overlapping classifications subtract once, and the per-bucket totals stay per-category for presentation only; waiting time without label/run/queue evidence (for example CI waiting with no status label or queue row) stays unclassified instead of being attributed to a named bucket",
   load: "maxConcurrentRuns = maximum number of overlapping positive-length execution-run intervals observed inside the cohort; a load confounder surfaced alongside cohort stats, never a causal claim",
   settings: "cohort keys and mixed labels are derived across ALL attempts; a lifecycle spanning settings is mixed, never attributed to the setting active at merge",
 });
@@ -493,6 +495,7 @@ export function deriveDeliverySample(
   const blockedIntervals = statusLabelIntervals(events, "status/blocked", terminalMs);
 
   let pickupMs: number | null = null;
+  let pickupInterval: RunIntervalMs | null = null;
   if (firstClaimMs !== null) {
     let firstExecutionStart: number | null = null;
     for (const run of runs) {
@@ -507,6 +510,7 @@ export function deriveDeliverySample(
     }
     if (firstExecutionStart !== null && firstExecutionStart > firstClaimMs) {
       pickupMs = firstExecutionStart - firstClaimMs;
+      pickupInterval = { startMs: firstClaimMs, endMs: firstExecutionStart };
     }
   }
 
@@ -541,18 +545,37 @@ export function deriveDeliverySample(
     runIntervalsMs.push({ startMs, endMs });
   }
 
-  const observedWaitSum =
-    (observedWaits.pickupMs ?? 0) +
-    (observedWaits.inReviewMs ?? 0) +
-    (observedWaits.blockedMs ?? 0) +
-    (observedWaits.fixQueuedMs ?? 0);
+  // The remainder must subtract the UNION of all classified intervals, never
+  // the per-category sum: a run can overlap a status/in-review or blocked
+  // interval, and a per-category sum would subtract the same wall-clock span
+  // twice and silently shrink the claim→done accounting. The named bucket
+  // totals above stay per-category for presentation only. Every classified
+  // interval is clipped to the claim→done window before the union, so time
+  // observed outside the window never subtracts from it.
+  const classifiedIntervals: RunIntervalMs[] =
+    claimToDoneMs !== null && firstClaimMs !== null && doneAtMs !== null
+      ? [
+          ...runIntervalsMs,
+          ...(pickupInterval !== null ? [pickupInterval] : []),
+          ...inReviewIntervals,
+          ...blockedIntervals,
+          ...fixQueuedIntervals,
+        ]
+          .map((interval) => {
+            const startMs = Math.max(interval.startMs, firstClaimMs);
+            const endMs = Math.min(interval.endMs, doneAtMs);
+            return endMs > startMs ? { startMs, endMs } : null;
+          })
+          .filter((interval): interval is RunIntervalMs => interval !== null)
+      : [];
 
   // The known claim→done span that no evidence attributes to a named phase
-  // stays visible as unclassified — minus worker time AND the observed
-  // waits. Only an unknown claim→done span makes it null.
+  // stays visible as unclassified — minus the union of every classified
+  // (worker + observed-wait) interval inside the window. Only an unknown
+  // claim→done span makes it null.
   const unclassifiedMs =
     claimToDoneMs !== null
-      ? Math.max(0, claimToDoneMs - (workerTimeMs ?? 0) - observedWaitSum)
+      ? Math.max(0, claimToDoneMs - (unionLengthMs(classifiedIntervals) ?? 0))
       : null;
 
   const fixRounds = fixRoundAttempts.length;

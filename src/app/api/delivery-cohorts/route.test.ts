@@ -421,6 +421,77 @@ describe("GET /api/delivery-cohorts", () => {
     );
   });
 
+  it("surfaces the sample-list cap in truncated and notes (#1184 review)", async () => {
+    const claim = new Date("2026-10-01T10:00:00.000Z");
+    mocks.eventsFindMany.mockImplementation((args: any) => {
+      if (args?.distinct) {
+        return Promise.resolve([{ issueId: "issue-1" }, { issueId: "issue-2" }]);
+      }
+      if (args?.where?.issueId) {
+        const ids: string[] = args.where.issueId.in;
+        return Promise.resolve(
+          ids.map((id) => eventRow({ id: `ev-${id}`, issueId: id, occurredAt: claim, observedAt: claim })),
+        );
+      }
+      return Promise.resolve([]);
+    });
+    mocks.issueFindMany.mockImplementation((args: any) => {
+      if (args?.where?.id) {
+        return Promise.resolve(
+          args.where.id.in.map((id: string, i: number) =>
+            issue({ id, number: 40 + i, state: "open", closedAt: null }),
+          ),
+        );
+      }
+      return Promise.resolve([]);
+    });
+
+    const res = await get(`${Q}&limit=1`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body.sampleCount).toBe(2);
+    expect(body.samples).toHaveLength(1);
+    expect(body.truncated).toBe(true);
+    expect(body.notes).toContain(
+      "Sample listing hit its limit (1); sampleCount is the full matched count and the cohorts aggregate every sample, only the per-item list is partial.",
+    );
+  });
+
+  it("does not flag the sample cap when the sample list is omitted", async () => {
+    const claim = new Date("2026-10-01T10:00:00.000Z");
+    mocks.eventsFindMany.mockImplementation((args: any) => {
+      if (args?.distinct) {
+        return Promise.resolve([{ issueId: "issue-1" }, { issueId: "issue-2" }]);
+      }
+      if (args?.where?.issueId) {
+        const ids: string[] = args.where.issueId.in;
+        return Promise.resolve(
+          ids.map((id) => eventRow({ id: `ev-${id}`, issueId: id, occurredAt: claim, observedAt: claim })),
+        );
+      }
+      return Promise.resolve([]);
+    });
+    mocks.issueFindMany.mockImplementation((args: any) => {
+      if (args?.where?.id) {
+        return Promise.resolve(
+          args.where.id.in.map((id: string, i: number) =>
+            issue({ id, number: 40 + i, state: "open", closedAt: null }),
+          ),
+        );
+      }
+      return Promise.resolve([]);
+    });
+
+    const res = await get(`${Q}&limit=1&includeSamples=0`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body.samples).toBeUndefined();
+    expect(body.sampleCount).toBe(2);
+    expect(body.truncated).toBe(false);
+  });
+
   it("carries dbIssueId on samples for per-item lifecycle drill-down", async () => {
     installMergedCohort();
 

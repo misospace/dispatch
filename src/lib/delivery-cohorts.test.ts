@@ -775,10 +775,11 @@ describe("aggregateDeliveryCohorts extended aggregates", () => {
     expect(a!.waiting.fixQueuedMs).toBe(105 * MIN);
     expect(a!.waiting.inReviewMs).toBeNull();
     expect(a!.waiting.blockedMs).toBeNull();
-    // unclassified: issue1 2h−1h run−10m pickup = 50m; issue2's bucket
-    // evidence overlaps its run interval, so its remainder clamps at zero —
-    // overlapping observations never go negative.
-    expect(a!.waiting.unclassifiedMs).toBe(50 * MIN);
+    // unclassified: issue1 2h − 70m union (pickup 10m + run 1h) = 50m; issue2's
+    // classified intervals (pickup, runs, fix-queued wait) union into
+    // 00:00→02:40 = 160m, so its remainder is 4h − 160m = 80m — the overlap
+    // between the fix-queued wait and the runs subtracts once, not twice.
+    expect(a!.waiting.unclassifiedMs).toBe(130 * MIN);
     // run-1 and run-2 overlap inside cohort A.
     expect(a!.confounders.maxConcurrentRuns).toBe(2);
     expect(a!.confounders.mixedSettings).toBe(0);
@@ -814,7 +815,9 @@ describe("aggregateDeliveryCohorts extended aggregates", () => {
     expect(report.totals.confounders.maxConcurrentRuns).toBe(3);
     expect(report.totals.waiting.pickupMs).toBe(20 * MIN);
     expect(report.totals.waiting.fixQueuedMs).toBe(105 * MIN);
-    expect(report.totals.waiting.unclassifiedMs).toBe(50 * MIN);
+    // issue1 50m + issue2 80m (union remainder); open items have no claim→done
+    // span and contribute nothing.
+    expect(report.totals.waiting.unclassifiedMs).toBe(130 * MIN);
 
     // Per-sample execution attempt counts ride on the samples.
     const [mergedA, closedWithFixA, openB, openNoMeta] = extendedSamples();
@@ -951,6 +954,70 @@ describe("observed wait buckets", () => {
     // Pickup stops at the first EXECUTION run; the fix queue wait is separate.
     expect(s.observedWaits.pickupMs).toBe(10 * MIN);
     expect(s.observedWaits.fixQueuedMs).toBe(HOUR);
+  });
+
+  it("subtracts the union of overlapping run and wait intervals once, not the per-bucket sum", () => {
+    const s = deriveDeliverySample(
+      sample({
+        issue: issue({ issueNumber: 19, state: "closed", closedAt: "2026-10-01T02:00:00.000Z" }),
+        events: [
+          event({ kind: "claim", agentName: "alpha", occurredAt: "2026-10-01T00:00:00.000Z" }),
+          event({
+            kind: "status_changed",
+            occurredAt: "2026-10-01T00:30:00.000Z",
+            toStatus: "status/in-review",
+          }),
+          event({
+            kind: "status_changed",
+            occurredAt: "2026-10-01T01:30:00.000Z",
+            fromStatus: "status/in-review",
+            toStatus: "status/in-progress",
+          }),
+          event({ kind: "completed", agentName: "alpha", occurredAt: "2026-10-01T02:00:00.000Z" }),
+        ],
+        runs: [
+          run({
+            id: "run-19",
+            startedAt: "2026-10-01T00:00:00.000Z",
+            finishedAt: "2026-10-01T01:00:00.000Z",
+          }),
+        ],
+      }),
+      NOW,
+    );
+    // Named bucket totals stay per-category for presentation.
+    expect(s.workerTimeMs).toBe(HOUR);
+    expect(s.observedWaits.inReviewMs).toBe(HOUR);
+    expect(s.observedWaits.pickupMs).toBeNull();
+    // The run [00:00, 01:00) and the in-review interval [00:30, 01:30)
+    // overlap for 30m. The per-category sum would subtract 2h and zero the
+    // remainder; the union [00:00, 01:30) is 90m, so 30m stays unclassified.
+    expect(s.unclassifiedMs).toBe(30 * MIN);
+  });
+
+  it("clips classified intervals to the claim→done window", () => {
+    const s = deriveDeliverySample(
+      sample({
+        issue: issue({ issueNumber: 20, state: "closed", closedAt: "2026-10-01T02:00:00.000Z" }),
+        events: [
+          event({ kind: "claim", agentName: "alpha", occurredAt: "2026-10-01T01:00:00.000Z" }),
+          event({ kind: "completed", agentName: "alpha", occurredAt: "2026-10-01T02:00:00.000Z" }),
+        ],
+        runs: [
+          run({
+            id: "run-20",
+            startedAt: "2026-10-01T00:00:00.000Z",
+            finishedAt: "2026-10-01T01:30:00.000Z",
+          }),
+        ],
+      }),
+      NOW,
+    );
+    // The 90m run starts before the claim; only its in-window 30m may
+    // subtract from the 1h claim→done span. A pre-window subtraction would
+    // zero the remainder on the full interval.
+    expect(s.workerTimeMs).toBe(90 * MIN);
+    expect(s.unclassifiedMs).toBe(30 * MIN);
   });
 
   it("leaves every bucket null when no evidence exists", () => {

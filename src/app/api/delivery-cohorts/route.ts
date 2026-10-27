@@ -440,6 +440,16 @@ export async function GET(request: NextRequest) {
       return aMs - bMs;
     });
 
+    // The documented contract: truncated = ANY bounded result hit its cap.
+    // The sample list cap must surface too — sampleCount stays the full
+    // matched count, so a capped list must never read as complete.
+    const samplesTruncated = includeSamples && orderedSamples.length > sampleLimit;
+    if (samplesTruncated) {
+      notes.push(
+        `Sample listing hit its limit (${sampleLimit}); sampleCount is the full matched count and the cohorts aggregate every sample, only the per-item list is partial.`,
+      );
+    }
+
     return NextResponse.json({
       schema: "dispatch.delivery-cohorts/v1",
       definitions: COHORT_DEFINITIONS,
@@ -458,7 +468,8 @@ export async function GET(request: NextRequest) {
         eventsTruncated ||
         runsTruncated ||
         prFixTruncated ||
-        prFixHistoryTruncated,
+        prFixHistoryTruncated ||
+        samplesTruncated,
       notes,
     }, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
