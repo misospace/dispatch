@@ -341,6 +341,59 @@ describe("POST /api/issues/status — business logic", () => {
     });
   });
 
+  it("retires the stored groomer verdict when writing a fresh blocked reason (#1453)", async () => {
+    // Groomed mark_needs_info verdict; an agent now moves the issue to blocked.
+    // The transition owns the current state: the pending groomer action and
+    // the legacy needs-info question must not survive to hide the fresh
+    // blocked reason behind a stale verdict on the card.
+    mocks.findUnique.mockResolvedValue({
+      id: "issue-1",
+      state: "open",
+      labels: ["status/backlog"],
+      nextGroomingAction: "mark_needs_info",
+      needsInfoReason: "which tenant?",
+      number: 42,
+      repository: { fullName: "org/repo" },
+    });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/backlog"]);
+    const res = await POST(makeRequest({ status: "blocked", blockedReason: "Waiting on API team" }));
+    expect(res.status).toBe(200);
+    expect(mocks.updateIssue).toHaveBeenCalledWith({
+      where: { id: "issue-1" },
+      data: expect.objectContaining({
+        blockedReason: "Waiting on API team",
+        nextGroomingAction: null,
+        needsInfoReason: null,
+        notReadyReason: null,
+      }),
+    });
+  });
+
+  it("retires the stored groomer verdict on any other transition (#1453)", async () => {
+    mocks.findUnique.mockResolvedValue({
+      id: "issue-1",
+      state: "open",
+      labels: ["status/backlog"],
+      nextGroomingAction: "promote_to_ready",
+      needsInfoReason: "legacy question",
+      notReadyReason: "legacy not-ready",
+      number: 42,
+      repository: { fullName: "org/repo" },
+    });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/backlog"]);
+    const res = await POST(makeRequest({ status: "in-progress" }));
+    expect(res.status).toBe(200);
+    expect(mocks.updateIssue).toHaveBeenCalledWith({
+      where: { id: "issue-1" },
+      data: expect.objectContaining({
+        blockedReason: null,
+        nextGroomingAction: null,
+        needsInfoReason: null,
+        notReadyReason: null,
+      }),
+    });
+  });
+
   it("returns 503 and performs no writes when live GitHub labels cannot be verified", async () => {
     mocks.getLiveIssueLabels.mockRejectedValueOnce(new Error("github 500"));
     const res = await POST(makeRequest());

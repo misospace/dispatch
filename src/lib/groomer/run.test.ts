@@ -2091,10 +2091,9 @@ Investigate session handling in auth module.`;
 
       await runHostedGroomer();
 
-      for (const call of mocks.prisma.issue.update.mock.calls) {
-        const data = (call[0] as { data: Record<string, unknown> }).data;
-        for (const field of reasonFields) expect(field in data).toBe(false);
-      }
+      // The dry run returns before any issue write: nothing can erase or
+      // overwrite a reason field.
+      expect(mocks.prisma.issue.update).not.toHaveBeenCalled();
     });
 
     it("a replayed application cannot erase the current reason", async () => {

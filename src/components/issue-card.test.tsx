@@ -312,7 +312,7 @@ describe("IssueCard superseded grooming reasons (#1453)", () => {
 
   it("keeps reasons visible under the manual groom route's operator-authored actions", () => {
     const issue = makeIssue({
-      nextGroomingAction: "Request missing information from issue author or assignee",
+      nextGroomingAction: "Request missing information from the issue author or assignee",
       needsInfoReason: "Need reproduction steps",
     });
 
