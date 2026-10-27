@@ -327,8 +327,17 @@ describe("DeliveryCohortsClient", () => {
     expect(screen.getAllByText(/superseded/).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/fix-round/).length).toBeGreaterThan(0);
 
-    // Milestone labels render.
-    expect(screen.getAllByText(/first merge/).length).toBeGreaterThan(0);
+// Milestone labels render.
+expect(screen.getAllByText(/first merge/).length).toBeGreaterThan(0);
+// Provenance badges render every observed value, not just backfilled (#1184 review).
+expect(screen.getAllByText("backfilled").length).toBeGreaterThan(0);
+expect(screen.getAllByText("observed").length).toBeGreaterThan(0);
+// Drill-down discloses that the lifecycle read is on demand, not a cohort snapshot.
+expect(
+  screen.getByText(
+    "Fetched on demand from the per-item lifecycle route; it may reflect a later database state than the cohort snapshot above.",
+  ),
+).toBeInTheDocument();
 
     // Issue link points at the GitHub issue.
     const issueLink = screen.getByRole("link", { name: "Issue" });

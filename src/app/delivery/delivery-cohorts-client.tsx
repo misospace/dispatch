@@ -324,8 +324,30 @@ function DeliveryBadge({ d }: { d: Delivery }) {
 }
 
 function ProvenanceBadge({ p }: { p: Provenance | null | undefined }) {
-  if (p !== "backfilled") return null;
-  return <Badge variant="outline" className="ml-1 px-1.5 py-0">backfilled</Badge>;
+  // Provenance is part of the #1184 evidence contract: every rendered value
+  // must be distinguishable, not just the backfilled case.
+  if (p === "backfilled") {
+    return (
+      <Badge variant="outline" className="ml-1 px-1.5 py-0 text-amber-700">
+        backfilled
+      </Badge>
+    );
+  }
+  if (p === "unknown") {
+    return (
+      <Badge variant="outline" className="ml-1 px-1.5 py-0 text-muted-foreground">
+        unknown
+      </Badge>
+    );
+  }
+  if (p === "observed") {
+    return (
+      <Badge variant="outline" className="ml-1 px-1.5 py-0 text-muted-foreground">
+        observed
+      </Badge>
+    );
+  }
+  return null;
 }
 
 function FirstPassCell({ v }: { v: boolean | null | undefined }) {
@@ -473,6 +495,10 @@ function LifecycleDrilldown({ sample, state }: { sample: DeliverySample; state: 
   ];
   return (
     <div className="space-y-4 text-sm">
+      <p className="text-xs text-muted-foreground">
+        Fetched on demand from the per-item lifecycle route; it may reflect a later
+        database state than the cohort snapshot above.
+      </p>
       <div>
         <h4 className="mb-1 font-medium">Milestones</h4>
         <dl className="space-y-1">

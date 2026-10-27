@@ -173,7 +173,7 @@ export async function GET(request: NextRequest) {
       }),
     ]);
 
-    let issuesTruncated =
+    const issuesTruncated =
       eventCandidates.length > MAX_CANDIDATE_ISSUES ||
       closedCandidates.length > MAX_CANDIDATE_ISSUES;
 
@@ -417,13 +417,9 @@ export async function GET(request: NextRequest) {
       windowUntilMs: window.untilMs,
     });
 
-    if (
-      eventRowsRaw.length > MAX_EVENTS_TOTAL ||
-      prFixRowsRaw.length > MAX_PRFIX_ITEMS_TOTAL ||
-      runRowsRaw.length > MAX_RUNS_TOTAL
-    ) {
-      issuesTruncated = true;
-    }
+    // Evidence-row truncation is surfaced by its own flags + notes below
+    // (events/runs/PR-fix); it must NOT be attributed to the candidate-issue
+    // read, whose cap has its own flag and note.
     notes.push(
       "Setting changes observed only per attempt: an attempt that restarted under a different runtime keeps its first observed setting, so intra-attempt config changes are not detected.",
       "Wait buckets (pickup, in-review, blocked, fix-queued) count only intervals with both boundaries observed from status labels, run starts, or queue rows; waiting time without such evidence (CI waiting included) stays unclassified, never attributed to a named bucket.",

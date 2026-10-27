@@ -149,4 +149,7 @@ done and merge — with provenance and missing evidence — stays the existing
 `GET /api/issues/[issueId]/lifecycle` contract (#1203/#1183). The `/delivery`
 page links each sample to it (`dbIssueId`) and renders the timeline, linked
 PRs and attempt chain inline, so the cohort view and the per-item view cannot
-disagree: both consume the same projections.
+disagree: both consume the same projections. The drill-down is fetched on
+demand when a sample row is expanded — it is a separate read of that route and
+may therefore reflect a later database state than the cohort snapshot; it is
+not an atomic snapshot of the cohort request.

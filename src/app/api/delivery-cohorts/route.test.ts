@@ -371,6 +371,35 @@ describe("GET /api/delivery-cohorts", () => {
     expect(body.totals.sampleCount).toBe(400);
   });
 
+  it("does not attribute evidence-row truncation to the candidate-issue read (#1184 review)", async () => {
+    installMergedCohort();
+    mocks.eventsFindMany.mockImplementation((args: any) => {
+      if (args?.distinct) {
+        return Promise.resolve([{ issueId: "issue-1" }]);
+      }
+      if (args?.where?.issueId) {
+        return Promise.resolve(
+          Array.from({ length: 20_001 }, (_, i) =>
+            eventRow({ id: `ev-${i}`, issueId: "issue-1" }),
+          ),
+        );
+      }
+      return Promise.resolve([]);
+    });
+
+    const res = await get();
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body.truncated).toBe(true);
+    expect(body.notes).toContain(
+      "Event read hit its row cap; some items have partial event history.",
+    );
+    expect(body.notes).not.toContain(
+      "Candidate issue read hit its cap; the cohort covers only part of the window.",
+    );
+  });
+
   it("orders the bulk event read with a unique id tie-break (#1184 review)", async () => {
     installMergedCohort();
     await get();
