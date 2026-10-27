@@ -302,7 +302,24 @@ proof), and still-running parks (`retryAfter` elapsed — the stale-work sweep
 keeps that fenced delete). Dead tombstones are paged past in every mode, so
 `audit` reaches valid candidates with zero mutations; under `enforce` they are
 additionally deleted with the same CAS fence as the stamp, converging the
-table. A pass reads at most `LEASE_SCAN_MAX_ROWS` lease rows: that bounds
+table — but only after **authoritative proof the claim is gone** (#1417 review
+round 4): the cached `Issue.labels` mirror is non-authoritative (the claim
+route writes GitHub before the local mirror transaction, so a failed mirror
+leaves the live `agent/<name>` label invisible to the cache), so a tombstone
+on an OPEN issue is deleted only after a live forge label read confirms no
+`agent/*` label; a forge failure or an exhausted per-pass verification budget
+(`LEASE_TOMBSTONE_VERIFY_BUDGET`) fails closed and the row stays for a later
+pass. Tombstones on closed (or cache-missing) issues need no forge read —
+closure itself is treated as the claim being gone (GitHub retains labels
+across close→reopen, so a tombstone deleted on a later-reopened issue leaves
+a tier-6 label-only claim with no Dispatch evidence — the pre-existing
+label-only handling, not a new gap). The live read also cannot eliminate
+every race: a claim landing on GitHub between the read and the delete, with
+a failed mirror transaction, is a milliseconds-wide residual window the CAS
+fence (DB-state only) cannot see. Deleting on cache evidence alone
+would destroy the only Dispatch-side evidence behind a live claim and strand
+it — the exact failure this section exists to prevent. A pass reads at most
+`LEASE_SCAN_MAX_ROWS` lease rows: that bounds
 read cost, and under `audit` it is also the residual starvation bound — more
 than that many dead tombstones older than every valid candidate would hide it
 until `enforce` (or an operator) prunes. A settled release deletes the lease

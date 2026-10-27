@@ -17,10 +17,15 @@
  *   2. `reconcileOwnership` in AUDIT mode surfaces the tombstoned claim as an
  *      ABANDONED_CANDIDATE annotation (`disposition_expired` +
  *      `evidence_stale`) with zero forge writes and zero mutations.
- *   3. `reconcileOwnership` in ENFORCE mode ladders the same claim through
- *      the §8.2 confirmation ladder and releases it via the §8.7 protocol:
- *      the epoch CAS pins the tombstone, the forge delete removes exactly the
- *      claim label, and the Phase C settle consumes the tombstone row.
+  *   3. `reconcileOwnership` in ENFORCE mode ladders the same claim through
+  *      the §8.2 confirmation ladder and releases it via the §8.7 protocol:
+  *      the epoch CAS pins the tombstone, the forge delete removes exactly the
+  *      claim label, and the Phase C settle consumes the tombstone row.
+  *   4. ENFORCE never prunes a tombstone on the cached label mirror alone
+  *      (#1417 review round 4): a cached pre-claim label set with a LIVE
+  *      forge claim keeps its tombstone evidence and stays recoverable.
+  *      The cache is non-authoritative — the claim route writes GitHub
+  *      before the local mirror transaction.
  *
  * Opt-in via RUN_DB_INTEGRATION=1, NOT merely DATABASE_URL: that variable is
  * set workflow-wide in ci.yaml, so gating on it alone would make this file
@@ -67,6 +72,9 @@ const CLAIM_TOKEN = "tok-integration-dead-claim";
 // completed could never build an unscoped filter.
 let issueId: string = UNSET_ISSUE_ID;
 let issueSeeded = false;
+// Secondary issues created by individual scenarios (e.g. the stale-mirror
+// regression); cleaned with the same issue-scoped guards.
+let extraIssueIds: string[] = [];
 
 const { holder, githubCalls } = vi.hoisted(() => ({
   holder: { prisma: null as unknown },
@@ -135,6 +143,7 @@ suite("the #1417 dead-claim recovery chain against a real PostgreSQL", () => {
   beforeEach(async () => {
     issueId = UNSET_ISSUE_ID;
     issueSeeded = false;
+    extraIssueIds = [];
     base = new Date();
     githubCalls.add.length = 0;
     githubCalls.remove.length = 0;
@@ -194,6 +203,13 @@ suite("the #1417 dead-claim recovery chain against a real PostgreSQL", () => {
       await db.issueLifecycleEvent.deleteMany({ where: { issueId } });
       await db.issue.deleteMany({ where: { id: issueId } });
     }
+    for (const extraId of extraIssueIds) {
+      await db.lease.deleteMany({ where: { issueId: extraId } });
+      await db.ownershipReleaseIntent.deleteMany({ where: { issueId: extraId } });
+      await db.ownershipReconcileCandidate.deleteMany({ where: { issueId: extraId } });
+      await db.issueLifecycleEvent.deleteMany({ where: { issueId: extraId } });
+      await db.issue.deleteMany({ where: { id: extraId } });
+    }
     await db.auditLog.deleteMany({ where: { repoFullName: { startsWith: REPO_PREFIX } } });
     await db.repository.deleteMany({ where: { fullName: { startsWith: REPO_PREFIX } } });
   }
@@ -202,6 +218,7 @@ suite("the #1417 dead-claim recovery chain against a real PostgreSQL", () => {
     await cleanupSeededRows();
     issueId = UNSET_ISSUE_ID;
     issueSeeded = false;
+    extraIssueIds = [];
     vi.unstubAllEnvs();
   });
 
@@ -356,5 +373,75 @@ suite("the #1417 dead-claim recovery chain against a real PostgreSQL", () => {
     // The churn bound survives the release (§8.2 item 4).
     const candidateAfter = await db.ownershipReconcileCandidate.findUnique({ where: { issueId } });
     expect(candidateAfter!.reclaimCount).toBe(1);
+  });
+
+  it("enforce never prunes a tombstone whose cached labels lost the agent label while the forge still carries it (#1417 review round 4)", async () => {
+    // The claim route writes GitHub BEFORE the local mirror transaction; a
+    // failed mirror leaves the live claim invisible to the cached labels.
+    // A second issue models exactly that: cached labels are pre-claim, the
+    // forge still carries the claim, the lease has tombstoned.
+    const staleIssue = await db.issue.create({
+      data: {
+        number: 2,
+        repositoryId: (await db.issue.findUniqueOrThrow({ where: { id: issueId }, select: { repositoryId: true } })).repositoryId,
+        title: "stale mirror pre-claim cache",
+        state: "open",
+        url: "https://example.test/stale-mirror",
+        labels: ["status/in-progress"], // cache: pre-claim, no agent/*
+        assignees: [],
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    });
+    extraIssueIds.push(staleIssue.id);
+    await db.lease.create({
+      data: {
+        agentName: "stalemirror",
+        issueId: staleIssue.id,
+        checkpoint: "issue_claimed",
+        claimToken: "tok-integration-stale-mirror",
+        expiredAt: new Date(base.getTime() - EXPIRED_AT_MS_AGO),
+        renewedAt: new Date(base.getTime() - CLAIMED_AT_MS_AGO),
+        lastRenewalObservedAt: new Date(base.getTime() - CLAIMED_AT_MS_AGO),
+        renewCount: 0,
+      },
+    });
+    await releaseExpiredLeases(staleIssue.id);
+    stubReconcileWindows();
+    vi.stubEnv("DISPATCH_OWNERSHIP_RECONCILE_MODE", "enforce");
+    // The forge's single label set serves both issues on this fake; it still
+    // carries BOTH claims — the destructive decision must not happen.
+    const forge = makeForge(["agent/dead", "agent/stalemirror", "status/in-progress"]);
+    const deps = {
+      prisma: db as unknown as NonNullable<Parameters<typeof reconcileOwnership>[0]>["prisma"],
+      forge,
+      guard: withIssueMutationGuard,
+    };
+
+    const report = await reconcileOwnership(deps, base);
+
+    // The stale-cache issue is not a candidate source (the scan filters on
+    // cached labels), but its tombstone evidence SURVIVES the enforce pass.
+    const preserved = await db.lease.findUnique({
+      where: { agentName_issueId: { agentName: "stalemirror", issueId: staleIssue.id } },
+    });
+    expect(preserved).not.toBeNull();
+    expect(preserved!.disposition).toBe("expired");
+    expect(preserved!.claimToken).toBe("tok-integration-stale-mirror");
+    // The primary tombstone was examined as the candidate it is.
+    expect(report.examined).toBe(1);
+
+    // Recoverable: once sync reflects the live label, the SAME tombstone
+    // becomes candidate evidence and is examined — still never destroyed.
+    await db.issue.update({
+      where: { id: staleIssue.id },
+      data: { labels: ["status/in-progress", "agent/stalemirror"] },
+    });
+    const second = await reconcileOwnership(deps, base);
+    expect(second.examined).toBe(2);
+    const stillThere = await db.lease.findUnique({
+      where: { agentName_issueId: { agentName: "stalemirror", issueId: staleIssue.id } },
+    });
+    expect(stillThere).not.toBeNull();
   });
 });

@@ -1554,6 +1554,75 @@ describe("ownership reconciliation (#1254)", () => {
       expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-dead"]);
     });
 
+    it("enforce preserves a tombstone whose cached labels lost the agent label while the forge still carries it (#1417 review round 4)", async () => {
+      // The claim route writes GitHub BEFORE the local mirror transaction; a
+      // failed mirror leaves the live `agent/alpha` label invisible to the
+      // cached labels. Deleting the tombstone on that stale cache would
+      // destroy the only Dispatch-side evidence and strand the live claim —
+      // the #1417 failure mode again. The delete requires a LIVE forge read.
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.issue[0].labels = ["status/in-progress"]; // cache: pre-claim
+      forgeShared.setLabels(REPO, 42, ["status/in-progress", "agent/alpha"]); // forge: claimed
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-cache-stale", issueId: ISSUE_ID, expiredMinutesAgo: 120 }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+
+      const report = await runReconcile(fixture, now, "enforce");
+      // The live read ran, saw the claim, and the evidence survived.
+      expect(forgeShared.liveReads).toBeGreaterThanOrEqual(1);
+      expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-cache-stale"]);
+      // The stale cache is not a candidate source: nothing examined.
+      expect(report.examined).toBe(0);
+
+      // Recoverable: once sync reflects the live label, the SAME tombstone
+      // becomes candidate evidence and is examined — never destroyed.
+      fixture.tables.issue[0].labels = ["status/in-progress", "agent/alpha"];
+      const second = await runReconcile(fixture, now, "enforce");
+      expect(second.examined).toBe(1);
+      expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-cache-stale"]);
+    });
+
+    it("enforce deletes an open-issue tombstone once the live forge read confirms the claim is gone", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.issue[0].labels = ["status/in-progress"]; // cache: no claim
+      forgeShared.setLabels(REPO, 42, ["status/in-progress"]); // forge: no claim either
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-genuinely-dead", issueId: ISSUE_ID, expiredMinutesAgo: 120 }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+
+      const report = await runReconcile(fixture, now, "enforce");
+      expect(report.examined).toBe(0);
+      expect(fixture.tables.lease).toHaveLength(0);
+    });
+
+    it("a failed live forge read fails closed: the open-issue tombstone survives for a later pass", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.issue[0].labels = ["status/in-progress"];
+      forgeShared.labels.delete(`${REPO}#42`); // getLiveIssueLabels throws
+      fixture.tables.lease.length = 0;
+      fixture.tables.lease.push(
+        tombstoneLease(now, { id: "tomb-unverifiable", issueId: ISSUE_ID, expiredMinutesAgo: 120 }),
+      );
+      fixture.tables.agentWork.length = 0;
+      fixture.tables.ownershipReconcileCandidate.length = 0;
+      vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "1");
+
+      const report = await runReconcile(fixture, now, "enforce");
+      expect(report.examined).toBe(0);
+      expect(fixture.tables.lease.map((r) => r.id)).toEqual(["tomb-unverifiable"]);
+    });
+
     it("a tombstone on an issue holding a parked intent survives cleanup", async () => {
       // Phase C's settle re-check reads exactly this lease row; deleting it
       // would wedge the settlement. Parked intents stay out of the replay
@@ -1650,6 +1719,9 @@ describe("ownership reconciliation (#1254)", () => {
           repository: { fullName: REPO },
         },
       );
+      // Round 4: the open-issue prune requires LIVE proof the claim is gone,
+      // so the forge must agree with the cache here.
+      forgeShared.setLabels(REPO, 92, ["status/ready"]);
       fixture.tables.lease.length = 0;
       fixture.tables.lease.push(
         tombstoneLease(now, { id: "tomb-dead", issueId: "issue-closed", expiredMinutesAgo: 120 }),

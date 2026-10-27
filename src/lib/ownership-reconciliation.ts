@@ -1219,6 +1219,16 @@ export async function replayPendingOwnershipReleases(
 // (audit's read-only contract, or a backlog accumulated under `off`).
 const LEASE_SCAN_MIN_PAGE_ROWS = 50;
 const LEASE_SCAN_MAX_ROWS = 5000;
+// #1417 review round 4: an open-issue dead tombstone is deleted only after a
+// LIVE forge label read confirms the claim is gone — the cached `Issue.labels`
+// mirror is non-authoritative (the claim route writes GitHub before the local
+// mirror transaction, so a failed mirror leaves the live claim invisible to
+// the cache). This caps the per-pass verification reads; rows beyond the
+// budget stay put (they never consume window budget) and are verified on a
+// later pass, so convergence stays monotone. Rows whose live read shows a
+// surviving claim re-verify each pass until the next sync heals the cache —
+// a transient head-of-line cost, bounded by the budget.
+const LEASE_TOMBSTONE_VERIFY_BUDGET = 50;
 
 /**
  * Bounded, evidence-driven candidate scan (§8.1). A candidate is an open issue
@@ -1235,13 +1245,17 @@ const LEASE_SCAN_MAX_ROWS = 5000;
  * open agent-labeled issues, not the first `batchSize` rows written, and
  * protected non-candidate rows (intents, receipts, running parks) are paged
  * past too without consuming budget. The delete stays an `enforce`-only
- * convergence mechanism, bounded per pass by `LEASE_SCAN_MAX_ROWS`.
+ * convergence mechanism, bounded per pass by `LEASE_SCAN_MAX_ROWS`, and a
+ * tombstone on an open issue is deleted only after a live forge label read
+ * confirms the claim is gone — the cached label mirror is never sufficient
+ * for a destructive decision (#1417 review round 4).
  */
 async function selectCandidates(
   client: OwnershipReconcileClient,
   graceCutoff: Date,
   now: Date,
   batchSize: number,
+  forge: OwnershipReconcileForge,
   readOnly = false,
 ): Promise<any[]> {
   // `reclaimCount` must be loaded: the dead-row cleanup below keeps rows with
@@ -1266,7 +1280,8 @@ async function selectCandidates(
   // worker's resume proof), and still-running parks (#1316/#1334,
   // `retryAfter` in the future — the stale-work sweep's fenced delete remains
   // their reclaimer). Everything else is a dead tombstone: skipped in every
-  // mode, deleted under `enforce` (below).
+  // mode, deleted under `enforce` after live forge proof the claim is gone
+  // (below).
   // `id`/`expiredAt`/`retryAfter` must be loaded: the cleanup fences on them,
   // same projection lesson as `reclaimCount` above.
   const leaseScanWhere = {
@@ -1297,13 +1312,21 @@ async function selectCandidates(
     const pageIssueIds = [...new Set(page.map((row: any) => row.issueId))];
     const pageIssues = await client.issue.findMany({
       where: { id: { in: pageIssueIds }, state: "open" },
-      select: { id: true, labels: true },
+      // `number`/`repository` feed the live forge verification of open-issue
+      // dead rows below (#1417 review round 4).
+      select: {
+        id: true,
+        labels: true,
+        number: true,
+        repository: { select: { fullName: true } },
+      },
     });
     const pageCandidateIds = new Set(
       pageIssues
         .filter((issue: any) => issue.labels.some((label: string) => label.startsWith(AGENT_PREFIX)))
         .map((issue: any) => issue.id),
     );
+    const pageOpenIssues = new Map(pageIssues.map((issue: any) => [issue.id, issue]));
     const pageIntents = await client.ownershipReleaseIntent.findMany({
       where: { issueId: { in: pageIssueIds } },
       select: { issueId: true },
@@ -1320,7 +1343,9 @@ async function selectCandidates(
       if (pageIntentIds.has(row.issueId)) continue;
       if (row.expiredAt && row.expiredAt > now) continue;
       if (row.retryAfter && row.retryAfter > now) continue;
-      deadTombstoneRows.push(row);
+      // The open issue (when the cache has one) rides along: deleting its
+      // tombstone requires live forge proof the claim is gone.
+      deadTombstoneRows.push({ row, issue: pageOpenIssues.get(row.issueId) ?? null });
     }
     if (page.length < leaseScanPageRows) break;
   }
@@ -1329,8 +1354,40 @@ async function selectCandidates(
   // the dead-ladder cleanup below does for ladder rows. Runs even when no
   // candidate survives the scan — a window of pure dead tombstones must still
   // shrink, or nothing would ever prune it.
-  const deadTombstoneIds = deadTombstoneRows.map((row: any) => row.id);
-  if (!readOnly && deadTombstoneIds.length > 0) {
+  //
+  // Deletion is gated on authoritative claim-gone proof (#1417 review round
+  // 4): the cached `Issue.labels` mirror is NOT authoritative — the claim
+  // route writes GitHub before the local mirror transaction, so a failed
+  // mirror leaves the live `agent/<name>` label invisible to the cache while
+  // the lease tombstones. Deleting that tombstone on cache evidence alone
+  // would destroy the only Dispatch-side evidence and strand the live claim
+  // — exactly the #1417 failure this PR exists to fix. So a tombstone on an
+  // OPEN issue is deleted only after a live forge label read confirms no
+  // `agent/*` label; a forge failure or an exhausted verification budget
+  // fails closed (the row stays for a later pass). Tombstones on closed (or
+  // cache-missing) issues need no forge read — closure itself is the claim
+  // being gone. Audit mode deletes nothing and reads no forge.
+  const deletableTombstoneIds: string[] = [];
+  if (!readOnly && deadTombstoneRows.length > 0) {
+    let verifications = 0;
+    for (const { row, issue } of deadTombstoneRows as Array<{ row: any; issue: any }>) {
+      if (!issue) {
+        deletableTombstoneIds.push(row.id);
+        continue;
+      }
+      if (verifications >= LEASE_TOMBSTONE_VERIFY_BUDGET) continue;
+      verifications++;
+      let liveLabels: string[];
+      try {
+        liveLabels = await forge.getLiveIssueLabels(issue.repository.fullName, issue.number);
+      } catch {
+        continue; // fail closed: unverifiable this pass, evidence stays
+      }
+      if (liveLabels.some((label: string) => label.startsWith(AGENT_PREFIX))) continue;
+      deletableTombstoneIds.push(row.id);
+    }
+  }
+  if (deletableTombstoneIds.length > 0) {
     // Fence the delete with the same CAS shape as releaseExpiredLeases's
     // stamp (including its `retryAfter` 3VL handling): every classification
     // above was evaluated at scan time, and a re-claim or renewal can
@@ -1339,7 +1396,7 @@ async function selectCandidates(
     // delete match zero rows instead of destroying the live receipt.
     await client.lease.deleteMany({
       where: {
-        id: { in: deadTombstoneIds },
+        id: { in: deletableTombstoneIds },
         expiredAt: { lte: now },
         OR: [{ retryAfter: null }, { retryAfter: { lte: now } }],
       },
@@ -1497,7 +1554,7 @@ export async function reconcileOwnership(
   //    the off-mode early-return).
   let candidates: any[];
   try {
-    candidates = await selectCandidates(client, graceCutoff, now, batchSize, mode === "audit");
+    candidates = await selectCandidates(client, graceCutoff, now, batchSize, resolved.forge, mode === "audit");
   } catch (error) {
     report.errors.push(`candidate selection failed: ${error instanceof Error ? error.message : String(error)}`);
     return report;
