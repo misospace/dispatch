@@ -346,11 +346,22 @@ expect(screen.getAllByText("backfilled").length).toBeGreaterThan(0);
 expect(screen.getAllByText("observed").length).toBeGreaterThan(0);
 // Every NON-NULL milestone row carries its own provenance, not just done
 // (#1184 round 5): first claim is a backfilled non-done milestone, closed an
-// observed one.
-const firstClaimMilestone = screen.getByText("first claim").closest("div");
+// observed one. Scoped to the drill-down panel so the queries stay unique
+// even if a "closed"/"first claim" label appears elsewhere on the page.
+const drilldown = screen
+  .getByText(
+    "Fetched on demand from the per-item lifecycle route; it may reflect a later database state than the cohort snapshot above.",
+  )
+  .closest("div");
+expect(drilldown).not.toBeNull();
+const firstClaimMilestone = within(drilldown as HTMLElement)
+  .getByText("first claim")
+  .closest("div");
 expect(firstClaimMilestone).not.toBeNull();
 expect(within(firstClaimMilestone as HTMLElement).getByText("backfilled")).toBeInTheDocument();
-const closedMilestone = screen.getByText("closed").closest("div");
+const closedMilestone = within(drilldown as HTMLElement)
+  .getByText("closed")
+  .closest("div");
 expect(closedMilestone).not.toBeNull();
 expect(within(closedMilestone as HTMLElement).getByText("observed")).toBeInTheDocument();
 // Drill-down discloses that the lifecycle read is on demand, not a cohort snapshot.
