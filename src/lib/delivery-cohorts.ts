@@ -458,8 +458,21 @@ export function deriveDeliverySample(
   input: DeliverySampleInput,
   nowMs: number,
 ): DeliverySample {
-  const { issue, events, runs, prFixItems } = input;
+  const { issue, events, runs: rawRuns, prFixItems } = input;
   const labels = input.labels ?? [];
+
+  // A verified `followup-pr` report can persist both `issueId` and
+  // `prFixQueueItemId` on one AgentRun, so a per-item run set assembled from
+  // both link paths can carry the same row twice. Canonicalize by run id once
+  // so every raw-run consumer below (pickup, fix hand-off, run intervals,
+  // chain) sees each run exactly once — a dual-linked run must never count as
+  // two simultaneous intervals in the load confounder. Insertion order is
+  // preserved and the first occurrence wins, so the result is deterministic.
+  const runsById = new Map<string, WorkAttemptRunRecord>();
+  for (const run of rawRuns) {
+    if (!runsById.has(run.id)) runsById.set(run.id, run);
+  }
+  const runs = Array.from(runsById.values());
 
   const timeline = buildIssueLifecycleTimeline(issue, events);
   const chain = buildWorkItemDeliveryChain(

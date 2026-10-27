@@ -1152,4 +1152,53 @@ describe("observed wait buckets", () => {
     });
     expect(report.totals.confounders.maxConcurrentRuns).toBe(1);
   });
+
+  it("counts a dual-linked run (issue + pr-fix item) once in the load confounder", () => {
+    // A verified followup-pr report can persist both issueId and
+    // prFixQueueItemId on one AgentRun, so the route's per-item run set
+    // concatenates the same run row twice (once per link path). The
+    // projection must canonicalize by run id: the dual-linked run contributes
+    // exactly one interval, never two simultaneous ones.
+    const dualLinked = run({
+      id: "run-dual",
+      startedAt: iso(T0 + 30 * MIN),
+      finishedAt: iso(T0 + 90 * MIN),
+      prFixQueueItemId: "fi-dual",
+    });
+    const first = deriveDeliverySample(
+      sample({
+        issue: issue({ issueNumber: 19 }),
+        events: [event({ kind: "claim", occurredAt: iso(T0) })],
+        runs: [
+          run({ id: "run-a", startedAt: iso(T0), finishedAt: iso(T0 + HOUR) }),
+          dualLinked,
+          dualLinked,
+        ],
+      }),
+      NOW,
+    );
+    expect(first.runIntervalsMs).toHaveLength(2);
+    const second = deriveDeliverySample(
+      sample({
+        issue: issue({ issueNumber: 20 }),
+        events: [event({ kind: "claim", occurredAt: iso(T0 + HOUR) })],
+        runs: [
+          run({
+            id: "run-b",
+            startedAt: iso(T0 + HOUR),
+            finishedAt: iso(T0 + 2 * HOUR),
+          }),
+        ],
+      }),
+      NOW,
+    );
+    const report = aggregateDeliveryCohorts([first, second], {
+      dimension: "repository",
+      windowSinceMs: null,
+      windowUntilMs: null,
+    });
+    // run-a ∩ run-dual overlap once (30m→60m); the duplicated dual-linked
+    // row must not inflate the sweep-line to 3.
+    expect(report.totals.confounders.maxConcurrentRuns).toBe(2);
+  });
 });
