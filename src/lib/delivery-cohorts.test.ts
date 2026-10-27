@@ -162,7 +162,7 @@ describe("deriveDeliverySample", () => {
 
   // ── 2. multiple fix rounds → firstPass false ──────────────────────────────
 
-  it("marks firstPass false when fix rounds exist", () => {
+  it("marks firstPass false when multiple fix rounds exist", () => {
     const s = deriveDeliverySample(
       sample({
         issue: issue({ issueNumber: 1, state: "closed", closedAt: "2026-10-01T05:00:00.000Z" }),
@@ -186,7 +186,7 @@ describe("deriveDeliverySample", () => {
             executionMetadata: { model: "gpt-5" },
           }),
           run({
-            id: "run-fix",
+            id: "run-fix-1",
             agentName: "bravo",
             startedAt: "2026-10-01T02:00:00.000Z",
             finishedAt: "2026-10-01T02:10:00.000Z",
@@ -194,16 +194,27 @@ describe("deriveDeliverySample", () => {
             prFixQueueItemId: "fi-1",
             prFixGeneration: 1,
           }),
+          run({
+            id: "run-fix-2",
+            agentName: "bravo",
+            startedAt: "2026-10-01T03:00:00.000Z",
+            finishedAt: "2026-10-01T03:10:00.000Z",
+            executionMetadata: { model: "gpt-5" },
+            prFixQueueItemId: "fi-1",
+            prFixGeneration: 2,
+          }),
         ],
-        prFixItems: [prFixItem({ id: "fi-1", generation: 1, status: "FIXED" })],
+        prFixItems: [prFixItem({ id: "fi-1", generation: 2, status: "FIXED" })],
       }),
       NOW,
     );
 
     expect(s.delivery).toBe("merged");
     expect(s.firstPass).toBe(false);
-    expect(s.fixRounds).toBe(1);
-    expect(s.failedAttempts).toBe(0);
+    // Two stamped generations on the same item produce two fix rounds; the
+    // superseded first round also counts as a failed attempt.
+    expect(s.fixRounds).toBe(2);
+    expect(s.failedAttempts).toBe(1);
   });
 
   // ── 3. mixed models (regression: failed=m-old, merged=m-new) ──────────────

@@ -161,8 +161,10 @@ The per-work-item timeline through linked artifacts, all attempts/fix rounds,
 done and merge — with provenance and missing evidence — stays the existing
 `GET /api/issues/[issueId]/lifecycle` contract (#1203/#1183). The `/delivery`
 page links each sample to it (`dbIssueId`) and renders the timeline, linked
-PRs and attempt chain inline, so the cohort view and the per-item view cannot
-disagree: both consume the same projections. Every milestone with an observed
+PRs and attempt chain inline. Both consume the same projections, so they agree
+whenever the database state is unchanged — but the drill-down is a separate
+read and may observe a later state, so the two views are not guaranteed to be
+in lockstep at a single instant. Every milestone with an observed
 timestamp (first claim, done, closed, last reopen, first merge) and every
 linked PR renders with its provenance badge (`observed` / `backfilled` /
 `unknown`); a milestone without evidence stays "unknown", never a manufactured
