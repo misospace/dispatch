@@ -115,7 +115,12 @@ export async function GET(request: Request) {
     const now = new Date();
     // #1129: a bound worker's stale-lease view is scoped to its own agent too;
     // otherwise the listing would leak every other agent's leases.
-    const leaseWhere: Record<string, unknown> = { expiredAt: { lte: now } };
+    // #1445: only rows with no disposition belong here. Expired tombstones
+    // (`disposition: "expired"`, #1443) are dead-claim evidence the ownership
+    // reconciler consumes, and terminal dispositions are settled elsewhere;
+    // without this filter retained tombstones permanently occupy the bounded
+    // `take: 50` window and crowd live stale leases out of the listing.
+    const leaseWhere: Record<string, unknown> = { expiredAt: { lte: now }, disposition: null };
     if (effectiveAgentFilter) leaseWhere.agentName = effectiveAgentFilter;
     const expiredLeases = await prisma.lease.findMany({
       where: leaseWhere,

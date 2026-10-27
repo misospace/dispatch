@@ -331,6 +331,29 @@ describe("GET /api/agent-work", () => {
     expect(body.staleLeases).toEqual([]);
   });
 
+  // #1445: retained expired tombstones (`disposition: "expired"`, #1443) and
+  // other dispositioned leases are settled evidence elsewhere; the stale-lease
+  // listing must not let them crowd live stale leases out of its `take: 50`
+  // window.
+  it("lists only undispositioned leases in the stale-lease view", async () => {
+    await makeGetRequest("http://localhost/api/agent-work?include_stale=true");
+    const callArgs = lease.findMany.mock.calls[0][0];
+    expect(callArgs.where.disposition).toBeNull();
+  });
+
+  it("does not surface a tombstoned expired lease as a stale lease", async () => {
+    lease.findMany.mockResolvedValueOnce([]);
+    const res = await makeGetRequest("http://localhost/api/agent-work?include_stale=true");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.staleLeases).toEqual([]);
+    const callArgs = lease.findMany.mock.calls[0][0];
+    expect(callArgs.where).toMatchObject({
+      expiredAt: { lte: expect.any(Date) },
+      disposition: null,
+    });
+  });
+
   it("returns 500 on database error", async () => {
     agentWork.findMany.mockRejectedValueOnce(new Error("DB connection failed"));
     const res = await makeGetRequest("http://localhost/api/agent-work");
