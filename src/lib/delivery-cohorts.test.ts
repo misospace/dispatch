@@ -248,6 +248,50 @@ describe("deriveDeliverySample", () => {
     expect(s.settings.model).toBeNull();
   });
 
+  // ── 3b. intra-attempt setting change (#1423): one claim, two runs ─────────
+
+  it("marks model mixed when one attempt's runs restart under another model", () => {
+    const s = deriveDeliverySample(
+      sample({
+        issue: issue({ issueNumber: 1, state: "closed", closedAt: "2026-10-01T05:00:00.000Z" }),
+        events: [
+          event({ kind: "claim", agentName: "alpha", occurredAt: "2026-10-01T00:00:00.000Z" }),
+          event({ kind: "completed", agentName: "alpha", occurredAt: "2026-10-01T04:00:00.000Z" }),
+          event({
+            kind: "pr_merged",
+            source: "reconciler",
+            sourceEventId: "pr-101",
+            occurredAt: "2026-10-01T04:00:00.000Z",
+            metadata: { pullRequestNumber: 101 },
+          }),
+        ],
+        runs: [
+          run({
+            id: "run-a",
+            agentName: "alpha",
+            startedAt: "2026-10-01T00:10:00.000Z",
+            finishedAt: "2026-10-01T00:50:00.000Z",
+            executionMetadata: { model: "m-old" },
+          }),
+          run({
+            id: "run-b",
+            agentName: "alpha",
+            startedAt: "2026-10-01T01:10:00.000Z",
+            finishedAt: "2026-10-01T02:00:00.000Z",
+            executionMetadata: { model: "m-new" },
+          }),
+        ],
+      }),
+      NOW,
+    );
+
+    // Both runs land on the SAME attempt; the union must still see the
+    // intra-attempt change through the chain's distinct value sets.
+    expect(s.cohortKeys.model).toBe("mixed");
+    expect(s.mixedSettings).toBe(true);
+    expect(s.settings.model).toBeNull();
+  });
+
   // ── 4. missing claim ──────────────────────────────────────────────────────
 
   it("marks missing claim and nulls intervals when no claim event exists", () => {

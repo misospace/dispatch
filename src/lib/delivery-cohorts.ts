@@ -27,6 +27,7 @@ import {
   type WorkAttemptPrFixItemRecord,
   type WorkAttemptRunRecord,
   type WorkItemAttemptExecutionMetadata,
+  type WorkItemExecutionMetadataField,
 } from "./work-attempt-chain";
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -191,7 +192,7 @@ const SETTING_DIMENSIONS: readonly CohortGroupDimension[] = [
   "runtimeRevision",
 ];
 
-const METADATA_FIELD: Record<string, keyof WorkItemAttemptExecutionMetadata> = {
+const METADATA_FIELD: Record<string, WorkItemExecutionMetadataField> = {
   worker: "workerProduct",
   model: "model",
   reasoningEffort: "reasoningEffort",
@@ -216,7 +217,7 @@ export const COHORT_DEFINITIONS: Readonly<Record<string, string>> = Object.freez
   observedWaits: "waiting buckets shown separately ONLY where observed: pickupMs = first claim → first observed execution-run start (queue/pickup); inReviewMs = union of status/in-review label intervals from the lifecycle event stream; blockedMs = union of status/blocked label intervals (human wait); fixQueuedMs = PR-fix queue time until the first fix-run start per queue item. An interval counts only when both boundaries are observed; a bucket with no evidence is null, never zero",
   unclassified: "claimToDoneMs minus the union of all classified intervals (the item's observed run intervals plus the observed wait buckets, clipped to the claim→done window), clamped at zero; overlapping classifications subtract once, and the per-bucket totals stay per-category for presentation only; waiting time without label/run/queue evidence (for example CI waiting with no status label or queue row) stays unclassified instead of being attributed to a named bucket",
   load: "maxConcurrentRuns = maximum number of overlapping positive-length execution-run intervals observed inside the cohort; a load confounder surfaced alongside cohort stats, never a causal claim",
-  settings: "cohort keys and mixed labels are derived across ALL attempts; a lifecycle spanning settings is mixed, never attributed to the setting active at merge",
+  settings: "cohort keys and mixed labels are derived across ALL attempts and each attempt's distinct per-field value sets (a setting that changed inside one attempt counts); a lifecycle spanning settings is mixed, never attributed to the setting active at merge",
 });
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -375,10 +376,13 @@ function statusLabelIntervals(
  *
  * The four settings dimensions (worker, model, reasoningEffort,
  * runtimeRevision) and cohortLabel are read across ALL attempts (execution
- * and fix rounds). A dimension with >1 distinct non-null values is "mixed";
- * zero distinct values is "unknown". The `settings` object carries the
- * single value for each of the four settings fields, or null when the
- * dimension is mixed or unknown.
+ * and fix rounds), unioning each attempt's DISTINCT per-field value sets
+ * (#1423), so a setting that changed INSIDE one attempt (a claim re-run
+ * under a different model) counts exactly like a change observed across two
+ * attempts. A dimension with >1 distinct non-null values is "mixed"; zero
+ * distinct values is "unknown". The `settings` object carries the single
+ * value for each of the four settings fields, or null when the dimension is
+ * mixed or unknown.
  *
  * Repository and taskType are single-valued per issue and never mix.
  */
@@ -413,9 +417,12 @@ function deriveCohortKeys(
     const field = METADATA_FIELD[dim];
     const values = new Set<string>();
     for (const attempt of attempts) {
-      const value = attempt.executionMetadata[field];
-      if (value !== null && value.length > 0) {
-        values.add(value);
+      // Union the attempt's distinct set, not its first-non-null scalar:
+      // the scalar alone would hide an intra-attempt setting change (#1423).
+      for (const value of attempt.executionMetadata.distinctValues[field]) {
+        if (value.length > 0) {
+          values.add(value);
+        }
       }
     }
     if (values.size === 1) {

@@ -421,7 +421,7 @@ export async function GET(request: NextRequest) {
     // (events/runs/PR-fix); it must NOT be attributed to the candidate-issue
     // read, whose cap has its own flag and note.
     notes.push(
-      "Setting changes observed only per attempt: an attempt that restarted under a different runtime keeps its first observed setting, so intra-attempt config changes are not detected.",
+      "Setting changes are detected per distinct value per attempt, including changes inside one attempt: a run set that restarted under a different model marks the dimension mixed and the per-attempt scalar stays the first observed value (never the setting at merge).",
       "Wait buckets (pickup, in-review, blocked, fix-queued) count only intervals with both boundaries observed from status labels, run starts, or queue rows; waiting time without such evidence (CI waiting included) stays unclassified, never attributed to a named bucket.",
     );
     if (eventsTruncated) notes.push("Event read hit its row cap; some items have partial event history.");
