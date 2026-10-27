@@ -60,45 +60,56 @@ async function generateCspNonce(): Promise<string> {
   return btoa(String.fromCharCode(...bytes));
 }
 
-async function applySecurityHeaders(request: NextRequest, response: NextResponse): Promise<void> {
-  // The CSP is only enforced outside development. In `next dev` (Next 16.2)
-  // the proxy is invoked several times per document request (4, verified),
-  // and each invocation's response CSP header is accumulated onto the same
-  // outgoing response: 4 headers with 4 different random nonces. The browser
-  // combines multiple CSP headers by intersecting same-named directive
-  // source lists, so script-src collapses to 'self' alone and the framework's
-  // own nonce-stamped scripts are blocked — the dev server's hydration dies
-  // for a reason that cannot be fixed from inside the proxy (each pass sees
-  // the original incoming request, so no per-request identity lets the passes
-  // agree on a value, and a stable value is exactly what a nonce must not
-  // be). Not enforcing the CSP in dev is strictly better than enforcing a
-  // broken one: dev is local, and the deployment target (`next start`) gets
-  // the full policy. If Next fixes the dev multi-pass behaviour, the gate
-  // can be removed.
-  if (process.env.NODE_ENV !== "development") {
-    const nonce = await generateCspNonce();
-
-    // The policy the browser enforces: same-origin scripts plus this
-    // response's nonce. Our own page markup carries no inline scripts (the
-    // theme initialiser is a static file, see src/app/layout.tsx); the nonce
-    // exists for the framework's inline scripts.
-    response.headers.set("Content-Security-Policy", CSP_TEMPLATE.replace("__NONCE__", nonce));
-
-    // The nonce the framework's own inline scripts will carry. Next's App
-    // Router reads a nonce from the *incoming request's* content-security-policy
-    // header and stamps it onto the inline scripts it emits itself (the RSC
-    // flight payload, the preinit script) — see parseRequestHeaders /
-    // getScriptNonceFromHeader in next/dist/server/app-render. Without this
-    // header those scripts are emitted without a nonce and script-src 'self'
-    // blocks them, so hydration fails regardless of our own markup. This is
-    // the same pattern Next documents for edge proxies that set the CSP; the
-    // proxy just plays the proxy's role in-process.
-    request.headers.set("content-security-policy", `script-src 'nonce-${nonce}'`);
-  }
-
+function applyStaticSecurityHeaders(response: NextResponse): void {
   for (const [key, value] of Object.entries(SECURITY_HEADERS)) {
     response.headers.set(key, value);
   }
+}
+
+async function applySecurityHeaders(response: NextResponse): Promise<void> {
+  // Redirect/401 responses do not render an App Router document, so they only
+  // need the browser-facing policy. Pass-through responses use
+  // nextResponseWithSecurityHeaders so the same policy is also forwarded to
+  // the renderer.
+  if (process.env.NODE_ENV !== "development") {
+    const nonce = await generateCspNonce();
+    response.headers.set("Content-Security-Policy", CSP_TEMPLATE.replace("__NONCE__", nonce));
+  }
+  applyStaticSecurityHeaders(response);
+}
+
+async function nextResponseWithSecurityHeaders(request: NextRequest): Promise<NextResponse> {
+  // The CSP is only enforced outside development. In `next dev` (Next 16.2)
+  // the proxy is invoked several times per document request and accumulates
+  // divergent nonce policies, so development keeps only the static headers.
+  if (process.env.NODE_ENV === "development") {
+    const response = NextResponse.next();
+    applyStaticSecurityHeaders(response);
+    return response;
+  }
+
+  const nonce = await generateCspNonce();
+  const csp = CSP_TEMPLATE.replace("__NONCE__", nonce);
+
+  // Mutating NextRequest headers in place is not the middleware forwarding
+  // contract. Next only exposes overridden request headers to the App Router
+  // renderer when they are supplied through NextResponse.next({ request }).
+  // The renderer reads this CSP and stamps the nonce onto its inline RSC
+  // flight scripts.
+  const requestHeaders = new Headers(request.headers);
+  requestHeaders.set("content-security-policy", csp);
+
+  const response = NextResponse.next({
+    request: {
+      headers: requestHeaders,
+    },
+  });
+
+  // The browser must enforce the exact policy the renderer saw. If these
+  // diverge, the page still server-renders but React hydration is blocked.
+  response.headers.set("Content-Security-Policy", csp);
+  applyStaticSecurityHeaders(response);
+  return response;
 }
 
 function getAuthMode(): AuthMode {
@@ -207,9 +218,7 @@ export async function middleware(request: NextRequest) {
   // CSP whose nonce its own inline scripts carry. It was previously excluded
   // from the matcher entirely and shipped with no security headers at all.
   if (request.nextUrl.pathname === "/login" || request.nextUrl.pathname.startsWith("/login/")) {
-    const response = NextResponse.next();
-    await applySecurityHeaders(request, response);
-    return response;
+    return nextResponseWithSecurityHeaders(request);
   }
 
   // Static assets (favicon, theme-init script, Next.js chunks) must load
@@ -223,23 +232,17 @@ export async function middleware(request: NextRequest) {
     request.nextUrl.pathname.startsWith("/_next/static/") ||
     request.nextUrl.pathname.startsWith("/_next/image")
   ) {
-    const response = NextResponse.next();
-    await applySecurityHeaders(request, response);
-    return response;
+    return nextResponseWithSecurityHeaders(request);
   }
 
   // "disabled" mode — no enforcement
   if (authMode === "disabled") {
-    const response = NextResponse.next();
-    await applySecurityHeaders(request, response);
-    return response;
+    return nextResponseWithSecurityHeaders(request);
   }
 
   if (authMode === "oidc") {
     if (isApiRoute) {
-      const response = NextResponse.next();
-      await applySecurityHeaders(request, response);
-      return response;
+      return nextResponseWithSecurityHeaders(request);
     }
 
     const token = await getToken({
@@ -248,23 +251,19 @@ export async function middleware(request: NextRequest) {
       secureCookie: shouldUseSecureAuthCookie(request),
     });
     if (token) {
-      const response = NextResponse.next();
-      await applySecurityHeaders(request, response);
-      return response;
+      return nextResponseWithSecurityHeaders(request);
     }
 
     const loginUrl = new URL("/login", request.url);
     loginUrl.searchParams.set("callbackUrl", request.nextUrl.pathname + request.nextUrl.search);
     const redirectResponse = NextResponse.redirect(loginUrl);
-    await applySecurityHeaders(request, redirectResponse);
+    await applySecurityHeaders(redirectResponse);
     return redirectResponse;
   }
 
   // No auth mode set (legacy) — no middleware enforcement; routes handle their own auth
   if (!authMode) {
-    const response = NextResponse.next();
-    await applySecurityHeaders(request, response);
-    return response;
+    return nextResponseWithSecurityHeaders(request);
   }
 
   // The GitHub webhooks (pr-followup, issues) authenticate via HMAC signature
@@ -277,9 +276,7 @@ export async function middleware(request: NextRequest) {
     request.nextUrl.pathname.startsWith("/api/pr-followup/webhook") ||
     request.nextUrl.pathname.startsWith("/api/issues/webhook");
   if (isWebhookRoute && process.env.WEBHOOK_SECRET) {
-    const response = NextResponse.next();
-    await applySecurityHeaders(request, response);
-    return response;
+    return nextResponseWithSecurityHeaders(request);
   }
 
   const authHeader = request.headers.get("authorization");
@@ -294,15 +291,11 @@ export async function middleware(request: NextRequest) {
   // enforcing the tier itself is the route handler's job.
   if (isBasicAuthorized(authHeader)) {
     resetRateLimitKey(`basic-auth:${trustedClientIp(request.headers)}`);
-    const response = NextResponse.next();
-    await applySecurityHeaders(request, response);
-    return response;
+    return nextResponseWithSecurityHeaders(request);
   }
 
   if (isApiRoute && isBearerAuthorized(authHeader)) {
-    const response = NextResponse.next();
-    await applySecurityHeaders(request, response);
-    return response;
+    return nextResponseWithSecurityHeaders(request);
   }
 
   // A request with a syntactically valid Basic credential pair but the wrong
@@ -313,14 +306,14 @@ export async function middleware(request: NextRequest) {
     const ip = trustedClientIp(request.headers);
     const lockedResponse = enforceRateLimit(`basic-auth:${ip}`, BASIC_AUTH_RATE_LIMIT);
     if (lockedResponse) {
-      await applySecurityHeaders(request, lockedResponse);
+      await applySecurityHeaders(lockedResponse);
       return lockedResponse;
     }
   }
 
   // No valid credentials — reject
   const unauthorizedResp = unauthorizedResponse(request);
-  await applySecurityHeaders(request, unauthorizedResp);
+  await applySecurityHeaders(unauthorizedResp);
   return unauthorizedResp;
 }
 

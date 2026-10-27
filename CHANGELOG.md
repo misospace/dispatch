@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.5.73](https://github.com/misospace/dispatch/compare/v0.5.72...v0.5.73) (2026-10-27)
+
+
+### Features
+
+* **deps:** update dependency lucide-react (1.61.0 → 1.62.0) ([#1449](https://github.com/misospace/dispatch/issues/1449)) ([e11db74](https://github.com/misospace/dispatch/commit/e11db74d0dcbd3b765c7c746b8a546e5383e6009))
+* **observability:** alert when enforced grooming admission starves the ready queue ([#1420](https://github.com/misospace/dispatch/issues/1420)) ([#1438](https://github.com/misospace/dispatch/issues/1438)) ([63616b9](https://github.com/misospace/dispatch/commit/63616b9541cb5698232e85291a52f4848dd62792))
+
+
+### Bug Fixes
+
+* **agent-work:** exclude dispositioned leases from the stale-lease listing ([#1445](https://github.com/misospace/dispatch/issues/1445)) ([6e439fe](https://github.com/misospace/dispatch/commit/6e439fe60e296689fbf22abc897887c25a3f8b90))
+* **agent-work:** exclude dispositioned leases from the stale-lease listing ([#1445](https://github.com/misospace/dispatch/issues/1445)) ([6a8b543](https://github.com/misospace/dispatch/commit/6a8b543c37f4821ac410d1a6ef514fdf030f0336))
+* **csp:** forward nonce policy to the App Router renderer ([#1450](https://github.com/misospace/dispatch/issues/1450)) ([c363a48](https://github.com/misospace/dispatch/commit/c363a48af9d7a16a3fba1489c0f82efad5f3d720))
+* **ownership:** tombstone expired leases so dead claims stay recoverable ([#1417](https://github.com/misospace/dispatch/issues/1417)) ([#1443](https://github.com/misospace/dispatch/issues/1443)) ([6e531ac](https://github.com/misospace/dispatch/commit/6e531acd5ae0a8b8fcb0e605097b6d29930a6da8))
+
+
+### Chores
+
+* **deps:** lock file maintenance ([#1441](https://github.com/misospace/dispatch/issues/1441)) ([8c3f9d6](https://github.com/misospace/dispatch/commit/8c3f9d63b5cef3fc2eb25ed97e75dc3183350b25))
+* **observability:** index GroomingRun (status, dryRun, stage, completedAt) for the [#1420](https://github.com/misospace/dispatch/issues/1420) stall-baseline query ([#1437](https://github.com/misospace/dispatch/issues/1437)) ([#1448](https://github.com/misospace/dispatch/issues/1448)) ([d5023cd](https://github.com/misospace/dispatch/commit/d5023cd0853fd7977384cbd92450a76e9acf3848))
+
 ## [0.5.72](https://github.com/misospace/dispatch/compare/v0.5.71...v0.5.72) (2026-10-26)
 
 

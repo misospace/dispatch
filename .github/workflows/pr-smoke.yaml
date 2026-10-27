@@ -148,45 +148,44 @@ jobs:
       - name: Inline scripts survive the CSP
         run: |
           URL="http://dispatch-${INSTANCE}.${NS}:3000"
-          POD="csp-${INSTANCE}-$RANDOM"
 
-          # Fetch from INSIDE the cluster, not from the runner.
-          #
-          # The runner is a long-lived pod in another namespace. When the app's
-          # pod restarts its IP changes, and the runner's connection to the
-          # Service then times out while fresh in-cluster pods reach the same
-          # address fine — observed repeatedly: the health gate above passed
-          # three times from throwaway pods at :31, :39 and :47, and the
-          # runner's own fetch timed out at :48 against a pod that was still
-          # 1/1 Running with no further restart. That asymmetry failed this
-          # assertion without anything being wrong with the app.
-          #
-          # A throwaway pod per run removes the runner's connection state from
-          # the equation entirely. curl -i keeps headers and body in ONE
-          # request, so the CSP header and the scripts it governs are
-          # guaranteed to describe the same response.
-          kubectl run "$POD" -n "$NS" --restart=Never --attach=false \
-            --image=curlimages/curl:latest --command -- \
-            curl -sSi --max-time 20 "$URL/"
+          # Hydration failures can be route-specific when rendering mode drifts,
+          # so exercise the interactive surfaces that exposed the production
+          # bug instead of proving only that the root document works.
+          for route in / /login /automation /groomer; do
+            slug=$(printf '%s' "$route" | tr -cd '[:alnum:]')
+            [ -n "$slug" ] || slug=root
+            POD="csp-${INSTANCE}-${slug}-$RANDOM"
+            RESPONSE="response-${slug}.http"
 
-          # --attach=false because the runner's Role has pods/log but not
-          # pods/attach; `kubectl run -i` silently degrades and loses output.
-          for _ in $(seq 1 30); do
-            phase=$(kubectl get pod "$POD" -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-            case "$phase" in Succeeded|Failed) break;; esac
-            sleep 2
+            # Fetch from INSIDE the cluster, not from the long-lived runner.
+            # curl -i keeps headers and body in one request, so the CSP header
+            # and the scripts it governs describe the exact same response.
+            kubectl run "$POD" -n "$NS" --restart=Never --attach=false \
+              --image=curlimages/curl:latest --command -- \
+              curl -sSi --max-time 20 "$URL$route"
+
+            # --attach=false because the runner's Role has pods/log but not
+            # pods/attach; `kubectl run -i` silently degrades and loses output.
+            phase=""
+            for _ in $(seq 1 30); do
+              phase=$(kubectl get pod "$POD" -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+              case "$phase" in Succeeded|Failed) break;; esac
+              sleep 2
+            done
+
+            kubectl logs "$POD" -n "$NS" > "$RESPONSE" || true
+            kubectl delete pod "$POD" -n "$NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+
+            if [ ! -s "$RESPONSE" ]; then
+              echo "::error::in-cluster fetch for $route produced no response (pod phase: ${phase:-unknown})"
+              kubectl get pod -n "$NS" -l "app=dispatch-${INSTANCE}" -o wide || true
+              exit 1
+            fi
+
+            echo "checking CSP hydration contract for $route"
+            node scripts/smoke-csp.mjs --raw-response "$RESPONSE"
           done
-
-          kubectl logs "$POD" -n "$NS" > response.http || true
-          kubectl delete pod "$POD" -n "$NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-
-          if [ ! -s response.http ]; then
-            echo "::error::in-cluster fetch produced no response (pod phase: ${phase:-unknown})"
-            kubectl get pod -n "$NS" -l "app=dispatch-${INSTANCE}" -o wide || true
-            exit 1
-          fi
-
-          node scripts/smoke-csp.mjs --raw-response response.http
 
       - name: Sync does not wedge on a stale lock
         run: |

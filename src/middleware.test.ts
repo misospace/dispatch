@@ -640,14 +640,12 @@ describe("security headers", () => {
     expect(scriptSrc).not.toContain("'unsafe-inline'");
   });
 
-  it("passes the same nonce to the framework via the request CSP header", async () => {
-    // The App Router's own inline scripts (the RSC flight payload) are only
-    // unblocked if the framework stamps its nonce on them. Next reads that
-    // nonce from the *incoming request's* content-security-policy header
-    // (parseRequestHeaders / getScriptNonceFromHeader in next's app-render),
-    // so the middleware forwards its generated nonce there. The two must
-    // agree: a divergent request nonce means every flight script is blocked
-    // and hydration fails on every page.
+  it("forwards the same CSP to the App Router through Next's request-header override", async () => {
+    // Mutating the NextRequest object in memory is not enough: Next forwards
+    // request headers to the App Router only through the
+    // NextResponse.next({ request: { headers } }) override envelope. Assert
+    // that envelope directly so this test fails if the browser-facing nonce
+    // is no longer the nonce the renderer sees.
     process.env.DISPATCH_AUTH_MODE = "disabled";
 
     const req = makeRequest("/board");
@@ -656,8 +654,15 @@ describe("security headers", () => {
     const responseCsp = res.headers.get("content-security-policy") ?? "";
     const responseNonce = responseCsp.match(/'nonce-([^']+)'/)?.[1];
     expect(responseNonce).toBeTruthy();
-    expect(req.headers.get("content-security-policy")).toBe(
-      `script-src 'nonce-${responseNonce}'`,
+
+    // The original request is untouched; forwarding is explicit in the
+    // middleware response envelope consumed by Next.
+    expect(req.headers.get("content-security-policy")).toBeNull();
+    expect(res.headers.get("x-middleware-override-headers")).toContain(
+      "content-security-policy",
+    );
+    expect(res.headers.get("x-middleware-request-content-security-policy")).toBe(
+      responseCsp,
     );
   });
 
