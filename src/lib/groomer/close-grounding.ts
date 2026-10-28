@@ -36,8 +36,13 @@ import type { EvidenceCatalog, EvidenceCatalogEntry } from "./plan-evidence";
  */
 export interface PinnedReadContent {
   headSha: string | null;
-  /** Path to whitespace-normalised content, as read at `headSha`. */
-  files: ReadonlyMap<string, string>;
+  /**
+   * Path to the whitespace-normalised segments read at `headSha`.
+   * A bounded ranged read (dispatch#1451) contributes one segment per read;
+   * excerpts are checked against each segment on its own and never across
+   * an unseen gap between two ranges.
+   */
+  files: ReadonlyMap<string, string[]>;
 }
 
 export interface PinnedRead {
@@ -65,26 +70,32 @@ export function normalizeWhitespace(text: string): string {
 
 /**
  * Build the run's pinned content store. Reads at any other ref, or when the
- * run has no pinned head, are dropped. When a path was read more than once
- * (the same file, truncated differently) the longest read is kept.
+ * run has no pinned head, are dropped. A path read more than once keeps its
+ * distinct segments (dispatch#1451: head, tail and middle reads of one file
+ * each ground their own excerpts); a segment contained in another is folded
+ * away, and segments are never concatenated across an unseen gap.
  */
 export function collectPinnedReadContent(
   headSha: string | null,
   reads: PinnedRead[],
   maxBytes = MAX_PINNED_CONTENT_BYTES,
 ): PinnedReadContent {
-  const files = new Map<string, string>();
+  const files = new Map<string, string[]>();
   if (!headSha) return { headSha: null, files };
   let total = 0;
   for (const read of reads) {
     if (read.ref !== headSha || !read.path || !read.content) continue;
     const normalized = normalizeWhitespace(read.content);
-    const existing = files.get(read.path);
-    if (existing !== undefined && existing.length >= normalized.length) continue;
-    const delta = Buffer.byteLength(normalized, "utf8") - (existing ? Buffer.byteLength(existing, "utf8") : 0);
-    if (total + delta > maxBytes) continue;
-    files.set(read.path, normalized);
-    total += delta;
+    if (!normalized) continue;
+    const segments = files.get(read.path) ?? [];
+    if (segments.some((segment) => segment.includes(normalized))) continue;
+    const kept = segments.filter((segment) => !normalized.includes(segment));
+    const before = segments.reduce((sum, segment) => sum + Buffer.byteLength(segment, "utf8"), 0);
+    const after = kept.reduce((sum, segment) => sum + Buffer.byteLength(segment, "utf8"), 0)
+      + Buffer.byteLength(normalized, "utf8");
+    if (total - before + after > maxBytes) continue;
+    files.set(read.path, [...kept, normalized]);
+    total += after - before;
   }
   return { headSha, files };
 }
@@ -447,8 +458,8 @@ export function evaluateCloseGrounding(
       errors.push(`${at}.evidenceRef: ${path} was not read at the pinned head SHA`);
       return;
     }
-    const text = content.headSha === pinnedHead ? content.files.get(path) : undefined;
-    if (text === undefined) {
+    const segments = content.headSha === pinnedHead ? content.files.get(path) : undefined;
+    if (segments === undefined || segments.length === 0) {
       errors.push(`${at}.evidenceRef: the content of ${path} as read at the pinned head is not available to check the excerpt against`);
       return;
     }
@@ -464,7 +475,7 @@ export function evaluateCloseGrounding(
       return;
     }
     const excerpt = normalizeWhitespace(c.excerpt);
-    if (!text.includes(excerpt)) {
+    if (!segments.some((segment) => segment.includes(excerpt))) {
       errors.push(
         `${at}.excerpt: not found verbatim in ${path} as read at ${pinnedHead.slice(0, 12)} (exact substring after collapsing whitespace); quote the file, do not paraphrase`,
       );

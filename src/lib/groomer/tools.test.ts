@@ -845,6 +845,30 @@ describe("executeGroomerTool read_file bounded ranges (dispatch#1451)", () => {
     expect(result.bytes).toBe(Buffer.byteLength(result.content, "utf8"));
   });
 
+  it("rejects non-numeric range argument types instead of reading unbounded", async () => {
+    for (const bad of [true, {}, [], 1e400]) {
+      const deps = makeDeps({ readFile: vi.fn().mockResolvedValue(longFile(5)) });
+      const result = await executeGroomerTool(
+        { name: "read_file", arguments: { path: "a.ts", startLine: bad } },
+        options,
+        deps,
+      );
+      expect(result.ok).toBe(false);
+      expect(deps.readFile).not.toHaveBeenCalled();
+    }
+  });
+
+  it("counts a trailing newline as a terminator, not an empty final line", async () => {
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue(`${longFile(5)}\n`) });
+    const result = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "t.ts", startLine: 4 } },
+      options,
+      deps,
+    );
+    expect(result.content).toContain("(lines 4-5 of 5)");
+    expect(result.content).toContain("end of file");
+  });
+
   it("answers a startLine past the end without claiming file content", async () => {
     const deps = makeDeps({ readFile: vi.fn().mockResolvedValue(longFile(3)) });
     const result = await executeGroomerTool(
@@ -855,6 +879,7 @@ describe("executeGroomerTool read_file bounded ranges (dispatch#1451)", () => {
     expect(result.ok).toBe(true);
     expect(result.content).toContain("past the end of the file (3 line(s))");
     expect(result.file).toBeUndefined();
+    expect(result.sources).toEqual([]);
   });
 
   it("keeps the pinned-revision evidence identity for ranged reads", async () => {
@@ -923,7 +948,7 @@ describe("executeGroomerTool search failure vs true absence (dispatch#1451)", ()
   it("treats a failed search as an outage with a bounded fallback, not absence", async () => {
     const deps = makeDeps({
       searchCode: vi.fn().mockRejectedValue(
-        new Error("Code search failed for org/repo: search timed out with incomplete results and no matches"),
+        new Error("Code search failed for org/repo: 502 <html>\n<body>" + "x".repeat(5000) + "</body>"),
       ),
     });
     const result = await executeGroomerTool(
@@ -935,6 +960,9 @@ describe("executeGroomerTool search failure vs true absence (dispatch#1451)", ()
     expect(result.content).toContain("not evidence the code is missing");
     expect(result.content).toContain("list_directory");
     expect(result.content).not.toContain("No matches");
+    // Upstream bodies reach the model only collapsed and length-bounded.
+    expect(result.content).not.toContain("\n");
+    expect(result.content.length).toBeLessThan(700);
     expect(result.warnings?.[0]).toContain("bounded directory/file fallback");
   });
 

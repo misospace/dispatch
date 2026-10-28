@@ -119,7 +119,7 @@ describe("parseAcceptanceCriteria", () => {
 });
 
 describe("collectPinnedReadContent", () => {
-  it("keeps only reads at the pinned head, normalised, preferring the longest read of a path", () => {
+  it("keeps only reads at the pinned head, normalised, folding contained repeats of a path", () => {
     const store = collectPinnedReadContent(HEAD, [
       { path: "a.ts", ref: HEAD, content: "one\n  two" },
       { path: "a.ts", ref: HEAD, content: "one\n  two\nthree" },
@@ -127,8 +127,16 @@ describe("collectPinnedReadContent", () => {
       { path: "b.ts", ref: "main", content: "default branch read" },
       { path: "c.ts", ref: null, content: "unpinned" },
     ]);
-    expect([...store.files.entries()]).toEqual([["a.ts", "one two three"]]);
+    expect([...store.files.entries()]).toEqual([["a.ts", ["one two three"]]]);
     expect(collectPinnedReadContent(null, [{ path: "a.ts", ref: null, content: "x" }]).files.size).toBe(0);
+  });
+
+  it("keeps disjoint head/tail range segments of one path (dispatch#1451)", () => {
+    const store = collectPinnedReadContent(HEAD, [
+      { path: "a.ts", ref: HEAD, content: "head segment" },
+      { path: "a.ts", ref: HEAD, content: "tail segment" },
+    ]);
+    expect(store.files.get("a.ts")).toEqual(["head segment", "tail segment"]);
   });
 
   it("is bounded", () => {
@@ -211,6 +219,25 @@ describe("evaluateCloseGrounding", () => {
       errors: [],
       closingPullRequest: null,
     });
+  });
+
+  it("grounds an excerpt taken from a bounded tail read, not just the head read (dispatch#1451)", () => {
+    const headRead = "function alpha() {\n  return alphaConfig.enabled && verbose;";
+    const tailRead = "function omega() {\n  return omegaFallback.active || legacyMode;\n}";
+    const segmented = buildEvidenceCatalog(
+      snapshot(),
+      collectPinnedReadContent(HEAD, [
+        { path: "src/sync.ts", ref: HEAD, content: headRead },
+        { path: "src/sync.ts", ref: HEAD, content: tailRead },
+      ]),
+    );
+    expect(
+      evaluateCloseGrounding({ evidenceRefs: [], criteria: [criterion("omegaFallback.active || legacyMode")] }, segmented).errors,
+    ).toEqual([]);
+    // An excerpt crossing the unseen gap between two segments matches nothing.
+    expect(
+      evaluateCloseGrounding({ evidenceRefs: [], criteria: [criterion("verbose; function omega()")] }, segmented).errors[0],
+    ).toContain("not found verbatim in src/sync.ts");
   });
 
   it("rejects an excerpt that refers to another issue, but not one naming this issue", () => {

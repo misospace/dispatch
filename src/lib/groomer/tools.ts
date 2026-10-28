@@ -316,14 +316,27 @@ export const MAX_READ_LINES = 500;
 
 /**
  * Parse a line-range argument: undefined when absent or blank (the model may
- * send ""), null when present but not a positive whole number.
+ * send ""), null when present but not a positive whole number. Anything that
+ * is not a number or a string is rejected rather than silently read as
+ * absent — a garbled argument should teach the model, not change behavior.
  */
 function asLineNumber(value: unknown): number | undefined | null {
   if (value === undefined || value === null) return undefined;
-  if (typeof value === "number") return Number.isInteger(value) && value >= 1 ? value : null;
-  const raw = asString(value).trim();
+  if (typeof value === "number") return Number.isSafeInteger(value) && value >= 1 ? value : null;
+  if (typeof value !== "string") return null;
+  const raw = value.trim();
   if (raw === "") return undefined;
-  return /^\d+$/.test(raw) && parseInt(raw, 10) >= 1 ? parseInt(raw, 10) : null;
+  if (!/^\d+$/.test(raw)) return null;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(parsed) && parsed >= 1 ? parsed : null;
+}
+
+/**
+ * A trailing newline is a line terminator, not an empty final line. One
+ * definition of "line" for both the EOF check and the range render.
+ */
+function fileLines(text: string): string[] {
+  return text.endsWith("\n") ? text.slice(0, -1).split("\n") : text.split("\n");
 }
 
 /**
@@ -345,9 +358,11 @@ function renderLineRange(
   totalLines: number;
   hasMore: boolean;
   clamped: boolean;
+  lineTooLarge: boolean;
 } {
-  const lines = text.split("\n");
+  const lines = fileLines(text);
   const totalLines = lines.length;
+  const clamped = lineCount > MAX_READ_LINES;
   const bodyLines: string[] = [];
   let usedBytes = 0;
   for (let i = startLine - 1; i < startLine - 1 + lineCount && i < totalLines; i++) {
@@ -365,8 +380,9 @@ function renderLineRange(
       body: cut.text,
       lastShown: startLine,
       totalLines,
-      hasMore: cut.truncated ? true : startLine < totalLines,
-      clamped: lineCount > MAX_READ_LINES,
+      hasMore: cut.truncated || startLine < totalLines,
+      clamped,
+      lineTooLarge: cut.truncated,
     };
   }
   const lastShown = startLine - 1 + bodyLines.length;
@@ -375,7 +391,8 @@ function renderLineRange(
     lastShown,
     totalLines,
     hasMore: lastShown < totalLines,
-    clamped: lineCount > MAX_READ_LINES,
+    clamped,
+    lineTooLarge: false,
   };
 }
 
@@ -565,7 +582,12 @@ export async function executeGroomerTool(
           // retrying global search burns the round budget. Offer the bounded
           // fallback instead: named paths and directory listings through the
           // existing read capability, which stays under the same byte budgets.
-          const message = err instanceof Error ? err.message : String(err);
+          // Upstream bodies can be a full HTML page; collapse to one short line
+          // (same fence as summarizeErrorBody in github-code-search).
+          const message = (err instanceof Error ? err.message : String(err))
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, 200);
           const content =
             `search_code failed: ${message} This is a search outage or timeout, not evidence the code ` +
             "is missing — repeating the search will not help. Finish the investigation with bounded " +
@@ -622,14 +644,16 @@ export async function executeGroomerTool(
         // range arguments the call behaves exactly as before.
         if (startLineArg !== undefined || lineCountArg !== undefined) {
           const startLine = startLineArg ?? 1;
-          const lines = text.split("\n");
-          if (startLine > lines.length) {
-            const content = `${path}: startLine ${startLine} is past the end of the file (${lines.length} line(s)).`;
+          const totalLines = fileLines(text).length;
+          if (startLine > totalLines) {
+            // Nothing was shown, so the path is not reported as read: an
+            // answered coordinate is not fetch evidence.
+            const content = `${path}: startLine ${startLine} is past the end of the file (${totalLines} line(s)).`;
             return {
               ok: true,
               content,
               bytes: Buffer.byteLength(content, "utf8"),
-              sources: [path],
+              sources: [],
             };
           }
           const range = renderLineRange(
@@ -641,14 +665,16 @@ export async function executeGroomerTool(
           let header = `${path} (lines ${startLine}-${range.lastShown} of ${range.totalLines}`;
           if (range.clamped) header += `, line count capped at ${MAX_READ_LINES}`;
           header += "):";
-          // Continuation never claims a line past the end, and never claims
-          // more when the requested window ran out at EOF.
+          // Continuation never claims a line past the end, and a line cut
+          // mid-way says so instead of pretending the remainder was shown.
           let footer = "";
-          if (range.hasMore) {
+          if (range.lineTooLarge) {
             footer =
               range.lastShown < range.totalLines
-                ? `\n… continues at line ${range.lastShown + 1} (pass startLine=${range.lastShown + 1})`
-                : "\n… (this line exceeds the byte limit)";
+                ? `\n… (line ${range.lastShown} exceeds the byte limit; continues at line ${range.lastShown + 1})`
+                : `\n… (line ${range.lastShown} exceeds the byte limit)`;
+          } else if (range.hasMore) {
+            footer = `\n… continues at line ${range.lastShown + 1} (pass startLine=${range.lastShown + 1})`;
           } else {
             footer = "\n… end of file";
           }
