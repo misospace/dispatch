@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
 import type { GroomingCandidate } from "./selector";
-import type { GroomingPlanDraft } from "./plan";
+import type { GroomingPlanDraft, ReleaseSignal } from "./plan";
 import type { HostedGroomerConfig } from "./config";
 import type { ExploreResult } from "./explore";
 import type { GroomingEvidenceSnapshot } from "./evidence-snapshot";
@@ -192,6 +192,7 @@ type DraftPatch = {
   mutations?: Partial<GroomingPlanDraft["mutations"]>;
   decomposition?: GroomingPlanDraft["decomposition"];
   relatedWork?: GroomingPlanDraft["relatedWork"];
+  releaseSignal?: GroomingPlanDraft["releaseSignal"];
 };
 
 function planDraft(patch: DraftPatch = {}): GroomingPlanDraft {
@@ -201,6 +202,7 @@ function planDraft(patch: DraftPatch = {}): GroomingPlanDraft {
     mutations: { ...mockOutput.mutations, ...patch.mutations },
     decomposition: patch.decomposition ?? mockOutput.decomposition,
     relatedWork: patch.relatedWork ?? mockOutput.relatedWork,
+    releaseSignal: patch.releaseSignal,
   };
 }
 
@@ -4124,6 +4126,105 @@ Investigate session handling in auth module.`;
       expect(FAILED_RUN_PRIOR_FAILURES_TO_CAP).toBe(3);
       expect(failedRunBackoffMinutes(FAILED_RUN_PRIOR_FAILURES_TO_CAP)).toBeLessThan(FAILED_RUN_BACKOFF_MAX_MINUTES);
       expect(failedRunBackoffMinutes(FAILED_RUN_PRIOR_FAILURES_TO_CAP + 1)).toBe(FAILED_RUN_BACKOFF_MAX_MINUTES);
+    });
+  });
+
+  describe("release signal projection (dispatch#1481)", () => {
+    const signal: ReleaseSignal = {
+      kind: "feature",
+      headline: "Adds a tenant-scoped login redirect",
+      significance: "notable",
+      evidenceRefs: ["repo:src/auth/login.ts"],
+    };
+
+    function lastIssueUpdateData(): Record<string, unknown> {
+      const calls = mocks.prisma.issue.update.mock.calls;
+      expect(calls.length).toBeGreaterThan(0);
+      return (calls[calls.length - 1][0] as { data: Record<string, unknown> }).data;
+    }
+
+    it("a fresh applied groom persists the signal with provenance, and records it on the mutationPlan", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(planDraft({ releaseSignal: { ...signal } }));
+      const result = await runHostedGroomer();
+      expect(result!.appliedMutations?.outcome).toBe("applied");
+      const data = lastIssueUpdateData();
+      expect(data.releaseSignal).toMatchObject({
+        ...signal,
+        provenance: { groomingRunId: "gr-1", applicationKey: result!.mutationPlan!.applicationKey },
+      });
+      expect(result!.mutationPlan!.releaseSignal).toEqual(signal);
+    });
+
+    it("a plan without a signal persists releaseSignal null, clearing a stale projection", async () => {
+      await runHostedGroomer();
+      expect(lastIssueUpdateData().releaseSignal).toBeNull();
+    });
+
+    it("a signal-only re-groom is applied and the projection updates with the new run's provenance", async () => {
+      // Distinct run ids per run, so the persisted provenance shows who owns
+      // each projection write.
+      mocks.prisma.groomingRun.create.mockImplementation(
+        async () => ({ id: `gr-${mocks.prisma.groomingRun.create.mock.calls.length}`, stage: "selected" }),
+      );
+      mocks.callGroomerLLM.mockResolvedValue(planDraft({ releaseSignal: { ...signal, significance: "notable" } }));
+      await runHostedGroomer();
+      expect(lastIssueUpdateData().releaseSignal).toMatchObject({
+        kind: "feature",
+        significance: "notable",
+        provenance: { groomingRunId: "gr-1" },
+      });
+
+      // Only the signal changed: the new intent shape makes a fresh
+      // application key, so the groom is applied — not replayed — and the
+      // projection is overwritten wholesale with the new run's provenance.
+      mocks.callGroomerLLM.mockResolvedValue(planDraft({ releaseSignal: { ...signal, significance: "major" } }));
+      const result = await runHostedGroomer();
+      expect(result!.appliedMutations?.outcome).toBe("applied");
+      expect(lastIssueUpdateData().releaseSignal).toMatchObject({
+        kind: "feature",
+        significance: "major",
+        provenance: { groomingRunId: "gr-2" },
+      });
+    });
+
+    it("an identical re-groom replays and does not rewrite the projection", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(planDraft({ releaseSignal: { ...signal } }));
+      await runHostedGroomer();
+      mocks.prisma.issue.update.mockClear();
+      const result = await runHostedGroomer();
+      expect(result!.appliedMutations?.outcome).toBe("replayed");
+      for (const call of mocks.prisma.issue.update.mock.calls) {
+        const data = (call[0] as { data: Record<string, unknown> }).data;
+        expect(Object.keys(data).sort()).toEqual(["groomedAt", "groomedBy", "groomingRetryAfter"]);
+      }
+    });
+
+    it("an already_done groom carries the signal but acquires no delivery semantics", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("already_done", {
+          releaseSignal: { ...signal },
+          mutations: {
+            close: {
+              reason: "already_done",
+              rationale: "login.ts no longer has the step",
+              evidenceRefs: ["repo:src/auth/login.ts"],
+              criteria: GROUNDED_CRITERIA,
+            },
+          },
+        }),
+      );
+      const result = await runHostedGroomer();
+      expect(result!.appliedMutations?.outcome).toBe("applied");
+      const data = lastIssueUpdateData();
+      expect(data.releaseSignal).toMatchObject({ kind: "feature", provenance: { groomingRunId: "gr-1" } });
+      // Semantic-only: the persisted shape never carries a shipped/delivered field.
+      const serialized = JSON.stringify(data.releaseSignal).toLowerCase();
+      expect(serialized).not.toContain("shipped");
+      expect(serialized).not.toContain("delivered");
+      // Close behavior is unchanged: the row is closed locally exactly as before.
+      expect(data.state).toBe("closed");
+      expect(data.closedAt).toBeInstanceOf(Date);
+      expect(mocks.closeIssue).toHaveBeenCalledWith("org/repo", 42);
     });
   });
 });

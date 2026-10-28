@@ -6,11 +6,13 @@ import { collectPinnedReadContent } from "./close-grounding";
 import {
   GROOMING_PLAN_SCHEMA_VERSION,
   PLAN_LIMITS,
+  RELEASE_SIGNAL_KIND_VALUES,
   evaluateReadiness,
   toGroomerOutput,
   validateGroomingPlan,
   type GroomingPlan,
   type GroomingPlanDraft,
+  type ReleaseSignal,
 } from "./plan";
 
 function snapshot(overrides: Partial<GroomingEvidenceSnapshot> = {}): GroomingEvidenceSnapshot {
@@ -127,6 +129,7 @@ type DraftPatch = {
   mutations?: Partial<GroomingPlanDraft["mutations"]>;
   decomposition?: Partial<GroomingPlanDraft["decomposition"]>;
   relatedWork?: GroomingPlanDraft["relatedWork"];
+  releaseSignal?: GroomingPlanDraft["releaseSignal"];
 };
 
 function draft(patch: DraftPatch = {}): GroomingPlanDraft {
@@ -138,6 +141,7 @@ function draft(patch: DraftPatch = {}): GroomingPlanDraft {
     mutations: { ...base.mutations, ...patch.mutations },
     decomposition: { ...base.decomposition, ...patch.decomposition },
     relatedWork: patch.relatedWork ?? base.relatedWork,
+    releaseSignal: patch.releaseSignal,
   };
 }
 
@@ -934,5 +938,78 @@ describe("needs_info gap classification (dispatch#1452)", () => {
     expect(plan.verdict.lane.id).toBe("backlog");
     expect(plan.mutations.status).toBe("status/backlog");
     expect(plan.readiness.gapClass).toBe("investigation_incomplete");
+  });
+});
+
+describe("release signal (dispatch#1481)", () => {
+  const signal = (patch: Partial<ReleaseSignal> = {}): ReleaseSignal => ({
+    kind: "feature",
+    headline: "Adds a tenant-scoped login redirect to the dashboard",
+    significance: "notable",
+    evidenceRefs: ["repo:src/auth/login.ts"],
+    ...patch,
+  });
+
+  it("carries a valid signal of every kind and leaves readiness untouched", () => {
+    for (const kind of RELEASE_SIGNAL_KIND_VALUES) {
+      const plan = validPlan(draft({ releaseSignal: signal({ kind }) }));
+      expect(plan.releaseSignal).toEqual(signal({ kind }));
+      expect(plan.readiness.ready).toBe(true);
+    }
+    for (const significance of ["routine", "notable", "major"] as const) {
+      expect(validPlan(draft({ releaseSignal: signal({ significance }) })).releaseSignal?.significance).toBe(significance);
+    }
+  });
+
+  it("canonicalizes absent and explicitly null to null; the legacy shape still validates", () => {
+    // parseDraft always emits the key, so a validated plan canonicalizes an
+    // absent or null field to null.
+    expect(validPlan(readyDraft()).releaseSignal).toBeNull();
+    expect(validPlan(draft({ releaseSignal: null })).releaseSignal).toBeNull();
+    // A raw plan built before the field existed carries no releaseSignal key
+    // and still validates.
+    const legacy: Record<string, unknown> = { ...readyDraft() };
+    expect("releaseSignal" in legacy).toBe(false);
+    expect(validPlan(legacy).releaseSignal).toBeNull();
+  });
+
+  it("rejects an out-of-vocabulary kind or significance on the releaseSignal path", () => {
+    const kindErrors = expectInvalid(draft({ releaseSignal: signal({ kind: "shipped" as never }) }), "releaseSignal.kind: must be one of");
+    expect(kindErrors.some((e) => e.startsWith("releaseSignal.kind"))).toBe(true);
+    const significanceErrors = expectInvalid(
+      draft({ releaseSignal: signal({ significance: "huge" as never }) }),
+      "releaseSignal.significance: must be one of",
+    );
+    expect(significanceErrors.some((e) => e.startsWith("releaseSignal.significance"))).toBe(true);
+  });
+
+  it("rejects a headline over the bounded length", () => {
+    expectInvalid(
+      draft({ releaseSignal: signal({ headline: "x".repeat(PLAN_LIMITS.releaseHeadline + 1) }) }),
+      `releaseSignal.headline: must be at most ${PLAN_LIMITS.releaseHeadline} characters`,
+    );
+  });
+
+  it("rejects an unknown evidence reference in the signal", () => {
+    expectInvalid(
+      draft({ releaseSignal: signal({ evidenceRefs: ["repo:src/invented.ts"] }) }),
+      'releaseSignal.evidenceRefs[0]: unknown evidence reference "repo:src/invented.ts"',
+    );
+  });
+
+  it("validates signal refs against the catalog but never relies on them (semantic-only)", () => {
+    // Any evidence id is acceptable — issue, comment, repo or related work —
+    // with no required subject.
+    const plan = validPlan(
+      draft({ releaseSignal: signal({ evidenceRefs: ["issue", "github:pr:org/repo#12"] }) }),
+    );
+    expect(plan.releaseSignal?.evidenceRefs).toEqual(["issue", "github:pr:org/repo#12"]);
+    // The signal's refs never feed plan.citations, so they cannot drive
+    // deriveEvidenceReliance or the freshness baseline and make the signal
+    // operational. The verdict's own citations are unaffected.
+    const cited = plan.citations.map((c) => c.id);
+    expect(cited).not.toContain("issue");
+    expect(cited).not.toContain("github:pr:org/repo#12");
+    expect(cited).toEqual(["repo:src/auth/login.ts", "comment:101", "repo:src/auth/session.ts"]);
   });
 });

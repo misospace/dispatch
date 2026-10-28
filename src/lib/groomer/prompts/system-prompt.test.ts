@@ -223,6 +223,43 @@ describe("buildGroomerSystemPrompt", () => {
     expect(prompt).toContain('Most ready work belongs in "local"');
   });
 
+  describe("release signal (dispatch#1481)", () => {
+    it("carries releaseSignal in the plan shape, null by default", () => {
+      const prompt = buildGroomerSystemPrompt(baseParams);
+      expect(prompt).toContain('"releaseSignal": null');
+    });
+
+    it("describes the field shape with every kind and significance", () => {
+      const prompt = buildGroomerSystemPrompt(baseParams);
+      expect(prompt).toContain('"kind": "feature|fix|architecture|internal"');
+      expect(prompt).toContain('"significance": "routine|notable|major"');
+      expect(prompt).toContain("evidenceRefs");
+    });
+
+    it("states the authority boundary: semantic-only, never shipped or done", () => {
+      const prompt = buildGroomerSystemPrompt(baseParams);
+      expect(prompt).toContain("it NEVER means the work is shipped or done");
+      expect(prompt).toContain("Delivery stays authoritative to GitHub state");
+      expect(prompt).toContain("an already_done verdict may carry semantic context but that alone can never become a shipped highlight");
+      expect(prompt).toContain("no lane, priority, readiness or pickup change");
+    });
+
+    it("bounds the headline and ties evidenceRefs to the evidence list", () => {
+      const prompt = buildGroomerSystemPrompt(baseParams);
+      expect(prompt).toContain("≤120 chars");
+      expect(prompt).toContain("every evidenceRefs entry must cite an id from the evidence list");
+    });
+
+    it("says when the field is null", () => {
+      const prompt = buildGroomerSystemPrompt(baseParams);
+      // The grammar requires the key (nullable), so the prompt says it is
+      // always present rather than optional.
+      expect(prompt).toContain("The key is always present in the response");
+      expect(prompt).toContain("null when the work has no release-facing meaning");
+      expect(prompt).not.toContain("releaseSignal is optional");
+    });
+  });
+
   describe("lane selection", () => {
     it("lets the groomer assign the escalation lane directly", () => {
       const prompt = buildGroomerSystemPrompt(baseParams);

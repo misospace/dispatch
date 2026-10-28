@@ -745,6 +745,7 @@ async function executeGroomerRun(
       evidenceDigest: plan.evidence.evidenceDigest,
       readiness: plan.readiness,
       closeRecommendation: plan.mutations.close,
+      releaseSignal: diff.releaseSignal,
       applicationKey,
       ...(Object.keys(diff.withheld).length > 0 ? { withheld: diff.withheld } : {}),
     };
@@ -1196,6 +1197,15 @@ async function executeGroomerRun(
     // An already_done verdict has no pending next action; clearing it keeps
     // a closed issue from advertising the superseded verdict as pending.
     issueData.nextGroomingAction = verdictAction ?? null;
+    // Durable semantic-only release projection (dispatch#1481): the latest
+    // applied groom owns it wholesale (set or cleared); provenance ties it to
+    // the grooming result that produced it; it never means delivered/shipped.
+    // Written only on a fresh applied outcome — a replay already persisted the
+    // identical signal, and the in-flight skip path deletes the applicationKey
+    // and returns before this block.
+    issueData.releaseSignal = diff.releaseSignal
+      ? { ...diff.releaseSignal, provenance: { groomingRunId: groomingRun.id, applicationKey, appliedAt: new Date().toISOString() } }
+      : null;
     // When the groomer closes the issue, mirror the closed state locally so
     // the selector stops considering it (state: "open" is the implicit filter)
     // and the next sync confirms what we just wrote. A close that did not

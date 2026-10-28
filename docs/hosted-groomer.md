@@ -253,7 +253,7 @@ The ready and close policies are checked again here against the run's catalog. T
 
 ### Idempotency
 
-Every application has a key: a SHA-256 over the repository, issue number, the plan's evidence digest, the plan schema version and the normalized mutation intent (final label set, lane, comment text, title, body, close, the persisted verdict reason text, the verdict action, and the decomposition children). The persisted reason (#1461) makes a re-groom whose verdict reason changed apply — so the issue row carries the new text — rather than replay with the stale one; the verdict action decides which field that reason persists to, so a verdict flip with an identical reason text is a new application too. The key is claimed in the `GroomingApplication` table (unique on the key) before the first write, and each step's result is recorded as it lands.
+Every application has a key: a SHA-256 over the repository, issue number, the plan's evidence digest, the plan schema version and the normalized mutation intent (final label set, lane, comment text, title, body, close, the persisted verdict reason text, the verdict action, the release signal, and the decomposition children). The persisted reason (#1461) makes a re-groom whose verdict reason changed apply — so the issue row carries the new text — rather than replay with the stale one; the verdict action decides which field that reason persists to, so a verdict flip with an identical reason text is a new application too. The release signal (#1481) rides the same intent, so a re-groom whose release semantics changed applies (the projection is never replayed with an obsolete signal) while an identical re-groom replays. The key is claimed in the `GroomingApplication` table (unique on the key) before the first write, and each step's result is recorded as it lands.
 
 Every run captures its own snapshot, so the key only recurs when the issue, its comments and the head are exactly as they were for the earlier attempt:
 
@@ -266,7 +266,26 @@ Deploy note for application-key version 2 (dispatch#1461): the key now covers th
 
 Dry runs use the same preconditions, diff and policies without writing: `mutationPlan.applyOutcome` is `dry_run`, `stale` or `unverifiable` (with `preconditionFailures`), or `would_replay` when the key was already applied. A dry run never claims a key, so it never reports `busy`, and it never writes a backoff.
 
+Deploy note for application-key version 3 (dispatch#1481): the key now also covers the release signal, so keys recorded under version 2 (and version 1) can no longer match. Rows are not migrated and the deploy behaviour is the same one re-apply as described above.
+
+Deploy note for application-key version 2 (dispatch#1461): the key now covers the persisted verdict reason and the verdict action, so keys recorded under version 1 can no longer match. Rows are **not** migrated — the reason text is not stored on a `GroomingApplication` row, so a v1 key cannot be recomputed — and the deploy behaviour is one re-apply: the first post-deploy groom of an already-groomed issue applies again under its fresh key (its comment re-posts, except where the comment cooldown still covers the previous one) before the new key is claimed and idempotency resumes. Decomposed parents re-record their decomposition state (one extra `issue_decomposed` audit entry); the children themselves are reused by their own `childBriefKey`, which does not include the application key.
+
 Worker admission gating on these results (#1065) is shipped and documented under [Worker admission](#worker-admission); the operator view of run history evidence, freshness and mutation validation (#1067) is described under [History and Audit](#history-and-audit).
+
+### Release signal (dispatch#1481)
+
+A plan may carry an optional `releaseSignal`: semantic-only metadata describing what the issue represents **if/when** it is delivered — `{ kind: feature|fix|architecture|internal, headline, significance: routine|notable|major, evidenceRefs }`. The authority boundary is absolute: it **never** means the work shipped or is done. Delivery stays authoritative to GitHub state and lifecycle evidence, and an `already_done` verdict that carries a signal acquires no delivery semantics from it.
+
+The signal affects nothing operational: no lane, priority, readiness, admission, pickup or freshness change follows from it or from its evidence refs — signal refs are validated against the run's catalog but are deliberately excluded from `plan.citations`, so they never feed evidence-reliance derivation or the freshness baseline.
+
+On a fresh applied groom, the signal is persisted wholesale on `Issue.releaseSignal` (latest applied groom owns the column; a groom with no signal clears it):
+
+```
+{ kind, headline, significance, evidenceRefs,
+  provenance: { groomingRunId, applicationKey, appliedAt } }
+```
+
+`provenance` ties the projection to the grooming result that produced it. Because the signal is part of the application intent, a re-groom whose signal changed is applied and overwrites the projection; an identical re-groom replays and rewrites nothing.
 
 ## History and Audit
 

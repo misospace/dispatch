@@ -69,6 +69,10 @@ model Issue {
   notReadyReason     String?   @db.Text
   blockedReason      String?   @db.Text
   needsInfoReason    String?   @db.Text
+  // Semantic-only release signal projection (dispatch#1481): { kind, headline,
+  // significance, evidenceRefs, provenance: { groomingRunId, applicationKey,
+  // appliedAt } }; null when no release-facing meaning; NEVER means delivered.
+  releaseSignal      Json?
   nextGroomingAction String?   @db.Text
 
   // Grooming freshness (#1064): the evidence identity the latest applied
