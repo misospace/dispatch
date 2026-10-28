@@ -311,7 +311,7 @@ function truncate(text: string, maxBytes: number): { text: string; truncated: bo
  * Cut a summary to a byte budget, marking the cut so the model can see that
  * the line ends there instead of reading it as the whole upstream error.
  */
-function cutSummary(text: string, maxBytes: number): string {
+function cutWithMarker(text: string, maxBytes: number): string {
   if (maxBytes <= 0) return "";
   if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
   const marker = "…";
@@ -329,13 +329,16 @@ function cutSummary(text: string, maxBytes: number): string {
  * late in a run cannot push the run past its total byte budget. When that
  * budget is tight the upstream summary and the fallback instructions give way
  * first; the outage signal does not, because an answer the model can misread
- * as absence is worse than a short one.
+ * as absence is worse than a short one. The signal is added as whole clauses
+ * only, so a tight answer never ends mid-clause.
  */
-function buildSearchOutageAnswer(summary: string, cap: number): string {
+function buildSearchOutageAnswer(
+  summary: string,
+  cap: number,
+): { content: string; fallbackOffered: boolean } {
   const limit = Math.max(cap, 0);
   const prefix = "search_code failed:";
   const signal = "This is a search outage or timeout, not evidence the code is missing";
-  const shortSignal = "search outage, not evidence the code is missing";
   const noRetry = "— repeating the search will not help.";
   const fallback =
     "Finish the investigation with bounded local reads: list_directory the directories " +
@@ -344,28 +347,39 @@ function buildSearchOutageAnswer(summary: string, cap: number): string {
   const join = (parts: string[]) => parts.filter((part) => part.length > 0).join(" ");
   const size = (parts: string[]) => Buffer.byteLength(join(parts), "utf8");
 
-  if (size([prefix, signal]) > limit) {
-    // Not even the outage signal fits: the shortest honest answer does.
-    const short = join([prefix, shortSignal]);
-    return size([prefix, shortSignal]) > limit ? truncate(short, limit).text : short;
+  if (size([prefix, signal]) <= limit) {
+    // Room for the full answer: the upstream summary and the fallback
+    // instructions are what give way when the budget is tight.
+    let remaining = limit - size([prefix, signal]);
+    const tail: string[] = [];
+    const noRetryCost = 1 + Buffer.byteLength(noRetry, "utf8");
+    if (remaining >= noRetryCost) {
+      tail.push(noRetry);
+      remaining -= noRetryCost;
+    }
+    const fallbackCost = 1 + Buffer.byteLength(fallback, "utf8");
+    if (remaining >= fallbackCost) {
+      tail.push(fallback);
+      remaining -= fallbackCost;
+    }
+    // Whatever is left is the upstream summary's, and it is the first to go.
+    const summaryRoom = Math.min(200, remaining - 1);
+    const shortSummary = summaryRoom > 0 ? cutWithMarker(summary, summaryRoom) : "";
+    return {
+      content: join([prefix, shortSummary, signal, ...tail]),
+      fallbackOffered: tail.includes(fallback),
+    };
   }
 
-  let remaining = limit - size([prefix, signal]);
-  const tail: string[] = [];
-  const noRetryCost = 1 + Buffer.byteLength(noRetry, "utf8");
-  if (remaining >= noRetryCost) {
-    tail.push(noRetry);
-    remaining -= noRetryCost;
+  // Not enough room for the full answer: whole clauses only, most important
+  // first. The word "outage" is the one that must survive — an answer that
+  // says neither outage nor absence is worse than a short one.
+  const parts = [prefix, "outage"];
+  for (const clause of ["— not evidence the code is missing", noRetry]) {
+    if (size([...parts, clause]) > limit) break;
+    parts.push(clause);
   }
-  const fallbackCost = 1 + Buffer.byteLength(fallback, "utf8");
-  if (remaining >= fallbackCost) {
-    tail.push(fallback);
-    remaining -= fallbackCost;
-  }
-  // Whatever is left is the upstream summary's, and it is the first thing to go.
-  const summaryRoom = Math.min(200, remaining - 1);
-  const shortSummary = summaryRoom > 0 ? cutSummary(summary, summaryRoom) : "";
-  return join([prefix, shortSummary, signal, ...tail]);
+  return { content: truncate(join(parts), limit).text, fallbackOffered: false };
 }
 
 /**
@@ -755,7 +769,7 @@ export async function executeGroomerTool(
   // (dispatch#1451).
   const totalCap = Math.max(options.maxTotalBytesRemaining ?? options.maxFileBytes, 0);
   const fail = (message: string): GroomerToolResult => {
-    const text = truncate(message, totalCap).text;
+    const text = cutWithMarker(message, totalCap);
     return {
       ok: false,
       content: text,
@@ -794,10 +808,14 @@ export async function executeGroomerTool(
           const content = buildSearchOutageAnswer(summary, totalCap);
           return {
             ok: false,
-            content,
-            bytes: Buffer.byteLength(content, "utf8"),
+            content: content.content,
+            bytes: Buffer.byteLength(content.content, "utf8"),
             sources: [],
-            warnings: ["search_code unavailable; offered bounded directory/file fallback"],
+            warnings: [
+              content.fallbackOffered
+                ? "search_code unavailable; offered bounded directory/file fallback"
+                : "search_code unavailable; byte budget left no room for the fallback",
+            ],
           };
         }
         if (results.length === 0) {

@@ -1157,7 +1157,7 @@ describe("executeGroomerTool search failure vs true absence (dispatch#1451)", ()
     // Too little room for the full answer, but still an outage and never an
     // absence the model can act on.
     expect(result.content).toContain("search_code failed");
-    expect(result.content).toContain("search outage");
+    expect(result.content).toContain("outage");
     expect(result.content).not.toContain("No matches");
   });
 
@@ -1191,9 +1191,32 @@ describe("executeGroomerTool search failure vs true absence (dispatch#1451)", ()
       expect(result.bytes).toBeLessThanOrEqual(cap);
       expect(result.content).not.toContain("\n");
       expect(result.content).not.toContain("No matches");
-      // With room for it, the answer still calls the failure an outage.
-      if (cap >= 40) expect(result.content).toContain("search outage");
-      if (cap >= 100) expect(result.content).toContain("not evidence the code is missing");
+      // The outage signal is what must survive a tight budget. The thresholds
+      // are the byte lengths of the wording the answer falls back to.
+      if (cap >= 1) expect(result.content.length).toBeGreaterThan(0);
+      if (cap >= 18) expect(result.content).toContain("search_code failed");
+      if (cap >= 26) expect(result.content).toContain("outage");
+      if (cap >= 63) expect(result.content).toContain("not evidence the code is missing");
     }
+  });
+
+  it("renders the roomy-budget fallback exactly", async () => {
+    // The wording the model reads when the budget is not tight is pinned: the
+    // clamp only ever shortens it.
+    const deps = makeDeps({
+      searchCode: vi.fn().mockRejectedValue(new Error("Code search failed for org/repo: 502")),
+    });
+    const result = await executeGroomerTool(
+      { name: "search_code", arguments: { query: "enrich" } },
+      options,
+      deps,
+    );
+    expect(result.content).toBe(
+      "search_code failed: Code search failed for org/repo: 502 This is a search outage or " +
+        "timeout, not evidence the code is missing — repeating the search will not help. Finish " +
+        "the investigation with bounded local reads: list_directory the directories the issue " +
+        "names, then read_file the specific paths (use startLine/lineCount to reach sections of a " +
+        "long file).",
+    );
   });
 });
