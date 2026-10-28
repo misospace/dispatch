@@ -2167,6 +2167,56 @@ Investigate session handling in auth module.`;
     });
   });
 
+  describe("a re-groom that changes only the persisted reason (dispatch#1461)", () => {
+    function lastIssueUpdateData(): Record<string, unknown> {
+      const calls = mocks.prisma.issue.update.mock.calls;
+      expect(calls.length).toBeGreaterThan(0);
+      return (calls[calls.length - 1][0] as { data: Record<string, unknown> }).data;
+    }
+
+    it("is applied, and the issue row carries the new reason text", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("needs_info", { verdict: { rationale: "which tenant?" } }),
+      );
+      await runHostedGroomer();
+      expect(lastIssueUpdateData().needsInfoReason).toBe("which tenant?");
+
+      // Only the verdict reason changed — the machine gap class flipped (the
+      // #1460 shapes) — while every other intent field stayed. The new key is
+      // applied, not replayed, and the row carries the new text.
+      mocks.prisma.issue.update.mockClear();
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("needs_info", { verdict: { rationale: "human_question(credentials): which tenant?" } }),
+      );
+      const result = await runHostedGroomer();
+      expect(result!.appliedMutations?.outcome).toBe("applied");
+      expect(lastIssueUpdateData().needsInfoReason).toBe("human_question(credentials): which tenant?");
+    });
+
+    it("a re-groom that changes nothing is still replayed: no duplicate comment, no duplicate label write", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("needs_info", {
+          verdict: { rationale: "which tenant?" },
+          mutations: { githubComment: "Which tenant reproduces this?" },
+        }),
+      );
+      await runHostedGroomer();
+      expect(mocks.addIssueComment).toHaveBeenCalledTimes(1);
+
+      // Exact retry of the same plan: the application replays — no comment or
+      // label write repeats, and only the cooldown stamp moves.
+      mocks.prisma.issue.update.mockClear();
+      const result = await runHostedGroomer();
+      expect(result!.appliedMutations?.outcome).toBe("replayed");
+      expect(mocks.addIssueComment).toHaveBeenCalledTimes(1);
+      expect(mocks.updateIssueLabels).toHaveBeenCalledTimes(1);
+      for (const call of mocks.prisma.issue.update.mock.calls) {
+        const data = (call[0] as { data: Record<string, unknown> }).data;
+        expect(Object.keys(data).sort()).toEqual(["groomedAt", "groomedBy", "groomingRetryAfter"]);
+      }
+    });
+  });
+
   describe("exactly-one-status-label post-condition (dispatch#941)", () => {
     // A parked issue: it carries a status label plus the needs-human park marker.
     const parkedCandidate: GroomingCandidate = {
