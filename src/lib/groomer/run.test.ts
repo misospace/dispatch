@@ -2083,7 +2083,7 @@ Investigate session handling in auth module.`;
       const data = lastIssueUpdateData();
       expect(data).toMatchObject({
         nextGroomingAction: "mark_needs_info",
-        needsInfoReason: "which environment reproduces it?",
+        needsInfoReason: "human_question(product_decision): which environment reproduces it?",
       });
       expect(data.blockedReason).toBeNull();
       expect(data.notReadyReason).toBeNull();
@@ -2128,7 +2128,9 @@ Investigate session handling in auth module.`;
         notReadyDraft("needs_info", { verdict: { rationale: "which tenant?" } }),
       );
       await runHostedGroomer();
-      expect(lastIssueUpdateData().needsInfoReason).toBe("which tenant?");
+      expect(lastIssueUpdateData().needsInfoReason).toBe(
+        "human_question(product_decision): which tenant?",
+      );
 
       // Exact retry of the same plan: the application replays, and only the
       // cooldown stamp moves — no reason field is written, so the current
