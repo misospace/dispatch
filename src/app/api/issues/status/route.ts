@@ -148,6 +148,13 @@ export async function POST(request: Request) {
             // the stale verdict, or keep presenting a legacy needs-info
             // question under the moved status.
             nextGroomingAction: null,
+            // The same retirement for the attribution of that verdict: this
+            // route's actor is now the last voice on the issue (#1459). The
+            // blocked-reconciliation pass reads it to tell a deliberate human
+            // hold from a groomer-owned park, and it has to be atomic with
+            // the hold itself — no audit row can promise that, because the
+            // audit write is best-effort and happens after the commit.
+            groomedBy: actorName,
             needsInfoReason: null,
             notReadyReason: null,
             ...(targetLabel === "status/blocked"

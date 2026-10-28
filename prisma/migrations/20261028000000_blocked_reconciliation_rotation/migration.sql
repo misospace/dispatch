@@ -1,0 +1,35 @@
+-- #1459: fair-eligibility rotation stamp for the blocked-reconciliation pass.
+--
+-- The pass scans a capped slice of groomer-owned parked explained blocks per
+-- repository. Ordering that slice permanently by the oldest `groomedAt` let a
+-- row whose candidate dependency is still open — a row the pass can make no
+-- progress on — occupy the cap on every pass, so every later parked issue was
+-- starved out of reconsideration. This column records when the pass last
+-- CONSIDERED a row (reached it during a scan, whether or not it could act on
+-- it), so the scan can order least-recently-considered first and rotate.
+--
+-- Additive only: no column drop or type change, so `prisma migrate deploy` is
+-- safe against a database already at 20261027000000_grooming_run_stall_baseline_index.
+-- Audit only: no freshness, admission or block predicate reads it.
+ALTER TABLE "Issue" ADD COLUMN "blockedReconciliationAt" TIMESTAMP(3);
+
+-- Serves the fairness read of the blocked-reconciliation scan
+-- (WHERE repositoryId = ? AND state = 'open' AND "blockedReason" IS NOT NULL
+--  AND "nextGroomingAction" = 'mark_blocked' AND "admissionOverrideId" IS NULL
+--  AND "groomingStaleAt" IS NULL AND "groomedDependencyKeys" = '{}'
+--  ORDER BY "blockedReconciliationAt" ASC NULLS FIRST, "groomedAt" ASC NULLS FIRST,
+--           "number" ASC LIMIT 200).
+-- A btree only delivers that order when the index declares the same NULL
+-- placement and the same trailing tiebreak, so the index carries the full
+-- ORDER BY. The name is explicit: the generated one would exceed Postgres'
+-- 63-byte identifier limit.
+--
+-- Built with ordinary CREATE INDEX, not CREATE INDEX CONCURRENTLY: Prisma
+-- Migrate runs each migration as one transaction, and CONCURRENTLY is
+-- forbidden inside a transaction block. The build therefore takes a lock that
+-- blocks writes on "Issue" for its duration, but docker-entrypoint.sh runs
+-- `prisma migrate deploy` before the server starts, so on an instance being
+-- started there is no application traffic to block; only other replicas
+-- writing during a rolling deploy are affected, and the build is short on
+-- this bounded table.
+CREATE INDEX "Issue_blocked_reconciliation_rotation_idx" ON "Issue"("repositoryId", "blockedReconciliationAt" ASC NULLS FIRST, "groomedAt" ASC NULLS FIRST, "number" ASC);

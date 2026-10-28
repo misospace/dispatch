@@ -97,6 +97,16 @@ model Issue {
   // monopolize the groomer. Targeted runs ignore it.
   groomingRetryAfter        DateTime?
 
+  // Fair-eligibility stamp for the blocked-reconciliation pass (#1459): the
+  // last time that pass CONSIDERED this row (reached it during a scan,
+  // whether or not it could act on it). The scan orders
+  // least-recently-considered first with an explicit `nulls: "first"`, so a
+  // parked block whose candidate dependency is still open — a row that makes
+  // no progress — cannot hold the per-repository scan cap and starve a later
+  // parked issue out of reconsideration. Audit only: never a freshness,
+  // admission or block predicate. NULL = never considered.
+  blockedReconciliationAt   DateTime?
+
   // Explicit operator admission override (#1065). The override writes the
   // freshness baseline above with groomedRunId = admissionOverrideId, so it
   // goes stale under the same checks as a grooming result; it is current only
@@ -124,6 +134,11 @@ model Issue {
   @@index([linkedPrNeedsFollowup])
   @@index([groomingStaleAt])
   @@index([groomingRetryAfter])
+  // Fair-eligibility read for the blocked-reconciliation scan (#1459):
+  // repository scope plus the rotation columns with NULLS FIRST (never
+  // considered first), matching the scan's ORDER BY. Explicitly named: the
+  // generated name would exceed Postgres' 63-byte identifier limit.
+  @@index([repositoryId, blockedReconciliationAt(sort: Asc, nulls: First), groomedAt(sort: Asc, nulls: First), number(sort: Asc)], map: "Issue_blocked_reconciliation_rotation_idx")
 }
 
 model IssueMutationGuard {

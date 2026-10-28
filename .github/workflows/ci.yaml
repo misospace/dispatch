@@ -124,6 +124,25 @@ jobs:
           npx prisma db execute --file scripts/seed-applied-current-lane-migration.sql
           npm run db:deploy
           npx prisma db execute --file scripts/verify-current-lane-indexes.sql
+      # The #1459 rotation migration against a COPY OF THE PRODUCTION SCHEMA:
+      # a database that already carries the production schema and
+      # production-shaped rows, rewound to the pre-migration state, so the
+      # migration is exercised the way a production instance would run it —
+      # with real rows in the table, not an empty database. The verification
+      # proves the additive column and the rotation index landed, that the
+      # pre-existing rows survived with their values intact, and that the
+      # audit-only column back-fills nothing.
+      - name: Create the production copy for the rotation migration
+        run: echo 'CREATE DATABASE dispatch_production_copy;' | npx prisma db execute --stdin
+      - name: Verify the rotation migration on a copy of the production schema
+        env:
+          DATABASE_URL: "postgresql://test:test@localhost:5432/dispatch_production_copy"
+        run: |
+          npm run db:deploy
+          npx prisma db execute --file scripts/seed-production-copy-issues.sql
+          npx prisma db execute --file scripts/revert-blocked-reconciliation-migration.sql
+          npm run db:deploy
+          npx prisma db execute --file scripts/verify-blocked-reconciliation-migration.sql
 
   database-integration:
     name: Database integration
@@ -162,11 +181,15 @@ jobs:
       # transaction-level rollback guarantee, which the mocks cannot prove
       # (#1392). The #1417 dead-claim recovery chain joins for the same class
       # of reason: the tombstone → candidate → ladder → §8.7 settle sequence
-      # spans three modules and two real transactions.
+      # spans three modules and two real transactions. The blocked-reconciliation
+      # rotation test joins it for the same class of reason: the rotation
+      # guarantee ("a parked block that cannot progress must not hold the
+      # capped scan") is an ORDER BY over a nullable column plus a bulk stamp,
+      # and only a real PostgreSQL proves it (#1459).
       - name: Concurrency and idempotency against a real PostgreSQL
         env:
           RUN_DB_INTEGRATION: "1"
-        run: npx vitest run src/lib/sync-lock.integration.test.ts "src/app/api/agents/[agentName]/tasks/report/route.integration.test.ts" src/lib/groomer/apply.integration.test.ts src/lib/pr-fix-external-wait.integration.test.ts src/lib/issue-mutation-guard.integration.test.ts src/lib/agent-work.integration.test.ts src/lib/pr-fix-rebase-type.integration.test.ts src/lib/lease-expiry-recovery.integration.test.ts
+        run: npx vitest run src/lib/sync-lock.integration.test.ts "src/app/api/agents/[agentName]/tasks/report/route.integration.test.ts" src/lib/groomer/apply.integration.test.ts src/lib/groomer/blocked-reconciliation.integration.test.ts src/lib/pr-fix-external-wait.integration.test.ts src/lib/issue-mutation-guard.integration.test.ts src/lib/agent-work.integration.test.ts src/lib/pr-fix-rebase-type.integration.test.ts src/lib/lease-expiry-recovery.integration.test.ts
 
   coverage:
     name: Coverage

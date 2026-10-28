@@ -369,6 +369,34 @@ describe("POST /api/issues/status — business logic", () => {
     });
   });
 
+  it("stamps the deciding actor on the row, so a deliberate hold is distinguishable from a groomer park (#1459)", async () => {
+    // The blocked-reconciliation pass has to tell a human hold from a park the
+    // hosted groomer issued. The verdict marker cannot carry that (the route
+    // retires it), so the row carries the actor that decided — written in the
+    // same transaction as the hold, unlike the best-effort audit row.
+    mocks.findUnique.mockResolvedValue({
+      id: "issue-1",
+      state: "open",
+      labels: ["status/backlog"],
+      nextGroomingAction: "mark_blocked",
+      blockedReason: "waiting on the vendor rollout",
+      groomedBy: "hosted-groomer",
+      number: 42,
+      repository: { fullName: "org/repo" },
+    });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/backlog"]);
+    const res = await POST(makeRequest({ status: "blocked", blockedReason: "Waiting on API team", actor: "operator-1" }));
+    expect(res.status).toBe(200);
+    expect(mocks.updateIssue).toHaveBeenCalledWith({
+      where: { id: "issue-1" },
+      data: expect.objectContaining({
+        blockedReason: "Waiting on API team",
+        nextGroomingAction: null,
+        groomedBy: "operator-1",
+      }),
+    });
+  });
+
   it("retires the stored groomer verdict on any other transition (#1453)", async () => {
     mocks.findUnique.mockResolvedValue({
       id: "issue-1",

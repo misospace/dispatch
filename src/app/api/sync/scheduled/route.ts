@@ -16,6 +16,10 @@ import { syncAutomationRepo } from "@/lib/automation-sync";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { acquireLock, releaseLock } from "@/lib/sync-lock";
 import { runGroomingFreshnessPassBestEffort, type FreshnessPassResult } from "@/lib/groomer/freshness-invalidation";
+import {
+  runGroomingBlockedReconciliationPassBestEffort,
+  type BlockedReconciliationPassResult,
+} from "@/lib/groomer/blocked-reconciliation";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
 // 6 requests / 60s: the scheduler's default 15-minute cadence is well inside
@@ -69,6 +73,7 @@ export async function POST(request: Request) {
     let closedIssueReconcile: ClosedIssueReconcileResponse | null = null;
     let automationResult: { synced: number; failed: number } | null = null;
     let groomingFreshness: FreshnessPassResult | null = null;
+    let blockedReconciliation: BlockedReconciliationPassResult | null = null;
 
     // Issue sync (default enabled)
     if (syncIssues) {
@@ -94,6 +99,8 @@ export async function POST(request: Request) {
       // Mark grooming results stale against the state this sync just cached
       // (#1064). Bounded and best-effort: it never fails the sync.
       groomingFreshness = await runGroomingFreshnessPassBestEffort(repos);
+      // Parked explained blocks (#1459): best-effort, never fails the sync.
+      blockedReconciliation = await runGroomingBlockedReconciliationPassBestEffort(repos);
     }
 
     // Automation sync (optional, opt-in)
@@ -160,6 +167,7 @@ export async function POST(request: Request) {
             : null,
           automationResult,
           groomingFreshness,
+          blockedReconciliation,
         }),
       },
     });
@@ -193,6 +201,14 @@ export async function POST(request: Request) {
           markedStale: groomingFreshness.markedStale,
           deferred: groomingFreshness.deferred,
           githubCalls: groomingFreshness.githubCalls,
+        };
+      }
+
+      if (blockedReconciliation) {
+        response.blockedReconciliation = {
+          issuesConsidered: blockedReconciliation.issuesConsidered,
+          markedStale: blockedReconciliation.markedStale,
+          deferred: blockedReconciliation.deferred,
         };
       }
 
