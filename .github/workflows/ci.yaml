@@ -124,6 +124,25 @@ jobs:
           npx prisma db execute --file scripts/seed-applied-current-lane-migration.sql
           npm run db:deploy
           npx prisma db execute --file scripts/verify-current-lane-indexes.sql
+      # The #1459 rotation migration against a COPY OF THE PRODUCTION SCHEMA:
+      # a database that already carries the production schema and
+      # production-shaped rows, rewound to the pre-migration state, so the
+      # migration is exercised the way a production instance would run it —
+      # with real rows in the table, not an empty database. The verification
+      # proves the additive column and the rotation index landed, that the
+      # pre-existing rows survived with their values intact, and that the
+      # audit-only column back-fills nothing.
+      - name: Create the production copy for the rotation migration
+        run: echo 'CREATE DATABASE dispatch_production_copy;' | npx prisma db execute --stdin
+      - name: Verify the rotation migration on a copy of the production schema
+        env:
+          DATABASE_URL: "postgresql://test:test@localhost:5432/dispatch_production_copy"
+        run: |
+          npm run db:deploy
+          npx prisma db execute --file scripts/seed-production-copy-issues.sql
+          npx prisma db execute --file scripts/revert-blocked-reconciliation-migration.sql
+          npm run db:deploy
+          npx prisma db execute --file scripts/verify-blocked-reconciliation-migration.sql
 
   database-integration:
     name: Database integration
