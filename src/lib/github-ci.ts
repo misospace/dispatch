@@ -92,62 +92,41 @@ export async function fetchReleases(repoFullName: string, perPage = 10): Promise
   return fetchPaginated<GithubRelease>(url, 50);
 }
 
-// Upper bound on how deep the release-baseline search may paginate beyond
-// the sync's persisted release window (10 pages of 100). A pathological
-// listing cannot paginate forever; hitting the cap means stable-release
-// absence is unverified, not confirmed.
-export const RELEASE_BASELINE_SEARCH_MAX = 1000;
-
-export interface StableBaselineSearch {
-  release: GithubRelease | null;
-  // True when the answer is authoritative: the initial window held a stable
-  // release, or the release listing was fully enumerated. False when the
-  // bounded search hit its cap without finding one.
-  complete: boolean;
-}
-
-function newestStableRelease(releases: GithubRelease[]): GithubRelease | null {
-  return (
-    releases
-      .filter((rel) => !rel.draft && !rel.prerelease)
-      .sort((a, b) => new Date(b.published_at).getTime() - new Date(a.published_at).getTime())[0] ??
-    null
-  );
-}
-
 /**
- * Resolve the newest stable release for the release-delta baseline (#1480).
+ * Resolve the authoritative stable-release baseline for the release delta
+ * (#1480): GitHub's own "latest release" endpoint (`GET /releases/latest`),
+ * defined upstream as the most recent non-prerelease, non-draft release —
+ * the same release GitHub surfaces as "Latest".
  *
- * The sync persists a bounded release window (≤50 newest); a run of drafts
- * or prereleases can crowd every stable release out of that window. Rather
- * than letting the caller persist a false `no-baseline` from a truncated
- * view, this deepens the search by re-listing releases with a larger page
- * size up to `RELEASE_BASELINE_SEARCH_MAX` items — zero extra API calls when
- * the initial window already holds a stable release, at most the bounded
- * pagination when it does not. Throws on forge failure; the caller fails
- * closed to `unknown`.
+ * Baking the contract into a single forge read keeps the selection
+ * authoritative without trusting any locally persisted window: the release
+ * listing is ordered by release creation, not `published_at`, and a
+ * long-lived draft keeps its old position in that order when it is finally
+ * published later. A window that already holds a stable release therefore
+ * cannot prove which stable release is newest by publication time — only
+ * GitHub's own latest-release designation can. A 404 is GitHub's own
+ * verified absence ("no non-prerelease, non-draft release exists") and
+ * yields null; any other failure throws so the caller fails closed to
+ * `unknown`. The response is defensively rejected if it ever carries
+ * draft/prerelease flags, so a draft or prerelease can never become the
+ * baseline even if upstream semantics drift.
  */
 export async function fetchStableBaselineRelease(
-  repoFullName: string,
-  initialReleases: GithubRelease[]
-): Promise<StableBaselineSearch> {
-  const inWindow = newestStableRelease(initialReleases);
-  if (inWindow) {
-    return { release: inWindow, complete: true };
+  repoFullName: string
+): Promise<GithubRelease | null> {
+  const response = await fetchWithRetry(`${GITHUB_API}/repos/${repoFullName}/releases/latest`, {
+    headers: await getHeadersAsync(),
+  });
+  if (response.status === 404) return null;
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Failed to fetch latest release for ${repoFullName}: ${response.status} ${text}`);
   }
-
-  const url = `${GITHUB_API}/repos/${repoFullName}/releases?per_page=100`;
-  const deeper = await fetchPaginated<GithubRelease>(url, RELEASE_BASELINE_SEARCH_MAX);
-  return {
-    release: newestStableRelease(deeper),
-    // fetchPaginated only stops early when the listing is exhausted, so a
-    // total below the cap proves the whole listing was enumerated. (Like the
-    // persisted window itself, this trusts the forge's Link `rel="next"`
-    // headers; a proxy stripping them on a non-final page would read as
-    // exhausted — the same over-listing-trust trade-off, never a
-    // manufactured count.)
-    complete: deeper.length < RELEASE_BASELINE_SEARCH_MAX,
-  };
+  const data = (await response.json()) as GithubRelease;
+  if (!data?.tag_name || !data?.published_at || data.draft || data.prerelease) {
+    throw new Error(`Latest release for ${repoFullName} is not a stable published release`);
+  }
+  return data;
 }
 
 export interface GithubPackageInfo {
