@@ -325,11 +325,29 @@ describe("computeMutationDiff", () => {
   it("records the reason text the verdict persists on the issue row (dispatch#1461)", () => {
     expect(diffFor(draft()).persistedReason).toBeNull();
     const notReady = (actionability: "needs_info" | "blocked" | "backlog", rationale: string): GroomingPlanDraft => ({
-      ...draft({ actionability, lane: { id: "backlog", confidence: "medium", reason: "not ready yet" }, rationale }),
+      ...draft({
+        actionability,
+        lane: { id: "backlog", confidence: "medium", reason: "not ready yet" },
+        rationale,
+        // #1452: a needs_info verdict must declare its gap; the other
+        // actionabilities must not carry one.
+        ...(actionability === "needs_info"
+          ? {
+              infoGap: {
+                kind: "runtime_reproduction" as const,
+                question: rationale,
+                whyToolsCannotAnswer: "The repository records no runtime reproduction.",
+              },
+            }
+          : {}),
+      }),
       implementationBrief: null,
     });
+    // #1460 composes with #1461: a needs_info verdict that declares its gap
+    // persists the reason with the gap-class prefix; the other
+    // actionabilities carry the bare rationale.
     expect(diffFor(notReady("needs_info", "which tenant reproduces it?")).persistedReason).toBe(
-      "which tenant reproduces it?",
+      "human_question(runtime_reproduction): which tenant reproduces it?",
     );
     expect(diffFor(notReady("blocked", "waiting on the vendor API")).persistedReason).toBe("waiting on the vendor API");
     expect(diffFor(notReady("backlog", "no acceptance criteria yet")).persistedReason).toBe("no acceptance criteria yet");
@@ -367,6 +385,11 @@ describe("computeApplicationKey", () => {
         actionability: "needs_info",
         lane: { id: "backlog", confidence: "medium", reason: "not ready yet" },
         rationale,
+        infoGap: {
+          kind: "runtime_reproduction" as const,
+          question: "which tenant?",
+          whyToolsCannotAnswer: "The repository records no runtime reproduction.",
+        },
       }),
       implementationBrief: null,
     });
@@ -385,7 +408,21 @@ describe("computeApplicationKey", () => {
 
   it("changes when the verdict action flips even with an identical reason text", () => {
     const notReady = (actionability: "needs_info" | "backlog", rationale: string): GroomingPlanDraft => ({
-      ...draft({ actionability, lane: { id: "backlog", confidence: "medium", reason: "not ready yet" }, rationale }),
+      ...draft({
+        actionability,
+        lane: { id: "backlog", confidence: "medium", reason: "not ready yet" },
+        rationale,
+        // #1452: a needs_info verdict must declare its gap; backlog must not.
+        ...(actionability === "needs_info"
+          ? {
+              infoGap: {
+                kind: "runtime_reproduction" as const,
+                question: rationale,
+                whyToolsCannotAnswer: "The repository records no runtime reproduction.",
+              },
+            }
+          : {}),
+      }),
       implementationBrief: null,
     });
     const input = (actionability: "needs_info" | "backlog") => {
@@ -404,6 +441,11 @@ describe("computeApplicationKey", () => {
         actionability: "needs_info",
         lane: { id: "backlog", confidence: "medium", reason: "not ready yet" },
         rationale: "which tenant?",
+        infoGap: {
+          kind: "runtime_reproduction" as const,
+          question: "which tenant?",
+          whyToolsCannotAnswer: "The repository records no runtime reproduction.",
+        },
       }),
       implementationBrief: null,
     };

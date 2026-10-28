@@ -1140,6 +1140,7 @@ export async function executeGroomerTool(
             bytes: Buffer.byteLength(content, "utf8"),
             sources: [path],
             file: { path, ref: ref ?? null, content: body },
+            truncated: false,
           };
         }
         // The truncation marker names the line to continue from, so a known

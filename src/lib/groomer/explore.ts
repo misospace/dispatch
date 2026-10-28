@@ -452,14 +452,23 @@ export async function exploreRepository(
           // token so the failure cannot be lost — the fact, not the name, is
           // what the verdict is resolved against (dispatch#1452).
           gaps.toolFailures.push(gapFactToken(name) || UNKNOWN_TOOL_FAILURE);
-        } else if ((name === "read_file" || name === "list_directory") && truncated) {
+        } else if (name === "read_file" || name === "list_directory") {
           // The normalized path when available, recorded argument
           // otherwise (a pinned-ref read records its pinned arguments).
           const path = result.file?.path ?? (typeof args.path === "string" ? args.path : null);
-          const gapPath = path !== null ? gapFactToken(path) : "";
-          // A root listing has no path to name: keep the fact under a fixed
-          // token rather than losing it (dispatch#1452).
-          gaps.truncatedReads.push(gapPath || ROOT_TRUNCATED_READ);
+          const gapPath = gapFactToken(path ?? "") || ROOT_TRUNCATED_READ;
+          if (truncated) {
+            // A root listing has no path to name: keep the fact under a fixed
+            // token rather than losing it (dispatch#1452).
+            gaps.truncatedReads.push(gapPath);
+          } else {
+            // A completed read retires the path's earlier truncation fact
+            // (dispatch#1451): a continuation that reaches EOF — or a whole
+            // file, or a listing that showed every entry — means the run did
+            // establish what that file holds. Leaving the stale fact in place
+            // would keep classifying a completed investigation incomplete.
+            gaps.truncatedReads = gaps.truncatedReads.filter((p) => p !== gapPath);
+          }
         }
         messages.push({ role: "tool", tool_call_id: toolCall.id, name, content: result.content });
       }

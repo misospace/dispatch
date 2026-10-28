@@ -2179,18 +2179,31 @@ Investigate session handling in auth module.`;
         notReadyDraft("needs_info", { verdict: { rationale: "which tenant?" } }),
       );
       await runHostedGroomer();
-      expect(lastIssueUpdateData().needsInfoReason).toBe("which tenant?");
+      // #1460 composes with #1461: the persisted reason carries the machine
+      // gap-class prefix derived from the declared gap.
+      expect(lastIssueUpdateData().needsInfoReason).toBe(
+        "human_question(product_decision): which tenant?",
+      );
 
-      // Only the verdict reason changed — the machine gap class flipped (the
-      // #1460 shapes) — while every other intent field stayed. The new key is
+      // Only the machine gap class flipped (the #1460 shapes) — the verdict
+      // rationale and every other intent field stayed. The new key is
       // applied, not replayed, and the row carries the new text.
       mocks.prisma.issue.update.mockClear();
       mocks.callGroomerLLM.mockResolvedValue(
-        notReadyDraft("needs_info", { verdict: { rationale: "human_question(credentials): which tenant?" } }),
+        notReadyDraft("needs_info", {
+          verdict: {
+            rationale: "which tenant?",
+            infoGap: {
+              kind: "investigation_incomplete",
+              question: "which tenant?",
+              whyToolsCannotAnswer: "The repository reads were truncated before the answer.",
+            },
+          },
+        }),
       );
       const result = await runHostedGroomer();
       expect(result!.appliedMutations?.outcome).toBe("applied");
-      expect(lastIssueUpdateData().needsInfoReason).toBe("human_question(credentials): which tenant?");
+      expect(lastIssueUpdateData().needsInfoReason).toBe("investigation_incomplete: which tenant?");
     });
 
     it("a re-groom that changes nothing is still replayed: no duplicate comment, no duplicate label write", async () => {

@@ -623,6 +623,38 @@ describe("exploreRepository investigation gaps (dispatch#1452)", () => {
     expect(result.findings).toContain("- the read of src/big.ts was truncated");
   });
 
+  it("a continuation that reaches EOF retires the truncated-read gap (dispatch#1451)", async () => {
+    // 11 one-byte lines (22 bytes): with maxFileBytes 10 the head read shows
+    // its head and names the continuation line, the next read is truncated
+    // again, and the last one reaches the end of the file.
+    const body = "y\n".repeat(11);
+    const deps = makeDeps(
+      { readFile: vi.fn().mockResolvedValue(body) },
+      fetchReturning(
+        { content: null, tool_calls: [toolCall("1", "read_file", { path: "src/big.ts" })] },
+        {
+          content: null,
+          tool_calls: [
+            toolCall("2", "read_file", { path: "src/big.ts", startLine: 6 }),
+            toolCall("3", "read_file", { path: "src/big.ts", startLine: 11 }),
+            toolCall("4", "submit_findings", { files: ["src/big.ts"], ask: "do the thing" }),
+          ],
+        },
+      ),
+    );
+
+    const result = await exploreRepository({ ...options, maxFileBytes: 10 }, deps);
+
+    // The continuation reached the end of the file: the run did establish
+    // what the file holds, so the stale truncation fact is retired and the
+    // findings must not name the read as truncated.
+    expect(result.gaps.truncatedReads).toEqual([]);
+    expect(result.toolCalls[0].truncated).toBe(true);
+    expect(result.toolCalls[1].truncated).toBe(true);
+    expect(result.toolCalls[2].truncated).toBe(false);
+    expect(result.findings).not.toContain("was truncated");
+  });
+
   it("flags an exhausted byte budget in the gaps and the findings", async () => {
     const fetchImpl = fetchReturning({
       content: null,
