@@ -1,0 +1,14 @@
+-- #1481: semantic-only release signal projection on the issue.
+--
+-- The hosted groomer persists an optional, structured signal describing what
+-- the issue represents if/when it is delivered: { kind, headline,
+-- significance, evidenceRefs, provenance: { groomingRunId, applicationKey,
+-- appliedAt } }. Semantic-only by contract: it never means shipped or done —
+-- delivery stays authoritative to GitHub state and lifecycle evidence — and it
+-- affects nothing operational (no lane, readiness, admission or pickup
+-- change). Null when the work has no release-facing meaning; the latest
+-- applied groom owns the column wholesale (set or cleared).
+--
+-- Additive only: no column drop or type change, `prisma migrate deploy` safe
+-- on databases already at 20261028000000_blocked_reconciliation_rotation.
+ALTER TABLE "Issue" ADD COLUMN "releaseSignal" JSONB;

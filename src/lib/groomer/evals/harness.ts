@@ -223,6 +223,8 @@ export async function runCandidate(
         issueData = { ...args.data };
         return { id: selected.id };
       },
+      // Replay-time projection heal (dispatch#1481) reads the current column.
+      findUnique: async () => ({ releaseSignal: null }),
       findMany: async (args: unknown) => openTrackedIssues(c, args),
     },
     issueLane: { create: async () => ({ id: "lane-1" }) },
