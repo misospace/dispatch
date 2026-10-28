@@ -5,6 +5,7 @@ import { syncStatusLabels } from "@/lib/github";
 import { getSyncRepos, parseExcludedLabels } from "@/lib/config";
 import { syncIssuesForRepos, makePrismaIssueStore, fetchAllStateIssues } from "@/lib/issue-sync";
 import { runGroomingFreshnessPassBestEffort } from "@/lib/groomer/freshness-invalidation";
+import { runGroomingBlockedReconciliationPassBestEffort } from "@/lib/groomer/blocked-reconciliation";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { acquireLock, releaseLock } from "@/lib/sync-lock";
@@ -59,6 +60,8 @@ export async function POST(request: NextRequest) {
       const result = await syncIssuesForRepos(repos, fetchAllStateIssues, makePrismaIssueStore(), excludedLabels, syncStatusLabels);
       // Grooming freshness (#1064): best-effort, never fails the sync.
       await runGroomingFreshnessPassBestEffort(repos);
+      // Parked explained blocks (#1459): best-effort, never fails the sync.
+      await runGroomingBlockedReconciliationPassBestEffort(repos);
 
       // Update the sync run record
       await prisma.issueSyncRun.updateMany({

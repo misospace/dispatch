@@ -10,6 +10,7 @@ import {
   hasNegativeSearchResult,
   intersectEvidencePaths,
   isFreshnessTrackedStatus,
+  MAX_BASELINE_DEPENDENCIES,
   relatedWorkBaseline,
   type GroomingFreshnessInput,
   UNKNOWN_FRESHNESS,
@@ -258,6 +259,34 @@ describe("buildGroomingFreshnessBaseline", () => {
     );
     expect(baseline.groomedEvidenceScope).toBe("global");
     expect(baseline.groomedEvidencePaths).toEqual([]);
+  });
+
+  it("merges mark_blocked verdict dependency keys into the baseline (#1459)", async () => {
+    // Body names #5 and other/repo#9; the verdict also relies on org/repo#11,
+    // which only the body parse missed. Openness resolves against all of them.
+    const baseline = await buildGroomingFreshnessBaseline(
+      input({
+        blockedDependencyKeys: ["org/repo#5", "org/repo#11"],
+        resolveOpenKeys: async (keys) => new Set(keys.filter((key) => key === "org/repo#5" || key === "org/repo#11")),
+      }),
+    );
+    expect(baseline.groomedDependencyKeys).toEqual(["org/repo#5", "other/repo#9", "org/repo#11"]);
+    expect(baseline.groomedOpenBlockerKeys).toEqual(["org/repo#11", "org/repo#5"]);
+  });
+
+  it("dedupes verdict keys against the body keys before resolving openness", async () => {
+    const baseline = await buildGroomingFreshnessBaseline(
+      input({ blockedDependencyKeys: ["other/repo#9", "other/repo#9"] }),
+    );
+    expect(baseline.groomedDependencyKeys).toEqual(["org/repo#5", "other/repo#9"]);
+    expect(baseline.groomedOpenBlockerKeys).toEqual(["org/repo#5"]);
+  });
+
+  it("caps the merged dependency keys, body keys first", async () => {
+    const verdictKeys = Array.from({ length: MAX_BASELINE_DEPENDENCIES }, (_, i) => `org/repo#${100 + i}`);
+    const baseline = await buildGroomingFreshnessBaseline(input({ blockedDependencyKeys: verdictKeys }));
+    expect(baseline.groomedDependencyKeys).toHaveLength(MAX_BASELINE_DEPENDENCIES);
+    expect(baseline.groomedDependencyKeys.slice(0, 2)).toEqual(["org/repo#5", "other/repo#9"]);
   });
 
   it("records trimmed, deduplicated empty-search queries only for global evidence", async () => {

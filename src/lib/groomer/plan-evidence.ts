@@ -8,6 +8,9 @@ import {
   type PinnedReadContent,
   type ReopenRegressionEvidence,
 } from "./close-grounding";
+import { MAX_BASELINE_DEPENDENCIES, parseDependencyKey } from "./freshness";
+import { dependencyKey } from "@/lib/issue-dependencies";
+import type { GroomingPlan } from "./plan";
 
 /**
  * The citable view of a run's evidence snapshot.
@@ -200,6 +203,37 @@ export function buildEvidenceCatalog(
 
 export function catalogIds(catalog: EvidenceCatalog, subject?: EvidenceSubject): string[] {
   return catalog.entries.filter((entry) => !subject || entry.subject === subject).map((entry) => entry.id);
+}
+
+/** The `github:issue:owner/repo#N` prefix of a related-work issue evidence id. */
+const GITHUB_ISSUE_EVIDENCE_PREFIX = "github:issue:";
+
+/**
+ * Typed dependency keys (`owner/repo#N`) a mark_blocked verdict relies on
+ * (#1459): the brief's dependencies in `open` or `unknown` state whose
+ * evidenceRef resolves in the catalog to a related-work entry observed as a
+ * GitHub issue. Entries that do not resolve contribute nothing — that is the
+ * deliberate "evidence stays incomplete" path — so the blocked verdict is
+ * only anchored where the model actually grounded it. Deduped, excluding the
+ * groomed issue's own key, capped like the freshness baseline.
+ */
+export function typedVerdictDependencyKeys(plan: GroomingPlan, catalog: EvidenceCatalog): string[] {
+  const self = parseDependencyKey(catalog.grounding.issueKey);
+  const selfKey = self ? dependencyKey(self.repo, self.number) : null;
+  const keys: string[] = [];
+  for (const dep of plan.implementationBrief?.dependencies ?? []) {
+    if (dep.state !== "open" && dep.state !== "unknown") continue;
+    const entry = dep.evidenceRef ? catalog.entries.find((e) => e.id === dep.evidenceRef) : undefined;
+    if (!entry || entry.subject !== "related_work" || entry.provenance !== "github_issue") continue;
+    if (!entry.id.startsWith(GITHUB_ISSUE_EVIDENCE_PREFIX)) continue;
+    const parsed = parseDependencyKey(entry.id.slice(GITHUB_ISSUE_EVIDENCE_PREFIX.length));
+    if (!parsed?.repo) continue;
+    const key = dependencyKey(parsed.repo, parsed.number);
+    if (key === selfKey || keys.includes(key)) continue;
+    keys.push(key);
+    if (keys.length >= MAX_BASELINE_DEPENDENCIES) break;
+  }
+  return keys;
 }
 
 /**

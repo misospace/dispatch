@@ -3122,6 +3122,117 @@ Investigate session handling in auth module.`;
       });
     });
 
+    it("anchors a mark_blocked verdict's typed dependencies in the baseline (#1459)", async () => {
+      // The plan's brief names the load-bearing prerequisite, backed by a
+      // related-work issue the run read; the body itself names nothing.
+      mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
+        ...mockEvidence,
+        sources: [
+          ...mockEvidence.sources,
+          {
+            key: "github:issue:org/repo#7",
+            provenance: "github_issue",
+            state: "open",
+            url: null,
+            via: "read",
+            observedAt: "2026-09-25T00:00:00.000Z",
+            ref: null,
+          },
+        ],
+      });
+      mocks.prisma.issue.findMany.mockResolvedValue([{ number: 7, repository: { fullName: "org/repo" } }]);
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("blocked", {
+          verdict: { rationale: "waiting on the vendor API" },
+          implementationBrief: {
+            problem: "Cannot start until #7 lands.",
+            verifiedCurrentBehavior: { statement: "The flow is blocked.", evidenceRefs: [] },
+            relevantPaths: [],
+            filesToCreate: [],
+            invariants: [],
+            inScope: ["unblock follow-up"],
+            outOfScope: [],
+            dependencies: [{ ref: "org/repo#7", state: "open", evidenceRef: "github:issue:org/repo#7" }],
+            acceptanceCriteria: [],
+            tests: [],
+          },
+        }),
+      );
+      await runHostedGroomer();
+      expect(issueUpdateData()).toMatchObject({
+        nextGroomingAction: "mark_blocked",
+        blockedReason: "waiting on the vendor API",
+        groomedDependencyKeys: ["org/repo#7"],
+        groomedOpenBlockerKeys: ["org/repo#7"],
+      });
+    });
+
+    it("does not anchor typed dependencies for a non-blocked verdict (#1459)", async () => {
+      mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
+        ...mockEvidence,
+        sources: [
+          ...mockEvidence.sources,
+          {
+            key: "github:issue:org/repo#7",
+            provenance: "github_issue",
+            state: "open",
+            url: null,
+            via: "read",
+            observedAt: "2026-09-25T00:00:00.000Z",
+            ref: null,
+          },
+        ],
+      });
+      mocks.prisma.issue.findMany.mockResolvedValue([{ number: 7, repository: { fullName: "org/repo" } }]);
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("backlog", {
+          verdict: { rationale: "not ready yet" },
+          implementationBrief: {
+            problem: "Cannot start until #7 lands.",
+            verifiedCurrentBehavior: { statement: "The flow is blocked.", evidenceRefs: [] },
+            relevantPaths: [],
+            filesToCreate: [],
+            invariants: [],
+            inScope: ["unblock follow-up"],
+            outOfScope: [],
+            dependencies: [{ ref: "org/repo#7", state: "open", evidenceRef: "github:issue:org/repo#7" }],
+            acceptanceCriteria: [],
+            tests: [],
+          },
+        }),
+      );
+      await runHostedGroomer();
+      expect(issueUpdateData()).toMatchObject({
+        groomedDependencyKeys: [],
+        groomedOpenBlockerKeys: [],
+      });
+    });
+
+    it("contributes nothing for a mark_blocked dependency without evidence (#1459)", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("blocked", {
+          verdict: { rationale: "blocked, unclear on what" },
+          implementationBrief: {
+            problem: "Blocked on something.",
+            verifiedCurrentBehavior: { statement: "The flow is blocked.", evidenceRefs: [] },
+            relevantPaths: [],
+            filesToCreate: [],
+            invariants: [],
+            inScope: ["unblock follow-up"],
+            outOfScope: [],
+            dependencies: [{ ref: "org/repo#7", state: "open", evidenceRef: null }],
+            acceptanceCriteria: [],
+            tests: [],
+          },
+        }),
+      );
+      await runHostedGroomer();
+      expect(issueUpdateData()).toMatchObject({
+        groomedDependencyKeys: [],
+        groomedOpenBlockerKeys: [],
+      });
+    });
+
     it("falls back to unknown freshness when the baseline cannot be built, without failing the run", async () => {
       mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
         ...mockEvidence,
