@@ -92,6 +92,60 @@ export async function fetchReleases(repoFullName: string, perPage = 10): Promise
   return fetchPaginated<GithubRelease>(url, 50);
 }
 
+// Upper bound on how deep the release-baseline search may paginate beyond
+// the sync's persisted release window (10 pages of 100). A pathological
+// listing cannot paginate forever; hitting the cap means stable-release
+// absence is unverified, not confirmed.
+export const RELEASE_BASELINE_SEARCH_MAX = 1000;
+
+export interface StableBaselineSearch {
+  release: GithubRelease | null;
+  // True when the answer is authoritative: the initial window held a stable
+  // release, or the release listing was fully enumerated. False when the
+  // bounded search hit its cap without finding one.
+  complete: boolean;
+}
+
+function newestStableRelease(releases: GithubRelease[]): GithubRelease | null {
+  return (
+    releases
+      .filter((rel) => !rel.draft && !rel.prerelease)
+      .sort((a, b) => new Date(b.published_at).getTime() - new Date(a.published_at).getTime())[0] ??
+    null
+  );
+}
+
+/**
+ * Resolve the newest stable release for the release-delta baseline (#1480).
+ *
+ * The sync persists a bounded release window (≤50 newest); a run of drafts
+ * or prereleases can crowd every stable release out of that window. Rather
+ * than letting the caller persist a false `no-baseline` from a truncated
+ * view, this deepens the search by re-listing releases with a larger page
+ * size up to `RELEASE_BASELINE_SEARCH_MAX` items — zero extra API calls when
+ * the initial window already holds a stable release, at most the bounded
+ * pagination when it does not. Throws on forge failure; the caller fails
+ * closed to `unknown`.
+ */
+export async function fetchStableBaselineRelease(
+  repoFullName: string,
+  initialReleases: GithubRelease[]
+): Promise<StableBaselineSearch> {
+  const inWindow = newestStableRelease(initialReleases);
+  if (inWindow) {
+    return { release: inWindow, complete: true };
+  }
+
+  const url = `${GITHUB_API}/repos/${repoFullName}/releases?per_page=100`;
+  const deeper = await fetchPaginated<GithubRelease>(url, RELEASE_BASELINE_SEARCH_MAX);
+  return {
+    release: newestStableRelease(deeper),
+    // fetchPaginated only stops early when the listing is exhausted, so a
+    // total below the cap proves the whole listing was enumerated.
+    complete: deeper.length < RELEASE_BASELINE_SEARCH_MAX,
+  };
+}
+
 export interface GithubPackageInfo {
   name: string;
   package_type: string;

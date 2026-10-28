@@ -48,6 +48,7 @@ vi.mock("@/lib/github", () => ({
   fetchClosedPullRequests: vi.fn().mockResolvedValue([]),
   fetchLatestCommit: vi.fn(),
   fetchCompare: vi.fn(),
+  fetchStableBaselineRelease: vi.fn(),
   fetchPackages: vi.fn(),
   fetchRunJobs: vi.fn(),
 }));
@@ -76,9 +77,14 @@ const upsertPR = prisma.githubPullRequest.upsert as ReturnType<typeof vi.fn>;
 const fetchCommitMock = github.fetchLatestCommit as ReturnType<typeof vi.fn>;
 const fetchPackagesMock = github.fetchPackages as ReturnType<typeof vi.fn>;
 const fetchRunJobsMock = github.fetchRunJobs as ReturnType<typeof vi.fn>;
+const fetchStableBaselineReleaseMock = github.fetchStableBaselineRelease as ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Empty-window syncs deep-search releases before claiming no-baseline;
+  // default to a verified-empty listing so behavior matches the pre-deepener
+  // window-only shape unless a test stubs a deeper result.
+  fetchStableBaselineReleaseMock.mockResolvedValue({ release: null, complete: true });
   // Default: $transaction just runs the array of promises immediately,
   // matching Prisma's behavior for our purposes.
   transaction.mockImplementation(async (input: unknown) => {
@@ -959,11 +965,15 @@ describe("release delta (#1480)", () => {
       comparison = { status: "ahead", aheadBy: 3, behindBy: 0, mergeBaseCommitSha: "basesha1" },
       resolveError,
       compareError,
+      stableSearch,
+      stableSearchError,
     }: {
       resolvedSha?: string | null;
       comparison?: { status: string; aheadBy: number; behindBy: number; mergeBaseCommitSha: string | null } | null;
       resolveError?: Error;
       compareError?: Error;
+      stableSearch?: { release: ReturnType<typeof rel> | null; complete: boolean };
+      stableSearchError?: Error;
     } = {},
   ) {
     return {
@@ -973,6 +983,12 @@ describe("release delta (#1480)", () => {
       compare: compareError
         ? vi.fn().mockRejectedValue(compareError)
         : vi.fn().mockResolvedValue(comparison),
+      findStableRelease:
+        stableSearchError !== undefined
+          ? vi.fn().mockRejectedValue(stableSearchError)
+          : stableSearch !== undefined
+            ? vi.fn().mockResolvedValue(stableSearch)
+            : undefined,
     };
   }
 
@@ -1034,6 +1050,56 @@ describe("release delta (#1480)", () => {
     expect(delta.releaseHeadSha).toBe("headsha9");
     expect(deps.resolveRef).not.toHaveBeenCalled();
     expect(deps.compare).not.toHaveBeenCalled();
+  });
+
+  it("deepens the release search when the window holds only drafts/prereleases", async () => {
+    const deps = deltaDeps({
+      stableSearch: { release: rel({ id: 9, tag_name: "v0.9.0", published_at: "2023-06-01T00:00:00Z" }), complete: true },
+    });
+
+    const delta = await computeReleaseDelta(
+      "o/r",
+      [rel({ id: 3, tag_name: "v2.0.0-rc1", prerelease: true }), rel({ id: 2, draft: true })],
+      "headsha9",
+      deps,
+    );
+
+    expect(delta.releaseState).toBe("ahead");
+    expect(delta.releaseBaselineTag).toBe("v0.9.0");
+    expect(delta.releaseBaselinePublishedAt).toEqual(new Date("2023-06-01T00:00:00Z"));
+    expect(deps.findStableRelease).toHaveBeenCalledWith("o/r", expect.any(Array));
+    expect(deps.resolveRef).toHaveBeenCalledWith("o/r", "v0.9.0");
+  });
+
+  it("keeps no-baseline only when the deepened search verified the absence", async () => {
+    const deps = deltaDeps({ stableSearch: { release: null, complete: true } });
+
+    const delta = await computeReleaseDelta("o/r", [rel({ prerelease: true })], "headsha9", deps);
+
+    expect(delta.releaseState).toBe("no-baseline");
+    expect(delta.releaseError).toBeNull();
+  });
+
+  it("fails closed to unknown when the deepened search hits its cap without a stable", async () => {
+    const deps = deltaDeps({ stableSearch: { release: null, complete: false } });
+
+    const delta = await computeReleaseDelta("o/r", [rel({ prerelease: true })], "headsha9", deps);
+
+    expect(delta.releaseState).toBe("unknown");
+    expect(delta.releaseBaselineTag).toBeNull();
+    expect(delta.releaseHeadSha).toBe("headsha9");
+    expect(delta.releaseError).toContain("bounded release search");
+    expect(deps.resolveRef).not.toHaveBeenCalled();
+  });
+
+  it("fails closed to unknown when the deepened search throws", async () => {
+    const deps = deltaDeps({ stableSearchError: new Error("listing 502") });
+
+    const delta = await computeReleaseDelta("o/r", [rel({ prerelease: true })], "headsha9", deps);
+
+    expect(delta.releaseState).toBe("unknown");
+    expect(delta.releaseAheadBy).toBeNull();
+    expect(delta.releaseError).toContain("listing 502");
   });
 
   it("reports unknown when the release tag cannot be resolved", async () => {
@@ -1146,10 +1212,34 @@ describe("release delta (#1480)", () => {
     updateRepo.mockResolvedValue({});
     createEvent.mockResolvedValue({});
   }
+  it("deepens the release search when the persisted window holds no stable release", async () => {
+    stubDeltaSync({
+      releases: [rel({ id: 1, tag_name: "v2.0.0-rc1", prerelease: true })],
+      baselineSha: "basesha0",
+    });
+    fetchStableBaselineReleaseMock.mockResolvedValue({
+      release: rel({ id: 9, tag_name: "v0.9.0", published_at: "2023-06-01T00:00:00Z" }),
+      complete: true,
+    });
+
+    const result = await syncAutomationRepo("o/r");
+
+    expect(result.success).toBe(true);
+    expect(fetchStableBaselineReleaseMock).toHaveBeenCalledWith("o/r", expect.any(Array));
+    expect(updateRepo).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          releaseState: "ahead",
+          releaseBaselineTag: "v0.9.0",
+          releaseBaselineSha: "basesha0",
+          releaseAheadBy: 7,
+        }),
+      }),
+    );
+  });
 
   it("persists the delta snapshot alongside the sync head", async () => {
     stubDeltaSync();
-
     const result = await syncAutomationRepo("o/r");
 
     expect(result.success).toBe(true);

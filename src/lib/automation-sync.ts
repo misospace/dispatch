@@ -16,6 +16,7 @@ import {
   fetchClosedPullRequests,
   fetchLatestCommit,
   fetchCompare,
+  fetchStableBaselineRelease,
   fetchPackages,
   fetchRunJobs,
   type GithubCommit,
@@ -65,9 +66,24 @@ function boundedReleaseError(error: unknown): string {
     : message;
 }
 
+export interface StableReleaseSearchResult {
+  release: GithubRelease | null;
+  // True when stable-release absence is verified (listing fully enumerated);
+  // false when the bounded deep search hit its cap without finding one.
+  complete: boolean;
+}
+
 export interface ReleaseDeltaDeps {
   resolveRef: (repoFullName: string, ref: string) => Promise<GithubCommit | null>;
   compare: (repoFullName: string, baseRef: string, headRef: string) => Promise<GithubCompare | null>;
+  // Deepens the release search when the provided window holds no stable
+  // release (drafts/prereleases can crowd every stable release out of the
+  // persisted ≤50 window). Optional so test mocks of "@/lib/github" that
+  // predate this export keep the window-only behavior.
+  findStableRelease?: (
+    repoFullName: string,
+    initialReleases: GithubRelease[]
+  ) => Promise<StableReleaseSearchResult>;
 }
 
 // Lazy wrappers: resolved at call time so test mocks of "@/lib/github" that
@@ -76,7 +92,18 @@ export interface ReleaseDeltaDeps {
 const defaultReleaseDeltaDeps: ReleaseDeltaDeps = {
   resolveRef: (repoFullName, ref) => fetchLatestCommit(repoFullName, ref),
   compare: (repoFullName, baseRef, headRef) => fetchCompare(repoFullName, baseRef, headRef),
+  findStableRelease: (repoFullName, initialReleases) =>
+    fetchStableBaselineRelease(repoFullName, initialReleases),
 };
+
+function newestStableIn(releases: GithubRelease[]): GithubRelease | null {
+  return (
+    releases
+      .filter((rel) => !rel.draft && !rel.prerelease)
+      .sort((a, b) => new Date(b.published_at).getTime() - new Date(a.published_at).getTime())[0] ??
+    null
+  );
+}
 
 export async function computeReleaseDelta(
   repoFullName: string,
@@ -85,14 +112,48 @@ export async function computeReleaseDelta(
   deps: ReleaseDeltaDeps = defaultReleaseDeltaDeps
 ): Promise<ReleaseDeltaSnapshot> {
   // Newest stable first (drafts/prereleases never baseline). The listing is
-  // the same bounded history the sync already persists (≤50 newest); a repo
-  // whose entire fetched window were drafts/prereleases reports no-baseline —
-  // a deliberate over-listing-trust trade-off, never a manufactured count.
-  const stable = releases
-    .filter((rel) => !rel.draft && !rel.prerelease)
-    .sort((a, b) => new Date(b.published_at).getTime() - new Date(a.published_at).getTime())[0];
+  // the same bounded history the sync already persists (≤50 newest); when no
+  // stable release is in that window, the deepening search below resolves
+  // the actual newest stable before any absence is claimed.
+  let stable = newestStableIn(releases);
+  let searchComplete = true;
+  if (!stable && deps.findStableRelease) {
+    try {
+      const search = await deps.findStableRelease(repoFullName, releases);
+      stable = search.release;
+      searchComplete = search.complete;
+    } catch (error) {
+      return {
+        releaseState: "unknown",
+        releaseBaselineTag: null,
+        releaseBaselineSha: null,
+        releaseBaselinePublishedAt: null,
+        releaseHeadSha: headSha,
+        releaseAheadBy: null,
+        releaseError: boundedReleaseError(error).slice(0, RELEASE_ERROR_MAX_CHARS),
+      };
+    }
+  }
 
   if (!stable) {
+    if (!searchComplete) {
+      // The bounded deep search hit its cap without finding a stable
+      // release: absence is unverified, so fail closed to `unknown` instead
+      // of manufacturing a `no-baseline`.
+      return {
+        releaseState: "unknown",
+        releaseBaselineTag: null,
+        releaseBaselineSha: null,
+        releaseBaselinePublishedAt: null,
+        releaseHeadSha: headSha,
+        releaseAheadBy: null,
+        releaseError:
+          "no stable release found before the bounded release search hit its cap".slice(
+            0,
+            RELEASE_ERROR_MAX_CHARS
+          ),
+      };
+    }
     // Distinct "no baseline" state — not 0 commits, not an error.
     return {
       releaseState: "no-baseline",

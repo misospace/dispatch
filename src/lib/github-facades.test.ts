@@ -46,17 +46,19 @@ describe("github domain modules expose expected exports", () => {
   });
 
   it("github-ci exports CI/workflows/runs/jobs/releases/packages/commits/logs symbols", () => {
-    expect(Object.keys(Ci).sort()).toEqual([
-      "extractLogExcerpt",
+expect(Object.keys(Ci).sort()).toEqual([
+  "RELEASE_BASELINE_SEARCH_MAX",
+  "extractLogExcerpt",
       "fetchCommitDate",
       "fetchCompare",
       "fetchFailedJobLogExcerpt",
       "fetchLatestCommit",
       "fetchPackages",
-      "fetchRecentRunsAllWorkflows",
-      "fetchReleases",
-      "fetchRunJobs",
-      "fetchWorkflowRuns",
+"fetchRecentRunsAllWorkflows",
+  "fetchReleases",
+  "fetchRunJobs",
+  "fetchStableBaselineRelease",
+  "fetchWorkflowRuns",
       "fetchWorkflows",
       "jobIdFromCheckRunUrl",
       "rerunWorkflow",
@@ -101,6 +103,7 @@ describe("github domain modules expose expected exports", () => {
       "updateIssueTitleAndBody", "removeIssueLabel", "syncStatusLabels", "closeIssue",
       "fetchRepo", "fetchWorkflows", "fetchWorkflowRuns", "fetchRecentRunsAllWorkflows",
       "fetchRunJobs", "fetchReleases", "fetchPackages", "rerunWorkflow",
+      "fetchStableBaselineRelease",
       "triggerWorkflowDispatch", "fetchLatestCommit", "fetchCompare", "jobIdFromCheckRunUrl",
       "extractLogExcerpt", "fetchFailedJobLogExcerpt",
       "fetchPullRequests", "fetchClosedPullRequests", "fetchPullRequestHealthSignals",

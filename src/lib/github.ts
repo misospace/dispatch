@@ -33,6 +33,8 @@ export {
   fetchRunJobs,
   type GithubRelease,
   fetchReleases,
+  RELEASE_BASELINE_SEARCH_MAX,
+  fetchStableBaselineRelease,
   type GithubPackageInfo,
   fetchPackages,
   rerunWorkflow,

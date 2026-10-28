@@ -1206,3 +1206,109 @@ describe("fetchLatestCommit", () => {
     expect(url).toBe("https://api.github.com/repos/o/r/commits/release%2Fv1.0.0?per_page=1");
   });
 });
+
+describe("fetchStableBaselineRelease", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function release(overrides: Partial<{ id: number; tag_name: string; draft: boolean; prerelease: boolean; published_at: string }> = {}) {
+    return {
+      id: overrides.id ?? 1,
+      tag_name: overrides.tag_name ?? "v1.0.0",
+      name: "Release",
+      draft: overrides.draft ?? false,
+      prerelease: overrides.prerelease ?? false,
+      target_commitish: "main",
+      html_url: "https://github.com/o/r/releases/tag/v1.0.0",
+      published_at: overrides.published_at ?? "2024-01-01T00:00:00Z",
+    };
+  }
+
+  it("answers from the initial window without any extra API call", async () => {
+    const { fetchStableBaselineRelease } = await import("./github");
+
+    const result = await fetchStableBaselineRelease("o/r", [release()]);
+
+    expect(result).toEqual({ release: release(), complete: true });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("deepens the search and finds the newest stable beyond the window", async () => {
+    const { fetchStableBaselineRelease } = await import("./github");
+    const deepPage = [
+      release({ id: 5, tag_name: "v3.0.0-rc1", prerelease: true, published_at: "2024-06-01T00:00:00Z" }),
+      release({ id: 4, tag_name: "v0.9.0", published_at: "2023-06-01T00:00:00Z" }),
+    ];
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve(deepPage),
+      headers: new Headers(),
+    } as Response);
+
+    const result = await fetchStableBaselineRelease("o/r", [release({ id: 2, tag_name: "v2.0.0-rc2", prerelease: true })]);
+
+    expect(result).toEqual({ release: release({ id: 4, tag_name: "v0.9.0", published_at: "2023-06-01T00:00:00Z" }), complete: true });
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toBe("https://api.github.com/repos/o/r/releases?per_page=100");
+  });
+
+  it("reports a complete search when the listing is exhausted without a stable", async () => {
+    const { fetchStableBaselineRelease } = await import("./github");
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve([release({ id: 1, tag_name: "v1.0.0-rc1", prerelease: true })]),
+      headers: new Headers(),
+    } as Response);
+
+    const result = await fetchStableBaselineRelease("o/r", []);
+
+    expect(result).toEqual({ release: null, complete: true });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports an incomplete search when the cap is hit without a stable", async () => {
+    const { fetchStableBaselineRelease, RELEASE_BASELINE_SEARCH_MAX } = await import("./github");
+    const pageSize = 100;
+    const pages = RELEASE_BASELINE_SEARCH_MAX / pageSize;
+    fetchMock.mockImplementation((url: string) => {
+      const page = Number(new URL(url).searchParams.get("page") ?? "1");
+      const items = Array.from({ length: pageSize }, (_, i) =>
+        release({ id: page * pageSize + i, tag_name: `nightly-${page}-${i}`, prerelease: true })
+      );
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve(items),
+        headers: new Headers(page < pages ? { Link: `<https://api.github.com/repos/o/r/releases?per_page=100&page=${page + 1}>; rel="next"` } : {}),
+      } as Response);
+    });
+
+    const result = await fetchStableBaselineRelease("o/r", []);
+
+    expect(result).toEqual({ release: null, complete: false });
+    expect(fetchMock).toHaveBeenCalledTimes(pages);
+  });
+
+  it("propagates forge failures for the caller to fail closed", async () => {
+    const { fetchStableBaselineRelease } = await import("./github");
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 403,
+      json: () => Promise.resolve({}),
+      text: () => Promise.resolve("forbidden"),
+      headers: new Headers(),
+    } as Response);
+
+    await expect(fetchStableBaselineRelease("o/r", [])).rejects.toThrow(/403/);
+  });
+});
