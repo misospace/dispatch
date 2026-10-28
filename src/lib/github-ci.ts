@@ -141,7 +141,11 @@ export async function fetchStableBaselineRelease(
   return {
     release: newestStableRelease(deeper),
     // fetchPaginated only stops early when the listing is exhausted, so a
-    // total below the cap proves the whole listing was enumerated.
+    // total below the cap proves the whole listing was enumerated. (Like the
+    // persisted window itself, this trusts the forge's Link `rel="next"`
+    // headers; a proxy stripping them on a non-final page would read as
+    // exhausted — the same over-listing-trust trade-off, never a
+    // manufactured count.)
     complete: deeper.length < RELEASE_BASELINE_SEARCH_MAX,
   };
 }

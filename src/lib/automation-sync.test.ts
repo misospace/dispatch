@@ -1032,6 +1032,8 @@ describe("release delta (#1480)", () => {
 
     expect(delta.releaseBaselineTag).toBe("v1.0.0");
     expect(deps.resolveRef).toHaveBeenCalledWith("o/r", "v1.0.0");
+    // A window that already holds a stable release never deepens the search.
+    expect(deps.findStableRelease).toBeUndefined();
   });
 
   it("reports a distinct no-baseline state when there is no stable release", async () => {

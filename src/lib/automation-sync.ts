@@ -79,7 +79,8 @@ export interface ReleaseDeltaDeps {
   // Deepens the release search when the provided window holds no stable
   // release (drafts/prereleases can crowd every stable release out of the
   // persisted ≤50 window). Optional so test mocks of "@/lib/github" that
-  // predate this export keep the window-only behavior.
+  // predate this export still load the module; a missing export then fails
+  // closed into the bounded `unknown` delta below, never a crash.
   findStableRelease?: (
     repoFullName: string,
     initialReleases: GithubRelease[]
