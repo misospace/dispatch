@@ -8,7 +8,7 @@ min_version = "2026.10.13"
 locked = true
 
 [tools]
-node = "24"
+node = "26"
 
 [tasks.bootstrap]
 description = "Idempotent dev bootstrap: npm ci + Prisma client generation (no DATABASE_URL, no migrations, no git hooks, no tests, no formatting)"
