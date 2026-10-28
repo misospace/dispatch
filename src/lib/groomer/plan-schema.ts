@@ -14,6 +14,7 @@ import {
   VERIFICATION_VALUES,
   WORK_TYPE_VALUES,
 } from "./plan";
+import { INFO_GAP_KIND_VALUES } from "./investigation-gap";
 
 type Schema = Record<string, unknown>;
 
@@ -79,6 +80,15 @@ export function buildGroomingPlanResponseSchema(catalog?: EvidenceCatalog): Sche
           material: { type: "boolean" },
         }),
         L.uncertainties,
+      ),
+      // What a needs_info verdict waits on (dispatch#1452); null on every
+      // other actionability. The validator enforces that pairing.
+      infoGap: nullable(
+        obj({
+          kind: enumOf(INFO_GAP_KIND_VALUES),
+          question: str(L.text),
+          whyToolsCannotAnswer: str(L.text),
+        }),
       ),
     }),
     implementationBrief: nullable(

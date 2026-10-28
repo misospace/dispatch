@@ -123,4 +123,54 @@ describe("LoginPage", () => {
 
     expect(trackedHref).toBe("/api/login?callbackUrl=%2Fboard");
   });
+
+  async function renderAuthenticated(callbackUrl: string) {
+    getLoginPage(callbackUrl);
+    vi.mocked(window.fetch).mockResolvedValueOnce({
+      json: () => Promise.resolve({ user: { email: "test@example.com" } }),
+    } as Response);
+
+    const { default: LoginPage } = await import("./page");
+    render(<LoginPage />);
+  }
+
+  it("redirects an authenticated user to a valid local callback with query and fragment", async () => {
+    await renderAuthenticated("/board?tab=issues#card-7");
+
+    await waitFor(() => {
+      expect(mockReplace).toHaveBeenCalledWith("/board?tab=issues#card-7");
+    });
+  });
+
+  it("does not redirect an authenticated user through a slash-backslash external callback", async () => {
+    await renderAuthenticated("/\\evil.example/path");
+
+    await waitFor(() => {
+      expect(mockReplace).toHaveBeenCalledWith("/board");
+    });
+    expect(mockReplace).not.toHaveBeenCalledWith("/\\evil.example/path");
+  });
+
+  it.each([
+    ["tab", "/\t/evil.example"],
+    ["newline", "/\n/evil.example"],
+    ["carriage return", "/\r/evil.example"],
+  ])("does not redirect an authenticated user through a callback with an embedded %s", async (_name, callbackUrl) => {
+    await renderAuthenticated(callbackUrl);
+
+    await waitFor(() => {
+      expect(mockReplace).toHaveBeenCalledWith("/board");
+    });
+    expect(mockReplace).not.toHaveBeenCalledWith(callbackUrl);
+  });
+
+  it("encodes a rejected slash-backslash callback as /board on the sign-in link", async () => {
+    getLoginPage("/\\evil.example/path");
+    const { default: LoginPage } = await import("./page");
+    render(<LoginPage />);
+
+    await userEvent.click(screen.getByRole("button", { name: /sign in with sso/i }));
+
+    expect(trackedHref).toBe("/api/login?callbackUrl=%2Fboard");
+  });
 });

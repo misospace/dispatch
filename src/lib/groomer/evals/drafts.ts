@@ -28,6 +28,12 @@ interface CommonOptions {
   proposedBody?: string | null;
   githubComment?: string | null;
   relatedWork?: RelatedWorkCandidate[];
+  /**
+   * What a needs_info verdict is waiting on (dispatch#1452). No default:
+   * a fixture must state the gap explicitly, and the validator rejects a
+   * needs_info verdict without one.
+   */
+  infoGap?: GroomingPlanDraft["verdict"]["infoGap"];
 }
 
 export interface BriefOptions {
@@ -75,6 +81,7 @@ function base(
       rationale: o.rationale ?? o.summary,
       evidenceRefs: o.evidence,
       uncertainties: o.uncertainties ?? [],
+      infoGap: o.infoGap ?? null,
     },
     implementationBrief: null,
     mutations: {

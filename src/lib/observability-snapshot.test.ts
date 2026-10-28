@@ -192,6 +192,50 @@ describe("collectObservabilitySnapshot", () => {
     }
   });
 
+  it("loads lease dispositions and external waits for the derivation (#1455)", async () => {
+    const retryAfter = new Date(NOW.getTime() + 600_000);
+    mocks.lease.findMany.mockResolvedValue([
+      {
+        agentName: "worker-a",
+        issueId: "issue-1",
+        expiredAt: new Date(NOW.getTime() + 1_800_000),
+        renewedAt: null,
+        disposition: "completed",
+        retryAfter: null,
+        createdAt: new Date(NOW.getTime() - 120_000),
+      },
+      {
+        agentName: "worker-b",
+        issueId: "issue-2",
+        expiredAt: new Date(NOW.getTime() + 1_800_000),
+        renewedAt: null,
+        disposition: "blocked",
+        retryAfter,
+        createdAt: new Date(NOW.getTime() - 120_000),
+      },
+    ]);
+
+    const snapshot = await collectObservabilitySnapshot(NOW);
+
+    expect(mocks.lease.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        select: expect.objectContaining({ disposition: true, retryAfter: true }),
+      }),
+    );
+    // A completed lease is retained evidence, and a parked external wait is
+    // deferred ownership: neither is live execution or actionable expiry.
+    expect(snapshot.execution.activeLeases).toBe(0);
+    expect(snapshot.execution.expiredLeases).toBe(0);
+    expect(snapshot.execution.terminalLeases).toBe(1);
+    expect(snapshot.execution.externalWaitLeases).toBe(1);
+    expect(snapshot.execution.executionActive).toBe(0);
+    expect(snapshot.observations.staleOwnership).toBe(false);
+    // The collector stays read-only even with lease rows loaded.
+    for (const write of writes) {
+      expect(write).not.toHaveBeenCalled();
+    }
+  });
+
   it("tracks the last successful applied grooming run as the stall baseline", async () => {
     const previous = process.env.DISPATCH_GROOMER_INTERVAL_MS;
     try {

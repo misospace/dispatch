@@ -36,6 +36,7 @@ import {
   type SyncPipelineDeclaration,
   type SyncPipelineState,
 } from "@/lib/sync-pipeline";
+import { TERMINAL_DISPOSITIONS } from "@/lib/ownership-state";
 
 // ─── Bounded window allowlists (§4.10) ──────────────────────────────────────
 
@@ -264,6 +265,17 @@ export interface ObservabilityLeaseRow {
   issueId: string;
   expiredAt: Date;
   renewedAt: Date | null;
+  /**
+   * Durable ownership disposition (#1251): terminal
+   * `completed | released | handed_off`, the non-terminal `blocked`, or the
+   * system-stamped `expired` tombstone (#1417); null while the claim is live.
+   * Terminal dispositions are retained evidence — the row is never deleted —
+   * so a TTL-only classification would report finished work as live
+   * execution and later as actionable stale ownership (#1455).
+   */
+  disposition: string | null;
+  /** External-wait marker: while in the future, ownership defers (#1251 §4). */
+  retryAfter: Date | null;
   createdAt: Date;
 }
 
@@ -427,6 +439,18 @@ export interface ObservabilitySnapshot {
     assigned: number;
     activeLeases: number;
     expiredLeases: number;
+    /**
+     * Retained terminal ownership dispositions (completed/released/handed_off,
+     * #1455): durable gone-evidence counted as neither active execution nor
+     * actionable expired ownership.
+     */
+    terminalLeases: number;
+    /**
+     * Leases parked by a future external-wait `retryAfter` (#1455): deferred
+     * ownership, counted as neither active execution nor actionable expired
+     * ownership for as long as the marker is future.
+     */
+    externalWaitLeases: number;
     /** 0/1: a live lease or CLAIMED/IN_PROGRESS AgentWork by a worker identity. */
     executionActive: 0 | 1;
     agentWorkByState: CountMap;
@@ -872,9 +896,38 @@ export function computeObservabilitySnapshot(
   // ── Execution ──
   const workerLeases = inputs.leases.filter((l) => isWorkerIdentity(l.agentName));
   const activeLeaseSet = new Set<string>();
+  const externalWaitIssueSet = new Set<string>();
   let activeLeases = 0;
   let expiredLeases = 0;
+  let terminalLeases = 0;
+  let externalWaitLeases = 0;
   for (const lease of workerLeases) {
+    // A retained terminal disposition (#1251) is positive gone-evidence: the
+    // row survives on purpose, so it is neither live execution nor actionable
+    // stale ownership — before OR after its TTL. Pickup/execution-history
+    // evidence below still counts the row (createdAt is the pickup time).
+    // Checked BEFORE the wait marker on purpose: `deriveOwnershipState` orders
+    // EXTERNAL_WAIT first, but the write side makes terminal+future-retryAfter
+    // unreachable (the disposition route rejects retryAfter on non-blocked
+    // kinds and dispositionOwnership clears the marker), and gone-evidence
+    // is the stronger statement for these metrics if a legacy row ever
+    // carried both.
+    if (lease.disposition !== null && TERMINAL_DISPOSITIONS.has(lease.disposition)) {
+      terminalLeases += 1;
+      continue;
+    }
+    // The external-wait park follows the ownership capability contract
+    // (#1251 §4: claim + future retryAfter → EXTERNAL_WAIT, elapsed falls
+    // through): a parked owner is silent BY DESIGN. It is neither active
+    // execution nor actionable expired ownership while the marker is future.
+    if (lease.retryAfter !== null && lease.retryAfter > now) {
+      externalWaitLeases += 1;
+      externalWaitIssueSet.add(lease.issueId);
+      continue;
+    }
+    // Everything else classifies on TTL, including a `blocked` disposition
+    // without (or past) `retryAfter` and the system `expired` tombstone
+    // (#1417): both stay unverified stale-claim evidence, never gone-evidence.
     if (lease.expiredAt > now) {
       activeLeases += 1;
       activeLeaseSet.add(lease.issueId);
@@ -917,10 +970,18 @@ export function computeObservabilitySnapshot(
     .filter((r) => r.status === "failed" && r.createdAt <= now)
     .map((r) => r.createdAt);
 
-  // Assigned (label-only) without observed execution.
+  // Assigned (label-only) without observed execution. A terminal lease is NOT
+  // live execution here (#1455) — the lingering `agent/*` label on finished
+  // work should surface in the aggregate (its age clock stays suppressed by
+  // the executedIssueIds history rule, which still counts terminal rows). An
+  // external-wait park suppresses the aggregate: the owner holds the claim on
+  // purpose, so the issue is "waiting", not "never picked up".
   const assignedIssues = eligibleOpen.filter((i) => getAgentFromLabels(i.labels) !== null);
   const assignedWithoutExecution = assignedIssues.filter(
-    (i) => !activeLeaseSet.has(i.id) && !activeWorkIssueIds.has(i.id),
+    (i) =>
+      !activeLeaseSet.has(i.id) &&
+      !externalWaitIssueSet.has(i.id) &&
+      !activeWorkIssueIds.has(i.id),
   );
   const assignmentObservation = observeAssignments(inputs, assignedWithoutExecution);
 
@@ -1150,6 +1211,8 @@ export function computeObservabilitySnapshot(
       assigned: assignedIssues.length,
       activeLeases,
       expiredLeases,
+      terminalLeases,
+      externalWaitLeases,
       executionActive,
       agentWorkByState,
       agentWorkReleasePending: releasePending,

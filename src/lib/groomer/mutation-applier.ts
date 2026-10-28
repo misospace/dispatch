@@ -41,7 +41,18 @@ import {
   type LiveIssueState,
 } from "./mutation-validator";
 
-export const APPLICATION_KEY_VERSION = 1;
+/**
+ * v2 (dispatch#1461): the persisted verdict reason — and the verdict action
+ * that decides the field it persists to — joined the application intent, so a
+ * key recorded under v1 can never match a post-deploy key. The
+ * rows are NOT migrated — the reason text is not stored on a
+ * GroomingApplication row, so a v1 key cannot be recomputed — and the decided
+ * deploy behaviour is one re-apply: the first post-deploy groom of an
+ * already-groomed issue is applied again under its fresh v2 key (its GitHub
+ * comment re-posts, subject to the comment cooldown) before the new key is
+ * claimed and idempotency resumes.
+ */
+export const APPLICATION_KEY_VERSION = 2;
 export const MAX_GITHUB_COMMENT_CHARS = 4096;
 /**
  * The largest body the applier will write to GitHub. GitHub's issue body cap
@@ -296,6 +307,15 @@ export interface GroomingMutationDiff {
   /** Why proposed body enrichment was not applied, when it was not. */
   bodySkippedReason: string | null;
   close: boolean;
+  /**
+   * The reason text this verdict persists on the Issue row (dispatch#1461):
+   * the same value the run's mutation path writes (needs_info →
+   * needsInfoReason, blocked → blockedReason, backlog → notReadyReason), null
+   * when the verdict persists none. It is part of the application intent, so
+   * a re-groom whose verdict reason changed is applied — the Issue row
+   * carries the new text — rather than replayed with the stale one.
+   */
+  persistedReason: string | null;
   /** The plan's decomposition intent; null when the plan does not decompose. */
   children: DecompositionIntent | null;
 }
@@ -342,6 +362,9 @@ function withholdPlan(plan: GroomingPlan, what: string, reasons: string[]): Groo
       lane: null,
       evidenceDigest: plan.readiness.evidenceDigest,
       reasons: [`withheld ${what}: ${reasons.join("; ")}`],
+      // #1452: a withheld promotion lands as backlog, not as a gap: what it
+      // waits on is Dispatch's own rejection, recorded in reasons.
+      gapClass: null,
     },
   };
 }
@@ -448,6 +471,21 @@ export function computeMutationDiff(input: MutationDiffInput): GroomingMutationD
   const rawComment = output.githubComment?.replace(ANY_GROOMER_MARKER, "").trim();
   const comment = rawComment ? neutralizeMentions(rawComment) : null;
 
+  // The reason text the verdict persists (dispatch#1461), read from the
+  // effective output: a withheld close or ready promotion lands as backlog
+  // with its withheld rationale, and keys on the text it actually persists.
+  // The run path may yet replace the backlog text with its own fallback
+  // (run.ts's mark_not_ready fallback), which overrides this before the
+  // application key is computed.
+  const persistedReason =
+    output.nextGroomingAction === "mark_needs_info"
+      ? output.needsInfoReason || null
+      : output.nextGroomingAction === "mark_blocked"
+        ? output.blockedReason || null
+        : output.nextGroomingAction === "mark_not_ready"
+          ? output.notReadyReason || null
+          : null;
+
   return {
     output,
     withheld,
@@ -461,6 +499,7 @@ export function computeMutationDiff(input: MutationDiffInput): GroomingMutationD
     bodyBefore: live.body,
     bodySkippedReason,
     close: done && live.state === "open" && inFlightStatus(live.labels) === null,
+    persistedReason,
     children,
   };
 }
@@ -490,6 +529,14 @@ export function computeApplicationKey(input: {
       title: diff.title,
       body: diff.body,
       close: diff.close,
+      // The persisted reason text is part of the intent (dispatch#1461): a
+      // re-groom whose verdict reason changed must be applied, so the Issue
+      // row carries the new text, not replayed with the stale one. The
+      // verdict action rides along: it decides which field the reason is
+      // persisted to (and the row's nextGroomingAction), so a verdict flip
+      // that leaves the reason text identical is still a new application.
+      reason: diff.persistedReason,
+      action: diff.output.nextGroomingAction ?? null,
       // The decomposition is part of the intent: its children are the stable
       // childBriefKeys, so a change to the split (or its withholding) changes
       // the application key. Sorted, because the brief order is not identity —

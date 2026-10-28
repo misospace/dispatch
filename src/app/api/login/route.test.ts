@@ -85,4 +85,51 @@ describe("GET /api/login", () => {
     expect(mockSignIn).toHaveBeenCalledWith("oidc", { redirectTo: "/board/inbox" });
     expect(res.status).toBe(302);
   });
+
+  it("preserves query strings and fragments on valid local callbacks", async () => {
+    mockSignIn.mockResolvedValueOnce(new Response(null, { status: 302 }));
+
+    const { GET } = await import("./route");
+    const res = (await GET(makeRequest("http://localhost/api/login?callbackUrl=%2Fboard%3Ftab%3Dissues%23card-7"))) as Response;
+
+    expect(mockSignIn).toHaveBeenCalledWith("oidc", { redirectTo: "/board?tab=issues#card-7" });
+    expect(res.status).toBe(302);
+  });
+
+  it("rejects slash-backslash protocol-relative callbackUrl decoded by URLSearchParams", async () => {
+    mockSignIn.mockResolvedValueOnce(new Response(null, { status: 302 }));
+
+    const { GET } = await import("./route");
+    // Decodes to /\evil.example/path, which the URL parser normalizes to https://evil.example/path
+    const res = (await GET(makeRequest("http://localhost/api/login?callbackUrl=%2F%5Cevil.example%2Fpath"))) as Response;
+
+    expect(mockSignIn).toHaveBeenCalledWith("oidc", { redirectTo: "/board" });
+    expect(res.status).toBe(302);
+  });
+
+  it("rejects backslash-only variant callbackUrl decoded by URLSearchParams", async () => {
+    mockSignIn.mockResolvedValueOnce(new Response(null, { status: 302 }));
+
+    const { GET } = await import("./route");
+    // Decodes to /\/evil.example
+    const res = (await GET(makeRequest("http://localhost/api/login?callbackUrl=%2F%5C%2Fevil.example"))) as Response;
+
+    expect(mockSignIn).toHaveBeenCalledWith("oidc", { redirectTo: "/board" });
+    expect(res.status).toBe(302);
+  });
+
+  it.each([
+    ["tab", "%09"],
+    ["newline", "%0A"],
+    ["carriage return", "%0D"],
+  ])("rejects callbackUrl with embedded %s decoded by URLSearchParams", async (_name, encoded) => {
+    mockSignIn.mockResolvedValueOnce(new Response(null, { status: 302 }));
+
+    const { GET } = await import("./route");
+    // Decodes to /<control>/evil.example, which the URL parser normalizes to http://evil.example/
+    const res = (await GET(makeRequest(`http://localhost/api/login?callbackUrl=/${encoded}%2Fevil.example`))) as Response;
+
+    expect(mockSignIn).toHaveBeenCalledWith("oidc", { redirectTo: "/board" });
+    expect(res.status).toBe(302);
+  });
 });

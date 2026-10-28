@@ -112,6 +112,36 @@ describe("executeGroomerTool", () => {
     expect(result.content.length).toBeLessThan(400);
   });
 
+  it("reports whether a read_file was clipped by the byte budget (dispatch#1452)", async () => {
+    const deps = makeDeps({
+      readFile: vi.fn().mockImplementation(async (_repo: string, path: string) => (path === "big.ts" ? "x".repeat(500) : "const a = 1;")),
+    });
+
+    const big = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "big.ts" } },
+      { ...options, maxFileBytes: 100 },
+      deps,
+    );
+    expect(big.ok).toBe(true);
+    expect(big.truncated).toBe(true);
+
+    const small = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "small.ts" } },
+      options,
+      deps,
+    );
+    expect(small.ok).toBe(true);
+    expect(small.truncated).toBe(false);
+
+    // No other tool reports a clip.
+    const search = await executeGroomerTool(
+      { name: "search_code", arguments: { query: "x" } },
+      options,
+      makeDeps(),
+    );
+    expect(search.truncated).toBeUndefined();
+  });
+
   it("lists a directory and marks subdirectories", async () => {
     const deps = makeDeps({
       listDir: vi.fn().mockResolvedValue([

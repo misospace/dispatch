@@ -144,7 +144,22 @@ function draft(patch: DraftPatch = {}): GroomingPlanDraft {
 function notReady(actionability: "needs_info" | "blocked" | "backlog", patch: DraftPatch = {}): GroomingPlanDraft {
   return draft({
     ...patch,
-    verdict: { actionability, lane: { id: "backlog", confidence: "medium", reason: "not ready" }, ...patch.verdict },
+    verdict: {
+      actionability,
+      lane: { id: "backlog", confidence: "medium", reason: "not ready" },
+      // #1452: a needs_info verdict must carry its gap; helpers state the
+      // ordinary human-question case so gap-specific tests patch over it.
+      ...(actionability === "needs_info"
+        ? {
+            infoGap: {
+              kind: "product_decision" as const,
+              question: "Which tenant scope applies?",
+              whyToolsCannotAnswer: "The repository records no product-scope decision.",
+            },
+          }
+        : {}),
+      ...patch.verdict,
+    },
     implementationBrief: patch.implementationBrief === undefined ? null : patch.implementationBrief,
   });
 }
@@ -186,6 +201,7 @@ describe("GroomingPlan contract", () => {
       lane: "local",
       evidenceDigest: "digest-1",
       reasons: [],
+      gapClass: null,
     });
     expect(plan.mutations.status).toBe("status/ready");
   });
@@ -235,7 +251,13 @@ describe("GroomingPlan contract", () => {
         },
       }),
     );
-    expect(plan.readiness).toMatchObject({ ready: false, admission: null, lane: null, reasons: ["verdict is needs_info"] });
+    expect(plan.readiness).toMatchObject({
+      ready: false,
+      admission: null,
+      lane: null,
+      gapClass: "human_question",
+      reasons: ["verdict is needs_info", "awaiting human (product_decision): Which tenant scope applies?"],
+    });
     expect(plan.verdict.uncertainties[0].material).toBe(true);
   });
 
@@ -780,7 +802,10 @@ describe("toGroomerOutput (legacy compatibility view)", () => {
       nextGroomingAction: "mark_blocked",
       labelsToAdd: ["type/bug", "status/blocked"],
     });
-    expect(toGroomerOutput(validPlan(notReady("needs_info")), [])).toMatchObject({ needsInfoReason: expect.any(String), nextGroomingAction: "mark_needs_info" });
+    expect(toGroomerOutput(validPlan(notReady("needs_info")), [])).toMatchObject({
+      needsInfoReason: `human_question(product_decision): ${readyDraft().verdict.rationale}`,
+      nextGroomingAction: "mark_needs_info",
+    });
     expect(toGroomerOutput(validPlan(notReady("backlog")), [])).toMatchObject({ notReadyReason: expect.any(String), nextGroomingAction: "mark_not_ready" });
   });
 
@@ -809,5 +834,105 @@ describe("toGroomerOutput (legacy compatibility view)", () => {
     expect(output).not.toHaveProperty("githubComment");
     expect(output).not.toHaveProperty("proposedTitle");
     expect(output).not.toHaveProperty("proposedBody");
+  });
+});
+
+describe("needs_info gap classification (dispatch#1452)", () => {
+  const HUMAN_GAP = {
+    kind: "product_decision" as const,
+    question: "Where should the documentation link live?",
+    whyToolsCannotAnswer: "No destination exists in the repository; it is a maintainer choice.",
+  };
+
+  function gapFacts(patch: Partial<import("./investigation-gap").InvestigationGapFacts> = {}) {
+    return {
+      explorationRan: true,
+      toolFailures: [] as string[],
+      truncatedReads: [] as string[],
+      budgetExhausted: false,
+      roundsExhausted: false,
+      aborted: false,
+      unavailable: false,
+      ...patch,
+    };
+  }
+
+  it("rejects a needs_info verdict with no info gap", () => {
+    expectInvalid(notReady("needs_info", { verdict: { infoGap: null } }), "verdict.infoGap");
+  });
+
+  it("rejects an info gap on a verdict that is not needs_info", () => {
+    expectInvalid(notReady("backlog", { verdict: { infoGap: HUMAN_GAP } }), "only a needs_info verdict carries an info gap");
+    expectInvalid(draft({ verdict: { infoGap: HUMAN_GAP } }), "only a needs_info verdict carries an info gap");
+  });
+
+  it("keeps a concrete human question a human question when the exploration was clean", () => {
+    const plan = validateGroomingPlan(notReady("needs_info", { verdict: { infoGap: HUMAN_GAP } }), {
+      catalog: catalog(),
+      investigation: gapFacts(),
+    }).plan!;
+    expect(plan.readiness.gapClass).toBe("human_question");
+    expect(plan.readiness.reasons).toEqual([
+      "verdict is needs_info",
+      "awaiting human (product_decision): Where should the documentation link live?",
+    ]);
+  });
+
+  it("overrides a human question when the run's tool calls failed", () => {
+    const plan = validateGroomingPlan(notReady("needs_info", { verdict: { infoGap: HUMAN_GAP } }), {
+      catalog: catalog(),
+      investigation: gapFacts({ toolFailures: ["search_code"], truncatedReads: ["src/auth/login.ts"] }),
+    }).plan!;
+    expect(plan.readiness.gapClass).toBe("investigation_incomplete");
+    expect(plan.readiness.reasons[1]).toContain("investigation incomplete");
+    expect(plan.readiness.reasons[1]).toContain("tool_failure:search_code");
+    expect(plan.readiness.reasons[1]).toContain("truncated_read:src/auth/login.ts");
+  });
+
+  it("keeps the model's own investigation_incomplete even with clean facts", () => {
+    const plan = validateGroomingPlan(
+      notReady("needs_info", {
+        verdict: {
+          infoGap: {
+            kind: "investigation_incomplete",
+            question: "Which code path raises the timeout?",
+            whyToolsCannotAnswer: "The read of the worker entry point was cut off before the call site.",
+          },
+        },
+      }),
+      { catalog: catalog(), investigation: gapFacts() },
+    ).plan!;
+    expect(plan.readiness.gapClass).toBe("investigation_incomplete");
+  });
+
+  it("persists the declared gap on the plan, not just the resolution", () => {
+    const plan = validateGroomingPlan(notReady("needs_info", { verdict: { infoGap: HUMAN_GAP } }), {
+      catalog: catalog(),
+    }).plan!;
+    expect(plan.verdict.infoGap).toEqual(HUMAN_GAP);
+  });
+
+  it("codes the stored needsInfoReason with the resolved gap", () => {
+    const incomplete = validateGroomingPlan(notReady("needs_info", { verdict: { infoGap: HUMAN_GAP } }), {
+      catalog: catalog(),
+      investigation: gapFacts({ aborted: true }),
+    }).plan!;
+    expect(toGroomerOutput(incomplete, []).needsInfoReason).toBe(
+      `investigation_incomplete: ${readyDraft().verdict.rationale}`,
+    );
+  });
+
+  it("an incomplete investigation stays non-claimable and never becomes ready", () => {
+    const plan = validateGroomingPlan(
+      notReady("needs_info", {
+        verdict: { infoGap: HUMAN_GAP, lane: { id: "local", confidence: "high", reason: "looks ready" } },
+      }),
+      { catalog: catalog(), investigation: gapFacts({ budgetExhausted: true }) },
+    ).plan!;
+    // The invariant still forces a non-ready verdict out of the claimable lane.
+    expect(plan.readiness.ready).toBe(false);
+    expect(plan.verdict.lane.id).toBe("backlog");
+    expect(plan.mutations.status).toBe("status/backlog");
+    expect(plan.readiness.gapClass).toBe("investigation_incomplete");
   });
 });

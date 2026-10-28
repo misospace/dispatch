@@ -179,12 +179,33 @@ export async function runCandidate(
         ? [{ path, ref: c.repository.headSha, content: c.repository.contents[path] }]
         : [],
     ),
-    toolCalls: [],
+    toolCalls: (c.exploration?.toolCalls ?? []).map((call) => ({
+      name: call.name,
+      arguments: call.arguments ?? {},
+      ok: call.ok ?? true,
+      bytes: call.bytes ?? 0,
+      preview: call.preview ?? "",
+      truncated: call.truncated ?? false,
+    })),
     bytes: 0,
     warnings: [],
     relatedWorkQueries: [],
     relatedWorkRefs: related.map((w) => w.key),
     relatedWork: related,
+    // What this run's investigation could or could not establish
+    // (dispatch#1452): a clean completed exploration by default, merged
+    // with the case's exploration.gaps for the cases that model a broken
+    // one — a timed-out tool, a truncated read, an aborted loop.
+    gaps: {
+      explorationRan: true,
+      toolFailures: [],
+      truncatedReads: [],
+      budgetExhausted: false,
+      roundsExhausted: false,
+      aborted: false,
+      unavailable: false,
+      ...c.exploration?.gaps,
+    },
   };
 
   const applications: ApplicationRows = options.applications ?? new Map();
