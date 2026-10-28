@@ -20,6 +20,12 @@
  * issue to ready and never closes one: the stale mark is the reconsideration,
  * because stale results bypass the selector's blocked parking and get
  * re-groomed, where a fresh verdict re-decides.
+ *
+ * Fairness: the scan is capped per repository, so a row the pass can make no
+ * progress on (its candidate dependency is still open) must not keep that cap
+ * to itself. Every row the scan reaches is stamped with the time it was last
+ * considered and the scan orders least-recently-considered first, so the cap
+ * rotates through the parked set instead of parking on its oldest rows.
  */
 import { prisma } from "@/lib/prisma";
 import { findOpenIssueKeys } from "@/lib/issue-dependency-annotation";
@@ -35,7 +41,12 @@ import {
 
 export const BLOCKED_RECONCILIATION_ACTOR = "grooming-blocked-reconciliation";
 
-/** How many parked blocked issues one pass evaluates per repository. */
+/**
+ * How many parked blocked issues one pass scans per repository. The scan is
+ * capped so one repository cannot monopolize a pass, and the cap rotates:
+ * every row the scan reaches is stamped as considered, so the next pass reads
+ * the least-recently-considered rows first.
+ */
 export const DEFAULT_BLOCKED_RECONCILIATION_BUDGET: BlockedReconciliationBudget = { maxIssuesPerRepo: 200 };
 
 /**
@@ -58,6 +69,8 @@ export interface ParkedBlockedIssueRow {
   groomedIssueFingerprint: string | null;
   groomedDependencyKeys: string[];
   groomedOpenBlockerKeys: string[];
+  /** When the pass last reached this row during a scan. Audit only. */
+  blockedReconciliationAt: Date | null;
 }
 
 export interface BlockedReconciliationBudget {
@@ -74,6 +87,12 @@ export interface BlockedReconciliationStore {
   findParkedBlockedIssues(repositoryId: string, take: number): Promise<ParkedBlockedIssueRow[]>;
   findOpenIssueKeys(numbers: number[]): Promise<Set<string>>;
   markStale(row: ParkedBlockedIssueRow, mark: StaleMarkLike, at: Date): Promise<boolean>;
+  /**
+   * Record that the scan reached these rows, whether or not the pass could
+   * act on them. Audit only: it orders the next scan's slice and is never a
+   * freshness, admission or block predicate.
+   */
+  recordConsidered(rows: ParkedBlockedIssueRow[], at: Date): Promise<void>;
   recordAudit(repoFullName: string, row: ParkedBlockedIssueRow, mark: StaleMarkLike): Promise<void>;
 }
 
@@ -196,10 +215,19 @@ export async function runGroomingBlockedReconciliationPass(
   const result: BlockedReconciliationPassResult = { issuesConsidered: 0, markedStale: [], deferred: [], warnings: [] };
 
   for (const repo of repos) {
+    // Rows the pass actually reached. Every reached row is stamped afterwards,
+    // so a row the pass cannot progress on rotates out of the next pass's
+    // capped slice instead of holding it forever. Rows an error cut off
+    // before they were reached stay unstamped and lead the next pass.
+    const reached: ParkedBlockedIssueRow[] = [];
     try {
-      const rows = (await store.findParkedBlockedIssues(repo.id, budget.maxIssuesPerRepo)).filter(
-        (row) => row.state === "open" && isFreshnessTrackedStatus(row.labels) && !isRenovateIssue({ title: row.title, labels: row.labels }),
-      );
+      const scanned = await store.findParkedBlockedIssues(repo.id, budget.maxIssuesPerRepo);
+      const isReconsiderable = (row: ParkedBlockedIssueRow) =>
+        row.state === "open" && isFreshnessTrackedStatus(row.labels) && !isRenovateIssue({ title: row.title, labels: row.labels });
+      const rows = scanned.filter(isReconsiderable);
+      // A row the scan reached but the pass skips in memory was still
+      // considered: it must not pin the head of the order forever.
+      reached.push(...scanned.filter((row) => !isReconsiderable(row)));
       result.issuesConsidered += rows.length;
       if (rows.length === 0) continue;
 
@@ -230,6 +258,7 @@ export async function runGroomingBlockedReconciliationPass(
       }
 
       for (const row of rows) {
+        reached.push(row);
         const decision = evaluateParkedBlock(row, repo.fullName, openKeys, now(), windowHours);
         if (decision.action === "mark") {
           const mark: StaleMarkLike = { reasons: decision.reasons, detail: decision.detail };
@@ -250,9 +279,38 @@ export async function runGroomingBlockedReconciliationPass(
       }
     } catch (err) {
       result.warnings.push(`blocked-reconciliation: ${repo.fullName}: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      await stampConsidered(store, reached, now(), repo.fullName, result.warnings);
     }
   }
   return result;
+}
+
+/**
+ * Stamp the rows the scan reached so the next pass's capped slice rotates
+ * past them. Every reached row is stamped — including the rows the pass
+ * skipped in memory (worker-owned statuses, renovate issues) — because a row
+ * that cannot progress must not pin the head of the order forever and starve
+ * a later parked issue out of reconsideration. Rows the scan never reached
+ * (cut off by the cap) stay unstamped and lead the next pass.
+ *
+ * Best effort: a failed stamp is a warning, never a pass failure.
+ */
+async function stampConsidered(
+  store: BlockedReconciliationStore,
+  rows: ParkedBlockedIssueRow[],
+  at: Date,
+  repoFullName: string,
+  warnings: string[],
+): Promise<void> {
+  if (rows.length === 0) return;
+  try {
+    await store.recordConsidered(rows, at);
+  } catch (err) {
+    warnings.push(
+      `blocked-reconciliation: ${repoFullName}: consideration stamp failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -261,8 +319,8 @@ export async function runGroomingBlockedReconciliationPass(
 
 export function makePrismaBlockedReconciliationStore(client: typeof prisma = prisma): BlockedReconciliationStore {
   return {
-    // Oldest groom first (never-groomed legacy rows first), so a capped pass
-    // rotates fairly. Already-stale rows are excluded: the selector re-grooms
+    // Oldest groom first (never-groomed legacy rows first) within the
+    // rotation. Already-stale rows are excluded: the selector re-grooms
     // them and the markStale CAS below would only no-op.
     findParkedBlockedIssues(repositoryId, take) {
       return client.issue.findMany({
@@ -299,13 +357,41 @@ export function makePrismaBlockedReconciliationStore(client: typeof prisma = pri
           groomedIssueFingerprint: true,
           groomedDependencyKeys: true,
           groomedOpenBlockerKeys: true,
+          blockedReconciliationAt: true,
         },
-        orderBy: [{ groomedAt: { sort: "asc", nulls: "first" } }, { number: "asc" }],
+        // Least-recently-considered first: a row the scan reached last pass —
+        // whether or not the pass could act on it — moves to the back of the
+        // order, so the capped slice rotates through the parked set instead of
+        // parking on the rows it could not progress on. Never-considered rows
+        // lead (NULLS FIRST) and keep the never-groomed-first order among
+        // themselves, so legacy parks are reconsidered first.
+        orderBy: [
+          { blockedReconciliationAt: { sort: "asc", nulls: "first" } },
+          { groomedAt: { sort: "asc", nulls: "first" } },
+          { number: "asc" },
+        ],
         take,
       });
     },
     findOpenIssueKeys(numbers) {
       return findOpenIssueKeys(numbers, client);
+    },
+    // One bulk write per repo pass, scoped to rows that are still groomer-owned
+    // parked blocks: a row that left the parked state meanwhile is not stamped
+    // and leads the next pass. Writing through the Prisma client also advances
+    // `updatedAt` (@updatedAt) on those rows; that bump is inherent to the
+    // client and harmless here — the rotation read depends on
+    // `blockedReconciliationAt` alone, and `updatedAt` stays informational
+    // (never a freshness or ordering predicate).
+    async recordConsidered(rows, at) {
+      await client.issue.updateMany({
+        where: {
+          id: { in: rows.map((row) => row.id) },
+          blockedReason: { not: null },
+          nextGroomingAction: "mark_blocked",
+        },
+        data: { blockedReconciliationAt: at },
+      });
     },
     // Race guard: the write lands only while the read still describes the
     // issue — same baseline (groomedRunId, null matching IS NULL), no stale

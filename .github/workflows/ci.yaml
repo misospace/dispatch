@@ -162,11 +162,15 @@ jobs:
       # transaction-level rollback guarantee, which the mocks cannot prove
       # (#1392). The #1417 dead-claim recovery chain joins for the same class
       # of reason: the tombstone → candidate → ladder → §8.7 settle sequence
-      # spans three modules and two real transactions.
+      # spans three modules and two real transactions. The blocked-reconciliation
+      # rotation test joins it for the same class of reason: the rotation
+      # guarantee ("a parked block that cannot progress must not hold the
+      # capped scan") is an ORDER BY over a nullable column plus a bulk stamp,
+      # and only a real PostgreSQL proves it (#1459).
       - name: Concurrency and idempotency against a real PostgreSQL
         env:
           RUN_DB_INTEGRATION: "1"
-        run: npx vitest run src/lib/sync-lock.integration.test.ts "src/app/api/agents/[agentName]/tasks/report/route.integration.test.ts" src/lib/groomer/apply.integration.test.ts src/lib/pr-fix-external-wait.integration.test.ts src/lib/issue-mutation-guard.integration.test.ts src/lib/agent-work.integration.test.ts src/lib/pr-fix-rebase-type.integration.test.ts src/lib/lease-expiry-recovery.integration.test.ts
+        run: npx vitest run src/lib/sync-lock.integration.test.ts "src/app/api/agents/[agentName]/tasks/report/route.integration.test.ts" src/lib/groomer/apply.integration.test.ts src/lib/groomer/blocked-reconciliation.integration.test.ts src/lib/pr-fix-external-wait.integration.test.ts src/lib/issue-mutation-guard.integration.test.ts src/lib/agent-work.integration.test.ts src/lib/pr-fix-rebase-type.integration.test.ts src/lib/lease-expiry-recovery.integration.test.ts
 
   coverage:
     name: Coverage

@@ -44,6 +44,7 @@ function parkedRow(overrides: Partial<FakeRow> = {}): FakeRow {
     groomedIssueFingerprint: null,
     groomedDependencyKeys: [],
     groomedOpenBlockerKeys: [],
+    blockedReconciliationAt: null,
     blockedReason: "waiting on #5",
     nextGroomingAction: "mark_blocked",
     admissionOverrideId: null,
@@ -60,7 +61,10 @@ interface FakeStore extends BlockedReconciliationStore {
   openKeys: Set<string>;
   failOpenKeys: boolean;
   raceOnMark: boolean;
+  failMarkStale: boolean;
+  failConsidered: boolean;
   takeSeen: number | null;
+  considered: string[];
 }
 
 function fakeStore(rows: FakeRow[], openKeys: Set<string> = new Set()): FakeStore {
@@ -71,7 +75,10 @@ function fakeStore(rows: FakeRow[], openKeys: Set<string> = new Set()): FakeStor
     openKeys,
     failOpenKeys: false,
     raceOnMark: false,
+    failMarkStale: false,
+    failConsidered: false,
     takeSeen: null,
+    considered: [],
     async findParkedBlockedIssues(_repositoryId, take) {
       store.takeSeen = take;
       // Mirror the real store's where clause: open, explained block, a park
@@ -79,14 +86,25 @@ function fakeStore(rows: FakeRow[], openKeys: Set<string> = new Set()): FakeStor
       // nextGroomingAction), no admission override, retry backoff elapsed,
       // not already stale, and not a row the freshness pass owns (it has a
       // typed dependency anchor).
-      return store.rows
+      const eligible = store.rows
         .filter((r) => r.state === "open" && r.blockedReason != null)
         .filter((r) => r.nextGroomingAction === "mark_blocked")
         .filter((r) => r.admissionOverrideId == null)
         .filter((r) => r.groomingRetryAfter == null || r.groomingRetryAfter.getTime() <= NOW.getTime())
         .filter((r) => !store.stale.has(r.id))
-        .filter((r) => !hasTypedDependencyAnchor(r))
-        .slice(0, take);
+        .filter((r) => !hasTypedDependencyAnchor(r));
+      // Mirror the real store's order: least-recently-considered first (NULL =
+      // never considered), then never-groomed first, then issue number.
+      const ordered = [...eligible].sort((a, b) => {
+        const consideredA = a.blockedReconciliationAt?.getTime() ?? -Infinity;
+        const consideredB = b.blockedReconciliationAt?.getTime() ?? -Infinity;
+        if (consideredA !== consideredB) return consideredA - consideredB;
+        const groomedA = a.groomedAt?.getTime() ?? -Infinity;
+        const groomedB = b.groomedAt?.getTime() ?? -Infinity;
+        if (groomedB !== groomedA) return groomedA - groomedB;
+        return a.number - b.number;
+      });
+      return ordered.slice(0, take);
     },
     async findOpenIssueKeys() {
       if (store.failOpenKeys) throw new Error("db down");
@@ -95,11 +113,16 @@ function fakeStore(rows: FakeRow[], openKeys: Set<string> = new Set()): FakeStor
     async markStale(row, mark) {
       // CAS emulation: a mark lands only while the row is still unmarked and
       // the run that groomed it has not changed since the read.
+      if (store.failMarkStale) throw new Error("db down");
       if (store.raceOnMark || store.stale.has(row.id)) return false;
       store.stale.set(row.id, { reasons: [...mark.reasons], detail: mark.detail });
       return true;
     },
-    async recordAudit(_repo, row) {
+    async recordConsidered(rows, at) {
+      if (store.failConsidered) throw new Error("db down");
+      store.considered.push(...rows.map((row) => row.id));
+      for (const row of rows) row.blockedReconciliationAt = at;
+    },    async recordAudit(_repo, row) {
       store.audits.push(row.id);
     },
   };
@@ -389,6 +412,72 @@ describe("runGroomingBlockedReconciliationPass", () => {
     expect(result.issuesConsidered).toBe(2);
   });
 
+  it("rotates the capped slice so a row that cannot progress does not starve the tail", async () => {
+    // Rows 1 and 2 wait on an open prerequisite: the pass can make no
+    // progress on them. Before the rotation stamp they held the capped slice
+    // on every pass, so row 3 — whose prerequisite closed — was never
+    // reconsidered.
+    const store = fakeStore(
+      [
+        parkedRow({ id: "issue-1", number: 1, body: "Depends on #5.", groomedAt: new Date(NOW.getTime() - 25 * HOUR) }),
+        parkedRow({ id: "issue-2", number: 2, body: "Depends on #6.", groomedAt: new Date(NOW.getTime() - 25 * HOUR) }),
+        parkedRow({ id: "issue-3", number: 3, body: "Depends on #7.", groomedAt: new Date(NOW.getTime() - 25 * HOUR) }),
+      ],
+      new Set(["org/repo#5", "org/repo#6"]),
+    );
+    const budget = { maxIssuesPerRepo: 2 };
+
+    const first = await runGroomingBlockedReconciliationPass([REPO], store, budget, () => NOW, BLOCKED_RECONSIDER_WINDOW_HOURS);
+    expect(first.markedStale).toEqual([]);
+    expect(first.issuesConsidered).toBe(2);
+
+    // The next pass reads the least-recently-considered rows first, so the
+    // never-considered row 3 is in the slice and its closed prerequisite is
+    // noticed.
+    const second = await runGroomingBlockedReconciliationPass([REPO], store, budget, () => NOW, BLOCKED_RECONSIDER_WINDOW_HOURS);
+    expect(second.markedStale).toEqual([{ repo: "org/repo", issueNumber: 3, reasons: ["evidence_incomplete"] }]);
+  });
+
+  it("stamps every row the scan reached, including the rows the pass skips", async () => {
+    // A worker-owned row and a renovate row are skipped in memory. They are
+    // still stamped: a row the pass cannot act on must not pin the head of
+    // the order forever and starve a later parked issue.
+    const store = fakeStore([
+      parkedRow({ id: "issue-1", number: 1, labels: ["status/blocked", "status/in-progress"] }),
+      parkedRow({ id: "issue-2", number: 2, title: "Dependency dashboard", labels: [] }),
+    ]);
+    const result = await pass(store);
+    expect(result.issuesConsidered).toBe(0);
+    expect(result.markedStale).toEqual([]);
+    expect(store.considered).toEqual(["issue-1", "issue-2"]);
+  });
+
+  it("turns a failed consideration stamp into a warning without failing the pass", async () => {
+    const store = fakeStore([parkedRow({ body: "Depends on #5.", groomedAt: new Date(NOW.getTime() - 25 * HOUR) })]);
+    store.failConsidered = true;
+    const result = await pass(store);
+    // The stale mark still lands: the stamp is a rotation aid, not a fence.
+    expect(result.markedStale).toEqual([{ repo: "org/repo", issueNumber: 1, reasons: ["evidence_incomplete"] }]);
+    expect(result.warnings).toHaveLength(1);
+    expect(result.warnings[0]).toContain("consideration stamp failed");
+  });
+
+  it("leaves the rows an error cut off before they were reached unstamped", async () => {
+    // The mark write failed on the first row, so the pass never reached the
+    // other two. Stamping them would push them to the back of the rotation
+    // for a pass that never looked at them; unstamped, they lead the next
+    // pass and are retried first.
+    const store = fakeStore([
+      parkedRow({ id: "issue-1", number: 1, body: "Depends on #5.", groomedAt: new Date(NOW.getTime() - 25 * HOUR) }),
+      parkedRow({ id: "issue-2", number: 2, body: "Depends on #6.", groomedAt: new Date(NOW.getTime() - 25 * HOUR) }),
+    ]);
+    store.failMarkStale = true;
+    const result = await pass(store);
+    expect(result.markedStale).toEqual([]);
+    expect(result.warnings).toHaveLength(1);
+    expect(store.considered).toEqual(["issue-1"]);
+  });
+
   it("turns a repo-level failure into a warning and keeps the other repos", async () => {
     const healthy = fakeStore([
       parkedRow({ body: "Depends on #5.", groomedAt: new Date(NOW.getTime() - 25 * HOUR) }),
@@ -415,10 +504,10 @@ describe("runGroomingBlockedReconciliationPass", () => {
 
 describe("makePrismaBlockedReconciliationStore", () => {
   it("pins the production selection to anchorless rows", async () => {
-    let captured: { where?: { AND?: unknown[] } } = {};
+    let captured: { where?: { AND?: unknown[] }; orderBy?: unknown } = {};
     const client = {
       issue: {
-        findMany: async (args: { where?: { AND?: unknown[] } }) => {
+        findMany: async (args: { where?: { AND?: unknown[] }; orderBy?: unknown }) => {
           captured = args;
           return [];
         },
@@ -432,5 +521,52 @@ describe("makePrismaBlockedReconciliationStore", () => {
     // clause, so the rule is pinned on both sides.
     expect(NO_TYPED_DEPENDENCY_ANCHOR).toEqual({ groomedDependencyKeys: { isEmpty: true } });
     expect(captured.where?.AND).toContainEqual(NO_TYPED_DEPENDENCY_ANCHOR);
+  });
+
+  it("pins the production scan order to least-recently-considered first", async () => {
+    let captured: { orderBy?: unknown } = {};
+    const client = {
+      issue: {
+        findMany: async (args: { orderBy?: unknown }) => {
+          captured = args;
+          return [];
+        },
+      },
+    } as unknown as PrismaClient;
+    const store = makePrismaBlockedReconciliationStore(client);
+    await store.findParkedBlockedIssues("repo-1", 10);
+    // The capped slice must rotate: the rotation stamp leads (NULL = never
+    // considered first), then never-groomed legacy rows, then the issue
+    // number as a deterministic tiebreak.
+    expect(captured.orderBy).toEqual([
+      { blockedReconciliationAt: { sort: "asc", nulls: "first" } },
+      { groomedAt: { sort: "asc", nulls: "first" } },
+      { number: "asc" },
+    ]);
+  });
+
+  it("stamps the rows the scan reached in one bulk write", async () => {
+    const updates: Array<{ where: unknown; data: unknown }> = [];
+    const client = {
+      issue: {
+        updateMany: async (args: { where: unknown; data: unknown }) => {
+          updates.push(args);
+          return { count: 2 };
+        },
+      },
+    } as unknown as PrismaClient;
+    const store = makePrismaBlockedReconciliationStore(client);
+    const rows = [parkedRow({ id: "issue-1" }), parkedRow({ id: "issue-2", number: 2 })];
+    const at = new Date("2026-10-01T12:00:00.000Z");
+    await store.recordConsidered(rows, at);
+    // One write, scoped to rows that are still groomer-owned parked blocks: a
+    // row that left the parked state meanwhile is not stamped and leads the
+    // next pass.
+    expect(updates).toEqual([
+      {
+        where: { id: { in: ["issue-1", "issue-2"] }, blockedReason: { not: null }, nextGroomingAction: "mark_blocked" },
+        data: { blockedReconciliationAt: at },
+      },
+    ]);
   });
 });
