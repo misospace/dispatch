@@ -380,13 +380,24 @@ function buildSearchOutageAnswer(
 
   // Not enough room for the full answer: whole clauses only, most important
   // first. The word "outage" is the one that must survive — an answer that
-  // says neither outage nor absence is worse than a short one.
-  const parts = [prefix, "outage"];
-  for (const clause of ["— not evidence the code is missing", noRetry]) {
-    if (size([...parts, clause]) > limit) break;
-    parts.push(clause);
+  // says neither outage nor absence is worse than a short one (dispatch#1451).
+  // When even the prefix does not fit alongside it, the signal is the whole
+  // answer and the context gives way: cutting "search_code failed: outage"
+  // from the front would leave a prefix fragment that says nothing and could
+  // be read as a garbled absence.
+  if (size([prefix, "outage"]) <= limit) {
+    const parts = [prefix, "outage"];
+    for (const clause of ["— not evidence the code is missing", noRetry]) {
+      if (size([...parts, clause]) > limit) break;
+      parts.push(clause);
+    }
+    return { content: join(parts), fallbackOffered: false };
   }
-  return { content: truncate(join(parts), limit).text, fallbackOffered: false };
+  // Whole fallback answers, largest first: the outage signal itself is what
+  // must survive, and context (the prefix) only comes back as room remains.
+  const candidates = ["search outage", "outage"];
+  const best = candidates.find((candidate) => Buffer.byteLength(candidate, "utf8") <= limit);
+  return { content: best ?? truncate("outage", limit).text, fallbackOffered: false };
 }
 
 /**
@@ -1050,10 +1061,15 @@ export async function executeGroomerTool(
         const ref = options.pinnedRef ?? (asString(call.arguments.ref).trim() || undefined);
         const text = await deps.readFile(options.repoFullName, path, ref);
         if (!text) {
+          // The answer names the path and the way out, so it is model-visible
+          // content and is charged against the budget the caller has left
+          // like every other answer (dispatch#1451): repeated reads of empty
+          // files must consume the run's budget, not emit for free.
+          const content = buildUnreadableFileAnswer(path, totalCap);
           return {
             ok: true,
-            content: buildUnreadableFileAnswer(path, totalCap),
-            bytes: 0,
+            content,
+            bytes: Buffer.byteLength(content, "utf8"),
             sources: [],
           };
         }
@@ -1195,10 +1211,13 @@ export async function executeGroomerTool(
         const ref = options.pinnedRef ?? (asString(call.arguments.ref).trim() || undefined);
         const entries = await deps.listDir(options.repoFullName, path, ref);
         if (entries.length === 0) {
+          // Same as an empty file: the answer is model-visible content and is
+          // charged against the budget the caller has left (dispatch#1451).
+          const content = buildEmptyDirectoryAnswer(path, totalCap);
           return {
             ok: true,
-            content: buildEmptyDirectoryAnswer(path, totalCap),
-            bytes: 0,
+            content,
+            bytes: Buffer.byteLength(content, "utf8"),
             sources: [],
           };
         }

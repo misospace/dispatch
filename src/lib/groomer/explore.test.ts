@@ -303,6 +303,31 @@ describe("exploreRepository", () => {
     expect(search?.preview).not.toContain("list_directory");
   });
 
+  it("charges empty-file answers to the exploration byte budget (dispatch#1451)", async () => {
+    // An empty file answers with named, bounded content — model-visible, so
+    // it consumes the run's budget like every other answer. Repeated reads
+    // must decrease what is left, or they emit content for free.
+    const fetchImpl = fetchReturning({
+      content: null,
+      tool_calls: [toolCall("1", "read_file", { path: "ghost.ts" })],
+    });
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue("") }, fetchImpl);
+
+    const result = await exploreRepository({ ...options, maxTotalBytes: 100, maxRounds: 4 }, deps);
+
+    const reads = result.toolCalls.filter((call) => call.name === "read_file");
+    expect(reads.length).toBeGreaterThan(0);
+    for (const read of reads) {
+      expect(read.ok).toBe(true);
+      // Charged in full: every byte the model saw is what the record reports.
+      expect(read.bytes).toBe(Buffer.byteLength(read.preview, "utf8"));
+    }
+    expect(result.bytes).toBeGreaterThan(0);
+    expect(result.bytes).toBeLessThanOrEqual(100);
+    // The budget really ran out: the charged answers exhausted it.
+    expect(result.warnings).toContain("repository exploration hit its byte budget");
+  });
+
   it("never spends more than the exploration total when a search succeeds late (dispatch#1451)", async () => {
     // A successful search renders its match list; that answer is charged
     // against what is left of the run's byte budget, so a search after earlier

@@ -1222,11 +1222,61 @@ describe("executeGroomerTool search failure vs true absence (dispatch#1451)", ()
       expect(result.content).not.toContain("\n");
       expect(result.content).not.toContain("No matches");
       // The outage signal is what must survive a tight budget. The thresholds
-      // are the byte lengths of the wording the answer falls back to.
+      // are the byte lengths of the wording the answer falls back to: whole
+      // answers only, largest that fits — the signal first, context after.
       if (cap >= 1) expect(result.content.length).toBeGreaterThan(0);
-      if (cap >= 18) expect(result.content).toContain("search_code failed");
-      if (cap >= 26) expect(result.content).toContain("outage");
+      if (cap >= 6) expect(result.content).toContain("outage");
+      if (cap >= 26) expect(result.content).toContain("search_code failed");
       if (cap >= 63) expect(result.content).toContain("not evidence the code is missing");
+    }
+  });
+
+  it("keeps the whole outage signal when the budget cannot carry the prefix", async () => {
+    // A budget that fits "outage" but not the prefix must still say "outage":
+    // cutting "search_code failed: outage" from the front would leave a
+    // fragment like "search…" the model can misread as a garbled absence.
+    const deps = makeDeps({
+      searchCode: vi.fn().mockRejectedValue(new Error("Code search failed for org/repo: 502")),
+    });
+    for (let cap = 6; cap <= 25; cap += 1) {
+      const result = await executeGroomerTool(
+        { name: "search_code", arguments: { query: "enrich" } },
+        { ...options, maxTotalBytesRemaining: cap },
+        deps,
+      );
+      expect(result.bytes).toBeLessThanOrEqual(cap);
+      expect(result.content).toContain("outage");
+      // Whole answers only: the prefix fragment can never appear.
+      expect(result.content.startsWith("search…")).toBe(false);
+    }
+    // Pinned ladder in the middle band: signal only below the prefix cost,
+    // "search outage" once there is room for it, prefix and signal above 26.
+    for (let cap = 6; cap <= 12; cap += 1) {
+      const result = await executeGroomerTool(
+        { name: "search_code", arguments: { query: "enrich" } },
+        { ...options, maxTotalBytesRemaining: cap },
+        deps,
+      );
+      expect(result.content).toBe("outage");
+    }
+    for (let cap = 13; cap <= 25; cap += 1) {
+      const result = await executeGroomerTool(
+        { name: "search_code", arguments: { query: "enrich" } },
+        { ...options, maxTotalBytesRemaining: cap },
+        deps,
+      );
+      expect(result.content).toBe("search outage");
+    }
+    // Below the signal there is nothing whole left to say, but the answer
+    // still stays inside the budget.
+    for (let cap = 1; cap <= 5; cap += 1) {
+      const result = await executeGroomerTool(
+        { name: "search_code", arguments: { query: "enrich" } },
+        { ...options, maxTotalBytesRemaining: cap },
+        deps,
+      );
+      expect(result.bytes).toBeLessThanOrEqual(cap);
+      expect(result.content.length).toBeGreaterThan(0);
     }
   });
 
@@ -1361,9 +1411,12 @@ describe("executeGroomerTool answers stay inside the caller's remaining budget (
     expect(result.content).toContain("… ");
   });
 
-  it("keeps the zero-byte answers inside the remaining budget", async () => {
-    // A successful empty search still reads as possible absence (bytes 0),
-    // and every answer still fits the budget the caller has left.
+  it("charges empty file and directory answers, keeps the empty search zero-byte", async () => {
+    // The successful empty search is the freshness layer's negative-evidence
+    // signal (`ok && bytes === 0` means "found nothing"), so it stays
+    // zero-byte. An empty file or directory still answers with named, bounded
+    // content — that answer is model-visible and is charged against the
+    // budget the caller has left like every other answer (dispatch#1451).
     const emptySearch = makeDeps({ searchCode: vi.fn().mockResolvedValue([]) });
     const emptyFile = makeDeps({ readFile: vi.fn().mockResolvedValue("") });
     const emptyDir = makeDeps({ listDir: vi.fn().mockResolvedValue([]) });
@@ -1380,14 +1433,38 @@ describe("executeGroomerTool answers stay inside the caller's remaining budget (
         { ...options, maxTotalBytesRemaining: cap },
         emptyFile,
       );
-      expect(Buffer.byteLength(file.content, "utf8")).toBeLessThanOrEqual(cap);
+      // Charged in full: result.bytes is exactly the bytes the model saw.
+      expect(file.bytes).toBe(Buffer.byteLength(file.content, "utf8"));
+      expect(file.bytes).toBeLessThanOrEqual(cap);
       const dir = await executeGroomerTool(
         { name: "list_directory", arguments: { path: "x".repeat(300) } },
         { ...options, maxTotalBytesRemaining: cap },
         emptyDir,
       );
-      expect(Buffer.byteLength(dir.content, "utf8")).toBeLessThanOrEqual(cap);
+      expect(dir.bytes).toBe(Buffer.byteLength(dir.content, "utf8"));
+      expect(dir.bytes).toBeLessThanOrEqual(cap);
     }
+  });
+
+  it("charges empty file and directory answers on a roomy budget too", async () => {
+    // The cap must not be what makes the answer charged: with room to spare,
+    // the bytes the model saw are still what result.bytes reports.
+    const emptyFile = makeDeps({ readFile: vi.fn().mockResolvedValue("") });
+    const emptyDir = makeDeps({ listDir: vi.fn().mockResolvedValue([]) });
+    const file = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "ghost.ts" } },
+      { ...options, maxTotalBytesRemaining: 4096 },
+      emptyFile,
+    );
+    expect(file.bytes).toBe(Buffer.byteLength(file.content, "utf8"));
+    expect(file.bytes).toBeGreaterThan(0);
+    const dir = await executeGroomerTool(
+      { name: "list_directory", arguments: { path: "ghost" } },
+      { ...options, maxTotalBytesRemaining: 4096 },
+      emptyDir,
+    );
+    expect(dir.bytes).toBe(Buffer.byteLength(dir.content, "utf8"));
+    expect(dir.bytes).toBeGreaterThan(0);
   });
 
   it("still reads as absence when the no-match answer is squeezed", async () => {
