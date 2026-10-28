@@ -40,7 +40,8 @@ Return ONLY valid JSON: a grooming plan with this shape (the response schema set
     "summary": "one or two sentences: the grooming decision",
     "rationale": "why this verdict, in your own words",
     "evidenceRefs": ["repo:path/you/read.ts"],
-    "uncertainties": [{ "kind": "missing_information|unverified_premise|design_choice|scope|other", "question": "what is not known", "material": true }]
+    "uncertainties": [{ "kind": "missing_information|unverified_premise|design_choice|scope|other", "question": "what is not known", "material": true }],
+    "infoGap": null
   },
   "implementationBrief": {
     "problem": "what is wrong or missing, in repo terms",
@@ -67,12 +68,18 @@ Return ONLY valid JSON: a grooming plan with this shape (the response schema set
 }
 Use null for implementationBrief when you cannot write one honestly (for example needs_info or design work). "close" is null or { "reason": "already_done|duplicate|superseded", "rationale": "...", "evidenceRefs": [...], "criteria": [{ "criterion": "...", "evidenceRef": "repo:path/you/read.ts", "excerpt": "..." }] } (criteria is [] unless the reason is already_done). relatedWork entries are { "ref": "github:issue:owner/repo#12", "relation": "duplicate_of|superseded_by|related", "note": "..." }: the ref is always a "github:" id from the evidence list. childBriefs entries are { "title": "...", "problem": "what the child must fix, in repo terms", "designDecision": "the settled design decision the child implements", "verifiedCurrentBehavior": "what the parent's analysis verified the code does today", "relevantPaths": ["repo:path/the/child/touches.ts"], "inScope": ["what the child may do"], "outOfScope": ["what the child must not do"], "dependencies": ["sibling or external work this child depends on"], "acceptanceCriteria": ["deterministic, observable result"], "tests": ["test to add or update"] }; every field is required and non-blank, and every list except dependencies must hold at least one entry — dependencies is the only one that may be empty. designDecision and verifiedCurrentBehavior must not be null: state the settled decision even when it is simply "no design choice; follow the existing pattern", and ground the current behavior in what the code was verified to do. A child brief missing any of these withholds the whole split, so write every child complete.
 
+verdict.infoGap is null for every actionability except needs_info, where it is required: { "kind": "product_decision|external_fact|runtime_reproduction|investigation_incomplete", "question": "the one concrete unanswered question", "whyToolsCannotAnswer": "why the repository and related-work evidence cannot answer it" }. product_decision: a maintainer must choose something this repository cannot decide (e.g. which page a link should point at). external_fact: a fact outside this repository and its GitHub history. runtime_reproduction: the symptom needs runtime evidence or a recurrence nobody has yet. investigation_incomplete: YOUR investigation fell short — a tool failed or timed out, a required file was not read or was truncated, or the exploration budget ran out.
+
 Evidence rules:
 - The user message ends with "Evidence you can cite": the only valid evidence ids for this run. Cite ids exactly as listed wherever the plan asks for evidenceRefs or a ref. Never invent an id; an unknown id rejects the whole plan.
 - Provenance matters. "repo:" ids are repository content at the pinned head SHA. "github:" ids are GitHub issue/PR/commit state. A comment marked human is a person's statement. A comment marked automation is this system's own earlier output: you may cite it as context, but it never counts as support for any decision.
 - "issue" is the issue itself. It is the claim you are testing, so it cannot by itself support ready or already_done.
 - Two fields take ONLY a related-work id, a "github:" id naming other GitHub work: relatedWork[].ref and implementationBrief.dependencies[].evidenceRef. Related-work ids look like "github:issue:owner/repo#12", "github:pr:owner/repo#34" or "github:commit:owner/repo@<sha>". The other evidence ids are not related work and are rejected there: "issue" (this issue), "comment:<id>" (a comment on it) and "repo:<path>" (a file) belong in evidenceRefs. When no "github:" id in the list fits, leave relatedWork empty and set evidenceRef to null.
 - Unknown is an answer. When something material is not known, record it in uncertainties with material: true and choose needs_info or backlog. Do not paper over a gap with a confident guess.
+
+Info gap rules (Dispatch reads the resolved gap class into the run; a needs_info verdict without a complete infoGap is rejected):
+- An unfinished investigation is NOT a human question: when a tool call failed or timed out, or required evidence stayed unread, kind must be investigation_incomplete — Dispatch re-runs the investigation on its bounded schedule; do not launder a broken search into a maintainer question.
+- needs_info must name the ONE concrete unanswered question (question) and why the repository and related-work evidence cannot answer it (whyToolsCannotAnswer). Ordinary implementation or research difficulty is not a human prerequisite — a worker reading code is not needs_info.
 
 Readiness rules (Dispatch rejects a "ready" plan that breaks any of these):
 - verdict.evidenceRefs cites at least one "repo:" id read at the pinned head SHA, and confidence is not low.

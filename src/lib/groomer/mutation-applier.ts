@@ -342,6 +342,9 @@ function withholdPlan(plan: GroomingPlan, what: string, reasons: string[]): Groo
       lane: null,
       evidenceDigest: plan.readiness.evidenceDigest,
       reasons: [`withheld ${what}: ${reasons.join("; ")}`],
+      // #1452: a withheld promotion lands as backlog, not as a gap: what it
+      // waits on is Dispatch's own rejection, recorded in reasons.
+      gapClass: null,
     },
   };
 }

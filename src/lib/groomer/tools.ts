@@ -64,6 +64,12 @@ export interface GroomerToolResult {
    * exactly what was read (dispatch#1099).
    */
   file?: { path: string; ref: string | null; content: string };
+  /**
+   * read_file only: the file's text was clipped to maxFileBytes, so the model
+   * saw a prefix, not the whole file (dispatch#1452). Every other tool
+   * leaves it unset.
+   */
+  truncated?: boolean;
 }
 
 export interface GroomerToolDeps {
@@ -503,6 +509,7 @@ export async function executeGroomerTool(
           bytes: Buffer.byteLength(content, "utf8"),
           sources: [path],
           file: { path, ref: ref ?? null, content: body },
+          truncated,
         };
       }
 

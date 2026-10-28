@@ -18,6 +18,8 @@
 import type { StatusLabel } from "@/types";
 import type { RelatedWorkObservation } from "../evidence-snapshot";
 import type { GroomingStaleReason } from "../freshness";
+import type { ExploreToolRecord } from "../explore";
+import type { InfoGapResolution, InvestigationGapFacts } from "../investigation-gap";
 
 export interface CaseIssue {
   number: number;
@@ -46,6 +48,13 @@ export interface CaseComment {
   body: string;
   createdAt: string;
 }
+
+/**
+ * One exploration tool-call record, as a fixture states it (dispatch#1452):
+ * only the fields a case cares about; the harness fills the rest of
+ * ExploreToolRecord with neutral defaults.
+ */
+export type CaseToolCall = Partial<ExploreToolRecord> & { name: string };
 
 export interface CaseRepository {
   /** Default-branch head the run pinned; null models an unresolvable head. */
@@ -102,6 +111,12 @@ export type CandidateExpectation =
       status: StatusLabel;
       ready: boolean;
       admission?: "implementation" | "escalation" | null;
+      /**
+       * The gap class the persisted readiness must carry (dispatch#1452): what
+       * this non-ready verdict is waiting on, resolved against the run's
+       * exploration facts. Omitted: not asserted.
+       */
+      gapClass?: InfoGapResolution | null;
       /** Whether the issue is closed on GitHub. Defaults to false. */
       closes?: boolean;
       /**
@@ -182,6 +197,16 @@ export interface GroomingCase {
   commentsDesc?: CaseComment[];
   comments?: CaseComment[];
   repository: CaseRepository;
+  /**
+   * This run's exploration, as the fixture reconstructs it (dispatch#1452):
+   * the tool-call records and the gap facts the plan validator resolves a
+   * needs_info verdict against. Absent: a clean completed exploration — no
+   * tool failures, no truncated reads, budget and rounds intact.
+   */
+  exploration?: {
+    toolCalls?: CaseToolCall[];
+    gaps?: Partial<InvestigationGapFacts>;
+  };
   relatedWork?: Array<Pick<RelatedWorkObservation, "key" | "kind" | "state" | "via" | "closes" | "baseRef">>;
   trackedIssues?: TrackedIssue[];
   /** Dependency keys (`owner/repo#N`) that are merged/closed and must never count as open blockers. */

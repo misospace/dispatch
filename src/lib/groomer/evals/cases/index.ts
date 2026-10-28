@@ -9,6 +9,7 @@ import {
   alreadyDoneReopenRegression,
 } from "./already-done-reopen-regression";
 import { alreadyFixedOnMain } from "./already-fixed-on-main";
+import { alreadyFixedProofIncomplete } from "./already-fixed-proof-incomplete";
 import { automationCommentFalseClaim } from "./automation-comment-false-claim";
 import { broadNeedsDecomposition } from "./broad-needs-decomposition";
 import { dependencyAlreadyMerged } from "./dependency-already-merged";
@@ -16,9 +17,12 @@ import { duplicateCandidate } from "./duplicate-candidate";
 import { evidenceIdAsRelatedWork } from "./evidence-id-as-related-work";
 import { exactlyOneStatus, exactlyOneStatusForeignLabel } from "./exactly-one-status";
 import { inFlightUntouched } from "./in-flight-untouched";
+import { linkDestinationMaintainer } from "./link-destination-maintainer";
 import { movedCodeReference } from "./moved-code-reference";
+import { runtimeRecurrenceNeeded } from "./runtime-recurrence-needed";
 import { selfReinforcingDeferral } from "./self-reinforcing-deferral";
 import { siblingShippedNotThisIssue } from "./sibling-shipped-not-this-issue";
+import { toolGapTimedOutSearch } from "./tool-gap-timed-out-search";
 import { unpinnedSnapshot } from "./unpinned-snapshot";
 import { unresolvedArchitecture } from "./unresolved-architecture";
 import { wellGroomedStaysUnchanged } from "./well-groomed-stays-unchanged";
@@ -49,4 +53,10 @@ export const CASES: GroomingCase[] = [
   // Safety edges.
   inFlightUntouched,
   unpinnedSnapshot,
+  // dispatch#1452: needs_info gap classification (human_question vs
+  // investigation_incomplete) against the run's own exploration facts.
+  toolGapTimedOutSearch,
+  alreadyFixedProofIncomplete,
+  linkDestinationMaintainer,
+  runtimeRecurrenceNeeded,
 ];
