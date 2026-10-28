@@ -8,6 +8,8 @@
  * components can import it.
  */
 
+import { INFO_GAP_RESOLUTION_VALUES, type InfoGapResolution } from "./investigation-gap";
+
 export interface GroomingOutputSummary {
   format: "grooming-plan" | "legacy" | "unknown";
   schemaVersion: number | null;
@@ -17,6 +19,12 @@ export interface GroomingOutputSummary {
   summary: string | null;
   /** null for legacy rows: readiness was not evidence-checked then. */
   ready: boolean | null;
+  /**
+   * What a not-ready verdict waits on (dispatch#1452): `human_question` or
+   * `investigation_incomplete`. null for ready/other verdicts, legacy rows and
+   * values outside the contract.
+   */
+  gapClass: InfoGapResolution | null;
   admission: string | null;
   evidenceDigest: string | null;
   citationCount: number;
@@ -33,6 +41,8 @@ function str(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value : null;
 }
 
+const GAP_CLASS_VALUES: ReadonlySet<string> = new Set<string>(INFO_GAP_RESOLUTION_VALUES);
+
 const EMPTY: GroomingOutputSummary = {
   format: "unknown",
   schemaVersion: null,
@@ -41,6 +51,7 @@ const EMPTY: GroomingOutputSummary = {
   lane: null,
   summary: null,
   ready: null,
+  gapClass: null,
   admission: null,
   evidenceDigest: null,
   citationCount: 0,
@@ -56,6 +67,7 @@ export function summarizeGroomingOutput(validatedOutput: unknown): GroomingOutpu
     const evidence = isObj(validatedOutput.evidence) ? validatedOutput.evidence : {};
     const lane = isObj(verdict.lane) ? verdict.lane : {};
     const uncertainties = Array.isArray(verdict.uncertainties) ? verdict.uncertainties : [];
+    const gapClass = str(readiness.gapClass);
     return {
       format: "grooming-plan",
       schemaVersion: validatedOutput.schemaVersion,
@@ -64,6 +76,10 @@ export function summarizeGroomingOutput(validatedOutput: unknown): GroomingOutpu
       lane: str(lane.id),
       summary: str(verdict.summary),
       ready: typeof readiness.ready === "boolean" ? readiness.ready : null,
+      gapClass:
+        gapClass !== null && GAP_CLASS_VALUES.has(gapClass)
+          ? (gapClass as InfoGapResolution)
+          : null,
       admission: str(readiness.admission),
       evidenceDigest: str(evidence.evidenceDigest),
       citationCount: Array.isArray(validatedOutput.citations) ? validatedOutput.citations.length : 0,

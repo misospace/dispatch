@@ -24,11 +24,50 @@ describe("summarizeGroomingOutput", () => {
       lane: "local",
       summary: "Ready.",
       ready: true,
+      gapClass: null,
       admission: "implementation",
       evidenceDigest: "digest-1",
       citationCount: 2,
       materialUncertaintyCount: 1,
     });
+  });
+
+  it("surfaces the resolved gap class on a needs_info plan (dispatch#1452)", () => {
+    const summary = summarizeGroomingOutput({
+      schemaVersion: 1,
+      verdict: {
+        actionability: "needs_info",
+        workType: "implementation",
+        lane: { id: "backlog" },
+        summary: "Waiting on a decision.",
+        uncertainties: [{ material: true }],
+      },
+      readiness: { ready: false, admission: null, gapClass: "investigation_incomplete" },
+    });
+    expect(summary).toMatchObject({
+      format: "grooming-plan",
+      actionability: "needs_info",
+      ready: false,
+      gapClass: "investigation_incomplete",
+    });
+  });
+
+  it("keeps a human_question gap class as-is", () => {
+    const summary = summarizeGroomingOutput({
+      schemaVersion: 1,
+      verdict: { actionability: "needs_info", lane: { id: "backlog" } },
+      readiness: { ready: false, admission: null, gapClass: "human_question" },
+    });
+    expect(summary.gapClass).toBe("human_question");
+  });
+
+  it("tolerates a gap class outside the contract as null", () => {
+    const summary = summarizeGroomingOutput({
+      schemaVersion: 1,
+      verdict: { actionability: "backlog", lane: { id: "backlog" } },
+      readiness: { ready: false, admission: null, gapClass: "mystery" },
+    });
+    expect(summary.gapClass).toBeNull();
   });
 
   it("keeps legacy dry-run history renderable without claiming readiness", () => {
@@ -45,6 +84,7 @@ describe("summarizeGroomingOutput", () => {
       lane: "local",
       summary: "Ready for work.",
       ready: null,
+      gapClass: null,
       admission: null,
       evidenceDigest: null,
     });

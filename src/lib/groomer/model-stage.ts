@@ -17,6 +17,7 @@
 import type { callGroomerLLM, CallLlmOptions } from "./llm";
 import type { GroomingPlanValidationResult, validateGroomingPlan } from "./plan";
 import type { EvidenceCatalog } from "./plan-evidence";
+import type { InvestigationGapFacts } from "./investigation-gap";
 import { degradePlanDraft } from "./plan-degrade";
 import { sanitizeForStorage, sanitizeJsonForStorage, sanitizeModelJson } from "./sanitize";
 
@@ -37,6 +38,12 @@ export interface ModelStageInput {
    * (at most llm.timeoutMs) and is skipped when that is too little.
    */
   deadline?: number;
+  /**
+   * What this run's exploration could not establish (dispatch#1452), or null
+   * when the tool loop is disabled or the exploration did not run. The
+   * validator resolves a needs_info verdict's declared gap against it.
+   */
+  investigation?: InvestigationGapFacts | null;
 }
 
 export interface ModelStageResult {
@@ -97,7 +104,9 @@ export async function runModelStage(input: ModelStageInput): Promise<ModelStageR
 
 async function modelStage(input: ModelStageInput): Promise<ModelStageResult> {
   const { callLLM, validateOutput, llm, catalog } = input;
-  const validate = (output: unknown) => validateOutput(output, { catalog });
+  // The catalog is checked against the plan; the investigation facts resolve
+  // a needs_info verdict's declared gap (dispatch#1452).
+  const validate = (output: unknown) => validateOutput(output, { catalog, investigation: input.investigation ?? null });
 
   // Strip NUL and the other C0 control characters from the model's answer once,
   // before validation (dispatch#1130). This is the single point where model text

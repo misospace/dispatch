@@ -162,6 +162,10 @@ Other rules the validator enforces:
 - A dependency state that contradicts the cited GitHub state is rejected. Dependencies are descriptive: the `depends on #N` claim gate stays authoritative.
 - Output in the legacy `GroomerOutput` shape is rejected with a clear error rather than migrated.
 
+### What needs_info waits on (dispatch#1452)
+
+A `needs_info` verdict carries `verdict.infoGap`: a `kind` (`product_decision`, `external_fact`, `runtime_reproduction`, or `investigation_incomplete`), the one concrete `question`, and `whyToolsCannotAnswer` — why the repository and related-work evidence this run had cannot answer it. The run resolves the declaration against its own exploration facts and persists the class on `readiness.gapClass` (`human_question` or `investigation_incomplete`): failed tool calls, truncated reads, or an exhausted round/byte budget override a claimed human question into `investigation_incomplete`, because an investigation that never finished has not earned the right to ask. Both classes land non-claimable on `status/backlog` and re-groom on the existing bounded cooldown/freshness paths — no new retry channel, no schema change. The reason stored on `Issue.needsInfoReason` carries a machine prefix, `investigation_incomplete:` or `human_question(<kind>):`, so a board card or log reader can tell the two apart without parsing prose; an operator's manual `mark_needs_info` via `POST /api/issues/groom` stores the operator's text as given, with no prefix enforced there.
+
 ### Close policy
 
 The approved scope is limited to the existing deterministic `already_done` policy below. Duplicate and superseded outcomes remain recommendations for human review; see [Groomer Close Policy](./groomer-close-policy.md).
@@ -249,7 +253,7 @@ The ready and close policies are checked again here against the run's catalog. T
 
 ### Idempotency
 
-Every application has a key: a SHA-256 over the repository, issue number, the plan's evidence digest, the plan schema version and the normalized mutation intent (final label set, lane, comment text, title, body, close). The key is claimed in the `GroomingApplication` table (unique on the key) before the first write, and each step's result is recorded as it lands.
+Every application has a key: a SHA-256 over the repository, issue number, the plan's evidence digest, the plan schema version and the normalized mutation intent (final label set, lane, comment text, title, body, close, the persisted verdict reason text, the verdict action, and the decomposition children). The persisted reason (#1461) makes a re-groom whose verdict reason changed apply — so the issue row carries the new text — rather than replay with the stale one; the verdict action decides which field that reason persists to, so a verdict flip with an identical reason text is a new application too. The key is claimed in the `GroomingApplication` table (unique on the key) before the first write, and each step's result is recorded as it lands.
 
 Every run captures its own snapshot, so the key only recurs when the issue, its comments and the head are exactly as they were for the earlier attempt:
 
@@ -257,6 +261,8 @@ Every run captures its own snapshot, so the key only recurs when the issue, its 
 - A run whose key was claimed but not finished **resumes** it: steps recorded as landed are replayed, not repeated, and only the rest are attempted. Because a landed label, title/body or close write changes the issue (and so the next snapshot and key), in practice what a resume skips is a comment that landed before the attempt failed or crashed. An unfinished claim updated in the last 10 minutes may belong to an attempt that is still running, so a run that meets one writes nothing (`applyOutcome: "busy"`, retryable, no cooldown stamp); an older one is treated as abandoned and taken over with a compare-and-swap, so of two runs resuming the same abandoned claim only one proceeds.
 - A comment that landed without being recorded is found on GitHub by its marker instead of being posted again, including when the comment write itself reported a failure after GitHub accepted it.
 - A retry after earlier writes landed sees them in its own snapshot, so its preconditions pass and it has a new key. The diff from live state makes the already-applied parts no-ops, and the comment cooldown (recorded runs, or groomer markers on the issue) stops a second comment within the window.
+
+Deploy note for application-key version 2 (dispatch#1461): the key now covers the persisted verdict reason and the verdict action, so keys recorded under version 1 can no longer match. Rows are **not** migrated — the reason text is not stored on a `GroomingApplication` row, so a v1 key cannot be recomputed — and the deploy behaviour is one re-apply: the first post-deploy groom of an already-groomed issue applies again under its fresh key (its comment re-posts, except where the comment cooldown still covers the previous one) before the new key is claimed and idempotency resumes. Decomposed parents re-record their decomposition state (one extra `issue_decomposed` audit entry); the children themselves are reused by their own `childBriefKey`, which does not include the application key.
 
 Dry runs use the same preconditions, diff and policies without writing: `mutationPlan.applyOutcome` is `dry_run`, `stale` or `unverifiable` (with `preconditionFailures`), or `would_replay` when the key was already applied. A dry run never claims a key, so it never reports `busy`, and it never writes a backoff.
 

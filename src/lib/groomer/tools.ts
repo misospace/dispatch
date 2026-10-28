@@ -66,6 +66,13 @@ export interface GroomerToolResult {
    * coordinates are rendering, not evidence content.
    */
   file?: { path: string; ref: string | null; content: string };
+  /**
+   * read_file / list_directory: the result the model was shown was clipped
+   * (read_file to maxFileBytes, list_directory to maxDirEntries), so the
+   * model saw a prefix, not the whole result (dispatch#1452). Every other
+   * tool leaves it unset.
+   */
+  truncated?: boolean;
 }
 
 export interface GroomerToolDeps {
@@ -1098,6 +1105,12 @@ export async function executeGroomerTool(
             bytes: Buffer.byteLength(range.content, "utf8"),
             sources: [path],
             file: { path, ref: ref ?? null, content: range.body },
+            // A range that stops short of EOF is a truncated read too
+            // (dispatch#1452): the footer names the continuation, and if the
+            // model never takes it the gap fact must stand. A range that
+            // reaches EOF ("end of file") leaves the fact unset, so a
+            // completed continuation can retire an earlier truncation.
+            truncated: range.hasMore || undefined,
           };
         }
         // Head read: the path prefix and the continuation marker are charged
@@ -1167,6 +1180,10 @@ export async function executeGroomerTool(
           bytes: Buffer.byteLength(content, "utf8"),
           sources: [path],
           file: { path, ref: ref ?? null, content: cut },
+          // Genuinely cut by the byte cap: the head the model saw is not the
+          // whole file (dispatch#1452), and a continuation read can retire
+          // the fact later.
+          truncated,
         };
       }
 
@@ -1203,6 +1220,9 @@ export async function executeGroomerTool(
           content: list.content,
           bytes: Buffer.byteLength(list.content, "utf8"),
           sources: [],
+          // The listing was clipped whenever the model did not see every
+          // entry — by the entry cap or by the byte budget (dispatch#1452).
+          truncated: list.shown.length < entries.length,
         };
       }
 

@@ -156,6 +156,8 @@ export function observabilityMetricFamilies(): string[] {
     "dispatch_issues_open_claimable",
     "dispatch_leases_active",
     "dispatch_leases_expired",
+    "dispatch_leases_terminal",
+    "dispatch_leases_external_wait",
     "dispatch_execution_active",
     "dispatch_pr_fix_human_decisions",
     "dispatch_pr_fix_items",
@@ -209,8 +211,10 @@ export function exportObservabilityMetrics(snapshot: ObservabilitySnapshot): str
   // ── Execution (§4.3/§4.4/§4.10; system emitters excluded upstream) ──
   families.push(scalar("dispatch_issue_assigned", "Open eligible issues carrying an agent/* label (label-only, no lease).", snapshot.execution.assigned));
   families.push(scalar("dispatch_assigned_without_execution", "Assigned (agent/*) with no ACTIVE lease/AgentWork right now. Dashboard aggregate only — must not fire alerts (§8.7).", snapshot.assignmentObservation.withoutExecutionAggregate));
-  families.push(scalar("dispatch_leases_active", "Worker leases with expiredAt in the future.", snapshot.execution.activeLeases));
-  families.push(scalar("dispatch_leases_expired", "Worker leases past TTL (recoverable ownership loss).", snapshot.execution.expiredLeases));
+  families.push(scalar("dispatch_leases_active", "Worker leases with expiredAt in the future, excluding terminal dispositions and running external-wait parks (#1455).", snapshot.execution.activeLeases));
+  families.push(scalar("dispatch_leases_expired", "Worker leases past TTL (recoverable ownership loss), excluding retained terminal dispositions and running external-wait parks (#1455).", snapshot.execution.expiredLeases));
+  families.push(scalar("dispatch_leases_terminal", "Retained terminal ownership dispositions (completed/released/handed_off): durable gone-evidence, neither active nor actionable expired (#1455). Rows survive on purpose — read as a retained-evidence population, not a churn counter.", snapshot.execution.terminalLeases));
+  families.push(scalar("dispatch_leases_external_wait", "Worker leases parked by a future retryAfter external wait: neither active nor actionable expired (#1455).", snapshot.execution.externalWaitLeases));
   families.push(scalar("dispatch_execution_active", "1 when a worker lease or CLAIMED/IN_PROGRESS AgentWork exists (A4 in-flight guard).", snapshot.execution.executionActive));
   families.push(byDimension("dispatch_agent_work", "AgentWork rows by state.", snapshot.execution.agentWorkByState, "state"));
   families.push(scalar("dispatch_agent_work_release_pending", "AgentWork rows with staleClaimReleasePending (stale recovery in flight).", snapshot.execution.agentWorkReleasePending));

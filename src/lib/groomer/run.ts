@@ -593,6 +593,9 @@ async function executeGroomerRun(
             sources: exploration.sources,
             bytes: exploration.bytes,
             toolCalls: exploration.toolCalls,
+            // What the investigation could not establish (dispatch#1452):
+            // machine-readable, so the run can be read back afterwards.
+            gaps: exploration.gaps,
           },
         }),
       });
@@ -631,6 +634,7 @@ async function executeGroomerRun(
       },
       catalog: evidenceCatalog,
       deadline: leaseExpiresAt - LEASE_APPLY_RESERVE_MS,
+      investigation: exploration ? exploration.gaps : null,
     });
     const { rawOutput, validation } = modelStage;
     contextWarnings.push(...modelStage.warnings);
@@ -663,12 +667,6 @@ async function executeGroomerRun(
     // Legacy GroomerOutput view of what is applied: the mutation path below
     // and existing run/history consumers read this shape.
     const output = diff.output;
-    const applicationKey = computeApplicationKey({
-      repoFullName: candidate.repoFullName,
-      issueNumber: candidate.number,
-      plan,
-      diff,
-    });
 
     // mark_not_ready degrades instead of failing the run (dispatch#839). The
     // model is not obliged to emit notReadyReason, so a routine omission must
@@ -700,7 +698,19 @@ async function executeGroomerRun(
           `[groomer] ${candidate.repoFullName}#${candidate.number}: mark_not_ready omitted notReadyReason and has no summary to fall back on; persisting the action without a reason`,
         );
       }
+      // The fallback above may replace the plan's own notReadyReason text
+      // (dispatch#1461): the application key must carry the text the issue
+      // row will actually hold, so a re-groom whose persisted fallback
+      // changed is applied rather than replayed.
+      diff.persistedReason = notReadyReason ?? null;
     }
+
+    const applicationKey = computeApplicationKey({
+      repoFullName: candidate.repoFullName,
+      issueNumber: candidate.number,
+      plan,
+      diff,
+    });
 
     for (const [what, reasons] of Object.entries(diff.withheld)) {
       const withheldName =

@@ -6,6 +6,7 @@ import {
 } from "./tools";
 import type { RelatedWorkObservation } from "./evidence-snapshot";
 import type { PinnedRead } from "./close-grounding";
+import type { InvestigationGapFacts } from "./investigation-gap";
 import { sanitizeModelJson, sanitizeModelText } from "./sanitize";
 
 export interface ExploreOptions {
@@ -35,6 +36,13 @@ export interface ExploreToolRecord {
   bytes: number;
   /** Truncated for storage; the model saw the full result. */
   preview: string;
+  /**
+   * True when this call's result was clipped (a read by bytes, a directory
+   * listing by entries) and the model saw a prefix, not the whole result
+   * (dispatch#1452). False for submit_findings and for every tool that does
+   * not truncate.
+   */
+  truncated: boolean;
 }
 
 export interface ExploreResult {
@@ -66,6 +74,15 @@ export interface ExploreResult {
   relatedWorkRefs: string[];
   /** Structured GitHub state behind relatedWorkRefs, for the evidence snapshot. */
   relatedWork: RelatedWorkObservation[];
+  /**
+   * What this run's investigation could not establish (dispatch#1452),
+   * derived from the loop's own control flow; model-authored tokens inside it
+   * (a failed unknown-tool name, a fallback read path) are sanitized and
+   * clamped at intake. The plan validator resolves a needs_info verdict
+   * against it: a human question asserted on top of a broken investigation
+   * resolves to an incomplete investigation.
+   */
+  gaps: InvestigationGapFacts;
 }
 
 export interface ExploreDeps {
@@ -118,6 +135,15 @@ const EMPTY: Omit<ExploreResult, "warnings"> = {
   relatedWorkQueries: [],
   relatedWorkRefs: [],
   relatedWork: [],
+  gaps: {
+    explorationRan: true,
+    toolFailures: [],
+    truncatedReads: [],
+    budgetExhausted: false,
+    roundsExhausted: false,
+    aborted: false,
+    unavailable: false,
+  },
 };
 
 interface ChatMessage {
@@ -159,7 +185,60 @@ function clampText(value: string, max = MAX_TEXT_CHARS): string {
   return value.length <= max ? value : `${value.slice(0, max)}…`;
 }
 
-function renderFindings(files: string[], ask: string | null, notes: string, records: ExploreToolRecord[]): string {
+/**
+ * Gap facts name tools and paths to operators and to the plan validator
+ * (dispatch#1452). Their raw source can be model-authored (an unknown tool
+ * name is exactly the model's request string), so each token is control-char
+ * stripped and tightly bounded before it enters the facts.
+ */
+const MAX_GAP_FACT_CHARS = 80;
+function gapFactToken(value: string): string {
+  return clampText(sanitizeModelText(value).trim(), MAX_GAP_FACT_CHARS);
+}
+
+/**
+ * The token recorded for a tool failure whose model-authored name sanitizes
+ * to nothing (dispatch#1452). Fixed and model-uncontrolled: the call did
+ * fail, and losing the fact would turn a broken investigation back into a
+ * human question.
+ */
+const UNKNOWN_TOOL_FAILURE = "unknown_tool";
+
+/**
+ * The token recorded for a truncated listing of the repository root, which
+ * has no path to name (dispatch#1452).
+ */
+const ROOT_TRUNCATED_READ = "the repository root";
+
+/**
+ * The bounded lines of the findings' "## Investigation gaps" section
+ * (dispatch#1452): one per distinct adverse fact, so the planning model sees
+ * exactly what its investigation lost. The section is absent when the
+ * investigation is complete.
+ */
+function renderInvestigationGapLines(gaps?: InvestigationGapFacts | null): string[] {
+  if (!gaps) return [];
+  const lines: string[] = [];
+  const failed = [...new Set(gaps.toolFailures)];
+  for (const name of failed.slice(0, 5)) lines.push(`${clampText(name)} failed`);
+  if (failed.length > 5) lines.push(`${failed.length} tool calls failed`);
+  const truncated = [...new Set(gaps.truncatedReads)];
+  for (const path of truncated.slice(0, 5)) lines.push(`the read of ${clampText(path)} was truncated`);
+  if (truncated.length > 5) lines.push(`${truncated.length} reads were truncated`);
+  if (gaps.budgetExhausted) lines.push("the byte budget ended this investigation");
+  if (gaps.roundsExhausted) lines.push("all rounds were used without submitted findings");
+  if (gaps.unavailable) lines.push("the exploration backend was unavailable");
+  if (gaps.aborted) lines.push("the exploration was aborted");
+  return lines;
+}
+
+function renderFindings(
+  files: string[],
+  ask: string | null,
+  notes: string,
+  records: ExploreToolRecord[],
+  gaps?: InvestigationGapFacts | null,
+): string {
   const lines: string[] = [];
   if (ask) lines.push(`What the issue is asking for, in repo terms: ${ask}`);
   if (files.length > 0) {
@@ -177,8 +256,15 @@ function renderFindings(files: string[], ask: string | null, notes: string, reco
       lines.push(`Files examined while investigating:\n${seen.map((f) => `- ${f}`).join("\n")}`);
     }
   }
-  if (lines.length === 0) return "";
-  return `## Repository investigation\n\n${lines.join("\n\n")}`;
+
+  const sections: string[] = [];
+  if (lines.length > 0) sections.push(`## Repository investigation\n\n${lines.join("\n\n")}`);
+  const gapLines = renderInvestigationGapLines(gaps);
+  if (gapLines.length > 0) {
+    sections.push(`## Investigation gaps\n\n${gapLines.map((line) => `- ${line}`).join("\n")}`);
+  }
+  if (sections.length === 0) return "";
+  return sections.join("\n\n");
 }
 
 /**
@@ -195,6 +281,18 @@ export async function exploreRepository(
 ): Promise<ExploreResult> {
   const warnings: string[] = [];
   const records: ExploreToolRecord[] = [];
+  // What this run's investigation could not establish (dispatch#1452): set
+  // only from the loop's own control flow; model-authored tokens are sanitized
+  // and clamped at intake by gapFactToken before entering these lists.
+  const gaps: InvestigationGapFacts = {
+    explorationRan: true,
+    toolFailures: [],
+    truncatedReads: [],
+    budgetExhausted: false,
+    roundsExhausted: false,
+    aborted: false,
+    unavailable: false,
+  };
   const sources: string[] = [];
   const readSources: string[] = [];
   const readContents: PinnedRead[] = [];
@@ -247,6 +345,7 @@ export async function exploreRepository(
       });
 
       if (!response.ok) {
+        gaps.unavailable = true;
         const text = await response.text();
         warnings.push(
           `repository exploration unavailable (${response.status}); grooming without it: ${sanitizeModelText(text.slice(0, 200))}`,
@@ -283,7 +382,7 @@ export async function exploreRepository(
             notes: typeof args.notes === "string" ? clampText(args.notes.trim()) : "",
           };
           sources.push(...files);
-          records.push({ name, arguments: args, ok: true, bytes: 0, preview: "" });
+          records.push({ name, arguments: args, ok: true, bytes: 0, preview: "", truncated: false });
           messages.push({
             role: "tool",
             tool_call_id: toolCall.id,
@@ -295,6 +394,7 @@ export async function exploreRepository(
 
         const remaining = options.maxTotalBytes - bytes;
         if (remaining <= 0) {
+          gaps.budgetExhausted = true;
           warnings.push("repository exploration hit its byte budget");
           messages.push({
             role: "tool",
@@ -331,19 +431,42 @@ export async function exploreRepository(
           const query = typeof args.query === "string" ? args.query.trim() : "";
           if (query) relatedWorkQueries.push(query);
         }
+        const truncated = result.truncated === true;
         records.push({
           name,
           arguments: args,
           ok: result.ok,
           bytes: result.bytes,
           preview: result.content.slice(0, 500),
+          truncated,
         });
+        if (!result.ok) {
+          // Tool names come from the model (an unknown-tool failure names
+          // whatever the model asked for), and these facts persist into the
+          // plan's readiness reasons and Issue.needsInfoReason — channels the
+          // model-answer sanitizer never sees. Strip control characters and
+          // clamp at intake (#1130 discipline, dispatch#1452).
+          //
+          // A name that sanitizes to nothing still names a real failure: the
+          // call failed. Keep the fact under a fixed, model-uncontrolled
+          // token so the failure cannot be lost — the fact, not the name, is
+          // what the verdict is resolved against (dispatch#1452).
+          gaps.toolFailures.push(gapFactToken(name) || UNKNOWN_TOOL_FAILURE);
+        } else if ((name === "read_file" || name === "list_directory") && truncated) {
+          // The normalized path when available, recorded argument
+          // otherwise (a pinned-ref read records its pinned arguments).
+          const path = result.file?.path ?? (typeof args.path === "string" ? args.path : null);
+          const gapPath = path !== null ? gapFactToken(path) : "";
+          // A root listing has no path to name: keep the fact under a fixed
+          // token rather than losing it (dispatch#1452).
+          gaps.truncatedReads.push(gapPath || ROOT_TRUNCATED_READ);
+        }
         messages.push({ role: "tool", tool_call_id: toolCall.id, name, content: result.content });
       }
 
       if (submitted) {
         return {
-          findings: renderFindings(submitted.files, submitted.ask, submitted.notes, records),
+          findings: renderFindings(submitted.files, submitted.ask, submitted.notes, records, gaps),
           files: submitted.files,
           ask: submitted.ask,
           sources: [...new Set(sources)],
@@ -355,17 +478,20 @@ export async function exploreRepository(
           relatedWorkQueries: [...new Set(relatedWorkQueries)],
           relatedWorkRefs: relatedWorkRefsOf(relatedWork),
           relatedWork,
+          gaps,
         };
       }
     }
 
     if (roundsExhausted) {
+      gaps.roundsExhausted = true;
       warnings.push("repository exploration used all its rounds without submitting findings");
     }
 
     return {
       ...EMPTY,
-      findings: renderFindings([], null, "", records),
+      gaps,
+      findings: renderFindings([], null, "", records, gaps),
       sources: [...new Set(sources)],
       readSources: [...new Set(readSources)],
       readContents,
@@ -377,6 +503,9 @@ export async function exploreRepository(
       relatedWork,
     };
   } catch (err) {
+    // Any failure of the loop is an aborted investigation, whatever the
+    // cause: a timed-out fetch (AbortError) or a thrown tool.
+    gaps.aborted = true;
     const message = err instanceof Error ? err.message : String(err);
     warnings.push(
       err instanceof Error && err.name === "AbortError"
@@ -385,7 +514,8 @@ export async function exploreRepository(
     );
     return {
       ...EMPTY,
-      findings: renderFindings([], null, "", records),
+      gaps,
+      findings: renderFindings([], null, "", records, gaps),
       sources: [...new Set(sources)],
       readSources: [...new Set(readSources)],
       readContents,

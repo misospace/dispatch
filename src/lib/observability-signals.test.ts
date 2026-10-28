@@ -53,6 +53,8 @@ function makeLease(overrides: Partial<ObservabilityLeaseRow>): ObservabilityLeas
     issueId: "i1",
     expiredAt: ago(-1800), // 30m in the future = active
     renewedAt: null,
+    disposition: null,
+    retryAfter: null,
     createdAt: ago(120),
     ...overrides,
   };
@@ -235,6 +237,137 @@ describe("observability signal derivation", () => {
         agentWork: [makeWork({ agentName: "hosted-groomer", createdAt: ago(60) })],
       });
       expect(s.execution.pickupsInWindow["1800"]).toBe(0);
+    });
+  });
+
+  describe("terminal lease dispositions (#1455)", () => {
+    it.each(["completed", "released", "handed_off"])(
+      "a retained %s lease is neither execution nor actionable expiry before its TTL",
+      (disposition) => {
+        const s = snapshot({ leases: [makeLease({ disposition })] });
+        expect(s.execution.activeLeases).toBe(0);
+        expect(s.execution.expiredLeases).toBe(0);
+        expect(s.execution.terminalLeases).toBe(1);
+        expect(s.execution.executionActive).toBe(0);
+        expect(s.observations.staleOwnership).toBe(false);
+      },
+    );
+
+    it.each(["completed", "released", "handed_off"])(
+      "a retained %s lease stays inert after its TTL (no phantom expired ownership)",
+      (disposition) => {
+        const s = snapshot({ leases: [makeLease({ disposition, expiredAt: ago(3600) })] });
+        expect(s.execution.activeLeases).toBe(0);
+        expect(s.execution.expiredLeases).toBe(0);
+        expect(s.execution.terminalLeases).toBe(1);
+        expect(s.execution.executionActive).toBe(0);
+        expect(s.observations.staleOwnership).toBe(false);
+      },
+    );
+
+    it("null disposition keeps the TTL classification (live vs actionable expiry)", () => {
+      const live = snapshot({ leases: [makeLease({ disposition: null })] });
+      expect(live.execution.activeLeases).toBe(1);
+      expect(live.execution.terminalLeases).toBe(0);
+      expect(live.observations.staleOwnership).toBe(false);
+      const dead = snapshot({ leases: [makeLease({ disposition: null, expiredAt: ago(600) })] });
+      expect(dead.execution.expiredLeases).toBe(1);
+      expect(dead.observations.staleOwnership).toBe(true);
+    });
+
+    it("the system expired tombstone stays actionable stale-claim evidence", () => {
+      // #1417: the tombstone is stamped when the TTL elapses without renewal;
+      // it is stale-claim evidence for reconciliation, never gone-evidence.
+      const s = snapshot({
+        leases: [makeLease({ disposition: "expired", expiredAt: ago(600) })],
+      });
+      expect(s.execution.expiredLeases).toBe(1);
+      expect(s.execution.terminalLeases).toBe(0);
+      expect(s.observations.staleOwnership).toBe(true);
+    });
+
+    it("a future retryAfter parks the lease as an external wait, not execution or expiry", () => {
+      for (const expiredAt of [ago(-1800), ago(3600)]) {
+        const s = snapshot({
+          leases: [makeLease({ disposition: "blocked", retryAfter: ago(-600), expiredAt })],
+        });
+        expect(s.execution.activeLeases).toBe(0);
+        expect(s.execution.expiredLeases).toBe(0);
+        expect(s.execution.externalWaitLeases).toBe(1);
+        expect(s.execution.executionActive).toBe(0);
+        expect(s.observations.staleOwnership).toBe(false);
+      }
+    });
+
+    it("a future retryAfter parks an undispositioned lease too (renewal externalWait)", () => {
+      // renewOwnership records an external-wait marker WITHOUT any
+      // disposition (worker-ownership.ts externalWaitData): the park is the
+      // marker itself, exactly the #1251 step-4 rule.
+      const s = snapshot({ leases: [makeLease({ disposition: null, retryAfter: ago(-600) })] });
+      expect(s.execution.externalWaitLeases).toBe(1);
+      expect(s.execution.activeLeases).toBe(0);
+      expect(s.execution.expiredLeases).toBe(0);
+      expect(s.execution.executionActive).toBe(0);
+      expect(s.observations.staleOwnership).toBe(false);
+    });
+
+    it("an elapsed retryAfter falls through to the TTL classification (#1251 §4)", () => {
+      const expired = snapshot({
+        leases: [makeLease({ disposition: "blocked", retryAfter: ago(600), expiredAt: ago(60) })],
+      });
+      expect(expired.execution.externalWaitLeases).toBe(0);
+      expect(expired.execution.expiredLeases).toBe(1);
+      expect(expired.observations.staleOwnership).toBe(true);
+      const live = snapshot({
+        leases: [makeLease({ disposition: "blocked", retryAfter: ago(600) })],
+      });
+      expect(live.execution.externalWaitLeases).toBe(0);
+      expect(live.execution.activeLeases).toBe(1);
+    });
+
+    it("blocked without a retryAfter classifies on TTL (no park invented)", () => {
+      const s = snapshot({
+        leases: [makeLease({ disposition: "blocked", retryAfter: null, expiredAt: ago(600) })],
+      });
+      expect(s.execution.externalWaitLeases).toBe(0);
+      expect(s.execution.expiredLeases).toBe(1);
+      expect(s.observations.staleOwnership).toBe(true);
+    });
+
+    it("terminal leases still count as historical pickup evidence", () => {
+      const s = snapshot({
+        leases: [makeLease({ disposition: "completed", createdAt: ago(60) })],
+      });
+      expect(s.execution.pickupsInWindow["1800"]).toBe(1);
+      expect(s.execution.activeLeases).toBe(0);
+      expect(s.execution.executionActive).toBe(0);
+    });
+
+    it("a terminal lease does not mask an assignment without execution; an external wait does", () => {
+      const s = snapshot({
+        issues: [
+          makeIssue({ id: "finished", labels: ["status/in-progress", "agent/worker-a"] }),
+          makeIssue({ id: "parked", labels: ["status/in-progress", "agent/worker-b"] }),
+        ],
+        leases: [
+          makeLease({
+            agentName: "worker-a",
+            issueId: "finished",
+            disposition: "completed",
+            expiredAt: ago(600),
+          }),
+          makeLease({
+            agentName: "worker-b",
+            issueId: "parked",
+            disposition: "blocked",
+            retryAfter: ago(-600),
+          }),
+        ],
+      });
+      expect(s.execution.assigned).toBe(2);
+      // The completed lease is gone-evidence, not live execution: the lingering
+      // label shows in the aggregate. The parked owner holds on purpose.
+      expect(s.assignmentObservation.withoutExecutionAggregate).toBe(1);
     });
   });
 

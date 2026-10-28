@@ -137,14 +137,16 @@ describe("exploreRepository", () => {
       text: async () => "tools not supported",
     }) as unknown as typeof fetch;
     const result = await exploreRepository(options, makeDeps({}, fetchImpl));
-    expect(result.findings).toBe("");
+    // The broken investigation is named for the plan stage (dispatch#1452).
+    expect(result.findings).toContain("the exploration backend was unavailable");
     expect(result.warnings[0]).toContain("repository exploration unavailable (400)");
   });
 
   it("never throws when the transport fails", async () => {
     const fetchImpl = vi.fn().mockRejectedValue(new Error("ECONNRESET")) as unknown as typeof fetch;
     const result = await exploreRepository(options, makeDeps({}, fetchImpl));
-    expect(result.findings).toBe("");
+    // The broken investigation is named for the plan stage (dispatch#1452).
+    expect(result.findings).toContain("the exploration was aborted");
     expect(result.warnings[0]).toContain("ECONNRESET");
   });
 
@@ -542,5 +544,192 @@ describe("exploreRepository pinned ref", () => {
     const result = await exploreRepository({ ...options, pinnedRef: "deadbeef" }, deps);
 
     expect(result.readContents).toEqual([{ path: "src/a.ts", ref: "deadbeef", content: "export const a = 1;" }]);
+  });
+});
+
+describe("exploreRepository investigation gaps (dispatch#1452)", () => {
+  it("reports clean gaps when the investigation completes", async () => {
+    const fetchImpl = fetchReturning(
+      { content: null, tool_calls: [toolCall("1", "read_file", { path: "src/a.ts" })] },
+      { content: null, tool_calls: [toolCall("2", "submit_findings", { files: ["src/a.ts"], ask: "do the thing" })] },
+    );
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue("code") }, fetchImpl);
+
+    const result = await exploreRepository(options, deps);
+
+    expect(result.gaps).toEqual({
+      explorationRan: true,
+      toolFailures: [],
+      truncatedReads: [],
+      budgetExhausted: false,
+      roundsExhausted: false,
+      aborted: false,
+      unavailable: false,
+    });
+    expect(result.toolCalls[0].truncated).toBe(false);
+    expect(result.toolCalls[1].truncated).toBe(false);
+    expect(result.findings).not.toContain("## Investigation gaps");
+  });
+
+  it("does not report exhausted rounds when the model submits on the final round", async () => {
+    // The last round is the one the model is told to wrap up on, and it is
+    // also the round the loop is allowed to end on. A submission there is a
+    // completed investigation: no fact may turn it into an incomplete one
+    // (dispatch#1452), or a clean human question would be misread as a
+    // broken investigation.
+    const fetchImpl = fetchReturning(
+      { content: null, tool_calls: [toolCall("1", "search_code", { query: "x" })] },
+      { content: null, tool_calls: [toolCall("2", "submit_findings", { files: ["src/a.ts"], ask: "do the thing" })] },
+    );
+    const deps = makeDeps({ searchCode: vi.fn().mockResolvedValue([{ path: "a.ts" }]) }, fetchImpl);
+
+    const result = await exploreRepository({ ...options, maxRounds: 2 }, deps);
+
+    expect(result.ask).toBe("do the thing");
+    expect(result.gaps.roundsExhausted).toBe(false);
+    expect(result.gaps.toolFailures).toEqual([]);
+    expect(result.gaps.budgetExhausted).toBe(false);
+    expect(result.findings).not.toContain("## Investigation gaps");
+  });
+
+  it("names a failed tool call in the gaps and in the findings", async () => {
+    const fetchImpl = fetchReturning(
+      { content: null, tool_calls: [toolCall("1", "read_file", { path: "missing.ts" })] },
+      { content: "done", tool_calls: [] },
+    );
+    const deps = makeDeps({ readFile: vi.fn().mockRejectedValue(new Error("404 Not Found")) }, fetchImpl);
+
+    const result = await exploreRepository(options, deps);
+
+    expect(result.gaps.toolFailures).toEqual(["read_file"]);
+    expect(result.gaps.truncatedReads).toEqual([]);
+    expect(result.toolCalls[0].truncated).toBe(false);
+    expect(result.findings).toContain("## Investigation gaps");
+    expect(result.findings).toContain("- read_file failed");
+  });
+
+  it("names a truncated read in the gaps, the record and the findings", async () => {
+    const fetchImpl = fetchReturning(
+      { content: null, tool_calls: [toolCall("1", "read_file", { path: "src/big.ts" })] },
+      { content: "done", tool_calls: [] },
+    );
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue("y".repeat(500)) }, fetchImpl);
+
+    const result = await exploreRepository({ ...options, maxFileBytes: 100 }, deps);
+
+    expect(result.gaps.truncatedReads).toEqual(["src/big.ts"]);
+    expect(result.gaps.toolFailures).toEqual([]);
+    expect(result.toolCalls[0].truncated).toBe(true);
+    expect(result.findings).toContain("- the read of src/big.ts was truncated");
+  });
+
+  it("flags an exhausted byte budget in the gaps and the findings", async () => {
+    const fetchImpl = fetchReturning({
+      content: null,
+      tool_calls: [toolCall("1", "read_file", { path: "a.ts" })],
+    });
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue("y".repeat(400)) }, fetchImpl);
+
+    const result = await exploreRepository({ ...options, maxTotalBytes: 100, maxRounds: 4 }, deps);
+
+    expect(result.gaps.budgetExhausted).toBe(true);
+    expect(result.gaps.roundsExhausted).toBe(true);
+    expect(result.findings).toContain("the byte budget ended this investigation");
+  });
+
+  it("flags exhausted rounds in the gaps and the findings", async () => {
+    const fetchImpl = fetchReturning({
+      content: null,
+      tool_calls: [toolCall("1", "search_code", { query: "loop" })],
+    });
+    const deps = makeDeps({ searchCode: vi.fn().mockResolvedValue([{ path: "a.ts" }]) }, fetchImpl);
+
+    const result = await exploreRepository({ ...options, maxRounds: 3 }, deps);
+
+    expect(result.gaps.roundsExhausted).toBe(true);
+    expect(result.gaps.budgetExhausted).toBe(false);
+    expect(result.findings).toContain("all rounds were used without submitted findings");
+  });
+
+  it("flags an unavailable backend in the gaps and the findings", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 400,
+      json: async () => ({}),
+      text: async () => "tools not supported",
+    }) as unknown as typeof fetch;
+    const result = await exploreRepository(options, makeDeps({}, fetchImpl));
+
+    expect(result.gaps.unavailable).toBe(true);
+    expect(result.gaps.aborted).toBe(false);
+    expect(result.findings).toContain("the exploration backend was unavailable");
+  });
+
+  it("flags an aborted exploration in the gaps and the findings", async () => {
+    const abort = new Error("aborted");
+    abort.name = "AbortError";
+    const fetchImpl = vi.fn().mockRejectedValue(abort) as unknown as typeof fetch;
+    const result = await exploreRepository(options, makeDeps({}, fetchImpl));
+
+    expect(result.gaps.aborted).toBe(true);
+    expect(result.findings).toContain("the exploration was aborted");
+  });
+
+  it("sanitizes and bounds the model-authored tool name entering the gap facts (dispatch#1452)", async () => {
+    const nasty = `search\u0000code${"\u0001".repeat(3)}${"x".repeat(200)}`;
+    const fetchImpl = fetchReturning(
+      { content: null, tool_calls: [toolCall("1", nasty, {})] },
+      { content: "done", tool_calls: [] },
+    );
+    const result = await exploreRepository(options, makeDeps({}, fetchImpl));
+
+    expect(result.gaps.toolFailures).toHaveLength(1);
+    const [token] = result.gaps.toolFailures;
+    expect(token).not.toMatch(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/);    // clampText keeps `max` characters plus a trailing ellipsis.
+    expect(token.length).toBeLessThanOrEqual(81);
+    expect(token.startsWith("searchcode")).toBe(true);
+  });
+
+  it("keeps a tool failure whose model-authored name sanitizes to nothing, under a fixed token", async () => {
+    // The call did fail: that is the fact the verdict is resolved against.
+    // The model-authored name cannot be persisted, so the failure is recorded
+    // under a fixed token instead of being dropped (dispatch#1452).
+    const fetchImpl = fetchReturning(
+      { content: null, tool_calls: [toolCall("1", "\u0000\u0001", {})] },
+      { content: "done", tool_calls: [] },
+    );
+    const result = await exploreRepository(options, makeDeps({}, fetchImpl));
+
+    expect(result.gaps.toolFailures).toEqual(["unknown_tool"]);
+  });
+
+  it("records a clipped directory listing as a truncated read", async () => {
+    const entries = Array.from({ length: 5 }, (_, i) => ({ path: `src/f${i}.ts`, type: "file" as const, size: 1 }));
+    const fetchImpl = fetchReturning(
+      { content: null, tool_calls: [toolCall("1", "list_directory", { path: "src" })] },
+      { content: "done", tool_calls: [] },
+    );
+    const deps = makeDeps({ listDir: vi.fn().mockResolvedValue(entries) }, fetchImpl);
+
+    const result = await exploreRepository({ ...options, maxDirEntries: 2 }, deps);
+
+    expect(result.gaps.truncatedReads).toEqual(["src"]);
+    expect(result.gaps.toolFailures).toEqual([]);
+    expect(result.toolCalls[0].truncated).toBe(true);
+    expect(result.findings).toContain("- the read of src was truncated");
+  });
+
+  it("names the repository root when its listing was clipped", async () => {
+    const entries = Array.from({ length: 5 }, (_, i) => ({ path: `d${i}/`, type: "dir" as const, size: null }));
+    const fetchImpl = fetchReturning(
+      { content: null, tool_calls: [toolCall("1", "list_directory", { path: "" })] },
+      { content: "done", tool_calls: [] },
+    );
+    const deps = makeDeps({ listDir: vi.fn().mockResolvedValue(entries) }, fetchImpl);
+
+    const result = await exploreRepository({ ...options, maxDirEntries: 2 }, deps);
+
+    expect(result.gaps.truncatedReads).toEqual(["the repository root"]);
+    expect(result.findings).toContain("- the read of the repository root was truncated");
   });
 });

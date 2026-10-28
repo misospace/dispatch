@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { createHash } from "crypto";
 import { childBriefKey } from "@/lib/decomposition";
 import type { GroomingEvidenceSnapshot } from "./evidence-snapshot";
 import { buildEvidenceCatalog } from "./plan-evidence";
@@ -7,6 +8,7 @@ import { validateGroomingPlan, type GroomingPlan, type GroomingPlanDraft } from 
 import type { LiveComment, LiveIssueState } from "./mutation-validator";
 import {
   ACTIVE_CLAIM_MS,
+  APPLICATION_KEY_VERSION,
   DECOMPOSITION_BODY_END,
   DECOMPOSITION_BODY_START,
   MANAGED_BODY_END,
@@ -319,6 +321,25 @@ describe("computeMutationDiff", () => {
   it("neutralizes mentions in the comment", () => {
     expect(diffFor(draft({}, { githubComment: "@alice fixed" })).comment).toBe("`@alice` fixed");
   });
+
+  it("records the reason text the verdict persists on the issue row (dispatch#1461)", () => {
+    expect(diffFor(draft()).persistedReason).toBeNull();
+    const notReady = (actionability: "needs_info" | "blocked" | "backlog", rationale: string): GroomingPlanDraft => ({
+      ...draft({ actionability, lane: { id: "backlog", confidence: "medium", reason: "not ready yet" }, rationale }),
+      implementationBrief: null,
+    });
+    expect(diffFor(notReady("needs_info", "which tenant reproduces it?")).persistedReason).toBe(
+      "which tenant reproduces it?",
+    );
+    expect(diffFor(notReady("blocked", "waiting on the vendor API")).persistedReason).toBe("waiting on the vendor API");
+    expect(diffFor(notReady("backlog", "no acceptance criteria yet")).persistedReason).toBe("no acceptance criteria yet");
+    // A withheld close lands as backlog with its withheld rationale — the
+    // text the issue row will actually carry.
+    const plan = planFor(alreadyDone());
+    const forged: GroomingPlan = { ...plan, verdict: { ...plan.verdict, confidence: "medium" } };
+    const withheld = computeMutationDiff({ plan: forged, live: live(), catalog: catalogFor(snapshot()) });
+    expect(withheld.persistedReason).toMatch(/^Dispatch withheld the already_done close:/);
+  });
 });
 
 describe("computeApplicationKey", () => {
@@ -340,6 +361,58 @@ describe("computeApplicationKey", () => {
     expect(computeApplicationKey({ repoFullName: "org/repo", issueNumber: 42, plan, diff: { ...diff, comment: "hi" } })).not.toBe(base);
   });
 
+  it("changes when the persisted reason changes, so a reason-only re-groom applies (dispatch#1461)", () => {
+    const needsInfo = (rationale: string): GroomingPlanDraft => ({
+      ...draft({
+        actionability: "needs_info",
+        lane: { id: "backlog", confidence: "medium", reason: "not ready yet" },
+        rationale,
+      }),
+      implementationBrief: null,
+    });
+    const keyFor = (rationale: string) =>
+      computeApplicationKey({
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        plan: planFor(needsInfo(rationale)),
+        diff: diffFor(needsInfo(rationale)),
+      });
+    // The machine gap class flipping (the #1460 shapes) changes the key.
+    expect(keyFor("which tenant?")).toBe(keyFor("which tenant?"));
+    expect(keyFor("human_question(credentials): which tenant?")).not.toBe(keyFor("investigation_incomplete: which tenant?"));
+    expect(keyFor("which tenant?")).not.toBe(keyFor("human_question(credentials): which tenant?"));
+  });
+
+  it("changes when the verdict action flips even with an identical reason text", () => {
+    const notReady = (actionability: "needs_info" | "backlog", rationale: string): GroomingPlanDraft => ({
+      ...draft({ actionability, lane: { id: "backlog", confidence: "medium", reason: "not ready yet" }, rationale }),
+      implementationBrief: null,
+    });
+    const input = (actionability: "needs_info" | "backlog") => {
+      const d = notReady(actionability, "which tenant?");
+      return { repoFullName: "org/repo", issueNumber: 42, plan: planFor(d), diff: diffFor(d) };
+    };
+    // A verdict flip decides which field the reason persists to (and the
+    // row's nextGroomingAction), so it is a new application even when the
+    // reason text is identical.
+    expect(computeApplicationKey(input("needs_info"))).not.toBe(computeApplicationKey(input("backlog")));
+  });
+
+  it("no longer matches the pre-#1461 (v1) key for the same plan, so existing rows cannot block (dispatch#1461)", () => {
+    const d: GroomingPlanDraft = {
+      ...draft({
+        actionability: "needs_info",
+        lane: { id: "backlog", confidence: "medium", reason: "not ready yet" },
+        rationale: "which tenant?",
+      }),
+      implementationBrief: null,
+    };
+    const input = { repoFullName: "org/repo", issueNumber: 42, plan: planFor(d), diff: diffFor(d) };
+    const v1Key = v1ApplicationKey(input);
+    expect(computeApplicationKey(input)).not.toBe(v1Key);
+    expect(APPLICATION_KEY_VERSION).toBe(2);
+  });
+
   it("is carried by the comment marker, which only counts at the end of a comment Dispatch posted", () => {
     expect(commentMarkerKey(`text\n\n${commentMarker(KEY)}`)).toBe(KEY);
     expect(commentMarkerKey("no marker")).toBeNull();
@@ -355,6 +428,39 @@ describe("computeApplicationKey", () => {
 });
 
 // ─── applyGroomingMutations ──────────────────────────────────────────────────
+
+/**
+ * The v1 application key, exactly as main computed it before dispatch#1461:
+ * no persisted reason, no verdict action, v: 1. Reconstructed here (field
+ * order included, since the digest hashes the serialized JSON) so the deploy
+ * tests seed rows that a pre-bump deploy really wrote.
+ */
+function v1ApplicationKey(input: {
+  repoFullName: string;
+  issueNumber: number;
+  plan: GroomingPlan;
+  diff: GroomingMutationDiff;
+}): string {
+  const canonical = {
+    v: 1,
+    repo: input.repoFullName.toLowerCase(),
+    issue: input.issueNumber,
+    evidenceDigest: input.plan.evidence.evidenceDigest,
+    planVersion: input.plan.schemaVersion,
+    intent: {
+      labels: [...new Set(input.diff.labelsAfter)].sort(),
+      lane: input.diff.lane,
+      comment: input.diff.comment,
+      title: input.diff.title,
+      body: input.diff.body,
+      close: input.diff.close,
+      children: input.diff.children
+        ? input.diff.children.briefs.map((brief) => childBriefKey(input.repoFullName, input.issueNumber, brief)).sort()
+        : null,
+    },
+  };
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
 
 function memoryStore(initial?: ApplicationRecord): ApplicationStore & {
   rows: Map<string, ApplicationRecord>;
@@ -487,8 +593,16 @@ function applyInput(diff: GroomingMutationDiff, overrides: Partial<ApplyInput> =
   };
 }
 
-const fullDiff = () =>
-  diffFor(alreadyDone({ labelsToAdd: ["type/bug"], proposedTitle: "Rewritten descriptive title", proposedBody: "Notes." }), snapshot({ issue: { ...snapshot().issue, title: "P0" } }));
+/** The plan behind fullDiff, for the v1-key reconstruction in the deploy tests. */
+const fullPlan = (() => {
+  const snap = snapshot({ issue: { ...snapshot().issue, title: "P0" } });
+  return planFor(alreadyDone({ labelsToAdd: ["type/bug"], proposedTitle: "Rewritten descriptive title", proposedBody: "Notes." }), snap);
+})();
+
+const fullDiff = () => {
+  const snap = snapshot({ issue: { ...snapshot().issue, title: "P0" } });
+  return computeMutationDiff({ plan: fullPlan, live: live(snap), catalog: catalogFor(snap) });
+};
 
 describe("applyGroomingMutations", () => {
   it("applies lowest impact first: labels, comment, title/body, close, then status/done", async () => {
@@ -578,6 +692,75 @@ describe("applyGroomingMutations", () => {
     expect(again.calls).toEqual([]);
     expect(replay.steps.comment?.status).toBe("replayed");
     expect(replay.commentUrl).toBe("https://github.com/org/repo/issues/42#issuecomment-1");
+  });
+
+  it("re-applies once under a fresh key when existing rows were recorded before the version bump (dispatch#1461 deploy decision)", async () => {
+    // Rows are not migrated: the reason text is not stored on a
+    // GroomingApplication row, so a v1 key cannot be recomputed. The first
+    // post-deploy groom claims its fresh v2 key and applies again — the
+    // comment re-posts, subject to the comment cooldown — and the old row is
+    // left untouched. A second application under the same v2 key replays:
+    // idempotency resumes after the one re-apply.
+    const fullInput = applyInput(fullDiff());
+    const v1Key = v1ApplicationKey({
+      repoFullName: fullInput.repoFullName,
+      issueNumber: fullInput.issueNumber,
+      plan: fullPlan,
+      diff: fullInput.diff,
+    });
+    expect(v1Key).not.toBe(KEY);
+    const { github, calls } = fakeGitHub();
+    const store = memoryStore({
+      applicationKey: v1Key,
+      groomingRunId: "run-0",
+      status: "applied",
+      steps: {},
+      attempts: 1,
+    });
+    const result = await applyGroomingMutations(fullInput, github, store);
+    expect(result.outcome).toBe("applied");
+    expect(calls).toContain("comment");
+    expect(store.rows.get(v1Key)).toMatchObject({ status: "applied", groomingRunId: "run-0" });
+    expect(store.rows.get(KEY)).toMatchObject({ status: "applied", groomingRunId: "run-1" });
+
+    const again = fakeGitHub();
+    const replay = await applyGroomingMutations(applyInput(fullDiff(), { groomingRunId: "run-2" }), again.github, store);
+    expect(replay.outcome).toBe("replayed");
+    expect(again.calls).toEqual([]);
+  });
+
+  it("a pre-bump comment still suppresses the re-applied comment inside the cooldown window (dispatch#1461 deploy decision)", async () => {
+    // The v1 comment's marker no longer matches the fresh v2 key, so it is
+    // not the application's own comment — but the cooldown counts any
+    // Dispatch-posted groomer comment in the window, so the re-apply does not
+    // double-post for a recently groomed issue.
+    const fullInput = applyInput(fullDiff());
+    const v1Key = v1ApplicationKey({
+      repoFullName: fullInput.repoFullName,
+      issueNumber: fullInput.issueNumber,
+      plan: fullPlan,
+      diff: fullInput.diff,
+    });
+    const { github, calls } = fakeGitHub();
+    const store = memoryStore({
+      applicationKey: v1Key,
+      groomingRunId: "run-0",
+      status: "applied",
+      steps: {},
+      attempts: 1,
+    });
+    const result = await applyGroomingMutations(
+      applyInput(fullDiff(), {
+        recentComments: [
+          { id: null, author: "itsmiso-ai", body: `old\n\n${commentMarker(v1Key)}`, url: null, createdAt: new Date().toISOString() },
+        ],
+      }),
+      github,
+      store,
+    );
+    expect(result.outcome).toBe("applied");
+    expect(result.steps.comment).toMatchObject({ status: "skipped", detail: "cooldown" });
+    expect(calls).not.toContain("comment");
   });
 
   it("resumes a partial application without repeating the steps that landed", async () => {
