@@ -162,6 +162,10 @@ Other rules the validator enforces:
 - A dependency state that contradicts the cited GitHub state is rejected. Dependencies are descriptive: the `depends on #N` claim gate stays authoritative.
 - Output in the legacy `GroomerOutput` shape is rejected with a clear error rather than migrated.
 
+### What needs_info waits on (dispatch#1452)
+
+A `needs_info` verdict carries `verdict.infoGap`: a `kind` (`product_decision`, `external_fact`, `runtime_reproduction`, or `investigation_incomplete`), the one concrete `question`, and `whyToolsCannotAnswer` — why the repository and related-work evidence this run had cannot answer it. The run resolves the declaration against its own exploration facts and persists the class on `readiness.gapClass` (`human_question` or `investigation_incomplete`): failed tool calls, truncated reads, or an exhausted round/byte budget override a claimed human question into `investigation_incomplete`, because an investigation that never finished has not earned the right to ask. Both classes land non-claimable on `status/backlog` and re-groom on the existing bounded cooldown/freshness paths — no new retry channel, no schema change. The reason stored on `Issue.needsInfoReason` carries a machine prefix, `investigation_incomplete:` or `human_question(<kind>):`, so a board card or log reader can tell the two apart without parsing prose; an operator's manual `mark_needs_info` via `POST /api/issues/groom` stores the operator's text as given, with no prefix enforced there.
+
 ### Close policy
 
 The approved scope is limited to the existing deterministic `already_done` policy below. Duplicate and superseded outcomes remain recommendations for human review; see [Groomer Close Policy](./groomer-close-policy.md).

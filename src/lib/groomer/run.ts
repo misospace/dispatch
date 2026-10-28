@@ -593,6 +593,9 @@ async function executeGroomerRun(
             sources: exploration.sources,
             bytes: exploration.bytes,
             toolCalls: exploration.toolCalls,
+            // What the investigation could not establish (dispatch#1452):
+            // machine-readable, so the run can be read back afterwards.
+            gaps: exploration.gaps,
           },
         }),
       });
@@ -631,6 +634,7 @@ async function executeGroomerRun(
       },
       catalog: evidenceCatalog,
       deadline: leaseExpiresAt - LEASE_APPLY_RESERVE_MS,
+      investigation: exploration ? exploration.gaps : null,
     });
     const { rawOutput, validation } = modelStage;
     contextWarnings.push(...modelStage.warnings);

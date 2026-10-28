@@ -211,7 +211,24 @@ function notReadyDraft(
 ): GroomingPlanDraft {
   return planDraft({
     ...patch,
-    verdict: { actionability, lane: { id: "backlog", confidence: "medium", reason: "not ready yet" }, ...patch.verdict },
+    verdict: {
+      actionability,
+      lane: { id: "backlog", confidence: "medium", reason: "not ready yet" },
+      ...patch.verdict,
+      // A needs_info verdict must declare what it is missing (dispatch#1452);
+      // give the draft a default gap so callers stay focused on their case.
+      // Applied after the patch so an explicitly-undefined `infoGap` cannot
+      // clobber it.
+      ...(actionability === "needs_info" && patch.verdict?.infoGap === undefined
+        ? {
+            infoGap: {
+              kind: "product_decision" as const,
+              question: "Which tenant scope applies?",
+              whyToolsCannotAnswer: "The repository records no product-scope decision.",
+            },
+          }
+        : {}),
+    },
     implementationBrief: patch.implementationBrief ?? null,
   });
 }
@@ -288,6 +305,15 @@ const mockExploration: ExploreResult = {
   relatedWorkQueries: [],
   relatedWorkRefs: [],
   relatedWork: [],
+  gaps: {
+    explorationRan: true,
+    toolFailures: [],
+    truncatedReads: [],
+    budgetExhausted: false,
+    roundsExhausted: false,
+    aborted: false,
+    unavailable: false,
+  },
 };
 
 // True if any string leaf (or key) of a value carries a NUL or other C0 control
@@ -897,7 +923,7 @@ describe("runHostedGroomer", () => {
       ...mockExploration,
       ask: "why\u0000 does login\u0007 drop the return URL?",
       files: ["src/auth/login.ts\u0000"],
-      toolCalls: [{ name: "submit_findings", arguments: { notes: "already\u0001 seen" }, ok: true, bytes: 0, preview: "" }],
+      toolCalls: [{ name: "submit_findings", arguments: { notes: "already\u0001 seen" }, ok: true, bytes: 0, preview: "", truncated: false }],
     });
 
     await runHostedGroomer();
@@ -1976,7 +2002,10 @@ Investigate session handling in auth module.`;
       await runHostedGroomer();
       expect(mocks.prisma.issue.update).toHaveBeenCalledWith(
         expect.objectContaining({
-          data: expect.objectContaining({ nextGroomingAction: "mark_needs_info", needsInfoReason: "which tenant?" }),
+          data: expect.objectContaining({
+        nextGroomingAction: "mark_needs_info",
+        needsInfoReason: "human_question(product_decision): which tenant?",
+      }),
         }),
       );
     });
@@ -2056,7 +2085,7 @@ Investigate session handling in auth module.`;
       const data = lastIssueUpdateData();
       expect(data).toMatchObject({
         nextGroomingAction: "mark_needs_info",
-        needsInfoReason: "which environment reproduces it?",
+        needsInfoReason: "human_question(product_decision): which environment reproduces it?",
       });
       expect(data.blockedReason).toBeNull();
       expect(data.notReadyReason).toBeNull();
@@ -2101,7 +2130,9 @@ Investigate session handling in auth module.`;
         notReadyDraft("needs_info", { verdict: { rationale: "which tenant?" } }),
       );
       await runHostedGroomer();
-      expect(lastIssueUpdateData().needsInfoReason).toBe("which tenant?");
+      expect(lastIssueUpdateData().needsInfoReason).toBe(
+        "human_question(product_decision): which tenant?",
+      );
 
       // Exact retry of the same plan: the application replays, and only the
       // cooldown stamp moves — no reason field is written, so the current
@@ -2241,6 +2272,44 @@ Investigate session handling in auth module.`;
         readiness: { ready: true },
         closeRecommendation: null,
       });
+    });
+
+    it("resolves a needs_info verdict to an incomplete investigation when this run's exploration broke (dispatch#1452)", async () => {
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true, toolLoopEnabled: true });
+      mocks.exploreRepository.mockResolvedValue({
+        ...mockExploration,
+        toolCalls: [
+          { name: "search_code", arguments: { query: "tenant" }, ok: false, bytes: 0, preview: "search unavailable", truncated: false },
+        ],
+        gaps: {
+          explorationRan: true,
+          toolFailures: ["search_code"],
+          truncatedReads: [],
+          budgetExhausted: false,
+          roundsExhausted: false,
+          aborted: false,
+          unavailable: false,
+        },
+      });
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("needs_info", {
+          verdict: {
+            rationale: "which tenant?",
+            infoGap: {
+              kind: "product_decision",
+              question: "Which tenant scope applies?",
+              whyToolsCannotAnswer: "The repository records no product-scope decision.",
+            },
+          },
+        }),
+      );
+
+      const result = await runHostedGroomer();
+
+      // The declared human question is outranked by the run's own failure:
+      // the issue keeps retrying instead of parking on an unasked question.
+      expect(result!.plan!.readiness.gapClass).toBe("investigation_incomplete");
+      expect(result!.output.needsInfoReason).toBe("investigation_incomplete: which tenant?");
     });
 
     it("gives the model the evidence catalog built from the snapshot", async () => {
@@ -2927,9 +2996,9 @@ Investigate session handling in auth module.`;
         sources: [],
         readSources: [],
         toolCalls: [
-          { name: "search_code", arguments: { query: "missing symbol" }, ok: true, bytes: 0, preview: "No matches" },
-          { name: "search_code", arguments: { query: "also missing" }, ok: true, bytes: 0, preview: "No matches" },
-          { name: "search_code", arguments: { query: "found it" }, ok: true, bytes: 400, preview: "src/a.ts" },
+          { name: "search_code", arguments: { query: "missing symbol" }, ok: true, bytes: 0, preview: "No matches", truncated: false },
+          { name: "search_code", arguments: { query: "also missing" }, ok: true, bytes: 0, preview: "No matches", truncated: false },
+          { name: "search_code", arguments: { query: "found it" }, ok: true, bytes: 400, preview: "src/a.ts", truncated: false },
         ],
       });
       await runHostedGroomer();

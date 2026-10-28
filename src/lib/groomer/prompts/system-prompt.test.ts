@@ -189,6 +189,35 @@ describe("buildGroomerSystemPrompt", () => {
     });
   });
 
+  describe("info gap (dispatch#1452)", () => {
+    it("carries infoGap in the verdict shape, null by default", () => {
+      const prompt = buildGroomerSystemPrompt(baseParams);
+      expect(prompt).toContain('"infoGap": null');
+    });
+
+    it("explains all four gap kinds, three of them human questions", () => {
+      const prompt = buildGroomerSystemPrompt(baseParams);
+      expect(prompt).toContain("product_decision");
+      expect(prompt).toContain("external_fact");
+      expect(prompt).toContain("runtime_reproduction");
+      expect(prompt).toContain("investigation_incomplete");
+    });
+
+    it("keeps a failed tool or unread evidence out of the human-question lane", () => {
+      const prompt = buildGroomerSystemPrompt(baseParams);
+      expect(prompt).toContain("An unfinished investigation is NOT a human question");
+      expect(prompt).toContain("failed or timed out");
+      expect(prompt).toContain("do not launder a broken search into a maintainer question");
+    });
+
+    it("requires the one concrete question and the tools-cannot-answer reason", () => {
+      const prompt = buildGroomerSystemPrompt(baseParams);
+      expect(prompt).toContain("ONE concrete unanswered question");
+      expect(prompt).toContain("whyToolsCannotAnswer");
+      expect(prompt).toContain("a worker reading code is not needs_info");
+    });
+  });
+
   it("includes default lane guidance", () => {
     const prompt = buildGroomerSystemPrompt(baseParams);
     expect(prompt).toContain('Most ready work belongs in "local"');

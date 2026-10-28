@@ -116,6 +116,23 @@ describe("buildGroomingPlanResponseSchema", () => {
     expect(bare.properties.mutations.properties.close.anyOf[1].properties.criteria.maxItems).toBe(0);
   });
 
+  it("carries the needs_info info gap as a required nullable object (dispatch#1452)", () => {
+    const verdict = schema.properties.verdict;
+    expect(verdict.required).toContain("infoGap");
+    const infoGap = verdict.properties.infoGap;
+    expect(infoGap.anyOf[0]).toEqual({ type: "null" });
+    const filled = infoGap.anyOf[1];
+    expect(filled.required).toEqual(["kind", "question", "whyToolsCannotAnswer"]);
+    expect(filled.properties.kind.enum).toEqual([
+      "product_decision",
+      "external_fact",
+      "runtime_reproduction",
+      "investigation_incomplete",
+    ]);
+    expect(filled.properties.question).toMatchObject({ type: "string", maxLength: 1000 });
+    expect(filled.properties.whyToolsCannotAnswer).toMatchObject({ type: "string", maxLength: 1000 });
+  });
+
   it("falls back to bounded strings without a catalog", () => {
     const plain = buildGroomingPlanResponseSchema() as Node;
     expect(plain.properties.verdict.properties.evidenceRefs.items).toMatchObject({ type: "string", maxLength: 300 });

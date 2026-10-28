@@ -36,6 +36,14 @@ import type {
 import { ISSUE_EVIDENCE_ID } from "./plan-evidence";
 import { evaluateCloseGrounding } from "./close-grounding";
 import type { GroomerOutput } from "./schema";
+import {
+  infoGapReadinessReason,
+  resolveInfoGap,
+  INFO_GAP_KIND_VALUES,
+  type InfoGap,
+  type InfoGapResolution,
+  type InvestigationGapFacts,
+} from "./investigation-gap";
 
 export const GROOMING_PLAN_SCHEMA_VERSION = 1 as const;
 
@@ -119,6 +127,14 @@ export interface GroomingVerdict {
   rationale: string;
   evidenceRefs: string[];
   uncertainties: Uncertainty[];
+  /**
+   * What a needs_info verdict is actually waiting on (dispatch#1452): a
+   * concrete human question the tools cannot answer, or an honest
+   * investigation_incomplete. Required by the validator for needs_info and
+   * rejected on every other actionability; optional in the type so
+   * pre-#1452 plans and drafts stay constructible.
+   */
+  infoGap?: InfoGap | null;
 }
 
 export interface ImplementationBrief {
@@ -241,6 +257,13 @@ export interface GroomingReadiness {
   evidenceDigest: string;
   /** Why the plan is not ready; empty when ready. */
   reasons: string[];
+  /**
+   * The machine-distinguishable gap classification for a non-ready verdict
+   * (dispatch#1452): what this plan is waiting on, resolved against the run's
+   * exploration facts. null when ready, for pre-#1452 plans, and for a
+   * needs_info answer that predates the infoGap contract.
+   */
+  gapClass: InfoGapResolution | null;
 }
 
 /** The validated, canonical plan. */
@@ -255,6 +278,14 @@ export interface GroomingPlan extends GroomingPlanDraft {
 
 export interface GroomingPlanValidationContext {
   catalog: EvidenceCatalog;
+  /**
+   * The run's exploration diagnostics (#1452). When present, they outrank a
+   * declared human question: a needs_info verdict that claims to await a
+   * human, on a run whose tools failed or ran out of budget, resolves to an
+   * incomplete investigation. Absent (legacy callers, unit tests) the
+   * declaration stands on its own.
+   */
+  investigation?: InvestigationGapFacts | null;
 }
 
 export interface GroomingPlanValidationResult {
@@ -376,6 +407,7 @@ function parseDraft(data: Obj, r: Reader): GroomingPlanDraft {
         material: r.boolean(u.material, `${path}.material`),
       };
     }),
+    infoGap: parseInfoGap(v.infoGap, r),
   };
 
   let implementationBrief: ImplementationBrief | null = null;
@@ -492,6 +524,22 @@ function parseDraft(data: Obj, r: Reader): GroomingPlanDraft {
   });
 
   return { verdict, implementationBrief, mutations, decomposition, relatedWork };
+}
+
+/**
+ * Optional in the grammar (absent/null is null); the validator requires a
+ * non-null gap on a needs_info verdict and rejects one anywhere else
+ * (dispatch#1452).
+ */
+function parseInfoGap(value: unknown, r: Reader): InfoGap | null {
+  if (value === undefined || value === null) return null;
+  const path = "verdict.infoGap";
+  const g = r.object(value, path);
+  return {
+    kind: r.enumValue(g.kind, `${path}.kind`, INFO_GAP_KIND_VALUES, "investigation_incomplete"),
+    question: r.text(g.question, `${path}.question`, PLAN_LIMITS.text),
+    whyToolsCannotAnswer: r.text(g.whyToolsCannotAnswer, `${path}.whyToolsCannotAnswer`, PLAN_LIMITS.text),
+  };
 }
 
 // ─── Evidence checks ──────────────────────────────────────────────────────────
@@ -753,10 +801,24 @@ export function validateGroomingPlan(data: unknown, context: GroomingPlanValidat
     }
   });
 
+  const { actionability } = draft.verdict;
+
+  // The verdict's gap (#1452): a needs_info verdict must say what it is
+  // waiting on and why this run's repository/related-work evidence cannot
+  // answer it. Ordinary implementation or research uncertainty is not a
+  // human prerequisite: only the declared kind, cross-checked against the
+  // run's exploration facts below, decides who owes an answer.
+  if (actionability === "needs_info" && !draft.verdict.infoGap) {
+    errors.push(
+      'verdict.infoGap: a needs_info verdict must name the unanswered question (question) and why the repository and related-work evidence cannot answer it (whyToolsCannotAnswer)',
+    );
+  } else if (actionability !== "needs_info" && draft.verdict.infoGap) {
+    errors.push(`verdict.infoGap: only a needs_info verdict carries an info gap (actionability is "${actionability}")`);
+  }
+
   // Close recommendation: already_done is the only applied close, and it is
   // exactly the already_done verdict. Duplicate/superseded are recorded
   // recommendations that must point at the related work they rely on.
-  const { actionability } = draft.verdict;
   const close = draft.mutations.close;
   if (actionability === "already_done") {
     if (!close || close.reason !== "already_done") {
@@ -837,14 +899,25 @@ export function validateGroomingPlan(data: unknown, context: GroomingPlanValidat
       lane: lane.id,
       evidenceDigest: catalog.binding.evidenceDigest,
       reasons: [],
+      gapClass: null,
     };
   } else {
+    // #1452: classify what the not-ready verdict waits on. Exploration facts
+    // outrank a declared human question; with no facts (legacy callers) the
+    // declaration stands. A needs_info answer without a gap (only possible
+    // for drafts that predate the contract, which validation rejects above)
+    // keeps gapClass null.
+    const infoGap =
+      actionability === "needs_info"
+        ? resolveInfoGap(draft.verdict.infoGap ?? null, context.investigation ?? null)
+        : null;
     readiness = {
       ready: false,
       admission: null,
       lane: null,
       evidenceDigest: catalog.binding.evidenceDigest,
-      reasons: [`verdict is ${actionability}`],
+      reasons: [`verdict is ${actionability}`, ...(infoGap ? [infoGapReadinessReason(infoGap)] : [])],
+      gapClass: infoGap ? infoGap.resolution : null,
     };
   }
 
@@ -918,10 +991,27 @@ export function toGroomerOutput(plan: GroomingPlan, currentLabels: string[]): Gr
   if (mutations.githubComment) output.githubComment = mutations.githubComment;
   if (mutations.proposedTitle) output.proposedTitle = mutations.proposedTitle;
   if (mutations.proposedBody) output.proposedBody = mutations.proposedBody;
-  if (verdict.actionability === "needs_info") output.needsInfoReason = verdict.rationale;
+  if (verdict.actionability === "needs_info") output.needsInfoReason = needsInfoReason(plan);
   if (verdict.actionability === "blocked") output.blockedReason = verdict.rationale;
   if (verdict.actionability === "backlog") output.notReadyReason = verdict.rationale;
   const action = nextGroomingActionFor(plan);
   if (action) output.nextGroomingAction = action;
   return output;
+}
+
+/**
+ * The reason stored on Issue.needsInfoReason (#1452): the verdict rationale
+ * with a machine-readable gap prefix, so a board card and any log reader can
+ * tell an incomplete investigation from a genuine human question without
+ * parsing prose. Plans whose gap predates the contract keep the bare
+ * rationale.
+ */
+function needsInfoReason(plan: GroomingPlan): string {
+  const gap = plan.readiness.gapClass;
+  if (!gap) return plan.verdict.rationale;
+  const code =
+    gap === "investigation_incomplete"
+      ? "investigation_incomplete"
+      : `human_question(${plan.verdict.infoGap?.kind ?? "unspecified"})`;
+  return `${code}: ${plan.verdict.rationale}`;
 }
