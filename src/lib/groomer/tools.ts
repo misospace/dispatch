@@ -61,7 +61,9 @@ export interface GroomerToolResult {
   /**
    * read_file only: the text the model was shown and the ref it was read at
    * (null for the default branch), so close excerpts can be checked against
-   * exactly what was read (dispatch#1099).
+   * exactly what was read (dispatch#1099). A bounded range read carries only
+   * the lines that were shown, verbatim; the header and continuation
+   * coordinates are rendering, not evidence content.
    */
   file?: { path: string; ref: string | null; content: string };
 }
@@ -118,7 +120,9 @@ export function buildGroomerToolDefinitions(): Record<string, unknown>[] {
         name: "read_file",
         description:
           "Read a file from this repository by its full path from the repo root, " +
-          "e.g. src/lib/prisma.ts. Long files are truncated. Pass `ref` to read " +
+          "e.g. src/lib/prisma.ts. Long files are truncated; when the output says " +
+          "it continues at line N, call read_file again with startLine=N to read " +
+          "the next section. Pass `ref` to read " +
           "a specific branch or SHA; without it, the repository's default branch " +
           "is used. Pass the default branch when verifying whether an issue's " +
           "premise still holds against the current `main`.",
@@ -134,6 +138,22 @@ export function buildGroomerToolDefinitions(): Record<string, unknown>[] {
                 "Branch, tag, or commit SHA. Omit for the repository's default " +
                 "branch; supply explicitly when verifying that a file/symbol " +
                 "still exists on `main`.",
+            },
+            startLine: {
+              type: "integer",
+              minimum: 1,
+              description:
+                "1-based first line to read. Use it with the \"continues at line N\" " +
+                "hint to finish reading a truncated file, e.g. to reach the tail " +
+                "of a long file a previous read cut off.",
+            },
+            lineCount: {
+              type: "integer",
+              minimum: 1,
+              description:
+                `Maximum number of lines to return, capped at ${MAX_READ_LINES}; the per-file byte ` +
+                "limit may cut earlier (the output says where to continue). Omit " +
+                "to read from the start up to the byte limit.",
             },
           },
         },
@@ -285,6 +305,78 @@ function truncate(text: string, maxBytes: number): { text: string; truncated: bo
   const decoder = new TextDecoder("utf-8", { fatal: false, ignoreBOM: true });
   const cut = decoder.decode(buf.subarray(0, maxBytes)).replace(/\uFFFD$/, "");
   return { text: cut, truncated: true };
+}
+
+/**
+ * Hard cap on the lines one ranged read_file call may return (dispatch#1451).
+ * The per-file byte budget still applies and usually cuts earlier; this bounds
+ * the request even for files made of many tiny lines.
+ */
+export const MAX_READ_LINES = 500;
+
+/**
+ * Parse a line-range argument: undefined when absent or blank (the model may
+ * send ""), null when present but not a positive whole number.
+ */
+function asLineNumber(value: unknown): number | undefined | null {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "number") return Number.isInteger(value) && value >= 1 ? value : null;
+  const raw = asString(value).trim();
+  if (raw === "") return undefined;
+  return /^\d+$/.test(raw) && parseInt(raw, 10) >= 1 ? parseInt(raw, 10) : null;
+}
+
+/**
+ * Render a bounded line-range slice of a file (dispatch#1451). Lines are whole
+ * (never mid-character or mid-line), charged against the per-file byte budget,
+ * and the slice carries its coordinates plus a continuation hint so a known
+ * path can be finished reading instead of only ever showing its head. The
+ * returned `body` is verbatim file content — the header and footer are
+ * rendering, not evidence — so close-excerpt grounding (#1099) keeps working.
+ */
+function renderLineRange(
+  text: string,
+  startLine: number,
+  lineCount: number,
+  maxBytes: number,
+): {
+  body: string;
+  lastShown: number;
+  totalLines: number;
+  hasMore: boolean;
+  clamped: boolean;
+} {
+  const lines = text.split("\n");
+  const totalLines = lines.length;
+  const bodyLines: string[] = [];
+  let usedBytes = 0;
+  for (let i = startLine - 1; i < startLine - 1 + lineCount && i < totalLines; i++) {
+    const cost = Buffer.byteLength(lines[i], "utf8") + (bodyLines.length > 0 ? 1 : 0);
+    if (usedBytes + cost > maxBytes) break;
+    bodyLines.push(lines[i]);
+    usedBytes += cost;
+  }
+  if (bodyLines.length === 0) {
+    // Not even the first requested line fits the byte budget. Show as much of
+    // it as fits (matching the head-read truncation) and continue past it, so
+    // a huge single line can never wedge continuation on the same startLine.
+    const cut = truncate(lines[startLine - 1], maxBytes);
+    return {
+      body: cut.text,
+      lastShown: startLine,
+      totalLines,
+      hasMore: cut.truncated ? true : startLine < totalLines,
+      clamped: lineCount > MAX_READ_LINES,
+    };
+  }
+  const lastShown = startLine - 1 + bodyLines.length;
+  return {
+    body: bodyLines.join("\n"),
+    lastShown,
+    totalLines,
+    hasMore: lastShown < totalLines,
+    clamped: lineCount > MAX_READ_LINES,
+  };
 }
 
 /**
@@ -464,7 +556,29 @@ export async function executeGroomerTool(
       case "search_code": {
         const query = asString(call.arguments.query).trim();
         if (!query) return fail("search_code needs a non-empty query.");
-        const results = await deps.searchCode(options.repoFullName, query, options.maxSearchResults);
+        let results: { path: string }[];
+        try {
+          results = await deps.searchCode(options.repoFullName, query, options.maxSearchResults);
+        } catch (err) {
+          // A failed or timed-out search is an outage, not absence (dispatch#1451):
+          // the model must not read it as "the code is missing", and blindly
+          // retrying global search burns the round budget. Offer the bounded
+          // fallback instead: named paths and directory listings through the
+          // existing read capability, which stays under the same byte budgets.
+          const message = err instanceof Error ? err.message : String(err);
+          const content =
+            `search_code failed: ${message} This is a search outage or timeout, not evidence the code ` +
+            "is missing — repeating the search will not help. Finish the investigation with bounded " +
+            "local reads: list_directory the directories the issue names, then read_file the specific " +
+            "paths (use startLine/lineCount to reach sections of a long file).";
+          return {
+            ok: false,
+            content,
+            bytes: Buffer.byteLength(content, "utf8"),
+            sources: [],
+            warnings: ["search_code unavailable; offered bounded directory/file fallback"],
+          };
+        }
         if (results.length === 0) {
           return {
             ok: true,
@@ -485,6 +599,14 @@ export async function executeGroomerTool(
         if ("error" in normalized) return fail(normalized.error);
         const path = normalized.path;
         if (!path) return fail("read_file needs a non-empty path.");
+        const startLineArg = asLineNumber(call.arguments.startLine);
+        if (startLineArg === null) {
+          return fail("read_file startLine must be a whole number ≥ 1.");
+        }
+        const lineCountArg = asLineNumber(call.arguments.lineCount);
+        if (lineCountArg === null) {
+          return fail("read_file lineCount must be a whole number ≥ 1.");
+        }
         const ref = options.pinnedRef ?? (asString(call.arguments.ref).trim() || undefined);
         const text = await deps.readFile(options.repoFullName, path, ref);
         if (!text) {
@@ -495,8 +617,60 @@ export async function executeGroomerTool(
             sources: [],
           };
         }
+        // Bounded range read (dispatch#1451): line coordinates, continuation
+        // metadata, and verbatim content for the evidence identity. Without
+        // range arguments the call behaves exactly as before.
+        if (startLineArg !== undefined || lineCountArg !== undefined) {
+          const startLine = startLineArg ?? 1;
+          const lines = text.split("\n");
+          if (startLine > lines.length) {
+            const content = `${path}: startLine ${startLine} is past the end of the file (${lines.length} line(s)).`;
+            return {
+              ok: true,
+              content,
+              bytes: Buffer.byteLength(content, "utf8"),
+              sources: [path],
+            };
+          }
+          const range = renderLineRange(
+            text,
+            startLine,
+            lineCountArg ?? MAX_READ_LINES,
+            options.maxFileBytes,
+          );
+          let header = `${path} (lines ${startLine}-${range.lastShown} of ${range.totalLines}`;
+          if (range.clamped) header += `, line count capped at ${MAX_READ_LINES}`;
+          header += "):";
+          // Continuation never claims a line past the end, and never claims
+          // more when the requested window ran out at EOF.
+          let footer = "";
+          if (range.hasMore) {
+            footer =
+              range.lastShown < range.totalLines
+                ? `\n… continues at line ${range.lastShown + 1} (pass startLine=${range.lastShown + 1})`
+                : "\n… (this line exceeds the byte limit)";
+          } else {
+            footer = "\n… end of file";
+          }
+          const content = `${header}\n${range.body}${footer}`;
+          return {
+            ok: true,
+            content,
+            bytes: Buffer.byteLength(content, "utf8"),
+            sources: [path],
+            file: { path, ref: ref ?? null, content: range.body },
+          };
+        }
         const { text: body, truncated } = truncate(text, options.maxFileBytes);
-        const content = `${path}:\n${body}${truncated ? "\n… (truncated)" : ""}`;
+        // The truncation marker names the line to continue from, so a known
+        // path can be finished reading instead of only ever showing its head
+        // (dispatch#1451). Substring "(truncated)" stays for existing readers.
+        // The cut usually lands mid-line; naming the line it landed in (not
+        // the next one) means a ranged continuation re-reads that line whole.
+        const marker = truncated
+          ? `\n… (truncated) to continue, call again with startLine=${body.split("\n").length}`
+          : "";
+        const content = `${path}:\n${body}${marker}`;
         return {
           ok: true,
           content,

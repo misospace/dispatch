@@ -4,6 +4,7 @@ import {
   buildGroomerToolDefinitions,
   executeGroomerTool,
   normalizeRepoPath,
+  MAX_READ_LINES,
   type GroomerToolDeps,
 } from "./tools";
 
@@ -735,5 +736,218 @@ describe("close-grounding evidence (dispatch#1099)", () => {
     expect(result.warnings).toEqual(["related-work: closing references lookup failed for org/repo#590"]);
     expect(result.relatedWork?.[0]).not.toHaveProperty("closes");
     expect(result.relatedWork?.[0]).toMatchObject({ state: "merged", baseRef: "main" });
+  });
+});
+
+describe("executeGroomerTool read_file bounded ranges (dispatch#1451)", () => {
+  function longFile(lines: number, prefix = "line"): string {
+    return Array.from({ length: lines }, (_, i) => `${prefix} ${i + 1}`).join("\n");
+  }
+
+  it("exposes startLine and lineCount on the read_file tool definition", () => {
+    const def = buildGroomerToolDefinitions().find(
+      (t) => (t.function as { name: string }).name === "read_file",
+    ) as { function: { parameters: { properties: Record<string, unknown> } } };
+    expect(def.function.parameters.properties).toHaveProperty("startLine");
+    expect(def.function.parameters.properties).toHaveProperty("lineCount");
+    expect(def.function.parameters.properties).not.toHaveProperty("maxBytes");
+  });
+
+  it("reads the tail of a long file a head read could never reach", async () => {
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue(longFile(120)) });
+    const head = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "big.ts" } },
+      { ...options, maxFileBytes: 120 },
+      deps,
+    );
+    expect(head.content).toContain("(truncated");
+    expect(head.content).not.toContain("line 120");
+    const tail = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "big.ts", startLine: 115 } },
+      { ...options, maxFileBytes: 200 },
+      deps,
+    );
+    expect(tail.ok).toBe(true);
+    expect(tail.content).toContain("line 120");
+    expect(tail.content).toContain("(lines 115-120 of 120)");
+    expect(tail.content).toContain("end of file");
+    expect(tail.file).toEqual({
+      path: "big.ts",
+      ref: null,
+      content: longFile(120).split("\n").slice(114).join("\n"),
+    });
+  });
+
+  it("names the continuation line when a range is cut by the byte budget", async () => {
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue(longFile(50, "x")) });
+    const result = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "many.ts", startLine: 10, lineCount: 40 } },
+      { ...options, maxFileBytes: 40 },
+      deps,
+    );
+    // "x 10".."x 17" cost 4 + 7*5 = 39 bytes; "x 18" would hit 44 and cut.
+    expect(result.content).toContain("(lines 10-17 of 50)");
+    expect(result.content).toContain("continues at line 18 (pass startLine=18)");
+    expect(result.file?.content).toBe(["x 10", "x 11", "x 12", "x 13", "x 14", "x 15", "x 16", "x 17"].join("\n"));
+  });
+
+  it("rejects invalid line ranges without fetching", async () => {
+    for (const args of [
+      { path: "a.ts", startLine: 0 },
+      { path: "a.ts", startLine: -3 },
+      { path: "a.ts", startLine: 1.5 },
+      { path: "a.ts", startLine: "ten" },
+      { path: "a.ts", lineCount: 0 },
+      { path: "a.ts", lineCount: "many" },
+    ]) {
+      const deps = makeDeps({ readFile: vi.fn().mockResolvedValue("x") });
+      const result = await executeGroomerTool({ name: "read_file", arguments: args }, options, deps);
+      expect(result.ok).toBe(false);
+      expect(deps.readFile).not.toHaveBeenCalled();
+    }
+  });
+
+  it("clamps an oversized lineCount to the per-call line cap", async () => {
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue(longFile(20, "s")) });
+    const result = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "s.ts", startLine: 1, lineCount: 100000 } },
+      { ...options, maxFileBytes: 4096 },
+      deps,
+    );
+    expect(result.content).toContain(`line count capped at ${MAX_READ_LINES}`);
+    expect(result.content).toContain("(lines 1-20 of 20,");
+  });
+
+  it("keeps whole UTF-8 characters inside a range cut by the byte budget", async () => {
+    const text = "héllo wörld ünïcode\n".repeat(20);
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue(text) });
+    const result = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "u.ts", startLine: 2, lineCount: 20 } },
+      { ...options, maxFileBytes: 35 },
+      deps,
+    );
+    expect(result.content).not.toContain("\uFFFD");
+    expect(result.file?.content).toContain("héllo");
+    // Charged bytes equal the rendered content; the body alone stays bounded.
+    expect(Buffer.byteLength(result.file?.content ?? "", "utf8")).toBeLessThanOrEqual(35);
+  });
+
+  it("charges range output against the byte budget the caller passes", async () => {
+    // explore.ts passes maxFileBytes = min(perFile, totalRemaining); a ranged
+    // read charged at that cap cannot exceed it (dispatch#1451).
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue(longFile(300, "longish line here")) });
+    const result = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "b.ts", startLine: 200, lineCount: 100 } },
+      { ...options, maxFileBytes: 60 },
+      deps,
+    );
+    expect(Buffer.byteLength(result.file?.content ?? "", "utf8")).toBeLessThanOrEqual(60);
+    expect(result.bytes).toBe(Buffer.byteLength(result.content, "utf8"));
+  });
+
+  it("answers a startLine past the end without claiming file content", async () => {
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue(longFile(3)) });
+    const result = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "tiny.ts", startLine: 9 } },
+      options,
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    expect(result.content).toContain("past the end of the file (3 line(s))");
+    expect(result.file).toBeUndefined();
+  });
+
+  it("keeps the pinned-revision evidence identity for ranged reads", async () => {
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue(longFile(10)) });
+    const result = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "p.ts", startLine: 8, ref: "feature" } },
+      { ...options, pinnedRef: "deadbeef" },
+      deps,
+    );
+    expect(deps.readFile).toHaveBeenCalledWith("org/repo", "p.ts", "deadbeef");
+    expect(result.file).toMatchObject({ path: "p.ts", ref: "deadbeef" });
+  });
+
+  it("truncates a single line larger than the budget and continues past it", async () => {
+    const deps = makeDeps({
+      readFile: vi.fn().mockResolvedValue(`small\n${"y".repeat(500)}\nafter`),
+    });
+    const first = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "huge.ts", startLine: 2 } },
+      { ...options, maxFileBytes: 50 },
+      deps,
+    );
+    expect(first.ok).toBe(true);
+    expect(first.content).toContain("continues at line 3");
+    expect(Buffer.byteLength(first.file?.content ?? "", "utf8")).toBeLessThanOrEqual(50);
+    const next = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "huge.ts", startLine: 3 } },
+      { ...options, maxFileBytes: 50 },
+      deps,
+    );
+    expect(next.content).toContain("after");
+  });
+
+  it("behaves exactly as before when no range arguments are given", async () => {
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue("plain content") });
+    const result = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "n.ts" } },
+      options,
+      deps,
+    );
+    expect(result.content).toBe("n.ts:\nplain content");
+  });
+
+  it("a head truncation names the line a continuation read starts from", async () => {
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue(longFile(10)) });
+    const head = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "c.ts" } },
+      { ...options, maxFileBytes: 20 },
+      deps,
+    );
+    const match = /startLine=(\d+)/.exec(head.content);
+    expect(match).not.toBeNull();
+    const rest = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "c.ts", startLine: Number(match?.[1]) } },
+      { ...options, maxFileBytes: 4096 },
+      deps,
+    );
+    // Lines shown in both calls overlap at most one line; together they cover
+    // the file, and the continuation ends at the tail.
+    expect(rest.content).toContain("line 10");
+    expect(rest.content).toContain("end of file");
+  });
+});
+
+describe("executeGroomerTool search failure vs true absence (dispatch#1451)", () => {
+  it("treats a failed search as an outage with a bounded fallback, not absence", async () => {
+    const deps = makeDeps({
+      searchCode: vi.fn().mockRejectedValue(
+        new Error("Code search failed for org/repo: search timed out with incomplete results and no matches"),
+      ),
+    });
+    const result = await executeGroomerTool(
+      { name: "search_code", arguments: { query: "enrich" } },
+      options,
+      deps,
+    );
+    expect(result.ok).toBe(false);
+    expect(result.content).toContain("not evidence the code is missing");
+    expect(result.content).toContain("list_directory");
+    expect(result.content).not.toContain("No matches");
+    expect(result.warnings?.[0]).toContain("bounded directory/file fallback");
+  });
+
+  it("still treats a successful empty search as possible absence", async () => {
+    const deps = makeDeps({ searchCode: vi.fn().mockResolvedValue([]) });
+    const result = await executeGroomerTool(
+      { name: "search_code", arguments: { query: "ghostSymbol" } },
+      options,
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    expect(result.bytes).toBe(0);
+    expect(result.content).toContain("No matches");
+    expect(result.warnings).toBeUndefined();
   });
 });
