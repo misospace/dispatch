@@ -296,6 +296,21 @@ describe("github-code-search: repository metadata and contents fetchers", () => 
       "Failed to list directory nope in org/repo: 404",
     );
   });
+
+  it("fences an upstream error body to one line inside 200 bytes", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      mockResponse(`<html>\n<body>${"é".repeat(400)}</body>\n</html>`, { status: 404 }),
+    );
+
+    const error = await listRepositoryDirectory("org/repo", "nope").catch((err: unknown) => err);
+
+    expect(error).toBeInstanceOf(Error);
+    const message = (error as Error).message;
+    expect(message).not.toContain("\n");
+    expect(message).not.toContain("�");
+    // The fence is bytes, not characters.
+    expect(Buffer.byteLength(message, "utf8")).toBeLessThanOrEqual(400);
+  });
 });
 
 describe("github-code-search: compareCommits (grooming freshness, #1064)", () => {

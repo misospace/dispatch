@@ -601,14 +601,20 @@ describe("executeGroomerTool path handling", () => {
   });
 
   it("does not leave a replacement character before the truncation marker", async () => {
-    // "…" is three UTF-8 bytes; cutting at 4 lands mid-character.
-    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue("ab…cd") });
+    // "…" is three UTF-8 bytes; the cut lands inside it, so the decoded
+    // prefix ends in an incomplete character. The path prefix and the
+    // continuation marker are charged to the same budget as the content, so
+    // the cut lands at byte 38 of this file.
+    const deps = makeDeps({
+      readFile: vi.fn().mockResolvedValue(`${"y".repeat(37)}…${"z".repeat(60)}`),
+    });
     const result = await executeGroomerTool(
       { name: "read_file", arguments: { path: "a.ts" } },
-      { ...options, maxFileBytes: 4 },
+      { ...options, maxFileBytes: 100 },
       deps,
     );
     expect(result.content).not.toContain("�");
+    expect(result.file?.content).toBe("y".repeat(37));
     expect(result.content).toContain("(truncated)");
   });
 });
@@ -694,7 +700,15 @@ describe("close-grounding evidence (dispatch#1099)", () => {
       { ...options, maxFileBytes: 100, pinnedRef: "deadbeef" },
       deps,
     );
-    expect(pinned.file).toEqual({ path: "src/a.ts", ref: "deadbeef", content: "x".repeat(100) });
+    // The evidence is exactly the file content the model was shown: the path
+    // prefix and the continuation marker are rendering, not content. The
+    // whole answer — prefix, content and marker — stays inside the budget
+    // the caller allowed.
+    const shown = pinned.file?.content ?? "";
+    expect(shown).toMatch(/^x+$/);
+    expect(pinned.content).toContain(shown);
+    expect(pinned.file).toMatchObject({ path: "src/a.ts", ref: "deadbeef" });
+    expect(pinned.bytes).toBeLessThanOrEqual(100);
     const unpinned = await executeGroomerTool({ name: "read_file", arguments: { path: "src/a.ts" } }, options, deps);
     expect(unpinned.file).toMatchObject({ path: "src/a.ts", ref: null });
   });
@@ -782,13 +796,18 @@ describe("executeGroomerTool read_file bounded ranges (dispatch#1451)", () => {
     const deps = makeDeps({ readFile: vi.fn().mockResolvedValue(longFile(50, "x")) });
     const result = await executeGroomerTool(
       { name: "read_file", arguments: { path: "many.ts", startLine: 10, lineCount: 40 } },
-      { ...options, maxFileBytes: 40 },
+      { ...options, maxFileBytes: 120 },
       deps,
     );
-    // "x 10".."x 17" cost 4 + 7*5 = 39 bytes; "x 18" would hit 44 and cut.
-    expect(result.content).toContain("(lines 10-17 of 50)");
-    expect(result.content).toContain("continues at line 18 (pass startLine=18)");
-    expect(result.file?.content).toBe(["x 10", "x 11", "x 12", "x 13", "x 14", "x 15", "x 16", "x 17"].join("\n"));
+    // The coordinates header and the continuation footer are charged to the
+    // same budget as the content, so the answer stays inside what the caller
+    // allowed: "x 10".."x 18" cost 4 + 8*5 = 44 of the 120 bytes.
+    expect(result.content).toContain("(lines 10-18 of 50)");
+    expect(result.content).toContain("continues at line 19 (pass startLine=19)");
+    expect(result.file?.content).toBe(
+      ["x 10", "x 11", "x 12", "x 13", "x 14", "x 15", "x 16", "x 17", "x 18"].join("\n"),
+    );
+    expect(result.bytes).toBeLessThanOrEqual(120);
   });
 
   it("rejects invalid line ranges without fetching", async () => {
@@ -823,25 +842,43 @@ describe("executeGroomerTool read_file bounded ranges (dispatch#1451)", () => {
     const deps = makeDeps({ readFile: vi.fn().mockResolvedValue(text) });
     const result = await executeGroomerTool(
       { name: "read_file", arguments: { path: "u.ts", startLine: 2, lineCount: 20 } },
-      { ...options, maxFileBytes: 35 },
+      { ...options, maxFileBytes: 120 },
       deps,
     );
-    expect(result.content).not.toContain("\uFFFD");
+    expect(result.content).not.toContain("�");
     expect(result.file?.content).toContain("héllo");
-    // Charged bytes equal the rendered content; the body alone stays bounded.
-    expect(Buffer.byteLength(result.file?.content ?? "", "utf8")).toBeLessThanOrEqual(35);
+    // The whole answer — header, content and footer — stays inside the budget.
+    expect(result.bytes).toBeLessThanOrEqual(120);
+    expect(Buffer.byteLength(result.file?.content ?? "", "utf8")).toBeLessThanOrEqual(120);
+  });
+
+  it("cuts a single oversized line on a character boundary", async () => {
+    // One line of two-byte characters: the byte budget cuts it mid-line, and
+    // the cut must land on a character boundary.
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue(`${"ü".repeat(200)}\nafter`) });
+    const result = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "u.ts", startLine: 1, lineCount: 2 } },
+      { ...options, maxFileBytes: 121 },
+      deps,
+    );
+    expect(result.content).not.toContain("�");
+    expect(result.content).toContain("(line 1 exceeds the byte limit; continues at line 2)");
+    expect(result.file?.content).toMatch(/^ü+$/);
+    expect(result.bytes).toBeLessThanOrEqual(121);
   });
 
   it("charges range output against the byte budget the caller passes", async () => {
-    // explore.ts passes maxFileBytes = min(perFile, totalRemaining); a ranged
-    // read charged at that cap cannot exceed it (dispatch#1451).
+    // The caller passes the budget it allows; a ranged read charged at that
+    // cap cannot exceed it, framing included (dispatch#1451).
     const deps = makeDeps({ readFile: vi.fn().mockResolvedValue(longFile(300, "longish line here")) });
     const result = await executeGroomerTool(
       { name: "read_file", arguments: { path: "b.ts", startLine: 200, lineCount: 100 } },
-      { ...options, maxFileBytes: 60 },
+      { ...options, maxFileBytes: 120 },
       deps,
     );
-    expect(Buffer.byteLength(result.file?.content ?? "", "utf8")).toBeLessThanOrEqual(60);
+    expect(result.content).toContain("(lines 200-");
+    expect(Buffer.byteLength(result.file?.content ?? "", "utf8")).toBeLessThanOrEqual(120);
+    expect(result.bytes).toBeLessThanOrEqual(120);
     expect(result.bytes).toBe(Buffer.byteLength(result.content, "utf8"));
   });
 
@@ -899,15 +936,16 @@ describe("executeGroomerTool read_file bounded ranges (dispatch#1451)", () => {
     });
     const first = await executeGroomerTool(
       { name: "read_file", arguments: { path: "huge.ts", startLine: 2 } },
-      { ...options, maxFileBytes: 50 },
+      { ...options, maxFileBytes: 150 },
       deps,
     );
     expect(first.ok).toBe(true);
     expect(first.content).toContain("continues at line 3");
-    expect(Buffer.byteLength(first.file?.content ?? "", "utf8")).toBeLessThanOrEqual(50);
+    expect(Buffer.byteLength(first.file?.content ?? "", "utf8")).toBeLessThanOrEqual(150);
+    expect(first.bytes).toBeLessThanOrEqual(150);
     const next = await executeGroomerTool(
       { name: "read_file", arguments: { path: "huge.ts", startLine: 3 } },
-      { ...options, maxFileBytes: 50 },
+      { ...options, maxFileBytes: 150 },
       deps,
     );
     expect(next.content).toContain("after");
@@ -919,13 +957,13 @@ describe("executeGroomerTool read_file bounded ranges (dispatch#1451)", () => {
     });
     const mid = await executeGroomerTool(
       { name: "read_file", arguments: { path: "huge.ts", startLine: 2 } },
-      { ...options, maxFileBytes: 50 },
+      { ...options, maxFileBytes: 150 },
       deps,
     );
     expect(mid.content).toContain("(line 2 exceeds the byte limit; continues at line 3)");
     const atEnd = await executeGroomerTool(
       { name: "read_file", arguments: { path: "tail.ts", startLine: 2 } },
-      { ...options, maxFileBytes: 50 },
+      { ...options, maxFileBytes: 150 },
       makeDeps({ readFile: vi.fn().mockResolvedValue(`small\n${"y".repeat(500)}`) }),
     );
     expect(atEnd.content).toContain("(line 2 exceeds the byte limit)");
@@ -946,11 +984,14 @@ describe("executeGroomerTool read_file bounded ranges (dispatch#1451)", () => {
     const deps = makeDeps({ readFile: vi.fn().mockResolvedValue(longFile(10)) });
     const head = await executeGroomerTool(
       { name: "read_file", arguments: { path: "c.ts" } },
-      { ...options, maxFileBytes: 20 },
+      { ...options, maxFileBytes: 70 },
       deps,
     );
     const match = /startLine=(\d+)/.exec(head.content);
     expect(match).not.toBeNull();
+    // The prefix and the marker are charged to the same budget as the content,
+    // so the whole answer still fits what the caller allowed.
+    expect(head.bytes).toBeLessThanOrEqual(70);
     const rest = await executeGroomerTool(
       { name: "read_file", arguments: { path: "c.ts", startLine: Number(match?.[1]) } },
       { ...options, maxFileBytes: 4096 },
@@ -960,6 +1001,75 @@ describe("executeGroomerTool read_file bounded ranges (dispatch#1451)", () => {
     // the file, and the continuation ends at the tail.
     expect(rest.content).toContain("line 10");
     expect(rest.content).toContain("end of file");
+  });
+
+  it("caps the returned lines at the per-call line cap", async () => {
+    // The tool definition advertises a cap of MAX_READ_LINES lines; a model
+    // asking for more must not get more.
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue(longFile(800, "L")) });
+    const result = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "s.ts", startLine: 1, lineCount: 100000 } },
+      { ...options, maxFileBytes: 8192 },
+      deps,
+    );
+    expect(result.content).toContain(`line count capped at ${MAX_READ_LINES}`);
+    expect(result.content).toContain("(lines 1-500 of 800");
+    expect(result.file?.content.split("\n").length).toBe(MAX_READ_LINES);
+    expect(result.file?.content).not.toContain("L 501");
+  });
+
+  it("cuts the content down to what the framing leaves, instead of giving up", async () => {
+    // The framing does not fit alongside the whole file, but it does fit
+    // alongside fewer lines: the read must show those lines rather than
+    // claim the budget is exhausted.
+    const deps = makeDeps({
+      readFile: vi.fn().mockResolvedValue(longFile(5, "0123456789abcdef")),
+    });
+    const result = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "f.ts", startLine: 1, lineCount: 500 } },
+      { ...options, maxFileBytes: 120 },
+      deps,
+    );
+    expect(result.content).not.toContain("byte budget exhausted");
+    expect(result.content).toContain("(lines 1-2 of 5)");
+    expect(result.content).toContain("continues at line 3 (pass startLine=3)");
+    expect(result.bytes).toBeLessThanOrEqual(120);
+  });
+
+  it("charges a ranged answer to the remaining exploration budget, not the file cap", async () => {
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue(longFile(300, "longish line here")) });
+    const result = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "b.ts", startLine: 200, lineCount: 100 } },
+      { ...options, maxFileBytes: 4096, maxTotalBytesRemaining: 300 },
+      deps,
+    );
+    expect(result.bytes).toBeLessThanOrEqual(300);
+  });
+
+  it("answers inside the budget when the framing alone does not fit", async () => {
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue(longFile(50, "x")) });
+    const result = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "many.ts", startLine: 10, lineCount: 40 } },
+      { ...options, maxFileBytes: 20 },
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    expect(result.bytes).toBeLessThanOrEqual(20);
+    expect(result.content).toContain("byte budget");
+    // Nothing was shown, so no path is claimed read and no evidence recorded.
+    expect(result.sources).toEqual([]);
+    expect(result.file).toBeUndefined();
+  });
+
+  it("keeps the head read inside the budget the caller allows", async () => {
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue(longFile(120)) });
+    const result = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "big.ts" } },
+      { ...options, maxFileBytes: 120 },
+      deps,
+    );
+    expect(result.bytes).toBeLessThanOrEqual(120);
+    expect(result.content).toContain("(truncated)");
   });
 });
 
@@ -983,6 +1093,23 @@ describe("executeGroomerTool search failure vs true absence (dispatch#1451)", ()
     expect(result.content).not.toContain("\n");
     expect(result.content.length).toBeLessThan(700);
     expect(result.warnings?.[0]).toContain("bounded directory/file fallback");
+  });
+
+  it("collapses the upstream search error to a 200-byte line", async () => {
+    // The fence is bytes, not characters: a body of multi-byte characters must
+    // not carry more bytes than the fence allows (dispatch#1451).
+    const deps = makeDeps({
+      searchCode: vi.fn().mockRejectedValue(new Error("é".repeat(400))),
+    });
+    const result = await executeGroomerTool(
+      { name: "search_code", arguments: { query: "enrich" } },
+      options,
+      deps,
+    );
+    const summary = /^search_code failed: (.*?) This is a search outage/s.exec(result.content)?.[1] ?? "";
+    expect(summary.length).toBeGreaterThan(0);
+    expect(Buffer.byteLength(summary, "utf8")).toBeLessThanOrEqual(200);
+    expect(result.content).not.toContain("\n");
   });
 
   it("still treats a successful empty search as possible absence", async () => {

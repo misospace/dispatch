@@ -249,6 +249,31 @@ describe("exploreRepository", () => {
     expect(result.readContents).toEqual([{ path: "src/lib/prisma.ts", ref: null, content: "const adapter = new PrismaPg(url);" }]);
   });
 
+  it("never spends more than the exploration total byte budget (dispatch#1451)", async () => {
+    // A ranged read charges its coordinates header and continuation footer to
+    // the same budget as its content, so no answer can push the run past the
+    // total budget it was given.
+    const fetchImpl = fetchReturning(
+      {
+        content: null,
+        tool_calls: [toolCall("1", "read_file", { path: "big.ts", startLine: 1, lineCount: 100 })],
+      },
+      {
+        content: null,
+        tool_calls: [toolCall("2", "read_file", { path: "big.ts", startLine: 101, lineCount: 100 })],
+      },
+    );
+    const deps = makeDeps(
+      { readFile: vi.fn().mockResolvedValue(Array.from({ length: 200 }, (_, i) => `line ${i + 1}`).join("\n")) },
+      fetchImpl,
+    );
+
+    const result = await exploreRepository({ ...options, maxTotalBytes: 1000, maxRounds: 4 }, deps);
+
+    expect(result.bytes).toBeLessThanOrEqual(1000);
+    expect(result.warnings).toContain("repository exploration hit its byte budget");
+  });
+
   it("counts related-work bytes against the exploration byte budget", async () => {
     const big = { evidenceKey: "issue:org/repo#1", body: "x".repeat(300) };
     const fetchImpl = fetchReturning({

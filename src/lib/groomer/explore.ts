@@ -310,7 +310,11 @@ export async function exploreRepository(
           {
             repoFullName: options.repoFullName,
             maxSearchResults: options.maxSearchResults,
-            maxFileBytes: Math.min(options.maxFileBytes, remaining),
+            maxFileBytes: options.maxFileBytes,
+            // The budget this run has left. A tool answer is charged against
+            // it in full — framing included — so no answer can push the run
+            // past its total byte budget (dispatch#1451).
+            maxTotalBytesRemaining: remaining,
             maxDirEntries: options.maxDirEntries,
             pinnedRef: options.pinnedRef,
           },

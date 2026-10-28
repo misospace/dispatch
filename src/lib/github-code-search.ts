@@ -86,10 +86,17 @@ export async function searchRepositoryCode(
 /**
  * Upstream error bodies reach the model and the GroomingRun record. Collapse
  * them to a single short line so an HTML error page cannot inject newlines or
- * bulk into either.
+ * bulk into either. The fence is 200 *bytes*, not 200 characters, so a body
+ * of multi-byte characters cannot carry more bytes than the fence allows.
  */
 function summarizeErrorBody(text: string): string {
-  return text.replace(/\s+/g, " ").trim().slice(0, 200);
+  const collapsed = text.replace(/\s+/g, " ").trim();
+  const buf = Buffer.from(collapsed, "utf8");
+  if (buf.byteLength <= 200) return collapsed;
+  // Cut back to a character boundary: a raw byte slice can land mid-sequence
+  // and leave a replacement character behind.
+  const decoder = new TextDecoder("utf-8", { fatal: false, ignoreBOM: true });
+  return decoder.decode(buf.subarray(0, 200)).replace(/�$/, "");
 }
 
 function encodePathForContentsApi(path: string): string {

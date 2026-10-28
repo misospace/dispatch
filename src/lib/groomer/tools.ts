@@ -340,34 +340,45 @@ function fileLines(text: string): string[] {
 }
 
 /**
- * Render a bounded line-range slice of a file (dispatch#1451). Lines are whole
- * (never mid-character or mid-line), charged against the per-file byte budget,
- * and the slice carries its coordinates plus a continuation hint so a known
- * path can be finished reading instead of only ever showing its head. The
- * returned `body` is verbatim file content — the header and footer are
- * rendering, not evidence — so close-excerpt grounding (#1099) keeps working.
+ * A rendered line-range answer: what the model sees, and the verbatim file
+ * content it saw. The coordinates header and the continuation footer are
+ * rendering, never evidence.
  */
-function renderLineRange(
-  text: string,
-  startLine: number,
-  lineCount: number,
-  maxBytes: number,
-): {
+interface LineRangeRender {
+  /** Header + body + footer, charged against the caller's byte budget. */
+  content: string;
+  /** Verbatim file content shown (the #1099 evidence identity). */
   body: string;
+  /** Last file line shown. */
   lastShown: number;
   totalLines: number;
   hasMore: boolean;
+  /** The requested line count was above the cap and was clamped. */
   clamped: boolean;
+  /** The line shown was cut by the byte budget. */
   lineTooLarge: boolean;
-} {
-  const lines = fileLines(text);
+  /** Nothing could be shown: the budget could not even carry the framing. */
+  budgetExhausted: boolean;
+}
+
+/**
+ * Render the lines a range covers, charged against `budget` bytes. Lines are
+ * whole (never mid-character or mid-line) unless a single line is larger than
+ * the whole budget — then it is cut like the head read, and the caller says so
+ * in the footer.
+ */
+function renderRangeBody(
+  lines: string[],
+  startLine: number,
+  count: number,
+  budget: number,
+): { body: string; lastShown: number; hasMore: boolean; lineTooLarge: boolean } {
   const totalLines = lines.length;
-  const clamped = lineCount > MAX_READ_LINES;
   const bodyLines: string[] = [];
   let usedBytes = 0;
-  for (let i = startLine - 1; i < startLine - 1 + lineCount && i < totalLines; i++) {
+  for (let i = startLine - 1; i < startLine - 1 + count && i < totalLines; i++) {
     const cost = Buffer.byteLength(lines[i], "utf8") + (bodyLines.length > 0 ? 1 : 0);
-    if (usedBytes + cost > maxBytes) break;
+    if (usedBytes + cost > budget) break;
     bodyLines.push(lines[i]);
     usedBytes += cost;
   }
@@ -375,13 +386,11 @@ function renderLineRange(
     // Not even the first requested line fits the byte budget. Show as much of
     // it as fits (matching the head-read truncation) and continue past it, so
     // a huge single line can never wedge continuation on the same startLine.
-    const cut = truncate(lines[startLine - 1], maxBytes);
+    const cut = truncate(lines[startLine - 1] ?? "", Math.max(budget, 0));
     return {
       body: cut.text,
       lastShown: startLine,
-      totalLines,
       hasMore: cut.truncated || startLine < totalLines,
-      clamped,
       lineTooLarge: cut.truncated,
     };
   }
@@ -389,10 +398,120 @@ function renderLineRange(
   return {
     body: bodyLines.join("\n"),
     lastShown,
-    totalLines,
     hasMore: lastShown < totalLines,
+    lineTooLarge: false,
+  };
+}
+
+/** The coordinates header of a ranged read: the path and the lines it covers. */
+function rangeHeader(
+  path: string,
+  startLine: number,
+  lastShown: number,
+  totalLines: number,
+  clamped: boolean,
+): string {
+  let header = `${path} (lines ${startLine}-${lastShown} of ${totalLines}`;
+  if (clamped) header += `, line count capped at ${MAX_READ_LINES}`;
+  return `${header}):`;
+}
+
+/** The continuation footer of a ranged read: where the next read starts. */
+function rangeFooter(
+  lastShown: number,
+  totalLines: number,
+  hasMore: boolean,
+  lineTooLarge: boolean,
+): string {
+  if (lineTooLarge) {
+    return lastShown < totalLines
+      ? `\n… (line ${lastShown} exceeds the byte limit; continues at line ${lastShown + 1})`
+      : `\n… (line ${lastShown} exceeds the byte limit)`;
+  }
+  if (hasMore) return `\n… continues at line ${lastShown + 1} (pass startLine=${lastShown + 1})`;
+  return "\n… end of file";
+}
+
+/**
+ * Render a bounded line-range slice of a file (dispatch#1451). The request is
+ * capped at MAX_READ_LINES lines, lines are whole (never mid-character or
+ * mid-line), and the slice carries its coordinates plus a continuation hint so
+ * a known path can be finished reading instead of only ever showing its head.
+ *
+ * The whole answer — coordinates header, content and continuation footer — is
+ * charged against `totalCap` bytes, not just the content: exploration passes
+ * its *remaining* total budget as that cap, so an answer that added its
+ * framing after the content was charged would push the run past the budget it
+ * was given. `bodyCap` separately bounds the file content shown.
+ *
+ * The returned `body` is verbatim file content — the header and footer are
+ * rendering, not evidence — so close-excerpt grounding (#1099) keeps working.
+ */
+function renderLineRange(
+  path: string,
+  text: string,
+  startLine: number,
+  lineCount: number,
+  bodyCap: number,
+  totalCap: number,
+): LineRangeRender {
+  const lines = fileLines(text);
+  const totalLines = lines.length;
+  // The advertised cap is a real cap: a model asking for more lines than the
+  // cap allows gets MAX_READ_LINES of them, and the header says so.
+  const count = Math.min(lineCount, MAX_READ_LINES);
+  const clamped = lineCount > MAX_READ_LINES;
+
+  let budget = Math.min(bodyCap, totalCap);
+  let rendered = renderRangeBody(lines, startLine, count, budget);
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const header = rangeHeader(path, startLine, rendered.lastShown, totalLines, clamped);
+    const footer = rangeFooter(
+      rendered.lastShown,
+      totalLines,
+      rendered.hasMore,
+      rendered.lineTooLarge,
+    );
+    const framingBytes =
+      Buffer.byteLength(header, "utf8") + Buffer.byteLength(footer, "utf8");
+    const used = framingBytes + 1 + Buffer.byteLength(rendered.body, "utf8");
+    if (used <= totalCap) {
+      return {
+        content: `${header}\n${rendered.body}${footer}`,
+        body: rendered.body,
+        lastShown: rendered.lastShown,
+        totalLines,
+        hasMore: rendered.hasMore,
+        clamped,
+        lineTooLarge: rendered.lineTooLarge,
+        budgetExhausted: false,
+      };
+    }
+    // The framing does not fit alongside the content: give the content the
+    // room the framing leaves and render again. That room is strictly
+    // smaller than the content it replaces, so the content shrinks and the
+    // loop converges (the content is cut on line boundaries, so it drops a
+    // whole line at a time).
+    const room = totalCap - framingBytes - 1;
+    if (room <= 0) break;
+    budget = Math.min(budget, room);
+    rendered = renderRangeBody(lines, startLine, count, budget);
+  }
+  // Even the framing alone does not fit the budget: say so inside the budget
+  // instead of overrunning it. Nothing was shown, so no path is claimed read.
+  const note = truncate(
+    `byte budget exhausted: ${path} lines ${startLine}+ of ${totalLines} not shown; stop reading this file.`,
+    Math.max(totalCap, 0),
+  );
+  return {
+    content: note.text,
+    body: "",
+    lastShown: startLine - 1,
+    totalLines,
+    hasMore: true,
     clamped,
     lineTooLarge: false,
+    budgetExhausted: true,
   };
 }
 
@@ -540,7 +659,15 @@ async function runRelatedWorkLookup(
 export interface ExecuteToolOptions {
   repoFullName: string;
   maxSearchResults: number;
+  /** Cap on the file content one read may show. */
   maxFileBytes: number;
+  /**
+   * Cap on the whole answer one call may return, framing included. Exploration
+   * passes the budget it has left here, so an answer that added its framing
+   * after the content was charged cannot push the run past that budget
+   * (dispatch#1451). Defaults to maxFileBytes when not given.
+   */
+  maxTotalBytesRemaining?: number;
   maxDirEntries: number;
   /**
    * When set, every read_file / list_directory read is forced to this ref
@@ -582,12 +709,15 @@ export async function executeGroomerTool(
           // retrying global search burns the round budget. Offer the bounded
           // fallback instead: named paths and directory listings through the
           // existing read capability, which stays under the same byte budgets.
-          // Upstream bodies can be a full HTML page; collapse to one short line
-          // (same fence as summarizeErrorBody in github-code-search).
-          const message = (err instanceof Error ? err.message : String(err))
-            .replace(/\s+/g, " ")
-            .trim()
-            .slice(0, 200);
+          // Upstream bodies can be a full HTML page; collapse to one short
+          // line under the same 200-byte fence summarizeErrorBody puts on
+          // upstream bodies in github-code-search: the fence is bytes, not
+          // characters, so a body of multi-byte characters cannot carry more
+          // bytes than the fence allows.
+          const message = truncate(
+            (err instanceof Error ? err.message : String(err)).replace(/\s+/g, " ").trim(),
+            200,
+          ).text;
           const content =
             `search_code failed: ${message} This is a search outage or timeout, not evidence the code ` +
             "is missing — repeating the search will not help. Finish the investigation with bounded " +
@@ -642,6 +772,12 @@ export async function executeGroomerTool(
         // Bounded range read (dispatch#1451): line coordinates, continuation
         // metadata, and verbatim content for the evidence identity. Without
         // range arguments the call behaves exactly as before.
+        //
+        // Budgets: the file content shown is capped by maxFileBytes, and the
+        // whole answer — header and footer included — by the budget the caller
+        // has left. Exploration passes that remainder as
+        // maxTotalBytesRemaining; without it the file cap is the only bound.
+        const totalCap = options.maxTotalBytesRemaining ?? options.maxFileBytes;
         if (startLineArg !== undefined || lineCountArg !== undefined) {
           const startLine = startLineArg ?? 1;
           const totalLines = fileLines(text).length;
@@ -657,52 +793,98 @@ export async function executeGroomerTool(
             };
           }
           const range = renderLineRange(
+            path,
             text,
             startLine,
             lineCountArg ?? MAX_READ_LINES,
             options.maxFileBytes,
+            totalCap,
           );
-          let header = `${path} (lines ${startLine}-${range.lastShown} of ${range.totalLines}`;
-          if (range.clamped) header += `, line count capped at ${MAX_READ_LINES}`;
-          header += "):";
-          // Continuation never claims a line past the end, and a line cut
-          // mid-way says so instead of pretending the remainder was shown.
-          let footer = "";
-          if (range.lineTooLarge) {
-            footer =
-              range.lastShown < range.totalLines
-                ? `\n… (line ${range.lastShown} exceeds the byte limit; continues at line ${range.lastShown + 1})`
-                : `\n… (line ${range.lastShown} exceeds the byte limit)`;
-          } else if (range.hasMore) {
-            footer = `\n… continues at line ${range.lastShown + 1} (pass startLine=${range.lastShown + 1})`;
-          } else {
-            footer = "\n… end of file";
+          if (range.budgetExhausted) {
+            // The budget could not carry the framing, so nothing was shown:
+            // no path is claimed read and no evidence is recorded.
+            return {
+              ok: true,
+              content: range.content,
+              bytes: Buffer.byteLength(range.content, "utf8"),
+              sources: [],
+            };
           }
-          const content = `${header}\n${range.body}${footer}`;
+          return {
+            ok: true,
+            content: range.content,
+            bytes: Buffer.byteLength(range.content, "utf8"),
+            sources: [path],
+            file: { path, ref: ref ?? null, content: range.body },
+          };
+        }
+        // Head read: the path prefix and the continuation marker are charged
+        // to the same budget as the content, so the whole answer stays inside
+        // what the caller allowed (dispatch#1451).
+        const prefix = `${path}:\n`;
+        const prefixBytes = Buffer.byteLength(prefix, "utf8");
+        const headCap = Math.min(options.maxFileBytes, totalCap - prefixBytes);
+        if (headCap <= 0) {
+          const note = truncate(
+            `byte budget exhausted: ${path} not shown; stop reading this file.`,
+            Math.max(totalCap, 0),
+          );
+          return {
+            ok: true,
+            content: note.text,
+            bytes: Buffer.byteLength(note.text, "utf8"),
+            sources: [],
+          };
+        }
+        const { text: body, truncated } = truncate(text, headCap);
+        if (!truncated) {
+          const content = `${prefix}${body}`;
           return {
             ok: true,
             content,
             bytes: Buffer.byteLength(content, "utf8"),
             sources: [path],
-            file: { path, ref: ref ?? null, content: range.body },
+            file: { path, ref: ref ?? null, content: body },
           };
         }
-        const { text: body, truncated } = truncate(text, options.maxFileBytes);
         // The truncation marker names the line to continue from, so a known
         // path can be finished reading instead of only ever showing its head
         // (dispatch#1451). Substring "(truncated)" stays for existing readers.
         // The cut usually lands mid-line; naming the line it landed in (not
         // the next one) means a ranged continuation re-reads that line whole.
-        const marker = truncated
-          ? `\n… (truncated) to continue, call again with startLine=${body.split("\n").length}`
-          : "";
-        const content = `${path}:\n${body}${marker}`;
+        // Reserve room for the marker so it does not push the answer past the
+        // budget the caller allowed.
+        const markerAllowance = Buffer.byteLength(
+          `\n… (truncated) to continue, call again with startLine=${"9".repeat(
+            String(fileLines(text).length).length,
+          )}`,
+          "utf8",
+        );
+        const truncatedCap = Math.min(
+          options.maxFileBytes,
+          totalCap - prefixBytes - markerAllowance,
+        );
+        if (truncatedCap <= 0) {
+          const note = truncate(
+            `byte budget exhausted: ${path} not shown; stop reading this file.`,
+            Math.max(totalCap, 0),
+          );
+          return {
+            ok: true,
+            content: note.text,
+            bytes: Buffer.byteLength(note.text, "utf8"),
+            sources: [],
+          };
+        }
+        const cut = truncate(text, truncatedCap).text;
+        const marker = `\n… (truncated) to continue, call again with startLine=${cut.split("\n").length}`;
+        const content = `${prefix}${cut}${marker}`;
         return {
           ok: true,
           content,
           bytes: Buffer.byteLength(content, "utf8"),
           sources: [path],
-          file: { path, ref: ref ?? null, content: body },
+          file: { path, ref: ref ?? null, content: cut },
         };
       }
 
