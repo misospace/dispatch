@@ -113,12 +113,33 @@ export type WorkItemAttemptClassification =
   | "waiting-review"
   | "unclassified";
 
+/** The five execution-metadata fields the chain resolves across runs. */
+export type WorkItemExecutionMetadataField =
+  | "workerProduct"
+  | "model"
+  | "reasoningEffort"
+  | "runtimeRevision"
+  | "cohortLabel";
+
 export interface WorkItemAttemptExecutionMetadata {
   workerProduct: string | null;
   model: string | null;
   reasoningEffort: string | null;
   runtimeRevision: string | null;
   cohortLabel: string | null;
+  /**
+   * Per-field DISTINCT non-empty values observed across ALL of the attempt's
+   * matched runs, sorted for order-invariance (#1423). The scalar fields keep
+   * the #1183 contract (first non-null in run order); this set makes an
+   * intra-attempt setting change observable: a scalar that is one of several
+   * distinct values means the attempt restarted under a different setting,
+   * so a consumer must treat the dimension as `mixed` rather than trusting
+   * the scalar. A field with 0 or 1 distinct values never contradicts its
+   * scalar. Consumers unioning values across attempts (delivery cohorts,
+   * #1184) must union THESE sets, not the scalars, or intra-attempt changes
+   * stay invisible.
+   */
+  distinctValues: Record<WorkItemExecutionMetadataField, string[]>;
 }
 
 export interface WorkItemAttemptArtifacts {
@@ -420,13 +441,23 @@ function unionLength(intervals: Array<{ start: number; end: number }>): number |
   return total + (currentEnd - currentStart);
 }
 
-const EXECUTION_METADATA_FIELDS: Array<[keyof WorkItemAttemptExecutionMetadata, string]> = [
+const EXECUTION_METADATA_FIELDS: Array<[WorkItemExecutionMetadataField, string]> = [
   ["workerProduct", "worker"],
   ["model", "model"],
   ["reasoningEffort", "reasoningEffort"],
   ["runtimeRevision", "runtimeRevision"],
   ["cohortLabel", "cohortLabel"],
 ];
+
+function emptyDistinctValues(): Record<WorkItemExecutionMetadataField, string[]> {
+  return {
+    workerProduct: [],
+    model: [],
+    reasoningEffort: [],
+    runtimeRevision: [],
+    cohortLabel: [],
+  };
+}
 
 function emptyExecutionMetadata(): WorkItemAttemptExecutionMetadata {
   return {
@@ -435,24 +466,46 @@ function emptyExecutionMetadata(): WorkItemAttemptExecutionMetadata {
     reasoningEffort: null,
     runtimeRevision: null,
     cohortLabel: null,
+    distinctValues: emptyDistinctValues(),
   };
 }
 
-/** First non-null per field across the matched runs, in run order. Values
+/**
+ * First non-null per field across the matched runs, in run order. Values
  * are taken verbatim from the run's stored executionMetadata — never
- * inferred from timestamps or deployment data. */
+ * inferred from timestamps or deployment data.
+ *
+ * Alongside the #1183 first-non-null scalars, each field carries the set of
+ * ALL distinct non-empty values seen across the matched runs (#1423): an
+ * attempt whose runs restart under a different setting keeps its first
+ * observed scalar, and the distinct set is what makes that change visible
+ * instead of silently lost. The sets are sorted, so they are order-invariant
+ * like the rest of the projection.
+ */
 function executionMetadataFromRuns(
   runs: ReadonlyArray<WorkAttemptRunRecord>,
 ): WorkItemAttemptExecutionMetadata {
   const merged = emptyExecutionMetadata();
+  const seen = emptyDistinctValues();
+  const seenSets = new Map<WorkItemExecutionMetadataField, Set<string>>();
   for (const run of runs) {
     const metadata = run.executionMetadata;
     for (const [field, key] of EXECUTION_METADATA_FIELDS) {
-      if (merged[field] !== null) continue;
       const value = metadata?.[key];
-      if (typeof value === "string" && value.length > 0) merged[field] = value;
+      if (typeof value !== "string" || value.length === 0) continue;
+      let set = seenSets.get(field);
+      if (!set) {
+        set = new Set<string>();
+        seenSets.set(field, set);
+      }
+      set.add(value);
+      if (merged[field] === null) merged[field] = value;
     }
   }
+  for (const [field, set] of seenSets) {
+    seen[field] = [...set].sort();
+  }
+  merged.distinctValues = seen;
   return merged;
 }
 

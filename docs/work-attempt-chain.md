@@ -87,7 +87,7 @@ Each `attempts.attempts[]` entry carries:
 | `reportedAt` | `occurredAt` of the closing lifecycle event (`attempt_failed` / `completed` / `claim_released`) that ends the attempt; null when open. |
 | `outcome` | See below. Every attempt is preserved with its outcome. |
 | `classification` | `"active-execution"` when an attributable run interval overlaps the attempt window (execution) or a run carries the round's durable association (fix round); `"waiting-review"` when a `claim_released` deliberately retained `status/in-review`; `"unclassified"` otherwise. Conservative by design: queued, waiting-CI, and merge-adjacent states stay unclassified unless explicit evidence says otherwise. |
-| `executionMetadata` | `{ workerProduct, model, reasoningEffort, runtimeRevision, cohortLabel }` normalized from the matched runs' stored execution metadata (keys `worker`, `model`, `reasoningEffort`, `runtimeRevision`, `cohortLabel`). Unknown/missing stays null and is never inferred from timestamps or deployment data. Multiple matched runs union first-non-null-per-field in run order. |
+| `executionMetadata` | `{ workerProduct, model, reasoningEffort, runtimeRevision, cohortLabel, distinctValues }` normalized from the matched runs' stored execution metadata (keys `worker`, `model`, `reasoningEffort`, `runtimeRevision`, `cohortLabel`). Unknown/missing stays null and is never inferred from timestamps or deployment data. Multiple matched runs union first-non-null-per-field in run order. `distinctValues` carries, per field, the sorted set of ALL distinct non-empty values seen across the matched runs (#1423): more than one value means the setting **changed inside the attempt** (e.g. a re-run under another model), so consumers must not treat the first-non-null scalar as the attempt's whole story. The scalars keep the #1183 contract; `distinctValues` is additive. |
 | `artifacts` | `agentRunIds` + `pullRequestNumbers` as above. |
 | `prFix` | `{ itemId, repo, pr, type }` for fix-round attempts (the PR-fix queue item the round belongs to and its current queue type), `null` for execution attempts. |
 | `wallTimeMs` | The **union** (not the sum) of the attempt's overlapping run intervals; null with no run evidence. |
@@ -351,7 +351,14 @@ result. The chain then reads, for that issue:
           "model": "gpt-5.5",
           "reasoningEffort": "high",
           "runtimeRevision": "abc1234",
-          "cohortLabel": "exp-42"
+          "cohortLabel": "exp-42",
+          "distinctValues": {
+            "workerProduct": ["my-ci-harness"],
+            "model": ["gpt-5.5"],
+            "reasoningEffort": ["high"],
+            "runtimeRevision": ["abc1234"],
+            "cohortLabel": ["exp-42"]
+          }
         },
         "artifacts": { "agentRunIds": ["run-1"], "pullRequestNumbers": [7] },
         "wallTimeMs": 3300000,
@@ -368,5 +375,6 @@ result. The chain then reads, for that issue:
 ```
 
 A different worker product with no execution metadata produces the same
-chain shape with every `executionMetadata` field null — the contract is
-worker-neutral and has no product-specific branching.
+chain shape with every `executionMetadata` scalar null and every
+`distinctValues` set empty — the contract is worker-neutral and has no
+product-specific branching.

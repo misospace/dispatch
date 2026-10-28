@@ -70,7 +70,7 @@ describe("RootLayout app shell", () => {
     );
     const desktopNav = container.querySelector('nav[class*="sm:flex"]');
     expect(desktopNav).toBeTruthy();
-    expect(desktopNav?.querySelectorAll("a").length).toBe(6);
+    expect(desktopNav?.querySelectorAll("a").length).toBe(7);
   });
 
   it("renders children in the main content area", () => {
