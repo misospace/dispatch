@@ -50,8 +50,20 @@ export interface GroomerToolResult {
   ok: boolean;
   /** Rendered for the model as the tool message content. */
   content: string;
-  /** Bytes charged against the exploration budget. */
+  /**
+   * Bytes charged against the exploration budget. An empty successful search
+   * keeps `bytes: 0` — the freshness layer reads it as the negative-evidence
+   * sentinel (dispatch#1091) — and charges its rendered answer through
+   * `chargedBytes` instead (dispatch#1451).
+   */
   bytes: number;
+  /**
+   * Bytes actually charged against the run budget when they differ from
+   * `bytes` (an empty search keeps `bytes: 0` as the freshness
+   * negative-evidence sentinel while its rendered answer is charged here,
+   * dispatch#1451). Everything else leaves it unset.
+   */
+  chargedBytes?: number;
   /** Repo paths this call surfaced, for the run's source list. */
   sources: string[];
   /** GitHub issue/PR/commit state a related-work call observed (not repo paths). */
@@ -84,6 +96,13 @@ export interface GroomerToolResult {
    * `truncated` (review of dispatch#1451).
    */
   established?: boolean;
+  /**
+   * read_file only: the line coordinates the answer showed (1-based,
+   * inclusive). Answers that showed nothing — unreadable/empty file,
+   * past-the-end coordinate, budget-exhausted notice — leave it unset
+   * (dispatch#1451).
+   */
+  shownRange?: { start: number; end: number; totalLines: number; eof: boolean };
 }
 
 export interface GroomerToolDeps {
@@ -1011,14 +1030,19 @@ export async function executeGroomerTool(
           };
         }
         if (results.length === 0) {
+          const content = buildNoMatchAnswer(query, totalCap);
           return {
             ok: true,
-            content: buildNoMatchAnswer(query, totalCap),
+            content,
             // The negative-evidence signal: the freshness layer reads a
             // successful search with zero bytes as possible absence
             // (dispatch#1091), so this answer carries no evidence bytes. It
-            // is still bounded by the budget the caller has left.
+            // is still bounded by the budget the caller has left. That bound
+            // is enforced through `chargedBytes` (dispatch#1451): the run
+            // pays for the answer it was shown, and the freshness layer
+            // keeps reading this call as `bytes === 0`.
             bytes: 0,
+            chargedBytes: Buffer.byteLength(content, "utf8"),
             sources: [],
           };
         }
@@ -1143,6 +1167,14 @@ export async function executeGroomerTool(
             // head was already read for the model to be here), so an
             // earlier truncation fact may retire.
             established: !range.hasMore,
+            // The coordinates the answer showed, so retirement can check it
+            // continued from what the run had already shown (dispatch#1451).
+            shownRange: {
+              start: startLine,
+              end: range.lastShown,
+              totalLines: range.totalLines,
+              eof: !range.hasMore,
+            },
           };
         }
         // Head read: the path prefix and the continuation marker are charged
@@ -1166,6 +1198,7 @@ export async function executeGroomerTool(
         const { text: body, truncated } = truncate(text, headCap);
         if (!truncated) {
           const content = `${prefix}${body}`;
+          const totalLines = fileLines(text).length;
           return {
             ok: true,
             content,
@@ -1175,6 +1208,7 @@ export async function executeGroomerTool(
             truncated: false,
             // The whole file was shown: the run established what it holds.
             established: true,
+            shownRange: { start: 1, end: totalLines, totalLines, eof: true },
           };
         }
         // The truncation marker names the line to continue from, so a known
@@ -1215,7 +1249,8 @@ export async function executeGroomerTool(
         }
         const cut = truncate(text, truncatedCap).text;
         const shownLines = cut.split("\n").length;
-        const firstLineBytes = Buffer.byteLength(fileLines(text)[0] ?? "", "utf8");
+        const firstLine = fileLines(text)[0] ?? "";
+        const firstLineBytes = Buffer.byteLength(firstLine, "utf8");
         const marker =
           shownLines > 1
             ? `\n… (truncated) to continue, call again with startLine=${shownLines}`
@@ -1227,6 +1262,18 @@ export async function executeGroomerTool(
                 ? `\n… (truncated) to continue, call again with startLine=2`
                 : `\n… (truncated) no further lines`;
         const content = `${prefix}${cut}${marker}`;
+        // Line 1-based accounting of what the cut actually showed whole
+        // (dispatch#1451): a cut that fell on a newline shows the lines before
+        // it whole and the split's empty tail is not a line; a partial last
+        // line was not shown whole. A cut inside an oversized line 1 exceeds
+        // every budget this run has, and the past-it continuation
+        // (startLine=2) must stay continuous.
+        const shownEnd =
+          cut === firstLine
+            ? 1
+            : cut.includes("\n")
+              ? cut.split("\n").length - 1
+              : 1;
         return {
           ok: true,
           content,
@@ -1237,6 +1284,7 @@ export async function executeGroomerTool(
           // whole file (dispatch#1452), and a continuation read can retire
           // the fact later.
           truncated,
+          shownRange: { start: 1, end: shownEnd, totalLines, eof: false },
         };
       }
 

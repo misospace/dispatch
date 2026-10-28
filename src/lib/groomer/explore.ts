@@ -299,6 +299,9 @@ export async function exploreRepository(
   const relatedWorkQueries: string[] = [];
   const relatedWork: RelatedWorkObservation[] = [];
   let bytes = 0;
+  // Highest line shown per gap-path token across the whole run (dispatch#1451):
+  // retirement of a truncation fact must continue from what was already shown.
+  const shownThrough = new Map<string, number>();
 
   let roundsExhausted = false;
   const controller = new AbortController();
@@ -421,7 +424,11 @@ export async function exploreRepository(
           deps.tools,
         );
 
-        bytes += result.bytes;
+        // A tool answer that reports `chargedBytes` charges that instead
+        // (dispatch#1451): an empty search keeps `bytes: 0` as the freshness
+        // negative-evidence sentinel while its rendered answer still spends
+        // the run's budget.
+        bytes += result.chargedBytes ?? result.bytes;
         sources.push(...result.sources);
         if (name === "read_file" && result.ok) readSources.push(...result.sources);
         if (name === "read_file" && result.ok && result.file) readContents.push(result.file);
@@ -457,6 +464,19 @@ export async function exploreRepository(
           // otherwise (a pinned-ref read records its pinned arguments).
           const path = result.file?.path ?? (typeof args.path === "string" ? args.path : null);
           const gapPath = gapFactToken(path ?? "") || ROOT_TRUNCATED_READ;
+          // Track what the run has shown of this path — truncated reads
+          // included (dispatch#1451) — so a later continuation's continuity
+          // is judged against the lines actually shown so far. The key is the
+          // real path, not the gap-fact token: gapFactToken clamps at 80
+          // chars, so distinct long paths can share a token and must not
+          // extend each other's shown coverage.
+          const shownKey = result.file?.path ?? gapPath;
+          if (result.shownRange) {
+            const prior = shownThrough.get(shownKey) ?? 0;
+            if (result.shownRange.start <= prior + 1) {
+              shownThrough.set(shownKey, Math.max(prior, result.shownRange.end));
+            }
+          }
           if (truncated) {
             // A root listing has no path to name: keep the fact under a fixed
             // token rather than losing it (dispatch#1452).
@@ -472,7 +492,19 @@ export async function exploreRepository(
             // unreadable/empty file, a budget-exhausted notice or an empty
             // listing shows nothing and establishes nothing, so it must
             // never retire an earlier truncation fact.
-            gaps.truncatedReads = gaps.truncatedReads.filter((p) => p !== gapPath);
+            //
+            // A read_file continuation retires the fact only when it
+            // continued from what was already shown (dispatch#1451): a read
+            // that skips unseen lines shows a tail, not the whole file, so
+            // the fact stands. A listing carries no line coordinates and
+            // retires as before.
+            if (
+              !result.shownRange ||
+              (result.shownRange.eof === true &&
+                (shownThrough.get(shownKey) ?? 0) + 1 >= result.shownRange.start)
+            ) {
+              gaps.truncatedReads = gaps.truncatedReads.filter((p) => p !== gapPath);
+            }
           }
         }
         messages.push({ role: "tool", tool_call_id: toolCall.id, name, content: result.content });

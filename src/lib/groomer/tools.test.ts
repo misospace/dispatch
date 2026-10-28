@@ -1173,6 +1173,139 @@ describe("executeGroomerTool read_file bounded ranges (dispatch#1451)", () => {
   });
 });
 
+describe("executeGroomerTool read_file shownRange (dispatch#1451)", () => {
+  function longFile(lines: number, prefix = "line"): string {
+    return Array.from({ length: lines }, (_, i) => `${prefix} ${i + 1}`).join("\n");
+  }
+
+  it("a clipped head read names the lines it showed", async () => {
+    // The cut lands exactly on a newline: lines 1-2 were shown whole and the
+    // split's empty tail is not a line, so the answer's range ends at 2 while
+    // the marker sends the continuation to line 3 (dispatch#1451).
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue("L1\nL2\nL3\n") });
+    const head = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "c.ts" } },
+      { ...options, maxFileBytes: 6, maxTotalBytesRemaining: 4096 },
+      deps,
+    );
+    expect(head.truncated).toBe(true);
+    expect(head.file?.content).toBe("L1\nL2\n");
+    expect(head.content).toContain("startLine=3");
+    expect(head.shownRange).toEqual({ start: 1, end: 2, totalLines: 3, eof: false });
+  });
+
+  it("a head cut mid-line accounts only the lines shown whole", async () => {
+    // The cut lands inside line 2: that partial line was not shown, so the
+    // range ends at 1 and the marker's startLine=2 continuation re-reads it
+    // whole (dispatch#1451).
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue("L1\nL22\n") });
+    const head = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "c.ts" } },
+      { ...options, maxFileBytes: 5, maxTotalBytesRemaining: 4096 },
+      deps,
+    );
+    expect(head.truncated).toBe(true);
+    expect(head.file?.content).toBe("L1\nL2");
+    expect(head.content).toContain("startLine=2");
+    expect(head.shownRange).toEqual({ start: 1, end: 1, totalLines: 2, eof: false });
+  });
+
+  it("a head cut equal to the first line accounts it whole", async () => {
+    // The cut carries line 1 verbatim with its newline cut off: the line was
+    // shown whole, and the marker still sends the continuation to line 2
+    // (dispatch#1451).
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue("L1\nL22\n") });
+    const head = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "c.ts" } },
+      { ...options, maxFileBytes: 2, maxTotalBytesRemaining: 4096 },
+      deps,
+    );
+    expect(head.truncated).toBe(true);
+    expect(head.file?.content).toBe("L1");
+    expect(head.content).toContain("startLine=2");
+    expect(head.shownRange).toEqual({ start: 1, end: 1, totalLines: 2, eof: false });
+  });
+
+  it("an oversized first line keeps the past-it continuation continuous", async () => {
+    // A cut inside line 1 can never show it whole; the range still ends at 1
+    // so the marker's startLine=2 continuation (the no-wedge fix) stays
+    // continuous (dispatch#1451).
+    const deps = makeDeps({
+      readFile: vi.fn().mockResolvedValue(`${"y".repeat(500)}\nsecond\nthird`),
+    });
+    const head = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "w.ts" } },
+      { ...options, maxFileBytes: 150, maxTotalBytesRemaining: 4096 },
+      deps,
+    );
+    expect(head.truncated).toBe(true);
+    expect(head.content).toContain("startLine=2");
+    expect(head.shownRange).toEqual({ start: 1, end: 1, totalLines: 3, eof: false });
+
+    // Same on the single-line shape: nothing continues, the marker says so.
+    const lone = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "s.ts" } },
+      { ...options, maxFileBytes: 150, maxTotalBytesRemaining: 4096 },
+      makeDeps({ readFile: vi.fn().mockResolvedValue("y".repeat(500)) }),
+    );
+    expect(lone.content).toContain("no further lines");
+    expect(lone.shownRange).toEqual({ start: 1, end: 1, totalLines: 1, eof: false });
+  });
+
+  it("a whole head read names the whole file", async () => {
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue("a\nb\nc") });
+    const result = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "w.ts" } },
+      options,
+      deps,
+    );
+    expect(result.truncated).toBe(false);
+    expect(result.shownRange).toEqual({ start: 1, end: 3, totalLines: 3, eof: true });
+  });
+
+  it("a ranged read names the lines it showed, cut short or complete", async () => {
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue(longFile(50)) });
+    const cut = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "r.ts", startLine: 10, lineCount: 5 } },
+      options,
+      deps,
+    );
+    expect(cut.truncated).toBe(true);
+    expect(cut.shownRange).toEqual({ start: 10, end: 14, totalLines: 50, eof: false });
+    const whole = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "r.ts", startLine: 45 } },
+      options,
+      deps,
+    );
+    expect(whole.content).toContain("end of file");
+    expect(whole.shownRange).toEqual({ start: 45, end: 50, totalLines: 50, eof: true });
+  });
+
+  it("answers that showed nothing carry no shownRange", async () => {
+    const pastEnd = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "tiny.ts", startLine: 9 } },
+      options,
+      makeDeps({ readFile: vi.fn().mockResolvedValue(longFile(3)) }),
+    );
+    expect(pastEnd.shownRange).toBeUndefined();
+
+    const exhausted = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "many.ts", startLine: 10, lineCount: 40 } },
+      { ...options, maxFileBytes: 20 },
+      makeDeps({ readFile: vi.fn().mockResolvedValue(longFile(50)) }),
+    );
+    expect(exhausted.content).toContain("byte budget");
+    expect(exhausted.shownRange).toBeUndefined();
+
+    const unreadable = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "gone.ts" } },
+      options,
+      makeDeps({ readFile: vi.fn().mockResolvedValue("") }),
+    );
+    expect(unreadable.shownRange).toBeUndefined();
+  });
+});
+
 describe("executeGroomerTool search failure vs true absence (dispatch#1451)", () => {
   it("treats a failed search as an outage with a bounded fallback, not absence", async () => {
     const deps = makeDeps({
@@ -1223,6 +1356,24 @@ describe("executeGroomerTool search failure vs true absence (dispatch#1451)", ()
     expect(result.bytes).toBe(0);
     expect(result.content).toContain("No matches");
     expect(result.warnings).toBeUndefined();
+  });
+
+  it("charges an empty search's rendered answer without spending its zero-byte sentinel (dispatch#1451)", async () => {
+    // The freshness layer reads `ok && bytes === 0` as negative evidence
+    // (dispatch#1091), so the sentinel stays 0; the model-visible answer is
+    // charged through `chargedBytes` instead, so repeated empty searches
+    // still consume the run's budget.
+    const deps = makeDeps({ searchCode: vi.fn().mockResolvedValue([]) });
+    const result = await executeGroomerTool(
+      { name: "search_code", arguments: { query: "ghostSymbol" } },
+      { ...options, maxTotalBytesRemaining: 120 },
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    expect(result.bytes).toBe(0);
+    expect(result.content).toContain("No matches");
+    expect(result.chargedBytes).toBe(Buffer.byteLength(result.content, "utf8"));
+    expect(result.chargedBytes).toBeLessThanOrEqual(120);
   });
 
   it("keeps the failed-search fallback inside the remaining budget", async () => {
