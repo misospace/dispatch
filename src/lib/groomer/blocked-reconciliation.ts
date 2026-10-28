@@ -247,12 +247,9 @@ export async function runGroomingBlockedReconciliationPass(
       // with zero candidates contribute none). The open set rides into the
       // audit detail — it records which prerequisites were still open when
       // the row was reconsidered, not whether the row may be reconsidered.
-      const candidatesByRow = new Map<string, string[]>();
       const numbers = new Set<number>();
       for (const row of rows) {
-        const candidates = parkedBlockCandidateKeys(row, repo.fullName);
-        candidatesByRow.set(row.id, candidates);
-        for (const key of candidates) {
+        for (const key of parkedBlockCandidateKeys(row, repo.fullName)) {
           const parsed = parseDependencyKey(key);
           if (parsed) numbers.add(parsed.number);
         }
@@ -408,10 +405,13 @@ export function makePrismaBlockedReconciliationStore(client: typeof prisma = pri
     },
     // Race guard: the write lands only while the read still describes the
     // issue — same baseline (groomedRunId, null matching IS NULL), no stale
-    // mark yet, still parked, still a groomer-owned park and not operator
-    // held. A concurrent groom that wrote a baseline, cleared the blocked
-    // reason, or an operator hold written through the status route (which
-    // retires nextGroomingAction) turns this into a no-op.
+    // mark yet, still parked, still a groomer-owned park, not operator
+    // held and not in a retry backoff. A concurrent groom that wrote a
+    // baseline, cleared the blocked reason, an operator hold written through
+    // the status route (which retires nextGroomingAction), or a failure
+    // backoff that started since the scan turns this into a no-op. The
+    // backoff clause mirrors the scan query's own filter, so the write can
+    // never land on a row the scan would not have selected.
     async markStale(row, mark, at) {
       const updated = await client.issue.updateMany({
         where: {
@@ -421,6 +421,7 @@ export function makePrismaBlockedReconciliationStore(client: typeof prisma = pri
           blockedReason: { not: null },
           nextGroomingAction: "mark_blocked",
           admissionOverrideId: null,
+          OR: [{ groomingRetryAfter: null }, { groomingRetryAfter: { lte: at } }],
         },
         data: { groomingStaleAt: at, groomingStaleReasons: mark.reasons, groomingStaleDetail: mark.detail },
       });

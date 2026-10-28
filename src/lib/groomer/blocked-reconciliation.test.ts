@@ -401,6 +401,9 @@ describe("runGroomingBlockedReconciliationPass", () => {
     expect(result.markedStale).toEqual([]);
     expect(store.audits).toEqual([]);
     expect(result.warnings).toEqual([]);
+    // The row still rotates out of the capped slice: a row whose mark lost the
+    // race cannot pin the head of the order and starve a later parked issue.
+    expect(store.considered).toEqual(["issue-1"]);
   });
 
   it("skips worker-owned statuses, renovate issues, future retry backoff and admission overrides", async () => {
@@ -572,6 +575,41 @@ describe("makePrismaBlockedReconciliationStore", () => {
       { blockedReconciliationAt: { sort: "asc", nulls: "first" } },
       { groomedAt: { sort: "asc", nulls: "first" } },
       { number: "asc" },
+    ]);
+  });
+
+  it("pins the production stale mark to the same fences the scan filters on", async () => {
+    const updates: Array<{ where: Record<string, unknown>; data: unknown }> = [];
+    const client = {
+      issue: {
+        updateMany: async (args: { where: Record<string, unknown>; data: unknown }) => {
+          updates.push(args);
+          return { count: 1 };
+        },
+      },
+    } as unknown as PrismaClient;
+    const store = makePrismaBlockedReconciliationStore(client);
+    const at = new Date("2026-10-01T12:00:00.000Z");
+    const wrote = await store.markStale(parkedRow({ id: "issue-1" }), { reasons: ["evidence_incomplete"], detail: "why" }, at);
+    expect(wrote).toBe(true);
+    // The write lands only while the read still describes the issue: same
+    // baseline, no stale mark yet, still parked, still a groomer-owned park,
+    // not operator held and not in a retry backoff — the same fences the scan
+    // query filters on, so the mark can never land on a row the scan would
+    // not have selected.
+    expect(updates).toEqual([
+      {
+        where: {
+          id: "issue-1",
+          groomedRunId: null,
+          groomingStaleAt: null,
+          blockedReason: { not: null },
+          nextGroomingAction: "mark_blocked",
+          admissionOverrideId: null,
+          OR: [{ groomingRetryAfter: null }, { groomingRetryAfter: { lte: at } }],
+        },
+        data: { groomingStaleAt: at, groomingStaleReasons: ["evidence_incomplete"], groomingStaleDetail: "why" },
+      },
     ]);
   });
 

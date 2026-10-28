@@ -8,6 +8,13 @@
 --     freshness pass's territory),
 --   - an anchorless legacy park (the reconciliation pass's territory),
 --   - a worker-owned row (skipped in memory by the scan).
+--
+-- Re-runnable: the seeded rows are replaced, so the exercise can be repeated
+-- on the same database.
+DELETE FROM "Issue" WHERE "repositoryId" = 'repo-production-copy';
+
+DELETE FROM "Repository" WHERE "id" = 'repo-production-copy';
+
 INSERT INTO "Repository" ("id", "name", "owner", "fullName", "enabled", "createdAt", "updatedAt")
 VALUES (
   'repo-production-copy',
@@ -18,7 +25,6 @@ VALUES (
   now(),
   now()
 );
-
 INSERT INTO "Issue" (
   "id", "number", "repositoryId", "title", "body", "state", "url", "labels", "assignees",
   "createdAt", "updatedAt", "blockedReason", "nextGroomingAction", "groomedAt",
