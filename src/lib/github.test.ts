@@ -1176,3 +1176,33 @@ describe("fetchCompare", () => {
     await expect(fetchCompare("o/r", "base1", "head1")).rejects.toThrow(/403/);
   });
 });
+
+describe("fetchLatestCommit", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("URL-encodes the ref so slash-containing tags and branches resolve", async () => {
+    const { fetchLatestCommit } = await import("./github");
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ sha: "abc123" }),
+      text: () => Promise.resolve(JSON.stringify({ sha: "abc123" })),
+      headers: new Headers(),
+    } as Response);
+
+    const result = await fetchLatestCommit("o/r", "release/v1.0.0");
+
+    expect(result).toEqual({ sha: "abc123" });
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toBe("https://api.github.com/repos/o/r/commits/release%2Fv1.0.0?per_page=1");
+  });
+});

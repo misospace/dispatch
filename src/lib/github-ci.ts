@@ -212,7 +212,7 @@ export async function fetchCompare(
 
 export async function fetchLatestCommit(repoFullName: string, branch: string): Promise<GithubCommit | null> {
   const response = await fetchWithRetry(
-    `${GITHUB_API}/repos/${repoFullName}/commits/${branch}?per_page=1`,
+    `${GITHUB_API}/repos/${repoFullName}/commits/${encodeURIComponent(branch)}?per_page=1`,
     { headers: await getHeadersAsync() }
   );
   if (!response.ok) {
