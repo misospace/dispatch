@@ -2179,15 +2179,16 @@ Investigate session handling in auth module.`;
         notReadyDraft("needs_info", { verdict: { rationale: "which tenant?" } }),
       );
       await runHostedGroomer();
-      // #1460 composes with #1461: the persisted reason carries the machine
-      // gap-class prefix derived from the declared gap.
+      // #1460: the persisted reason carries the machine prefix for the
+      // declared gap (the default product_decision gap).
       expect(lastIssueUpdateData().needsInfoReason).toBe(
         "human_question(product_decision): which tenant?",
       );
 
-      // Only the machine gap class flipped (the #1460 shapes) — the verdict
-      // rationale and every other intent field stayed. The new key is
-      // applied, not replayed, and the row carries the new text.
+      // Only the verdict's gap declaration changed — the machine gap class
+      // flipped (the #1460 shapes) — while every other intent field stayed.
+      // The new key is applied, not replayed, and the row carries the new
+      // text.
       mocks.prisma.issue.update.mockClear();
       mocks.callGroomerLLM.mockResolvedValue(
         notReadyDraft("needs_info", {
@@ -2195,8 +2196,8 @@ Investigate session handling in auth module.`;
             rationale: "which tenant?",
             infoGap: {
               kind: "investigation_incomplete",
-              question: "which tenant?",
-              whyToolsCannotAnswer: "The repository reads were truncated before the answer.",
+              question: "Which tenant scope applies?",
+              whyToolsCannotAnswer: "The repository records no product-scope decision.",
             },
           },
         }),

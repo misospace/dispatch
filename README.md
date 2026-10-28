@@ -13,7 +13,7 @@ Dispatch is a harness-agnostic Kanban and work dispatch layer for AI agents. It 
 - **Next.js**: 16.2.6 (App Router)
 - **React**: v19
 - **Prisma**: v7
-- **Node**: v24 (Dockerfile uses `node:24-bookworm-slim`)
+- **Node**: v26 (Dockerfile uses `node:26-bookworm-slim`)
 - **TypeScript**: v6
 - **Tailwind CSS**: v4
 
@@ -403,7 +403,7 @@ mise run test        # vitest suite
 Without mise, the equivalent manual steps are:
 
 ```bash
-# Install dependencies (Node >= 24; exact pinned version in .mise/mise.lock)
+# Install dependencies (Node >= 26; exact pinned version in .mise/mise.lock)
 npm ci --include=dev
 
 # Generate Prisma client

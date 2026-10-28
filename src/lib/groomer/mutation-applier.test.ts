@@ -5,6 +5,7 @@ import type { GroomingEvidenceSnapshot } from "./evidence-snapshot";
 import { buildEvidenceCatalog } from "./plan-evidence";
 import { collectPinnedReadContent } from "./close-grounding";
 import { validateGroomingPlan, type GroomingPlan, type GroomingPlanDraft } from "./plan";
+import type { InfoGap } from "./investigation-gap";
 import type { LiveComment, LiveIssueState } from "./mutation-validator";
 import {
   ACTIVE_CLAIM_MS,
@@ -329,25 +330,22 @@ describe("computeMutationDiff", () => {
         actionability,
         lane: { id: "backlog", confidence: "medium", reason: "not ready yet" },
         rationale,
-        // #1452: a needs_info verdict must declare its gap; the other
-        // actionabilities must not carry one.
+        // #1460: a needs_info verdict must declare its gap; the declared kind
+        // rides in the persisted reason's machine prefix.
         ...(actionability === "needs_info"
           ? {
               infoGap: {
-                kind: "runtime_reproduction" as const,
+                kind: "product_decision",
                 question: rationale,
-                whyToolsCannotAnswer: "The repository records no runtime reproduction.",
+                whyToolsCannotAnswer: "The repository records no product-scope decision.",
               },
             }
           : {}),
       }),
       implementationBrief: null,
     });
-    // #1460 composes with #1461: a needs_info verdict that declares its gap
-    // persists the reason with the gap-class prefix; the other
-    // actionabilities carry the bare rationale.
     expect(diffFor(notReady("needs_info", "which tenant reproduces it?")).persistedReason).toBe(
-      "human_question(runtime_reproduction): which tenant reproduces it?",
+      "human_question(product_decision): which tenant reproduces it?",
     );
     expect(diffFor(notReady("blocked", "waiting on the vendor API")).persistedReason).toBe("waiting on the vendor API");
     expect(diffFor(notReady("backlog", "no acceptance criteria yet")).persistedReason).toBe("no acceptance criteria yet");
@@ -380,30 +378,37 @@ describe("computeApplicationKey", () => {
   });
 
   it("changes when the persisted reason changes, so a reason-only re-groom applies (dispatch#1461)", () => {
-    const needsInfo = (rationale: string): GroomingPlanDraft => ({
+    const needsInfo = (rationale: string, gap: Partial<InfoGap> = {}): GroomingPlanDraft => ({
       ...draft({
         actionability: "needs_info",
         lane: { id: "backlog", confidence: "medium", reason: "not ready yet" },
         rationale,
         infoGap: {
-          kind: "runtime_reproduction" as const,
+          kind: "product_decision",
           question: "which tenant?",
-          whyToolsCannotAnswer: "The repository records no runtime reproduction.",
+          whyToolsCannotAnswer: "The repository records no product-scope decision.",
+          ...gap,
         },
       }),
       implementationBrief: null,
     });
-    const keyFor = (rationale: string) =>
+    const keyFor = (rationale: string, gap: Partial<InfoGap> = {}) =>
       computeApplicationKey({
         repoFullName: "org/repo",
         issueNumber: 42,
-        plan: planFor(needsInfo(rationale)),
-        diff: diffFor(needsInfo(rationale)),
+        plan: planFor(needsInfo(rationale, gap)),
+        diff: diffFor(needsInfo(rationale, gap)),
       });
-    // The machine gap class flipping (the #1460 shapes) changes the key.
+    // A plain rationale change persists different text, so it changes the key.
     expect(keyFor("which tenant?")).toBe(keyFor("which tenant?"));
-    expect(keyFor("human_question(credentials): which tenant?")).not.toBe(keyFor("investigation_incomplete: which tenant?"));
-    expect(keyFor("which tenant?")).not.toBe(keyFor("human_question(credentials): which tenant?"));
+    expect(keyFor("which tenant?")).not.toBe(keyFor("which vendor?"));
+    // The machine gap declaration flipping (the #1460 shapes) changes the
+    // persisted reason's prefix, so it changes the key too.
+    expect(keyFor("which tenant?", { kind: "external_fact" })).not.toBe(keyFor("which tenant?"));
+    expect(keyFor("which tenant?", { kind: "investigation_incomplete" })).not.toBe(keyFor("which tenant?"));
+    expect(keyFor("which tenant?", { kind: "external_fact" })).not.toBe(
+      keyFor("which tenant?", { kind: "investigation_incomplete" }),
+    );
   });
 
   it("changes when the verdict action flips even with an identical reason text", () => {
@@ -412,13 +417,14 @@ describe("computeApplicationKey", () => {
         actionability,
         lane: { id: "backlog", confidence: "medium", reason: "not ready yet" },
         rationale,
-        // #1452: a needs_info verdict must declare its gap; backlog must not.
+        // #1460: only a needs_info verdict carries a gap; the backlog verdict
+        // must stay gap-free to validate.
         ...(actionability === "needs_info"
           ? {
               infoGap: {
-                kind: "runtime_reproduction" as const,
-                question: rationale,
-                whyToolsCannotAnswer: "The repository records no runtime reproduction.",
+                kind: "product_decision",
+                question: "which tenant?",
+                whyToolsCannotAnswer: "The repository records no product-scope decision.",
               },
             }
           : {}),
@@ -426,7 +432,13 @@ describe("computeApplicationKey", () => {
       implementationBrief: null,
     });
     const input = (actionability: "needs_info" | "backlog") => {
-      const d = notReady(actionability, "which tenant?");
+      // The backlog rationale is the needs_info verdict's full persisted text
+      // (machine prefix included), so the persisted reason is identical and
+      // only the verdict action differs.
+      const d = notReady(
+        actionability,
+        actionability === "needs_info" ? "which tenant?" : "human_question(product_decision): which tenant?",
+      );
       return { repoFullName: "org/repo", issueNumber: 42, plan: planFor(d), diff: diffFor(d) };
     };
     // A verdict flip decides which field the reason persists to (and the
@@ -441,10 +453,11 @@ describe("computeApplicationKey", () => {
         actionability: "needs_info",
         lane: { id: "backlog", confidence: "medium", reason: "not ready yet" },
         rationale: "which tenant?",
+        // #1460: a needs_info verdict must declare its gap.
         infoGap: {
-          kind: "runtime_reproduction" as const,
+          kind: "product_decision",
           question: "which tenant?",
-          whyToolsCannotAnswer: "The repository records no runtime reproduction.",
+          whyToolsCannotAnswer: "The repository records no product-scope decision.",
         },
       }),
       implementationBrief: null,
