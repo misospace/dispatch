@@ -4,9 +4,13 @@ import {
   BLOCKED_RECONSIDER_WINDOW_HOURS,
   DEFAULT_BLOCKED_RECONCILIATION_BUDGET,
   evaluateParkedBlock,
+  GROOMER_OWNED_PARK,
   hasTypedDependencyAnchor,
+  isGroomerOwnedPark,
   makePrismaBlockedReconciliationStore,
   NO_TYPED_DEPENDENCY_ANCHOR,
+  OPERATOR_STATUS_AUDIT_ACTIONS,
+  OPERATOR_STATUS_SOURCES,
   runGroomingBlockedReconciliationPass,
   type BlockedReconciliationStore,
   type ParkedBlockedIssueRow,
@@ -24,6 +28,12 @@ const HOUR = 3_600_000;
 interface Extra {
   blockedReason?: string | null;
   nextGroomingAction?: string | null;
+  /** The actor that wrote the last verdict on the row. */
+  groomedBy?: string | null;
+  /** The issue has an operator-sourced status_changed lifecycle event. */
+  operatorStatusEvent?: boolean;
+  /** The issue has an operator-sourced status audit row (success only). */
+  operatorStatusAudit?: boolean;
   admissionOverrideId?: string | null;
   groomingRetryAfter?: Date | null;
   groomingStaleAt?: Date | null;
@@ -47,11 +57,26 @@ function parkedRow(overrides: Partial<FakeRow> = {}): FakeRow {
     blockedReconciliationAt: null,
     blockedReason: "waiting on #5",
     nextGroomingAction: "mark_blocked",
+    operatorStatusEvent: false,
+    operatorStatusAudit: false,
     admissionOverrideId: null,
     groomingRetryAfter: null,
     groomingStaleAt: null,
     ...overrides,
   };
+}
+
+/**
+ * A legacy park: no verdict marker (the verdict that wrote it omitted the
+ * action), the hosted groomer judged it, and no operator ever held it.
+ */
+function legacyPark(overrides: Partial<FakeRow> = {}): FakeRow {
+  return parkedRow({
+    nextGroomingAction: null,
+    groomedBy: "hosted-groomer",
+    groomedAt: new Date(NOW.getTime() - 25 * HOUR),
+    ...overrides,
+  });
 }
 
 interface FakeStore extends BlockedReconciliationStore {
@@ -82,13 +107,26 @@ function fakeStore(rows: FakeRow[], openKeys: Set<string> = new Set()): FakeStor
     async findParkedBlockedIssues(_repositoryId, take) {
       store.takeSeen = take;
       // Mirror the real store's where clause: open, explained block, a park
-      // the groomer itself issued (an operator hold retires
-      // nextGroomingAction), no admission override, retry backoff elapsed,
-      // not already stale, and not a row the freshness pass owns (it has a
-      // typed dependency anchor).
+      // the groomer itself issued (the verdict marker, or a legacy park the
+      // hosted groomer judged that no operator has held since), no admission
+      // override, retry backoff elapsed, not already stale, and not a row the
+      // freshness pass owns (it has a typed dependency anchor).
       const eligible = store.rows
         .filter((r) => r.state === "open" && r.blockedReason != null)
-        .filter((r) => r.nextGroomingAction === "mark_blocked")
+        .filter((r) =>
+          isGroomerOwnedPark(
+            {
+              nextGroomingAction: r.nextGroomingAction ?? null,
+              groomedBy: r.groomedBy ?? null,
+              groomedAt: r.groomedAt,
+              labels: r.labels,
+            },
+            {
+              operatorStatusEvent: r.operatorStatusEvent ?? false,
+              operatorStatusAudit: r.operatorStatusAudit ?? false,
+            },
+          ),
+        )
         .filter((r) => r.admissionOverrideId == null)
         .filter((r) => r.groomingRetryAfter == null || r.groomingRetryAfter.getTime() <= NOW.getTime())
         .filter((r) => !store.stale.has(r.id))
@@ -435,13 +473,13 @@ describe("runGroomingBlockedReconciliationPass", () => {
   });
 
   it("rotates the capped slice so a row that cannot progress does not starve the tail", async () => {
-    // Rows 1 and 2 are worker-owned: the store hands them to the pass, but
-    // the pass skips them in memory, so it can make no progress on them.
+    // Rows 1 and 2 are worker-owned: the store hands them to the pass, but the
+    // pass skips them in memory, so it can make no progress on them.
     // Before the rotation stamp they held the capped slice on every pass (they
     // are the oldest never-considered rows), so row 3 was never reconsidered.
     const store = fakeStore([
       parkedRow({ id: "issue-1", number: 1, labels: ["status/blocked", "status/in-progress"], groomedAt: new Date(NOW.getTime() - 25 * HOUR) }),
-      parkedRow({ id: "issue-2", number: 2, title: "Dependency dashboard", labels: [], groomedAt: new Date(NOW.getTime() - 25 * HOUR) }),
+      parkedRow({ id: "issue-2", number: 2, title: "Dependency dashboard", groomedAt: new Date(NOW.getTime() - 25 * HOUR) }),
       parkedRow({ id: "issue-3", number: 3, body: "Depends on #7.", groomedAt: new Date(NOW.getTime() - 25 * HOUR) }),
     ]);
     const budget = { maxIssuesPerRepo: 2 };
@@ -477,12 +515,26 @@ describe("runGroomingBlockedReconciliationPass", () => {
     // the order forever and starve a later parked issue.
     const store = fakeStore([
       parkedRow({ id: "issue-1", number: 1, labels: ["status/blocked", "status/in-progress"] }),
-      parkedRow({ id: "issue-2", number: 2, title: "Dependency dashboard", labels: [] }),
+      parkedRow({ id: "issue-2", number: 2, title: "Dependency dashboard" }),
     ]);
     const result = await pass(store);
     expect(result.issuesConsidered).toBe(0);
     expect(result.markedStale).toEqual([]);
     expect(store.considered).toEqual(["issue-1", "issue-2"]);
+  });
+
+  it("does not reach a row that is not a park: no blocked column, no park to reconsider", async () => {
+    // The cached block reason can outlive the card's column (a human moved the
+    // card, or the label write never landed). A row that is not on the blocked
+    // column is not a park, so the pass never selects it and never spends the
+    // scan cap on it.
+    const store = fakeStore([
+      parkedRow({ id: "issue-1", number: 1, labels: ["status/backlog"], groomedAt: new Date(NOW.getTime() - 25 * HOUR) }),
+    ]);
+    const result = await pass(store);
+    expect(result.issuesConsidered).toBe(0);
+    expect(result.markedStale).toEqual([]);
+    expect(store.considered).toEqual([]);
   });
 
   it("turns a failed consideration stamp into a warning without failing the pass", async () => {
@@ -535,7 +587,188 @@ describe("runGroomingBlockedReconciliationPass", () => {
   });
 });
 
+describe("legacy parks (a park without the verdict marker)", () => {
+  it("reconsiders a legacy park the hosted groomer judged and no operator has held", async () => {
+    // The review finding: a park whose verdict omitted the action marker
+    // carries no marker at all, so the marker-only scan stranded it forever.
+    // The legacy branch reconsiders it under the same bounded window.
+    const store = fakeStore([legacyPark({ body: "Depends on #5." })]);
+    const result = await pass(store);
+    expect(result.issuesConsidered).toBe(1);
+    expect(result.markedStale).toEqual([{ repo: "org/repo", issueNumber: 1, reasons: ["evidence_incomplete"] }]);
+    expect(store.stale.get("issue-1")?.reasons).toEqual(["evidence_incomplete"]);
+    expect(store.audits).toEqual(["issue-1"]);
+  });
+
+  it("never revisits a legacy park an operator held through the status route", async () => {
+    // The status route retires the marker and writes a `status_changed`
+    // lifecycle event: a deliberate human hold.
+    const store = fakeStore([legacyPark({ operatorStatusEvent: true })]);
+    const result = await pass(store);
+    expect(result.issuesConsidered).toBe(0);
+    expect(result.markedStale).toEqual([]);
+    expect(store.stale.size).toBe(0);
+    expect(store.audits).toEqual([]);
+  });
+
+  it("never revisits a legacy park an operator re-blocked without a label move", async () => {
+    // The same-status re-block: the status label did not move, so no
+    // lifecycle event was recorded — only the status route's successful
+    // `set_status` audit row proves the hold.
+    const store = fakeStore([legacyPark({ operatorStatusAudit: true })]);
+    const result = await pass(store);
+    expect(result.issuesConsidered).toBe(0);
+    expect(result.markedStale).toEqual([]);
+    expect(store.stale.size).toBe(0);
+    expect(store.audits).toEqual([]);
+  });
+
+  it("never revisits a legacy park the hosted groomer did not judge", async () => {
+    // Never groomed by the hosted groomer: the row is not a groomer-owned
+    // park, whatever its blocked reason says.
+    const store = fakeStore([legacyPark({ groomedBy: null })]);
+    const result = await pass(store);
+    expect(result.issuesConsidered).toBe(0);
+    expect(result.markedStale).toEqual([]);
+    expect(store.stale.size).toBe(0);
+  });
+
+  it("never revisits a legacy park a human groomed", async () => {
+    // The manual groom route stamps the operator actor, not the hosted
+    // groomer: a human's own park is a human's decision. The status route
+    // stamps its actor the same way, so a hold it wrote is excluded by that
+    // stamp alone — atomically with the hold, which no audit row can promise.
+    const store = fakeStore([legacyPark({ groomedBy: "operator" })]);
+    const result = await pass(store);
+    expect(result.issuesConsidered).toBe(0);
+    expect(result.markedStale).toEqual([]);
+    expect(store.stale.size).toBe(0);
+  });
+
+  it("never revisits a marked park a human moved off the blocked column", async () => {
+    // A board drag off the blocked column is a human decision about the card:
+    // the cached block reason is left behind, but the card is no longer a
+    // park, so the pass must not re-groom it over the human's move.
+    const store = fakeStore([parkedRow({ labels: ["status/ready"], groomedAt: new Date(NOW.getTime() - 25 * HOUR) })]);
+    const result = await pass(store);
+    expect(result.issuesConsidered).toBe(0);
+    expect(result.markedStale).toEqual([]);
+    expect(store.stale.size).toBe(0);
+  });
+
+  it("never revisits a legacy park that is no longer on the blocked column", async () => {
+    // The legacy branch has no marker to prove the card is still parked, so
+    // the blocked label is its positive evidence.
+    const store = fakeStore([legacyPark({ labels: ["status/ready"] })]);
+    const result = await pass(store);
+    expect(result.issuesConsidered).toBe(0);
+    expect(result.markedStale).toEqual([]);
+    expect(store.stale.size).toBe(0);
+  });
+
+  it("defers a legacy park whose reconsideration window has not elapsed", async () => {
+    // The legacy branch is reconsidered on the same bounded window as a
+    // marked park: at most one re-groom per window.
+    const store = fakeStore([legacyPark({ groomedAt: new Date(NOW.getTime() - HOUR) })]);
+    const result = await pass(store);
+    expect(result.markedStale).toEqual([]);
+    expect(result.deferred).toEqual([
+      { repo: "org/repo", issueNumber: 1, reason: "dependency evidence incomplete; reconsideration window not elapsed" },
+    ]);
+    expect(store.stale.size).toBe(0);
+  });
+
+  it("still reconsiders a marked park", async () => {
+    // The modern branch is unchanged by the legacy branch.
+    const store = fakeStore([parkedRow({ body: "Depends on #5.", groomedAt: new Date(NOW.getTime() - 25 * HOUR) })]);
+    const result = await pass(store);
+    expect(result.markedStale).toEqual([{ repo: "org/repo", issueNumber: 1, reasons: ["evidence_incomplete"] }]);
+  });
+});
+
+describe("isGroomerOwnedPark", () => {
+  const park = {
+    nextGroomingAction: null,
+    groomedBy: "hosted-groomer",
+    groomedAt: new Date("2020-01-01T00:00:00.000Z"),
+    labels: ["status/blocked"],
+  };
+  const noEvidence = { operatorStatusEvent: false, operatorStatusAudit: false };
+
+  it("accepts a marked park whatever else the row says", () => {
+    expect(isGroomerOwnedPark({ ...park, nextGroomingAction: "mark_blocked" }, noEvidence)).toBe(true);
+  });
+
+  it("accepts a legacy park without operator evidence", () => {
+    expect(isGroomerOwnedPark(park, noEvidence)).toBe(true);
+  });
+
+  it("rejects a legacy park with operator evidence", () => {
+    expect(isGroomerOwnedPark(park, { operatorStatusEvent: true, operatorStatusAudit: false })).toBe(false);
+    expect(isGroomerOwnedPark(park, { operatorStatusEvent: false, operatorStatusAudit: true })).toBe(false);
+  });
+
+  it("rejects a legacy park the hosted groomer did not judge", () => {
+    expect(isGroomerOwnedPark({ ...park, groomedBy: null }, noEvidence)).toBe(false);
+    expect(isGroomerOwnedPark({ ...park, groomedBy: "operator" }, noEvidence)).toBe(false);
+  });
+
+  it("rejects a legacy park that was never judged or is no longer parked", () => {
+    expect(isGroomerOwnedPark({ ...park, groomedAt: null }, noEvidence)).toBe(false);
+    expect(isGroomerOwnedPark({ ...park, labels: ["status/ready"] }, noEvidence)).toBe(false);
+  });
+
+  it("rejects a marked park that is no longer on the blocked column", () => {
+    // The marker alone is not enough: a card a human moved off the blocked
+    // column keeps the cached block reason, and the pass must leave it be.
+    expect(isGroomerOwnedPark({ ...park, nextGroomingAction: "mark_blocked", labels: ["status/ready"] }, noEvidence)).toBe(
+      false,
+    );
+  });
+
+  it("rejects a park whose marker is neither the groomer's nor absent", () => {
+    // A manual groom writes a prose marker: a human's decision, never this
+    // pass's business.
+    expect(isGroomerOwnedPark({ ...park, nextGroomingAction: "Resolve the blocking dependency" }, noEvidence)).toBe(false);
+  });
+});
+
 describe("makePrismaBlockedReconciliationStore", () => {
+  it("pins the groomer-owned park predicate to the marker and the legacy branch", () => {
+    // The clause shape is the rule: the marker branch (the verdict marker and
+    // the card still on the blocked column), and the legacy branch with every
+    // part of it spelled out — no marker, the hosted groomer's verdict, an
+    // actual verdict, the blocked column, and no operator evidence (a status
+    // route lifecycle event or a successful status audit row). The status
+    // route is the only writer of an operator's block reason, so it is the
+    // only operator evidence: a board move and a manual groom change the
+    // card's column or write a prose marker, and the column check covers the
+    // first.
+    expect(OPERATOR_STATUS_SOURCES).toEqual(["api:status"]);
+    expect(OPERATOR_STATUS_AUDIT_ACTIONS).toEqual(["set_status"]);
+    expect(GROOMER_OWNED_PARK).toEqual({
+      OR: [
+        {
+          AND: [{ nextGroomingAction: "mark_blocked" }, { labels: { has: "status/blocked" } }],
+        },
+        {
+          AND: [
+            { nextGroomingAction: null },
+            { groomedBy: "hosted-groomer" },
+            { groomedAt: { not: null } },
+            { labels: { has: "status/blocked" } },
+            {
+              lifecycleEvents: {
+                none: { kind: "status_changed", source: { in: ["api:status"] } },
+              },
+            },
+            { auditLogs: { none: { action: { in: ["set_status"] }, success: true } } },
+          ],
+        },
+      ],
+    });
+  });
+
   it("pins the production selection to anchorless rows", async () => {
     let captured: { where?: { AND?: unknown[] }; orderBy?: unknown } = {};
     const client = {
@@ -554,6 +787,11 @@ describe("makePrismaBlockedReconciliationStore", () => {
     // clause, so the rule is pinned on both sides.
     expect(NO_TYPED_DEPENDENCY_ANCHOR).toEqual({ groomedDependencyKeys: { isEmpty: true } });
     expect(captured.where?.AND).toContainEqual(NO_TYPED_DEPENDENCY_ANCHOR);
+    // The scan selects groomer-owned parks: the verdict marker, or a legacy
+    // park the hosted groomer judged that no operator has held since. The
+    // predicate rides in the `AND` array — as a sibling `OR` it would
+    // overwrite the retry-backoff clause.
+    expect(captured.where?.AND).toContainEqual(GROOMER_OWNED_PARK);
   });
 
   it("pins the production scan order to least-recently-considered first", async () => {
@@ -604,9 +842,14 @@ describe("makePrismaBlockedReconciliationStore", () => {
           groomedRunId: null,
           groomingStaleAt: null,
           blockedReason: { not: null },
-          nextGroomingAction: "mark_blocked",
           admissionOverrideId: null,
-          OR: [{ groomingRetryAfter: null }, { groomingRetryAfter: { lte: at } }],
+          // The retry backoff and the park-ownership predicate are both
+          // `OR`s, so they are separate elements of one `AND` array — two
+          // `OR` keys in one `where` would overwrite each other.
+          AND: [
+            { OR: [{ groomingRetryAfter: null }, { groomingRetryAfter: { lte: at } }] },
+            GROOMER_OWNED_PARK,
+          ],
         },
         data: { groomingStaleAt: at, groomingStaleReasons: ["evidence_incomplete"], groomingStaleDetail: "why" },
       },
@@ -629,10 +872,10 @@ describe("makePrismaBlockedReconciliationStore", () => {
     await store.recordConsidered(rows, at);
     // One write, scoped to rows that are still groomer-owned parked blocks: a
     // row that left the parked state meanwhile is not stamped and leads the
-    // next pass.
+    // next pass. The stamp shares the scan's park-ownership predicate.
     expect(updates).toEqual([
       {
-        where: { id: { in: ["issue-1", "issue-2"] }, blockedReason: { not: null }, nextGroomingAction: "mark_blocked" },
+        where: { id: { in: ["issue-1", "issue-2"] }, blockedReason: { not: null }, AND: [GROOMER_OWNED_PARK] },
         data: { blockedReconciliationAt: at },
       },
     ]);

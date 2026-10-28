@@ -33,7 +33,34 @@
  * time it was last considered and the scan orders least-recently-considered
  * first, so the cap rotates through the parked set instead of parking on its
  * oldest rows.
+ *
+ * Which parks the pass owns is decided by the park's owner, not by its
+ * content. A groomer-owned park is a block the groomer itself issued: either
+ * it carries the groomer's verdict marker (`nextGroomingAction` is
+ * `mark_blocked`), or it is a legacy park — no marker, because the verdict
+ * that wrote it omitted the action — whose last verdict was the hosted
+ * groomer's (`groomedBy`), that was actually judged (`groomedAt`), that is
+ * still on the blocked column, and that carries no operator evidence. The
+ * legacy branch exists because a park written before the marker existed would
+ * otherwise be stranded forever; it needs positive evidence for every part of
+ * the rule, because the marker it lacks is exactly what proves a deliberate
+ * hold elsewhere.
+ *
+ * Operator evidence is what keeps a hold out of the legacy branch, and the
+ * status route is the only writer of an operator's block reason: it stamps the
+ * row with the actor that decided (`groomedBy`), so a hold written now is
+ * excluded by that stamp alone — atomically with the hold itself, which no
+ * audit row can promise. Two history filters cover the holds written before
+ * that stamp existed: a `status_changed` lifecycle event from the status
+ * route, and a successful `set_status` audit row. Both are checked because the
+ * event is only recorded when the status label actually moved, so a re-block
+ * of an already-blocked issue (a new reason, the same label) leaves only the
+ * audit row. A board move and a manual groom are not holds here — neither
+ * writes a block reason, and the card's column is what they change: a card a
+ * human moved off the blocked column is not a park at all. The groomer's own
+ * `sync`/`webhook` echoes are not holds either.
  */
+import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { findOpenIssueKeys } from "@/lib/issue-dependency-annotation";
 import { dependencyKey, parseNativeBlockedBy } from "@/lib/issue-dependencies";
@@ -127,6 +154,107 @@ export function hasTypedDependencyAnchor(row: Pick<ParkedBlockedIssueRow, "groom
  * model churn with nothing changed.
  */
 export const NO_TYPED_DEPENDENCY_ANCHOR = { groomedDependencyKeys: { isEmpty: true } };
+
+/**
+ * The lifecycle source whose `status_changed` event means a human decided this
+ * issue's status: the status route (an operator or a worker). It is the only
+ * writer of an operator's block reason, so it is the only evidence that a
+ * deliberate hold replaced the groomer's verdict. A board move and a manual
+ * groom are not holds here: neither writes a block reason, and the card's
+ * column is what they change — a card a human moved off the blocked column is
+ * not a park at all. The groomer's own park is echoed by `sync` and `webhook`
+ * label writes, so those sources are not holds either: treating them as
+ * holds would strand every legacy park.
+ */
+export const OPERATOR_STATUS_SOURCES = ["api:status"] as const;
+
+/**
+ * The audit actions a human status decision leaves behind. Successful writes
+ * only: a failed write never changed the row, so it proves nothing about a
+ * hold.
+ */
+export const OPERATOR_STATUS_AUDIT_ACTIONS = ["set_status"] as const;
+
+/**
+ * The predicate that decides whether a parked block is the groomer's own.
+ *
+ * Modern branch: the groomer's verdict marker (`nextGroomingAction` is
+ * `mark_blocked`) and the card still on the blocked column — a park the hosted
+ * groomer issued and no human moved away.
+ *
+ * Legacy branch: a park written before the marker existed. It has no marker
+ * to prove it is the groomer's, so every part of the rule needs positive
+ * evidence: no marker at all, the last verdict from the hosted groomer
+ * (`groomedBy`), an actual verdict (`groomedAt`), the card still on the
+ * blocked column, and no operator evidence on the row.
+ *
+ * Operator evidence is a deliberate human hold the pass never revisits. The
+ * status route stamps the row with the actor that decided (`groomedBy`), so a
+ * hold written now is excluded by that stamp alone — atomically with the
+ * hold, which no audit row can promise. The two history filters cover the
+ * holds written before that stamp existed: a `status_changed` lifecycle event
+ * from the status route, and a successful `set_status` audit row. Both are
+ * checked because the event is only recorded when the status label actually
+ * moved, so a re-block of an already-blocked issue leaves only the audit row.
+ *
+ * The clause is an `OR` of the two branches, so it must be combined with any
+ * other `OR` (the retry backoff) as separate elements of an `AND` array: two
+ * `OR` keys in one `where` object overwrite each other.
+ */
+export const GROOMER_OWNED_PARK: Prisma.IssueWhereInput = {
+  OR: [
+    {
+      AND: [{ nextGroomingAction: "mark_blocked" }, { labels: { has: "status/blocked" } }],
+    },
+    {
+      AND: [
+        { nextGroomingAction: null },
+        { groomedBy: "hosted-groomer" },
+        { groomedAt: { not: null } },
+        { labels: { has: "status/blocked" } },
+        { lifecycleEvents: { none: { kind: "status_changed", source: { in: [...OPERATOR_STATUS_SOURCES] } } } },
+        { auditLogs: { none: { action: { in: [...OPERATOR_STATUS_AUDIT_ACTIONS] }, success: true } } },
+      ],
+    },
+  ],
+};
+
+/** The operator evidence the legacy branch looks for on a row. */
+export interface ParkOwnershipEvidence {
+  /** The issue has a status-route status_changed lifecycle event. */
+  operatorStatusEvent: boolean;
+  /** The issue has a successful status-route status audit row. */
+  operatorStatusAudit: boolean;
+}
+
+/** The fields the park-ownership rule reads. */
+export interface GroomerOwnedParkRow {
+  nextGroomingAction: string | null;
+  groomedBy: string | null;
+  groomedAt: Date | null;
+  labels: string[];
+}
+
+/**
+ * The pure mirror of `GROOMER_OWNED_PARK`: whether a row is a groomer-owned
+ * park, given the operator evidence the database filters on. The mocked store
+ * uses it so the fake selection mirrors the production one clause for clause.
+ */
+export function isGroomerOwnedPark(row: GroomerOwnedParkRow, evidence: ParkOwnershipEvidence): boolean {
+  // A park is a card on the blocked column with a block reason. A card a human
+  // moved off that column is not a park, whatever the cached reason says.
+  if (!row.labels.includes("status/blocked")) return false;
+  // Modern branch: the groomer's own marker.
+  if (row.nextGroomingAction === "mark_blocked") return true;
+  // Legacy branch: no marker, so every other part needs positive evidence.
+  if (row.nextGroomingAction !== null) return false;
+  if (row.groomedBy !== "hosted-groomer") return false;
+  if (row.groomedAt === null) return false;
+  // A deliberate human hold is never revisited.
+  if (evidence.operatorStatusEvent) return false;
+  if (evidence.operatorStatusAudit) return false;
+  return true;
+}
 
 /**
  * Every dependency candidate a parked explained block could rely on: the
@@ -338,11 +466,6 @@ export function makePrismaBlockedReconciliationStore(client: typeof prisma = pri
           repositoryId,
           state: "open",
           blockedReason: { not: null },
-          // Only parks the groomer itself issued. An operator/worker block
-          // written through the status route retires nextGroomingAction
-          // (#1453) and is a deliberate human hold this pass must never
-          // revisit.
-          nextGroomingAction: "mark_blocked",
           admissionOverrideId: null,
           groomingStaleAt: null,
           AND: [
@@ -352,6 +475,12 @@ export function makePrismaBlockedReconciliationStore(client: typeof prisma = pri
             // current open set and marks them `dependency_changed` when they
             // change). This pass only owns anchorless rows.
             NO_TYPED_DEPENDENCY_ANCHOR,
+            // Only parks the groomer itself issued: the verdict marker, or a
+            // legacy park the hosted groomer judged and no operator has held
+            // since. The predicate is an `OR`, so it rides in the `AND` array
+            // next to the backoff clause — two `OR` keys in one `where` would
+            // overwrite each other.
+            GROOMER_OWNED_PARK,
           ],
         },
         select: {
@@ -398,7 +527,11 @@ export function makePrismaBlockedReconciliationStore(client: typeof prisma = pri
         where: {
           id: { in: rows.map((row) => row.id) },
           blockedReason: { not: null },
-          nextGroomingAction: "mark_blocked",
+          // Still a groomer-owned park (the marker, or a legacy park the
+          // hosted groomer judged that no operator has held since): a row
+          // that left the parked state meanwhile is not stamped and leads the
+          // next pass.
+          AND: [GROOMER_OWNED_PARK],
         },
         data: { blockedReconciliationAt: at },
       });
@@ -407,11 +540,11 @@ export function makePrismaBlockedReconciliationStore(client: typeof prisma = pri
     // issue — same baseline (groomedRunId, null matching IS NULL), no stale
     // mark yet, still parked, still a groomer-owned park, not operator
     // held and not in a retry backoff. A concurrent groom that wrote a
-    // baseline, cleared the blocked reason, an operator hold written through
-    // the status route (which retires nextGroomingAction), or a failure
-    // backoff that started since the scan turns this into a no-op. The
-    // backoff clause mirrors the scan query's own filter, so the write can
-    // never land on a row the scan would not have selected.
+    // baseline, cleared the blocked reason, an operator hold (which either
+    // retires the verdict marker or leaves operator evidence on the row),
+    // or a failure backoff that started since the scan turns this into a
+    // no-op. The backoff clause mirrors the scan query's own filter, so the
+    // write can never land on a row the scan would not have selected.
     async markStale(row, mark, at) {
       const updated = await client.issue.updateMany({
         where: {
@@ -419,9 +552,14 @@ export function makePrismaBlockedReconciliationStore(client: typeof prisma = pri
           groomedRunId: row.groomedRunId,
           groomingStaleAt: null,
           blockedReason: { not: null },
-          nextGroomingAction: "mark_blocked",
           admissionOverrideId: null,
-          OR: [{ groomingRetryAfter: null }, { groomingRetryAfter: { lte: at } }],
+          // The same fences the scan filters on, plus the park-ownership
+          // predicate: the row must still be a groomer-owned park (the marker,
+          // or a legacy park the hosted groomer judged that gained no
+          // operator evidence meanwhile) and must not be in a retry backoff.
+          // The predicate and the backoff clause are both `OR`s, so they ride
+          // in the `AND` array as separate elements.
+          AND: [{ OR: [{ groomingRetryAfter: null }, { groomingRetryAfter: { lte: at } }] }, GROOMER_OWNED_PARK],
         },
         data: { groomingStaleAt: at, groomingStaleReasons: mark.reasons, groomingStaleDetail: mark.detail },
       });
