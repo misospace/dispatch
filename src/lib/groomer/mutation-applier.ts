@@ -769,6 +769,13 @@ export interface ApplyResult {
   /** The run that first claimed this key, when it was not this run. */
   claimedByRunId: string | null;
   commentUrl: string | null;
+  /**
+   * Replay-only: when the applied record was last written (its finalize save),
+   * so the caller can order this application against issue writes that landed
+   * after it — e.g. a release-signal projection a newer application already
+   * owns. Null when the store does not expose a timestamp.
+   */
+  appliedRecordedAt: string | null;
   /** Labels on GitHub after this attempt, as far as the recorded steps show. */
   labels: string[];
   /** Child issues created or reused this attempt, in brief order. */
@@ -864,6 +871,7 @@ export async function applyGroomingMutations(
   const nothing = {
     claimedByRunId,
     commentUrl: null,
+    appliedRecordedAt: null as string | null,
     labels: diff.labelsBefore,
     children: [] as ChildIssueLink[],
     title: null,
@@ -899,6 +907,7 @@ export async function applyGroomingMutations(
       ...nothing,
       commentUrl,
       children,
+      appliedRecordedAt: existing.updatedAt ? new Date(existing.updatedAt).toISOString() : null,
     };
   }
 
@@ -1221,6 +1230,7 @@ export async function applyGroomingMutations(
     steps,
     claimedByRunId,
     commentUrl,
+    appliedRecordedAt: null,
     labels,
     children: appliedChildren,
     title: landed(steps.content) && diff.title !== null ? diff.title : null,

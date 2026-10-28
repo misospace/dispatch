@@ -1114,12 +1114,48 @@ async function executeGroomerRun(
     }
 
     if (applied.outcome === "replayed") {
-      // This exact application already landed: nothing is written again,
-      // not even lane history. Only the local cooldown stamp moves, so the
-      // same plan is not re-billed every scheduler tick.
+      // This exact application already landed: lane history and the applier's
+      // writes are never repeated. Only the local cooldown stamp moves, so the
+      // same plan is not re-billed every scheduler tick. The release-signal
+      // projection is the one exception a replay may still write: it is
+      // persisted after the application finalizes, so a failed issue update on
+      // the fresh path would otherwise leave the signal missing or stale
+      // forever — every same-key retry replays and returns here. The heal is
+      // bounded: only an empty column, or one holding a projection this
+      // application supersedes (an older appliedAt); never a projection a
+      // newer application already owns.
+      const replayData: Record<string, unknown> = {
+        groomedAt: new Date(),
+        groomedBy: "hosted-groomer",
+        groomingRetryAfter: null,
+      };
+      const storedProjection = await deps.prisma.issue.findUnique({
+        where: { id: candidate.id },
+        select: { releaseSignal: true },
+      });
+      const stored = readProjectionProvenance(storedProjection?.releaseSignal);
+      const storedIsCurrent = stored?.applicationKey === applicationKey;
+      const storedIsNewer =
+        !!stored &&
+        !storedIsCurrent &&
+        !!stored.appliedAt &&
+        !!applied.appliedRecordedAt &&
+        stored.appliedAt >= applied.appliedRecordedAt;
+      if (!storedIsCurrent && !storedIsNewer && (diff.releaseSignal || !!stored)) {
+        replayData.releaseSignal = diff.releaseSignal
+          ? {
+              ...diff.releaseSignal,
+              provenance: {
+                groomingRunId: applied.claimedByRunId ?? groomingRun.id,
+                applicationKey,
+                appliedAt: applied.appliedRecordedAt ?? new Date().toISOString(),
+              },
+            }
+          : null;
+      }
       await deps.prisma.issue.update({
         where: { id: candidate.id },
-        data: { groomedAt: new Date(), groomedBy: "hosted-groomer", groomingRetryAfter: null },
+        data: replayData,
       });
       const replayRun = await deps.prisma.agentRun.create({
         data: {
@@ -1200,9 +1236,11 @@ async function executeGroomerRun(
     // Durable semantic-only release projection (dispatch#1481): the latest
     // applied groom owns it wholesale (set or cleared); provenance ties it to
     // the grooming result that produced it; it never means delivered/shipped.
-    // Written only on a fresh applied outcome — a replay already persisted the
-    // identical signal, and the in-flight skip path deletes the applicationKey
-    // and returns before this block.
+    // Written on a fresh applied outcome; a replay re-asserts it only to heal
+    // a lost or superseded write (this write landing is not guaranteed — it
+    // happens after the application finalized — see the replay path), and the
+    // in-flight skip path deletes the applicationKey and returns before this
+    // block.
     issueData.releaseSignal = diff.releaseSignal
       ? { ...diff.releaseSignal, provenance: { groomingRunId: groomingRun.id, applicationKey, appliedAt: new Date().toISOString() } }
       : null;
@@ -1455,6 +1493,23 @@ function candidateSourceOf(candidate: { selectionReason?: string }): string {
     default:
       return "selector";
   }
+}
+
+/**
+ * Read the persisted release-signal projection's provenance out of the JSONB
+ * column (dispatch#1481). The column holds foreign-shaped JSON from the
+ * reader's perspective, so only the fields the replay-time heal decision
+ * needs are picked out; anything malformed reads as no projection.
+ */
+function readProjectionProvenance(value: unknown): { applicationKey?: string; appliedAt?: string } | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const provenance = (value as Record<string, unknown>).provenance;
+  if (!provenance || typeof provenance !== "object" || Array.isArray(provenance)) return null;
+  const { applicationKey, appliedAt } = provenance as Record<string, unknown>;
+  return {
+    applicationKey: typeof applicationKey === "string" ? applicationKey : undefined,
+    appliedAt: typeof appliedAt === "string" ? appliedAt : undefined,
+  };
 }
 
 /**

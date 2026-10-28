@@ -287,6 +287,10 @@ On a fresh applied groom, the signal is persisted wholesale on `Issue.releaseSig
 
 `provenance` ties the projection to the grooming result that produced it. Because the signal is part of the application intent, a re-groom whose signal changed is applied and overwrites the projection; an identical re-groom replays and rewrites nothing.
 
+The projection write happens after the application finalizes, so a failed issue update there would otherwise leave the signal missing or stale with no later run to repair it — every same-key retry replays and skips the write. A replay therefore re-asserts the projection as a bounded heal: only an empty column, or one holding a projection this application supersedes (an older `appliedAt`), is written; a replay whose key already matches the stored provenance writes nothing.
+
+The heal is bounded, not bulletproof. It orders set projections by their provenance, but an application that carried no signal clears the column to `null` — an empty column carries no ownership evidence, so a later replay of an older signal-bearing key cannot tell that clear apart from its own lost write and may re-assert the older signal. Because the column is only ever written by an applied groom, the next application re-owns it; a provenance-carrying tombstone on clear would close the gap entirely.
+
 ## History and Audit
 
 Every hosted grooming run is recorded in a dedicated `GroomingRun` table. Operators can inspect recent runs at `/groomer` (also reachable via `/automation/groomer`, which redirects there), including dry-run plans, write-mode applied mutations, context warnings, the LLM output summary, labels before/after, lane before/after, and the failure stage when a run fails.

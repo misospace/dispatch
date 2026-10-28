@@ -43,6 +43,8 @@ const { mocks } = vi.hoisted(() => ({
     compareCommits: vi.fn(),
     applications: new Map<string, Record<string, any>>(),
     childClaims: new Map<string, Record<string, any>>(),
+    /** Simulated Issue.releaseSignal column state, written by issue.update. */
+    issueProjection: null as unknown,
     prisma: {
       $transaction: vi.fn(),
       $queryRaw: vi.fn(),
@@ -51,7 +53,7 @@ const { mocks } = vi.hoisted(() => ({
       groomingApplication: { findUnique: vi.fn(), create: vi.fn(), update: vi.fn(), updateMany: vi.fn() },
       groomingChildClaim: { findUnique: vi.fn(), create: vi.fn(), update: vi.fn() },
       groomerPendingReply: { updateMany: vi.fn(), upsert: vi.fn() },
-      issue: { update: vi.fn(), findMany: vi.fn() },
+      issue: { update: vi.fn(), findUnique: vi.fn(), findMany: vi.fn() },
       issueLifecycleEvent: { create: vi.fn(), upsert: vi.fn() },
       issueLane: { create: vi.fn() },
       agentRun: { create: vi.fn() },
@@ -365,6 +367,14 @@ describe("runHostedGroomer", () => {
     mocks.prisma.groomingRun.findFirst.mockResolvedValue(null);
     mocks.prisma.groomingRun.findMany.mockResolvedValue([]);
     mocks.prisma.issue.update.mockResolvedValue({ id: "issue-42" });
+    // The Issue.releaseSignal column is simulated: an issue.update whose data
+    // carries the field sets or clears it; one without leaves it untouched.
+    mocks.issueProjection = null;
+    mocks.prisma.issue.update.mockImplementation(async ({ data }: { data: Record<string, unknown> }) => {
+      if ("releaseSignal" in data) mocks.issueProjection = JSON.parse(JSON.stringify(data.releaseSignal));
+      return { id: "issue-42" };
+    });
+    mocks.prisma.issue.findUnique.mockImplementation(async () => ({ releaseSignal: mocks.issueProjection }));
     mocks.prisma.issueLane.create.mockResolvedValue({ id: "lane-1" });
     mocks.prisma.agentRun.create.mockResolvedValue({ id: "run-1" });
     mocks.prisma.auditLog.create.mockResolvedValue({ id: "audit-1" });
@@ -397,7 +407,9 @@ describe("runHostedGroomer", () => {
     );
     mocks.prisma.groomingApplication.create.mockImplementation(async ({ data }: { data: Record<string, any> }) => {
       if (mocks.applications.has(data.applicationKey)) throw Object.assign(new Error("Unique constraint"), { code: "P2002" });
-      const row = { ...data, attempts: 1 };
+      // Mirrors @updatedAt: the row is stamped at create and re-stamped on
+      // every write, so a replay sees the finalize save's timestamp.
+      const row = { ...data, attempts: 1, updatedAt: new Date() };
       mocks.applications.set(data.applicationKey, row);
       return row;
     });
@@ -406,6 +418,7 @@ describe("runHostedGroomer", () => {
         const row = mocks.applications.get(where.applicationKey);
         if (!row || row.status !== where.status || row.attempts !== where.attempts) return { count: 0 };
         if (data.attempts?.increment) row.attempts += data.attempts.increment;
+        row.updatedAt = new Date();
         return { count: 1 };
       },
     );
@@ -414,6 +427,7 @@ describe("runHostedGroomer", () => {
         const row = mocks.applications.get(where.applicationKey)!;
         if (data.attempts?.increment) row.attempts += data.attempts.increment;
         else Object.assign(row, JSON.parse(JSON.stringify(data)));
+        row.updatedAt = new Date();
         return row;
       },
     );
@@ -4225,6 +4239,108 @@ Investigate session handling in auth module.`;
       expect(data.state).toBe("closed");
       expect(data.closedAt).toBeInstanceOf(Date);
       expect(mocks.closeIssue).toHaveBeenCalledWith("org/repo", 42);
+    });
+
+    it("a replay heals a projection lost to a failed issue write after the application finalized", async () => {
+      // Distinct run ids per run, so the healed provenance names the run that
+      // produced the application, not the one replaying it.
+      mocks.prisma.groomingRun.create.mockImplementation(
+        async () => ({ id: `gr-${mocks.prisma.groomingRun.create.mock.calls.length}`, stage: "selected" }),
+      );
+      mocks.callGroomerLLM.mockResolvedValue(planDraft({ releaseSignal: { ...signal } }));
+      // DB blip: the projection write fails on the fresh path. The applier has
+      // already finalized the application, so this run dies without the signal.
+      let sawProjectionWrite = false;
+      mocks.prisma.issue.update.mockImplementation(async ({ data }: { data: Record<string, unknown> }) => {
+        if ("releaseSignal" in data && !sawProjectionWrite) {
+          sawProjectionWrite = true;
+          throw new Error("db blip");
+        }
+        if ("releaseSignal" in data) mocks.issueProjection = JSON.parse(JSON.stringify(data.releaseSignal));
+        return { id: "issue-42" };
+      });
+      await expect(runHostedGroomer()).rejects.toThrow(/db blip/);
+      expect(mocks.issueProjection).toBeNull();
+
+      // The next scheduler tick produces the same plan: the application
+      // replays, and the replay re-asserts the projection the lost write
+      // never persisted.
+      const result = await runHostedGroomer();
+      expect(result!.appliedMutations?.outcome).toBe("replayed");
+      const data = lastIssueUpdateData();
+      expect(data.releaseSignal).toMatchObject({
+        ...signal,
+        provenance: {
+          groomingRunId: "gr-1",
+          applicationKey: result!.mutationPlan!.applicationKey,
+          appliedAt: expect.any(String),
+        },
+      });
+    });
+
+    it("a replay does not overwrite a projection a newer application already owns", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(planDraft({ releaseSignal: { ...signal } }));
+      await runHostedGroomer();
+      // A newer application (different key) rewrote the column after this
+      // application's finalize save: its appliedAt is newer than the record's.
+      mocks.issueProjection = {
+        ...signal,
+        kind: "fix",
+        provenance: {
+          groomingRunId: "gr-9",
+          applicationKey: "a-newer-application",
+          appliedAt: new Date(Date.now() + 60_000).toISOString(),
+        },
+      };
+      mocks.prisma.issue.update.mockClear();
+      const result = await runHostedGroomer();
+      expect(result!.appliedMutations?.outcome).toBe("replayed");
+      for (const call of mocks.prisma.issue.update.mock.calls) {
+        const data = (call[0] as { data: Record<string, unknown> }).data;
+        expect("releaseSignal" in data).toBe(false);
+      }
+    });
+
+    it("a replay clears a superseded stale projection when the plan carries no signal", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(planDraft());
+      await runHostedGroomer();
+      // The column holds an older application's projection that this
+      // application's fresh write would have cleared before it was lost.
+      mocks.issueProjection = {
+        kind: "internal",
+        headline: "stale",
+        significance: "routine",
+        evidenceRefs: [],
+        provenance: {
+          groomingRunId: "gr-0",
+          applicationKey: "an-older-application",
+          appliedAt: new Date(Date.now() - 60_000).toISOString(),
+        },
+      };
+      mocks.prisma.issue.update.mockClear();
+      const result = await runHostedGroomer();
+      expect(result!.appliedMutations?.outcome).toBe("replayed");
+      expect(lastIssueUpdateData().releaseSignal).toBeNull();
+    });
+
+    it("a replay re-asserts a signal into a column a newer application cleared (documented heal limitation)", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(planDraft({ releaseSignal: { ...signal } }));
+      await runHostedGroomer();
+      // A newer application that carried no signal cleared the column: an
+      // empty column carries no ownership evidence, so the next replay of the
+      // older signal-bearing key cannot tell that clear apart from its own
+      // lost write and re-asserts the older signal. Pinned deliberately — the
+      // bounded heal prefers repairing lost writes over suppressing this
+      // resurrection window; a provenance-carrying tombstone on clear is the
+      // follow-up fix (dispatch#1487).
+      mocks.issueProjection = null;
+      mocks.prisma.issue.update.mockClear();
+      const result = await runHostedGroomer();
+      expect(result!.appliedMutations?.outcome).toBe("replayed");
+      expect(lastIssueUpdateData().releaseSignal).toMatchObject({
+        ...signal,
+        provenance: expect.objectContaining({ applicationKey: result!.mutationPlan!.applicationKey }),
+      });
     });
   });
 });

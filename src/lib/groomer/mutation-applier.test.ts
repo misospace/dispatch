@@ -583,6 +583,9 @@ function memoryStore(initial?: ApplicationRecord): ApplicationStore & {
       const row = rows.get(key)!;
       row.status = data.status;
       row.steps = JSON.parse(JSON.stringify(data.steps));
+      // Mirrors @updatedAt: every write re-stamps the row, so a replay reads
+      // the finalize save's timestamp.
+      row.updatedAt = new Date();
     },
     hasRecentComment: async () => false,
     resume: async (key, seen) => {
@@ -779,6 +782,9 @@ describe("applyGroomingMutations", () => {
     const replay = await applyGroomingMutations(applyInput(fullDiff(), { groomingRunId: "run-2" }), again.github, store);
     expect(replay.outcome).toBe("replayed");
     expect(replay.claimedByRunId).toBe("run-1");
+    // The finalize save's timestamp is surfaced so the caller can order this
+    // application against issue writes that landed after it.
+    expect(replay.appliedRecordedAt).toEqual(expect.any(String));
     expect(again.calls).toEqual([]);
     expect(replay.steps.comment?.status).toBe("replayed");
     expect(replay.commentUrl).toBe("https://github.com/org/repo/issues/42#issuecomment-1");
