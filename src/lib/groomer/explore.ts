@@ -299,9 +299,15 @@ export async function exploreRepository(
   const relatedWorkQueries: string[] = [];
   const relatedWork: RelatedWorkObservation[] = [];
   let bytes = 0;
-  // Highest line shown per gap-path token across the whole run (dispatch#1451):
+  // Highest line shown per real path across the whole run (dispatch#1451):
   // retirement of a truncation fact must continue from what was already shown.
   const shownThrough = new Map<string, number>();
+  // Distinct real paths owing each truncation-fact token (dispatch#1451
+  // review): gapFactToken clamps at 80 chars, so two different long paths can
+  // share one token. The token retires only once every real path behind it
+  // has established — completing one path must not hide another's unseen
+  // content.
+  const truncatedFactPaths = new Map<string, Set<string>>();
 
   let roundsExhausted = false;
   const controller = new AbortController();
@@ -464,23 +470,34 @@ export async function exploreRepository(
           // otherwise (a pinned-ref read records its pinned arguments).
           const path = result.file?.path ?? (typeof args.path === "string" ? args.path : null);
           const gapPath = gapFactToken(path ?? "") || ROOT_TRUNCATED_READ;
+          // The real path behind the fact, used to judge continuity (and to
+          // retire the fact) per path rather than per token: gapFactToken
+          // clamps at 80 chars, so distinct long paths can share a token and
+          // must not lend each other shown lines or retire each other's
+          // facts (dispatch#1451 review). Sanitized but not clamped, so a
+          // path that names nothing falls to the same fixed token as its
+          // fact (a root listing), while two long paths stay distinct here
+          // even when their facts clamp together. Two spellings of one path
+          // ("src/x" vs "src/x/") owe the fact separately and can only
+          // settle it in their own spelling — fail-closed, and no wider
+          // than the token itself, which never matched across spellings.
+          const factKey = (path ? sanitizeModelText(path).trim() : "") || gapPath;
           // Track what the run has shown of this path — truncated reads
           // included (dispatch#1451) — so a later continuation's continuity
-          // is judged against the lines actually shown so far. The key is the
-          // real path, not the gap-fact token: gapFactToken clamps at 80
-          // chars, so distinct long paths can share a token and must not
-          // extend each other's shown coverage.
-          const shownKey = result.file?.path ?? gapPath;
+          // is judged against the lines actually shown so far.
           if (result.shownRange) {
-            const prior = shownThrough.get(shownKey) ?? 0;
+            const prior = shownThrough.get(factKey) ?? 0;
             if (result.shownRange.start <= prior + 1) {
-              shownThrough.set(shownKey, Math.max(prior, result.shownRange.end));
+              shownThrough.set(factKey, Math.max(prior, result.shownRange.end));
             }
           }
           if (truncated) {
             // A root listing has no path to name: keep the fact under a fixed
             // token rather than losing it (dispatch#1452).
             gaps.truncatedReads.push(gapPath);
+            const owners = truncatedFactPaths.get(gapPath) ?? new Set<string>();
+            owners.add(factKey);
+            truncatedFactPaths.set(gapPath, owners);
           } else if (result.established === true) {
             // A completed read retires the path's earlier truncation fact
             // (dispatch#1451): a continuation that reaches EOF — or a whole
@@ -501,9 +518,18 @@ export async function exploreRepository(
             if (
               !result.shownRange ||
               (result.shownRange.eof === true &&
-                (shownThrough.get(shownKey) ?? 0) + 1 >= result.shownRange.start)
+                (shownThrough.get(factKey) ?? 0) + 1 >= result.shownRange.start)
             ) {
-              gaps.truncatedReads = gaps.truncatedReads.filter((p) => p !== gapPath);
+              // Retire per real path (dispatch#1451 review): the token may
+              // stand for several distinct long paths that clamped to the
+              // same 80 chars; it disappears only when this read settles the
+              // last path still owing it.
+              const owners = truncatedFactPaths.get(gapPath);
+              owners?.delete(factKey);
+              if (!owners || owners.size === 0) {
+                if (owners) truncatedFactPaths.delete(gapPath);
+                gaps.truncatedReads = gaps.truncatedReads.filter((p) => p !== gapPath);
+              }
             }
           }
         }

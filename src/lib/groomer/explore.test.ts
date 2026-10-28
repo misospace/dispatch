@@ -929,6 +929,96 @@ describe("exploreRepository investigation gaps (dispatch#1452)", () => {
     expect(result.gaps.truncatedReads.length).toBe(2);
   });
 
+  it("a colliding gap token retires only for the path that established (dispatch#1451 review)", async () => {
+    // Both paths clamp to the same 80-char gap-fact token. A's continuous
+    // chain to EOF establishes A and must leave B's truncation fact in place;
+    // only once B's own chain reaches EOF does the shared token retire.
+    const longA = `src/${"x".repeat(76)}a.ts`;
+    const longB = `src/${"x".repeat(76)}b.ts`;
+    const bodies = new Map([
+      [longA, "y\n".repeat(11)],
+      [longB, "z\n".repeat(11)],
+    ]);
+    const deps = (calls: [string, unknown][]) =>
+      makeDeps(
+        {
+          readFile: vi
+            .fn()
+            .mockImplementation((_repo: string, path: string) =>
+              Promise.resolve(bodies.get(path) ?? ""),
+            ),
+        },
+        fetchReturning(
+          {
+            content: null,
+            tool_calls: [
+              toolCall("1", "read_file", { path: longA }),
+              toolCall("2", "read_file", { path: longB }),
+            ],
+          },
+          { content: null, tool_calls: calls.map(([name, args], i) => toolCall(String(i + 3), name, args)) },
+        ),
+      );
+
+    const halfDone = await exploreRepository(
+      { ...options, maxFileBytes: 12 },
+      deps([
+        ["read_file", { path: longA, startLine: 7, lineCount: 2 }],
+        ["read_file", { path: longA, startLine: 9 }],
+        ["submit_findings", { files: [longA, longB], ask: "do the thing" }],
+      ]),
+    );
+    // A established continuously to EOF, but B was only shown its head: the
+    // shared token still names B's unseen content and cannot vanish.
+    expect([...new Set(halfDone.gaps.truncatedReads)].length).toBe(1);
+    expect(halfDone.findings).toContain("was truncated");
+
+    const bothDone = await exploreRepository(
+      { ...options, maxFileBytes: 12 },
+      deps([
+        ["read_file", { path: longA, startLine: 7, lineCount: 2 }],
+        ["read_file", { path: longA, startLine: 9 }],
+        ["read_file", { path: longB, startLine: 7, lineCount: 2 }],
+        ["read_file", { path: longB, startLine: 9 }],
+        ["submit_findings", { files: [longA, longB], ask: "do the thing" }],
+      ]),
+    );
+    // With B's own chain reaching EOF the last owner settles and the token
+    // retires.
+    expect(bothDone.gaps.truncatedReads).toEqual([]);
+
+    // Inverse: B never truncated and read whole (its body fits the budget);
+    // its established answer proves nothing about A, so A's fact survives the
+    // shared token.
+    const onlyADeps = makeDeps(
+      {
+        readFile: vi
+          .fn()
+          .mockImplementation((_repo: string, path: string) =>
+            Promise.resolve(path === longB ? "z\n" : "y\n".repeat(11)),
+          ),
+      },
+      fetchReturning(
+        {
+          content: null,
+          tool_calls: [
+            toolCall("1", "read_file", { path: longA }),
+            toolCall("2", "read_file", { path: longB }),
+          ],
+        },
+        {
+          content: null,
+          tool_calls: [
+            toolCall("3", "submit_findings", { files: [longA, longB], ask: "do the thing" }),
+          ],
+        },
+      ),
+    );
+    const onlyA = await exploreRepository({ ...options, maxFileBytes: 12 }, onlyADeps);
+    expect([...new Set(onlyA.gaps.truncatedReads)].length).toBe(1);
+    expect(onlyA.findings).toContain("was truncated");
+  });
+
   it("an answer that showed no content does not retire the truncated-read gap (dispatch#1451 review)", async () => {
     // A past-the-end coordinate answers successfully but shows nothing: the
     // file's body was never established, so a later ok read of the same path
