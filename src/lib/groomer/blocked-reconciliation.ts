@@ -21,11 +21,18 @@
  * because stale results bypass the selector's blocked parking and get
  * re-groomed, where a fresh verdict re-decides.
  *
- * Fairness: the scan is capped per repository, so a row the pass can make no
- * progress on (its candidate dependency is still open) must not keep that cap
- * to itself. Every row the scan reaches is stamped with the time it was last
- * considered and the scan orders least-recently-considered first, so the cap
- * rotates through the parked set instead of parking on its oldest rows.
+ * An anchorless row is reconsidered even when a candidate dependency is
+ * still open. The pass cannot tell which dependency the verdict relied on —
+ * an open candidate is not proof that the park still holds, so treating it as
+ * such would strand the row forever. The re-groom re-reads the dependency
+ * state and re-decides; it never unblocks the issue on its own.
+ *
+ * Fairness: the scan is capped per repository, so a row the pass cannot make
+ * progress on (one it skips in memory, or one whose mark lost the race) must
+ * not keep that cap to itself. Every row the scan reaches is stamped with the
+ * time it was last considered and the scan orders least-recently-considered
+ * first, so the cap rotates through the parked set instead of parking on its
+ * oldest rows.
  */
 import { prisma } from "@/lib/prisma";
 import { findOpenIssueKeys } from "@/lib/issue-dependency-annotation";
@@ -150,6 +157,12 @@ export function parkedBlockCandidateKeys(row: ParkedBlockedIssueRow, repoFullNam
  * directly. Rows with a typed dependency anchor are the freshness pass's
  * territory (it compares their recorded open blockers against the current open
  * set), so they are never marked here; the store query excludes them as well.
+ *
+ * An anchorless row is reconsidered on the window whether or not a candidate
+ * dependency is open: with no recorded anchor the pass cannot know which
+ * dependency the verdict relied on, so an open one does not prove the park
+ * still holds. The reconsideration is a re-groom, not an unblock — the fresh
+ * verdict decides whether the issue stays blocked.
  */
 export function evaluateParkedBlock(
   row: ParkedBlockedIssueRow,
@@ -166,28 +179,26 @@ export function evaluateParkedBlock(
   const candidates = parkedBlockCandidateKeys(row, repoFullName);
   const openNow = candidates.filter((key) => openKeys.has(key)).sort();
 
-  // A candidate dependency is still open: the park plausibly holds on a
-  // named, verifiable prerequisite. A NEW open dependency must never unblock
-  // the issue, and with no recorded anchor there is no earlier open set to
-  // compare against, so there is nothing to reconsider.
-  if (openNow.length > 0) return { action: "none" };
-
-  // No candidate dependency is open — but without a typed anchor recorded at
-  // verdict time this is not proof the block is stale: the load-bearing
-  // prerequisite may live in the model's assessment rather than the body, or
-  // the block may not be dependency-based at all. Window-bounded
-  // reconsideration so such a row is revisited on a schedule instead of
-  // staying parked forever, while an explicit hold keeps costing at most one
-  // re-groom per window.
+  // No typed anchor was recorded at verdict time, so the load-bearing
+  // prerequisite may live in the model's assessment rather than the body, and
+  // the block may not be dependency-based at all. A candidate that is still
+  // open is therefore not evidence that the park holds — the pass cannot tell
+  // whether the verdict relied on it — so the bounded reconsideration runs
+  // anyway: window-bounded, so an explicit hold keeps costing at most one
+  // re-groom per window, and a fresh verdict re-decides instead of this pass
+  // deciding on the model's behalf.
   if (row.groomedAt === null || row.groomedAt.getTime() < now.getTime() - windowHours * 3_600_000) {
     const considered =
       candidates.length > 0
         ? `considered: ${candidates.join(", ")}`
         : "no dependency candidates could be derived from the body, native blocked-by list or saved baseline";
+    // The observed open set rides along in the audit detail: it says why a row
+    // was reconsidered even though a prerequisite is still open.
+    const open = openNow.length > 0 ? `open now: ${openNow.join(", ")}` : "no candidate dependency is open";
     return {
       action: "mark",
       reasons: ["evidence_incomplete"],
-      detail: `dependency evidence incomplete (${considered}); reconsideration is bounded to a ${windowHours}h window`,
+      detail: `dependency evidence incomplete (${considered}; ${open}); reconsideration is bounded to a ${windowHours}h window`,
     };
   }
   return { action: "defer", reason: "dependency evidence incomplete; reconsideration window not elapsed" };
@@ -233,7 +244,9 @@ export async function runGroomingBlockedReconciliationPass(
 
       // One openness lookup per repo pass: candidate keys are computed per
       // row first and every referenced number is collected across rows (rows
-      // with zero candidates contribute none).
+      // with zero candidates contribute none). The open set rides into the
+      // audit detail — it records which prerequisites were still open when
+      // the row was reconsidered, not whether the row may be reconsidered.
       const candidatesByRow = new Map<string, string[]>();
       const numbers = new Set<number>();
       for (const row of rows) {

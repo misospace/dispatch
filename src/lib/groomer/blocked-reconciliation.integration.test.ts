@@ -74,13 +74,13 @@ suite("blocked reconciliation rotation against a real PostgreSQL", () => {
       WHERE table_name = 'Issue' AND column_name = 'blockedReconciliationAt'`;
     expect(columns.map((entry) => entry.column_name)).toEqual(["blockedReconciliationAt"]);
 
-    // Rows 1 and 2 wait on an open prerequisite (#5); row 3 waits on a
-    // prerequisite that is not open (#7 does not exist). The scan is capped at
+    // Rows 1 and 2 are worker-owned: the store hands them to the pass, the
+    // pass skips them in memory, so it can make no progress on them. Row 3 is
+    // a plain parked block whose prerequisite closed. The scan is capped at
     // two rows, so row 3 is only reached once rows 1 and 2 rotate out.
-    await issue(1, parked("Depends on #5."));
-    await issue(2, parked("Depends on #5."));
+    await issue(1, { ...parked("Waiting on the worker."), labels: ["status/blocked", "status/in-progress"] });
+    await issue(2, { ...parked("Waiting on the worker."), labels: ["status/blocked", "status/in-review"] });
     await issue(3, parked("Depends on #7."));
-    await issue(5, { body: "The prerequisite." });
 
     const store = makePrismaBlockedReconciliationStore(prisma);
     const repos = [{ id: repositoryId, fullName: REPO }];
@@ -88,7 +88,7 @@ suite("blocked reconciliation rotation against a real PostgreSQL", () => {
 
     const first = await runGroomingBlockedReconciliationPass(repos, store, budget);
     expect(first.markedStale).toEqual([]);
-    expect(first.issuesConsidered).toBe(2);
+    expect(first.issuesConsidered).toBe(0);
 
     // The rows the scan reached carry the consideration stamp, so they rotate
     // to the back of the order.
@@ -105,5 +105,29 @@ suite("blocked reconciliation rotation against a real PostgreSQL", () => {
     expect(marked?.groomingStaleReasons).toEqual(["evidence_incomplete"]);
     const audits = await prisma.auditLog.findMany({ where: { repoFullName: REPO, action: "grooming_stale" } });
     expect(audits.map((entry) => entry.issueNumber)).toEqual([3]);
+  });
+
+  it("reconsiders an anchorless parked block whose prerequisite is still open", async () => {
+    // The review finding, against a real PostgreSQL: an open candidate must
+    // not suppress the bounded reconsideration. The pass cannot tell which
+    // dependency the verdict relied on, so the row is re-groomed and the fresh
+    // verdict decides whether it stays blocked. The mark is a reconsideration,
+    // never an unblock: the row stays parked.
+    await issue(1, parked("Depends on #5."));
+    await issue(5, { body: "The prerequisite.", labels: [] });
+
+    const store = makePrismaBlockedReconciliationStore(prisma);
+    const result = await runGroomingBlockedReconciliationPass([{ id: repositoryId, fullName: REPO }], store);
+
+    expect(result.markedStale).toEqual([{ repo: REPO, issueNumber: 1, reasons: ["evidence_incomplete"] }]);
+    const marked = await prisma.issue.findFirst({ where: { repositoryId, number: 1 } });
+    expect(marked?.groomingStaleAt).toBeInstanceOf(Date);
+    expect(marked?.groomingStaleReasons).toEqual(["evidence_incomplete"]);
+    expect(marked?.groomingStaleDetail).toContain("open now: " + REPO + "#5");
+    // Still parked: the mark schedules a re-groom, it does not release the
+    // issue.
+    expect(marked?.blockedReason).not.toBeNull();
+    expect(marked?.labels).toContain("status/blocked");
+    expect(marked?.nextGroomingAction).toBe("mark_blocked");
   });
 });

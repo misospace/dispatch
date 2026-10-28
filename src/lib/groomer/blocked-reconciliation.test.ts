@@ -142,10 +142,11 @@ function pass(store: FakeStore) {
 describe("parkedBlockCandidateKeys", () => {
   it("fully qualifies same-repo native blocked-by refs", () => {
     const row = parkedRow({ nativeBlockedBy: ["org/repo#5", "other/repo#9"], groomedAt: new Date(NOW.getTime() - 25 * HOUR) });
-    // A still-open native prerequisite keeps the park (regression: a bare
-    // "#5" key could never match the fully qualified open set).
-    expect(evaluateParkedBlock(row, "org/repo", new Set(["org/repo#5"]), NOW)).toEqual({ action: "none" });
-    expect(evaluateParkedBlock(row, "org/repo", new Set(["other/repo#9"]), NOW)).toEqual({ action: "none" });
+    // Regression: a bare "#5" key could never match the fully qualified open
+    // set, so an open same-repo prerequisite would have read as closed.
+    const open = evaluateParkedBlock(row, "org/repo", new Set(["org/repo#5"]), NOW);
+    expect(open).toMatchObject({ action: "mark", reasons: ["evidence_incomplete"] });
+    expect(open.action === "mark" && open.detail).toContain("open now: org/repo#5");
     const closed = evaluateParkedBlock(row, "org/repo", new Set(), NOW);
     expect(closed).toMatchObject({ action: "mark", reasons: ["evidence_incomplete"] });
     expect(closed.action === "mark" && closed.detail).toContain("org/repo#5");
@@ -164,9 +165,17 @@ describe("evaluateParkedBlock", () => {
     expect(decision.action === "mark" && decision.detail).toContain("org/repo#6");
   });
 
-  it("leaves a legacy explained block parked while one body prerequisite is still open", () => {
+  it("reconsiders a legacy explained block while one body prerequisite is still open", () => {
+    // The review finding: an anchorless row is not excluded by an open
+    // candidate. The pass cannot tell which dependency the verdict relied on,
+    // so an open prerequisite does not prove the park holds — the bounded
+    // re-groom re-reads the dependency state and re-decides. It never
+    // unblocks the issue on its own.
     const row = parkedRow({ body: "Depends on #5 and #6.", groomedAt: new Date(NOW.getTime() - 25 * HOUR) });
-    expect(evaluateParkedBlock(row, "org/repo", new Set(["org/repo#6"]), NOW)).toEqual({ action: "none" });
+    const decision = evaluateParkedBlock(row, "org/repo", new Set(["org/repo#6"]), NOW);
+    expect(decision).toMatchObject({ action: "mark", reasons: ["evidence_incomplete"] });
+    expect(decision.action === "mark" && decision.detail).toContain("open now: org/repo#6");
+    expect(decision.action === "mark" && decision.detail).toContain("24h");
   });
 
   it("defers evidence-incomplete reconsideration inside the window and marks it after", () => {
@@ -226,15 +235,20 @@ describe("evaluateParkedBlock", () => {
     expect(evaluateParkedBlock(row, "org/repo", new Set(), NOW)).toEqual({ action: "none" });
   });
 
-  it("counts only keys present in the open set, across repos", () => {
+  it("records which candidates are still open in the audit detail, across repos", () => {
     const row = parkedRow({ body: "Depends on other/repo#7.", groomedAt: new Date(NOW.getTime() - 25 * HOUR) });
-    // A mixed open set: the cross-repo prerequisite open means nothing changed.
-    expect(evaluateParkedBlock(row, "org/repo", new Set(["other/repo#7", "org/repo#9"]), NOW)).toEqual({ action: "none" });
+    // A mixed open set: the cross-repo prerequisite is open, and the detail
+    // names it, so the operator sees the prerequisite the fresh verdict must
+    // weigh.
+    const open = evaluateParkedBlock(row, "org/repo", new Set(["other/repo#7", "org/repo#9"]), NOW);
+    expect(open).toMatchObject({ action: "mark", reasons: ["evidence_incomplete"] });
+    expect(open.action === "mark" && open.detail).toContain("open now: other/repo#7");
     // The same key absent (closed in its own repo) counts as closed even while
     // an unrelated same-repo issue is open.
     const decision = evaluateParkedBlock(row, "org/repo", new Set(["org/repo#9"]), NOW);
     expect(decision).toMatchObject({ action: "mark", reasons: ["evidence_incomplete"] });
     expect(decision.action === "mark" && decision.detail).toContain("other/repo#7");
+    expect(decision.action === "mark" && decision.detail).toContain("no candidate dependency is open");
   });
 
   it("never unblocks on a new open body dependency the row lacked", () => {
@@ -244,7 +258,12 @@ describe("evaluateParkedBlock", () => {
       groomedRunId: "gr-1",
       groomedIssueFingerprint: "fp",
     });
-    expect(evaluateParkedBlock(row, "org/repo", new Set(["org/repo#11"]), NOW)).toEqual({ action: "none" });
+    // Inside the reconsideration window the row is deferred, not marked: a
+    // stale mark is a re-groom, never an unblock.
+    expect(evaluateParkedBlock(row, "org/repo", new Set(["org/repo#11"]), NOW)).toEqual({
+      action: "defer",
+      reason: "dependency evidence incomplete; reconsideration window not elapsed",
+    });
   });
 
   it("treats closed-as-not-planned as closed (the key is simply absent from the open set)", () => {
@@ -413,29 +432,40 @@ describe("runGroomingBlockedReconciliationPass", () => {
   });
 
   it("rotates the capped slice so a row that cannot progress does not starve the tail", async () => {
-    // Rows 1 and 2 wait on an open prerequisite: the pass can make no
-    // progress on them. Before the rotation stamp they held the capped slice
-    // on every pass, so row 3 — whose prerequisite closed — was never
-    // reconsidered.
-    const store = fakeStore(
-      [
-        parkedRow({ id: "issue-1", number: 1, body: "Depends on #5.", groomedAt: new Date(NOW.getTime() - 25 * HOUR) }),
-        parkedRow({ id: "issue-2", number: 2, body: "Depends on #6.", groomedAt: new Date(NOW.getTime() - 25 * HOUR) }),
-        parkedRow({ id: "issue-3", number: 3, body: "Depends on #7.", groomedAt: new Date(NOW.getTime() - 25 * HOUR) }),
-      ],
-      new Set(["org/repo#5", "org/repo#6"]),
-    );
+    // Rows 1 and 2 are worker-owned: the store hands them to the pass, but
+    // the pass skips them in memory, so it can make no progress on them.
+    // Before the rotation stamp they held the capped slice on every pass (they
+    // are the oldest never-considered rows), so row 3 was never reconsidered.
+    const store = fakeStore([
+      parkedRow({ id: "issue-1", number: 1, labels: ["status/blocked", "status/in-progress"], groomedAt: new Date(NOW.getTime() - 25 * HOUR) }),
+      parkedRow({ id: "issue-2", number: 2, title: "Dependency dashboard", labels: [], groomedAt: new Date(NOW.getTime() - 25 * HOUR) }),
+      parkedRow({ id: "issue-3", number: 3, body: "Depends on #7.", groomedAt: new Date(NOW.getTime() - 25 * HOUR) }),
+    ]);
     const budget = { maxIssuesPerRepo: 2 };
 
     const first = await runGroomingBlockedReconciliationPass([REPO], store, budget, () => NOW, BLOCKED_RECONSIDER_WINDOW_HOURS);
     expect(first.markedStale).toEqual([]);
-    expect(first.issuesConsidered).toBe(2);
+    expect(first.issuesConsidered).toBe(0);
 
     // The next pass reads the least-recently-considered rows first, so the
-    // never-considered row 3 is in the slice and its closed prerequisite is
-    // noticed.
+    // never-considered row 3 is in the slice and is reconsidered.
     const second = await runGroomingBlockedReconciliationPass([REPO], store, budget, () => NOW, BLOCKED_RECONSIDER_WINDOW_HOURS);
     expect(second.markedStale).toEqual([{ repo: "org/repo", issueNumber: 3, reasons: ["evidence_incomplete"] }]);
+  });
+
+  it("reconsiders an anchorless parked block whose prerequisite is still open", async () => {
+    // The review finding at the pass level: an open candidate must not
+    // suppress the bounded reconsideration. The row is still parked when the
+    // mark lands (the mark only schedules a re-groom) and the open
+    // prerequisite rides into the audit detail.
+    const store = fakeStore(
+      [parkedRow({ id: "issue-1", number: 1, body: "Depends on #5.", groomedAt: new Date(NOW.getTime() - 25 * HOUR) })],
+      new Set(["org/repo#5"]),
+    );
+    const result = await pass(store);
+    expect(result.markedStale).toEqual([{ repo: "org/repo", issueNumber: 1, reasons: ["evidence_incomplete"] }]);
+    expect(store.stale.get("issue-1")?.detail).toContain("open now: org/repo#5");
+    expect(store.audits).toEqual(["issue-1"]);
   });
 
   it("stamps every row the scan reached, including the rows the pass skips", async () => {
