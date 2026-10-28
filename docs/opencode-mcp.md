@@ -4,7 +4,7 @@ Local stdio MCP server that bridges OpenCode to Dispatch issue APIs.
 
 ## Prerequisites
 
-- Node.js 18+ (the repo ships with Node 24)
+- Node.js 18+ (the repo ships with Node 26)
 - A running Dispatch instance
 - `DISPATCH_URL` and `DISPATCH_AGENT_TOKEN` set in your environment
 
