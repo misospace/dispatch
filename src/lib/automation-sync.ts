@@ -15,9 +15,150 @@ import {
   fetchPullRequests,
   fetchClosedPullRequests,
   fetchLatestCommit,
+  fetchCompare,
   fetchPackages,
   fetchRunJobs,
+  type GithubCommit,
+  type GithubCompare,
+  type GithubRelease,
 } from "@/lib/github";
+
+/**
+ * Release delta (#1480): authoritative unreleased count from the newest
+ * *stable* release (drafts/prereleases never baseline) to the pinned
+ * default-branch head.
+ *
+ * State vocabulary (persisted verbatim; consumers must never read
+ * `releaseAheadBy` as an unreleased count outside identical/ahead):
+ * - `identical` — head is the baseline commit itself; 0 unreleased.
+ * - `ahead`     — head is N commits past the baseline; `releaseAheadBy` is N.
+ * - `diverged`  — baseline is not an ancestor of head (rebase/force-push or a
+ *   head behind the tag); surfaced explicitly, count withheld.
+ * - `no-baseline` — the repo has no stable release. Distinct from "0 commits";
+ *   never a count.
+ * - `unknown`   — fail-closed (tag unresolvable, GitHub unreadable, head
+ *   unresolved, compare impossible) with a bounded error; the last good
+ *   release history is untouched.
+ *
+ * Never throws: a delta failure degrades to `unknown` + `releaseError` and
+ * leaves the rest of the sync intact.
+ */
+export type ReleaseDeltaState = "identical" | "ahead" | "diverged" | "unknown" | "no-baseline";
+
+export interface ReleaseDeltaSnapshot {
+  releaseState: ReleaseDeltaState;
+  releaseBaselineTag: string | null;
+  releaseBaselineSha: string | null;
+  releaseBaselinePublishedAt: Date | null;
+  releaseHeadSha: string | null;
+  releaseAheadBy: number | null;
+  releaseError: string | null;
+}
+
+const RELEASE_ERROR_MAX_CHARS = 500;
+
+function boundedReleaseError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (!message) return "unknown error";
+  return message.length > RELEASE_ERROR_MAX_CHARS
+    ? `${message.slice(0, RELEASE_ERROR_MAX_CHARS - 1)}…`
+    : message;
+}
+
+export interface ReleaseDeltaDeps {
+  resolveRef: (repoFullName: string, ref: string) => Promise<GithubCommit | null>;
+  compare: (repoFullName: string, baseRef: string, headRef: string) => Promise<GithubCompare | null>;
+}
+
+// Lazy wrappers: resolved at call time so test mocks of "@/lib/github" that
+// predate this export still load the module; a missing compare export then
+// fails closed into the bounded `unknown` delta below, never a crash.
+const defaultReleaseDeltaDeps: ReleaseDeltaDeps = {
+  resolveRef: (repoFullName, ref) => fetchLatestCommit(repoFullName, ref),
+  compare: (repoFullName, baseRef, headRef) => fetchCompare(repoFullName, baseRef, headRef),
+};
+
+export async function computeReleaseDelta(
+  repoFullName: string,
+  releases: GithubRelease[],
+  headSha: string | null,
+  deps: ReleaseDeltaDeps = defaultReleaseDeltaDeps
+): Promise<ReleaseDeltaSnapshot> {
+  const stable = releases
+    .filter((rel) => !rel.draft && !rel.prerelease)
+    .sort((a, b) => new Date(b.published_at).getTime() - new Date(a.published_at).getTime())[0];
+
+  if (!stable) {
+    // Distinct "no baseline" state — not 0 commits, not an error.
+    return {
+      releaseState: "no-baseline",
+      releaseBaselineTag: null,
+      releaseBaselineSha: null,
+      releaseBaselinePublishedAt: null,
+      releaseHeadSha: headSha,
+      releaseAheadBy: null,
+      releaseError: null,
+    };
+  }
+
+  const baselineInfo = {
+    releaseBaselineTag: stable.tag_name,
+    releaseBaselineSha: null as string | null,
+    releaseBaselinePublishedAt: new Date(stable.published_at),
+    releaseHeadSha: headSha,
+  };
+
+  const unknownDelta = (error: string): ReleaseDeltaSnapshot => ({
+    ...baselineInfo,
+    releaseState: "unknown",
+    releaseAheadBy: null,
+    releaseError: error.slice(0, RELEASE_ERROR_MAX_CHARS),
+  });
+
+  if (!headSha) {
+    return unknownDelta("default-branch head SHA unresolved; compare skipped");
+  }
+
+  let baselineCommit: GithubCommit | null;
+  try {
+    baselineCommit = await deps.resolveRef(repoFullName, stable.tag_name);
+  } catch (error) {
+    return unknownDelta(boundedReleaseError(error));
+  }
+  if (!baselineCommit?.sha) {
+    return unknownDelta(`release tag ${stable.tag_name} did not resolve to a commit`);
+  }
+
+  let comparison: GithubCompare | null;
+  try {
+    // Pin both endpoints to immutable SHAs (head was pinned by the caller
+    // from the same fetch that persisted latestCommitSha) so the persisted
+    // numbers describe exactly what was compared.
+    comparison = await deps.compare(repoFullName, baselineCommit.sha, headSha);
+  } catch (error) {
+    return unknownDelta(boundedReleaseError(error));
+  }
+  if (!comparison) {
+    return unknownDelta(`compare ${stable.tag_name}...${headSha} unavailable`);
+  }
+
+  const resolved = {
+    ...baselineInfo,
+    releaseBaselineSha: baselineCommit.sha,
+    releaseError: null,
+  };
+
+  // `behind` (head lacks the release commit) is not a normal unreleased
+  // state either: fold it into `diverged` rather than reporting ahead_by.
+  if (comparison.status === "behind" || comparison.status === "diverged") {
+    return { ...resolved, releaseState: "diverged", releaseAheadBy: null };
+  }
+  return {
+    ...resolved,
+    releaseState: comparison.status === "identical" ? "identical" : "ahead",
+    releaseAheadBy: comparison.aheadBy,
+  };
+}
 
 export interface AutomationSyncResult {
   success: boolean;
@@ -78,6 +219,11 @@ export async function syncAutomationRepo(repoFullName: string): Promise<Automati
     });
 
     const latestCommit = await fetchLatestCommit(repoFullName, githubRepo.default_branch);
+    const releaseDelta = await computeReleaseDelta(
+      repoFullName,
+      releases,
+      latestCommit?.sha || null
+    );
     await prisma.automationRepo.update({
       where: { id: repo.id },
       data: {
@@ -85,6 +231,8 @@ export async function syncAutomationRepo(repoFullName: string): Promise<Automati
         openPRCount: prs.filter((pr) => pr.state === "open").length,
         lastSyncedAt: new Date(),
         syncError: null,
+        ...releaseDelta,
+        releaseDeltaSyncedAt: new Date(),
       },
     });
 

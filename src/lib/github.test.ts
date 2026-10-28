@@ -1086,3 +1086,81 @@ describe("extractLogExcerpt / jobIdFromCheckRunUrl", () => {
     expect(extractLogExcerpt(huge, 2000).length).toBeLessThanOrEqual(2002);
   });
 });
+
+describe("fetchCompare", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function compareResponse(body: unknown, status = 200): Response {
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      json: () => Promise.resolve(body),
+      text: () => Promise.resolve(JSON.stringify(body)),
+      headers: new Headers(),
+    } as Response;
+  }
+
+  it("parses status and exact counts, pinning both endpoints in the URL", async () => {
+    const { fetchCompare } = await import("./github");
+    fetchMock.mockResolvedValueOnce(
+      compareResponse({
+        status: "ahead",
+        ahead_by: 1234,
+        behind_by: 0,
+        total_commits: 250,
+        commits: [{ sha: "h1" }],
+        merge_base_commit: { sha: "mb1" },
+      }),
+    );
+
+    const result = await fetchCompare("o/r", "v1.2.3", "abc123def");
+
+    expect(result).toEqual({
+      status: "ahead",
+      aheadBy: 1234,
+      behindBy: 0,
+      mergeBaseCommitSha: "mb1",
+    });
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toContain("/repos/o/r/compare/v1.2.3...abc123def");
+    // Counts stay exact even when the commit-identity list is bounded.
+    expect(url).toContain("per_page=1");
+  });
+
+  it("returns null on 404 (ref or comparison missing) without throwing", async () => {
+    const { fetchCompare } = await import("./github");
+    fetchMock.mockResolvedValueOnce(compareResponse({ message: "Not Found" }, 404));
+    expect(await fetchCompare("o/r", "nope", "head1")).toBeNull();
+  });
+
+  it("returns null on 409 (empty/conflicted repo)", async () => {
+    const { fetchCompare } = await import("./github");
+    fetchMock.mockResolvedValueOnce(compareResponse({ message: "Conflict" }, 409));
+    expect(await fetchCompare("o/r", "base1", "head1")).toBeNull();
+  });
+
+  it("returns null on an unrecognized status or missing counts", async () => {
+    const { fetchCompare } = await import("./github");
+    fetchMock
+      .mockResolvedValueOnce(compareResponse({ status: "wibble", ahead_by: 1, behind_by: 0 }))
+      .mockResolvedValueOnce(compareResponse({ status: "ahead" }));
+
+    expect(await fetchCompare("o/r", "base1", "head1")).toBeNull();
+    expect(await fetchCompare("o/r", "base1", "head1")).toBeNull();
+  });
+
+  it("throws on non-comparable failures (fail upward, caller degrades to unknown)", async () => {
+    const { fetchCompare } = await import("./github");
+    fetchMock.mockResolvedValueOnce(compareResponse({ message: "Forbidden" }, 403));
+    await expect(fetchCompare("o/r", "base1", "head1")).rejects.toThrow(/403/);
+  });
+});

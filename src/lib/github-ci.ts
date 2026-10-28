@@ -147,6 +147,66 @@ export interface GithubCommit {
   html_url: string;
 }
 
+/**
+ * Result of GitHub's compare semantics (`base...head`, three-dot: from the
+ * merge base). `aheadBy`/`behindBy` are exact commit counts — GitHub only
+ * bounds the detailed `commits` identity list, never these counts — so a
+ * large delta keeps its correct total even though no commit list is kept.
+ */
+export interface GithubCompare {
+  status: "ahead" | "behind" | "identical" | "diverged";
+  aheadBy: number;
+  behindBy: number;
+  mergeBaseCommitSha: string | null;
+}
+
+const COMPARE_STATUSES = new Set(["ahead", "behind", "identical", "diverged"]);
+
+/**
+ * Compare two refs (branch, tag, or SHA). Returns null when the comparison
+ * is impossible — a missing ref (404), an empty/conflicted repo (409), or an
+ * unrecognized status — so callers fail closed to "unknown" instead of
+ * manufacturing a count. Other failures (rate limit, outage) throw.
+ */
+export async function fetchCompare(
+  repoFullName: string,
+  baseRef: string,
+  headRef: string
+): Promise<GithubCompare | null> {
+  const basehead = `${baseRef}...${headRef}`;
+  // per_page=1: only the counts matter; keep the commit-identity payload bounded.
+  const response = await fetchWithRetry(
+    `${GITHUB_API}/repos/${repoFullName}/compare/${encodeURIComponent(basehead)}?per_page=1`,
+    { headers: await getHeadersAsync() }
+  );
+  if (!response.ok) {
+    if (response.status === 404 || response.status === 409) return null;
+    const text = await response.text();
+    throw new Error(`Failed to compare ${basehead} for ${repoFullName}: ${response.status} ${text}`);
+  }
+  const data = (await response.json()) as {
+    status?: unknown;
+    ahead_by?: unknown;
+    behind_by?: unknown;
+    merge_base_commit?: { sha?: unknown };
+  };
+  if (
+    typeof data.status !== "string" ||
+    !COMPARE_STATUSES.has(data.status) ||
+    typeof data.ahead_by !== "number" ||
+    typeof data.behind_by !== "number"
+  ) {
+    return null;
+  }
+  return {
+    status: data.status as GithubCompare["status"],
+    aheadBy: data.ahead_by,
+    behindBy: data.behind_by,
+    mergeBaseCommitSha:
+      typeof data.merge_base_commit?.sha === "string" ? data.merge_base_commit.sha : null,
+  };
+}
+
 export async function fetchLatestCommit(repoFullName: string, branch: string): Promise<GithubCommit | null> {
   const response = await fetchWithRetry(
     `${GITHUB_API}/repos/${repoFullName}/commits/${branch}?per_page=1`,

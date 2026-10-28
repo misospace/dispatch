@@ -49,6 +49,7 @@ describe("github domain modules expose expected exports", () => {
     expect(Object.keys(Ci).sort()).toEqual([
       "extractLogExcerpt",
       "fetchCommitDate",
+      "fetchCompare",
       "fetchFailedJobLogExcerpt",
       "fetchLatestCommit",
       "fetchPackages",
@@ -100,7 +101,7 @@ describe("github domain modules expose expected exports", () => {
       "updateIssueTitleAndBody", "removeIssueLabel", "syncStatusLabels", "closeIssue",
       "fetchRepo", "fetchWorkflows", "fetchWorkflowRuns", "fetchRecentRunsAllWorkflows",
       "fetchRunJobs", "fetchReleases", "fetchPackages", "rerunWorkflow",
-      "triggerWorkflowDispatch", "fetchLatestCommit", "jobIdFromCheckRunUrl",
+      "triggerWorkflowDispatch", "fetchLatestCommit", "fetchCompare", "jobIdFromCheckRunUrl",
       "extractLogExcerpt", "fetchFailedJobLogExcerpt",
       "fetchPullRequests", "fetchClosedPullRequests", "fetchPullRequestHealthSignals",
       "fetchPullRequestState", "fetchPullRequestMergeState", "fetchPullRequestCheckFailures",

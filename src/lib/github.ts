@@ -39,6 +39,8 @@ export {
   triggerWorkflowDispatch,
   type GithubCommit,
   fetchLatestCommit,
+  type GithubCompare,
+  fetchCompare,
   jobIdFromCheckRunUrl,
   extractLogExcerpt,
   fetchFailedJobLogExcerpt,

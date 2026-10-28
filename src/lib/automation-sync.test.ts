@@ -47,6 +47,7 @@ vi.mock("@/lib/github", () => ({
   // the tests that care about merge persistence stub it explicitly.
   fetchClosedPullRequests: vi.fn().mockResolvedValue([]),
   fetchLatestCommit: vi.fn(),
+  fetchCompare: vi.fn(),
   fetchPackages: vi.fn(),
   fetchRunJobs: vi.fn(),
 }));
@@ -54,7 +55,7 @@ vi.mock("@/lib/github", () => ({
 import { prisma } from "@/lib/prisma";
 import * as github from "@/lib/github";
 
-import { syncAutomationRepo } from "./automation-sync";
+import { computeReleaseDelta, syncAutomationRepo } from "./automation-sync";
 
 const upsertRepo = prisma.automationRepo.upsert as ReturnType<typeof vi.fn>;
 const updateRepo = prisma.automationRepo.update as ReturnType<typeof vi.fn>;
@@ -927,5 +928,295 @@ describe("syncAutomationRepo", () => {
         }),
       );
     });
+  });
+});
+describe("release delta (#1480)", () => {
+  const upsertRepo2 = prisma.automationRepo.upsert as ReturnType<typeof vi.fn>;
+  const fetchCompareMock = github.fetchCompare as ReturnType<typeof vi.fn>;
+
+  function rel(overrides: Partial<{
+    id: number;
+    tag_name: string;
+    draft: boolean;
+    prerelease: boolean;
+    published_at: string;
+  }> = {}) {
+    return {
+      id: overrides.id ?? 1,
+      tag_name: overrides.tag_name ?? "v1.0.0",
+      name: "Release",
+      draft: overrides.draft ?? false,
+      prerelease: overrides.prerelease ?? false,
+      target_commitish: "main",
+      html_url: "https://github.com/o/r/releases/tag/v1.0.0",
+      published_at: overrides.published_at ?? "2024-01-01T00:00:00Z",
+    };
+  }
+
+  function deltaDeps(
+    {
+      resolvedSha = "basesha1",
+      comparison = { status: "ahead", aheadBy: 3, behindBy: 0, mergeBaseCommitSha: "basesha1" },
+      resolveError,
+      compareError,
+    }: {
+      resolvedSha?: string | null;
+      comparison?: { status: string; aheadBy: number; behindBy: number; mergeBaseCommitSha: string | null } | null;
+      resolveError?: Error;
+      compareError?: Error;
+    } = {},
+  ) {
+    return {
+      resolveRef: resolveError
+        ? vi.fn().mockRejectedValue(resolveError)
+        : vi.fn().mockResolvedValue(resolvedSha === null ? null : { sha: resolvedSha }),
+      compare: compareError
+        ? vi.fn().mockRejectedValue(compareError)
+        : vi.fn().mockResolvedValue(comparison),
+    };
+  }
+
+  it("reports identical with 0 unreleased when head sits on the release commit", async () => {
+    const deps = deltaDeps({
+      resolvedSha: "same123",
+      comparison: { status: "identical", aheadBy: 0, behindBy: 0, mergeBaseCommitSha: "same123" },
+    });
+
+    const delta = await computeReleaseDelta("o/r", [rel()], "same123", deps);
+
+    expect(delta.releaseState).toBe("identical");
+    expect(delta.releaseAheadBy).toBe(0);
+    expect(delta.releaseBaselineSha).toBe("same123");
+    expect(delta.releaseHeadSha).toBe("same123");
+    expect(delta.releaseError).toBeNull();
+  });
+
+  it("reports N ahead with the exact pinned baseline and head SHAs", async () => {
+    const deps = deltaDeps();
+
+    const delta = await computeReleaseDelta("o/r", [rel()], "headsha9", deps);
+
+    expect(delta.releaseState).toBe("ahead");
+    expect(delta.releaseAheadBy).toBe(3);
+    expect(deps.compare).toHaveBeenCalledWith("o/r", "basesha1", "headsha9");
+    expect(delta.releaseBaselineSha).toBe("basesha1");
+    expect(delta.releaseHeadSha).toBe("headsha9");
+    expect(delta.releaseBaselinePublishedAt).toEqual(new Date("2024-01-01T00:00:00Z"));
+  });
+
+  it("never lets a newer draft or prerelease replace the stable baseline", async () => {
+    const deps = deltaDeps();
+    const releases = [
+      rel({ id: 3, tag_name: "v2.0.0-rc1", prerelease: true, published_at: "2024-06-01T00:00:00Z" }),
+      rel({ id: 2, tag_name: "v2.0.0-draft", draft: true, published_at: "2024-05-01T00:00:00Z" }),
+      rel({ id: 1, tag_name: "v1.0.0", published_at: "2024-01-01T00:00:00Z" }),
+    ];
+
+    const delta = await computeReleaseDelta("o/r", releases, "headsha9", deps);
+
+    expect(delta.releaseBaselineTag).toBe("v1.0.0");
+    expect(deps.resolveRef).toHaveBeenCalledWith("o/r", "v1.0.0");
+  });
+
+  it("reports a distinct no-baseline state when there is no stable release", async () => {
+    const deps = deltaDeps();
+
+    const delta = await computeReleaseDelta(
+      "o/r",
+      [rel({ prerelease: true }), rel({ draft: true })],
+      "headsha9",
+      deps,
+    );
+
+    expect(delta.releaseState).toBe("no-baseline");
+    expect(delta.releaseAheadBy).toBeNull();
+    expect(delta.releaseError).toBeNull();
+    expect(delta.releaseHeadSha).toBe("headsha9");
+    expect(deps.resolveRef).not.toHaveBeenCalled();
+    expect(deps.compare).not.toHaveBeenCalled();
+  });
+
+  it("reports unknown when the release tag cannot be resolved", async () => {
+    const deps = deltaDeps({ resolvedSha: null });
+
+    const delta = await computeReleaseDelta("o/r", [rel({ tag_name: "v9.9.9" })], "headsha9", deps);
+
+    expect(delta.releaseState).toBe("unknown");
+    expect(delta.releaseAheadBy).toBeNull();
+    expect(delta.releaseBaselineTag).toBe("v9.9.9");
+    expect(delta.releaseBaselineSha).toBeNull();
+    expect(delta.releaseError).toContain("v9.9.9");
+    expect(deps.compare).not.toHaveBeenCalled();
+  });
+
+  it("fails closed to unknown with a bounded error when the forge read throws", async () => {
+    const deps = deltaDeps({ resolveError: new Error("boom ".repeat(400)) });
+
+    const delta = await computeReleaseDelta("o/r", [rel()], "headsha9", deps);
+
+    expect(delta.releaseState).toBe("unknown");
+    expect(delta.releaseAheadBy).toBeNull();
+    expect(delta.releaseError!.length).toBeLessThanOrEqual(500);
+  });
+
+  it("fails closed to unknown when the compare call fails or is unavailable", async () => {
+    const thrown = await computeReleaseDelta("o/r", [rel()], "headsha9", deltaDeps({ compareError: new Error("502 upstream") }));
+    expect(thrown.releaseState).toBe("unknown");
+    expect(thrown.releaseError).toContain("502 upstream");
+
+    const unavailable = await computeReleaseDelta("o/r", [rel()], "headsha9", deltaDeps({ comparison: null }));
+    expect(unavailable.releaseState).toBe("unknown");
+    expect(unavailable.releaseAheadBy).toBeNull();
+  });
+
+  it("surfaces diverged and behind comparisons as divergence without an ahead count", async () => {
+    for (const status of ["diverged", "behind"] as const) {
+      const delta = await computeReleaseDelta(
+        "o/r",
+        [rel()],
+        "headsha9",
+        deltaDeps({ comparison: { status, aheadBy: 12, behindBy: 4, mergeBaseCommitSha: "mb" } }),
+      );
+      expect(delta.releaseState).toBe("diverged");
+      expect(delta.releaseAheadBy).toBeNull();
+      expect(delta.releaseBaselineSha).toBe("basesha1");
+    }
+  });
+
+  it("reports unknown when the default-branch head itself is unresolved", async () => {
+    const deps = deltaDeps();
+
+    const delta = await computeReleaseDelta("o/r", [rel()], null, deps);
+
+    expect(delta.releaseState).toBe("unknown");
+    expect(delta.releaseHeadSha).toBeNull();
+    expect(delta.releaseError).toContain("head SHA unresolved");
+    expect(deps.compare).not.toHaveBeenCalled();
+  });
+
+  it("is idempotent for repeated syncs of the same baseline/head", async () => {
+    const first = await computeReleaseDelta("o/r", [rel()], "headsha9", deltaDeps());
+    const second = await computeReleaseDelta("o/r", [rel()], "headsha9", deltaDeps());
+    expect(second).toEqual(first);
+  });
+
+  function stubDeltaSync(
+    {
+      releases = [rel()],
+      headSha = "headsha1",
+      baselineSha = "basesha1",
+      comparison = { status: "ahead", aheadBy: 7, behindBy: 0, mergeBaseCommitSha: "basesha1" },
+      compareError,
+    }: {
+      releases?: ReturnType<typeof rel>[];
+      headSha?: string | null;
+      baselineSha?: string | null;
+      comparison?: unknown;
+      compareError?: Error;
+    } = {},
+  ) {
+    // This describe sits outside the outer beforeEach (clearAllMocks), so
+    // drop queued Once values from earlier suites before stubbing.
+    for (const mock of [
+      upsertRepo2, createSyncRun, fetchRepoMock, fetchWorkflowsMock, fetchRunsMock,
+      fetchReleasesMock, fetchPRsMock, fetchClosedPRsMock, fetchPackagesMock,
+      fetchCommitMock, fetchCompareMock, updateSyncRun, updateRepo, createEvent,
+    ]) {
+      mock.mockReset();
+    }
+    upsertRepo2.mockResolvedValue(repoStub());
+    createSyncRun.mockResolvedValue(syncRunStub());
+    fetchRepoMock.mockResolvedValue({ name: "r", owner: { login: "o" }, default_branch: "main" });
+    fetchWorkflowsMock.mockResolvedValue([]);
+    fetchRunsMock.mockResolvedValue([]);
+    fetchReleasesMock.mockResolvedValue(releases);
+    fetchPRsMock.mockResolvedValue([]);
+    fetchClosedPRsMock.mockResolvedValue([]);
+    fetchPackagesMock.mockResolvedValue([]);
+    fetchCommitMock.mockImplementation(async (_repo: string, ref: string) => {
+      if (ref === "main") return headSha === null ? null : { sha: headSha };
+      return baselineSha === null ? null : { sha: baselineSha };
+    });
+    if (compareError) {
+      fetchCompareMock.mockRejectedValue(compareError);
+    } else {
+      fetchCompareMock.mockResolvedValue(comparison);
+    }
+    updateSyncRun.mockResolvedValue({});
+    updateRepo.mockResolvedValue({});
+    createEvent.mockResolvedValue({});
+  }
+
+  it("persists the delta snapshot alongside the sync head", async () => {
+    stubDeltaSync();
+
+    const result = await syncAutomationRepo("o/r");
+
+    expect(result.success).toBe(true);
+    expect(updateRepo).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          latestCommitSha: "headsha1",
+          releaseState: "ahead",
+          releaseBaselineTag: "v1.0.0",
+          releaseBaselineSha: "basesha1",
+          releaseBaselinePublishedAt: new Date("2024-01-01T00:00:00Z"),
+          releaseHeadSha: "headsha1",
+          releaseAheadBy: 7,
+          releaseError: null,
+        }),
+      }),
+    );
+    const data = updateRepo.mock.calls.find(
+      (call) => (call[0] as { data?: Record<string, unknown> }).data?.releaseState !== undefined,
+    )?.[0] as { data: Record<string, unknown> };
+    expect(data.data.releaseDeltaSyncedAt).toBeInstanceOf(Date);
+  });
+
+  it("keeps the sync successful when the compare read fails (fail-closed snapshot)", async () => {
+    stubDeltaSync({ compareError: new Error("compare 503 unavailable") });
+
+    const result = await syncAutomationRepo("o/r");
+
+    expect(result.success).toBe(true);
+    expect(updateRepo).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          latestCommitSha: "headsha1",
+          releaseState: "unknown",
+          releaseAheadBy: null,
+          releaseError: expect.stringContaining("503"),
+        }),
+      }),
+    );
+  });
+
+  it("resets the baseline to the newer stable release on the next sync", async () => {
+    stubDeltaSync({ releases: [rel({ id: 1, tag_name: "v1.0.0" })] });
+    await syncAutomationRepo("o/r");
+    expect(updateRepo).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ releaseBaselineTag: "v1.0.0" }),
+      }),
+    );
+
+    stubDeltaSync({
+      releases: [
+        rel({ id: 2, tag_name: "v2.0.0", published_at: "2024-07-01T00:00:00Z" }),
+        rel({ id: 1, tag_name: "v1.0.0" }),
+      ],
+      baselineSha: "basesha2",
+      comparison: { status: "ahead", aheadBy: 1, behindBy: 0, mergeBaseCommitSha: "basesha2" },
+    });
+    await syncAutomationRepo("o/r");
+    expect(updateRepo).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          releaseBaselineTag: "v2.0.0",
+          releaseBaselineSha: "basesha2",
+          releaseAheadBy: 1,
+        }),
+      }),
+    );
   });
 });

@@ -683,6 +683,21 @@ model AutomationRepo {
   lastSyncedAt    DateTime @default(now())
   syncError       String?
   source          String   @default("env")
+
+  // Release delta (#1480): durable snapshot of latest-stable-release → head.
+  // releaseState: "identical" | "ahead" | "diverged" | "unknown" | "no-baseline";
+  // null means never computed. Counts are only meaningful when the state is
+  // identical/ahead — never present releaseAheadBy as an unreleased count for
+  // diverged/unknown/no-baseline.
+  releaseState               String    @default("unknown")
+  releaseBaselineTag         String?
+  releaseBaselineSha         String?
+  releaseBaselinePublishedAt DateTime?
+  releaseHeadSha             String?
+  releaseAheadBy             Int?
+  releaseError               String?
+  releaseDeltaSyncedAt       DateTime?
+
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
