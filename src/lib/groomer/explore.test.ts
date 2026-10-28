@@ -492,6 +492,27 @@ describe("exploreRepository investigation gaps (dispatch#1452)", () => {
     expect(result.findings).not.toContain("## Investigation gaps");
   });
 
+  it("does not report exhausted rounds when the model submits on the final round", async () => {
+    // The last round is the one the model is told to wrap up on, and it is
+    // also the round the loop is allowed to end on. A submission there is a
+    // completed investigation: no fact may turn it into an incomplete one
+    // (dispatch#1452), or a clean human question would be misread as a
+    // broken investigation.
+    const fetchImpl = fetchReturning(
+      { content: null, tool_calls: [toolCall("1", "search_code", { query: "x" })] },
+      { content: null, tool_calls: [toolCall("2", "submit_findings", { files: ["src/a.ts"], ask: "do the thing" })] },
+    );
+    const deps = makeDeps({ searchCode: vi.fn().mockResolvedValue([{ path: "a.ts" }]) }, fetchImpl);
+
+    const result = await exploreRepository({ ...options, maxRounds: 2 }, deps);
+
+    expect(result.ask).toBe("do the thing");
+    expect(result.gaps.roundsExhausted).toBe(false);
+    expect(result.gaps.toolFailures).toEqual([]);
+    expect(result.gaps.budgetExhausted).toBe(false);
+    expect(result.findings).not.toContain("## Investigation gaps");
+  });
+
   it("names a failed tool call in the gaps and in the findings", async () => {
     const fetchImpl = fetchReturning(
       { content: null, tool_calls: [toolCall("1", "read_file", { path: "missing.ts" })] },

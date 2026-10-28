@@ -321,6 +321,35 @@ describe("IssueCard superseded grooming reasons (#1453)", () => {
     expect(screen.getByTestId("needs-info-reason")).toHaveTextContent("Need reproduction steps");
   });
 
+  it("renders a machine-prefixed needs-info reason verbatim", () => {
+    // The groomer stores the gap class as a machine prefix (dispatch#1452).
+    // The card is a display-only consumer: it must show the stored text as
+    // given, prefix included, and never drop or mangle it.
+    const issue = makeIssue({
+      nextGroomingAction: "mark_needs_info",
+      needsInfoReason: "human_question(product_decision): which tenant?",
+    });
+
+    render(React.createElement(IssueCard, { issue }));
+
+    expect(screen.getByTestId("needs-info-reason")).toHaveTextContent(
+      "human_question(product_decision): which tenant?",
+    );
+  });
+
+  it("renders an investigation-incomplete needs-info reason verbatim", () => {
+    const issue = makeIssue({
+      nextGroomingAction: "mark_needs_info",
+      needsInfoReason: "investigation_incomplete: the search timed out",
+    });
+
+    render(React.createElement(IssueCard, { issue }));
+
+    expect(screen.getByTestId("needs-info-reason")).toHaveTextContent(
+      "investigation_incomplete: the search timed out",
+    );
+  });
+
   it("still renders the dependency annotation when the verdict supersedes groomer reasons", () => {
     const issue = makeIssue({
       nextGroomingAction: "promote_to_ready",
