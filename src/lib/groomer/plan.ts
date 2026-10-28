@@ -64,6 +64,8 @@ export const PATH_CHANGE_VALUES = ["modify", "reference"] as const;
 export const DEPENDENCY_STATE_VALUES = ["open", "closed", "merged", "unknown"] as const;
 export const CLOSE_REASON_VALUES = ["already_done", "duplicate", "superseded"] as const;
 export const RELATION_VALUES = ["duplicate_of", "superseded_by", "related"] as const;
+export const RELEASE_SIGNAL_KIND_VALUES = ["feature", "fix", "architecture", "internal"] as const;
+export const RELEASE_SIGNAL_SIGNIFICANCE_VALUES = ["routine", "notable", "major"] as const;
 
 export type Actionability = (typeof ACTIONABILITY_VALUES)[number];
 export type Confidence = (typeof CONFIDENCE_VALUES)[number];
@@ -74,6 +76,8 @@ export type PathChange = (typeof PATH_CHANGE_VALUES)[number];
 export type DependencyState = (typeof DEPENDENCY_STATE_VALUES)[number];
 export type CloseReason = (typeof CLOSE_REASON_VALUES)[number];
 export type RelatedWorkRelation = (typeof RELATION_VALUES)[number];
+export type ReleaseSignalKind = (typeof RELEASE_SIGNAL_KIND_VALUES)[number];
+export type ReleaseSignalSignificance = (typeof RELEASE_SIGNAL_SIGNIFICANCE_VALUES)[number];
 
 /**
  * Labels the plan may add or remove directly. Status is not here: it is
@@ -104,6 +108,8 @@ export const PLAN_LIMITS = {
   comment: 4000,
   /** already_done criterion evidence (dispatch#1099). */
   closeCriteria: 12,
+  /** releaseSignal.headline (dispatch#1481): one bounded dashboard sentence. */
+  releaseHeadline: 120,
   /** Before whitespace normalisation; the grounding check applies MIN_EXCERPT_CHARS after it. */
   excerptMin: 24,
   excerpt: 300,
@@ -224,6 +230,21 @@ export interface RelatedWorkCandidate {
   note: string;
 }
 
+/**
+ * Semantic-only release metadata for the issue itself (dispatch#1481): what
+ * the issue represents if/when it is delivered. It never means shipped or
+ * done — delivery stays authoritative to GitHub state and lifecycle evidence
+ * elsewhere — and it affects nothing operational: no lane, priority,
+ * readiness, admission or pickup change. Null when the work has no
+ * release-facing meaning.
+ */
+export interface ReleaseSignal {
+  kind: ReleaseSignalKind;
+  headline: string;
+  significance: ReleaseSignalSignificance;
+  evidenceRefs: string[];
+}
+
 /** What the model emits. */
 export interface GroomingPlanDraft {
   verdict: GroomingVerdict;
@@ -231,6 +252,14 @@ export interface GroomingPlanDraft {
   mutations: GroomingMutationIntent;
   decomposition: GroomingDecomposition;
   relatedWork: RelatedWorkCandidate[];
+  /**
+   * Semantic-only metadata describing what the issue represents if/when
+   * delivered (dispatch#1481); never means shipped/done, and does not affect
+   * readiness, lane, status, admission or pickup. Null when the work has no
+   * release-facing meaning. Optional like verdict.infoGap, so pre-#1481
+   * drafts stay constructible.
+   */
+  releaseSignal?: ReleaseSignal | null;
 }
 
 export interface GroomingPlanCitation {
@@ -523,7 +552,7 @@ function parseDraft(data: Obj, r: Reader): GroomingPlanDraft {
     };
   });
 
-  return { verdict, implementationBrief, mutations, decomposition, relatedWork };
+  return { verdict, implementationBrief, mutations, decomposition, relatedWork, releaseSignal: parseReleaseSignal(data.releaseSignal, r) };
 }
 
 /**
@@ -542,6 +571,24 @@ function parseInfoGap(value: unknown, r: Reader): InfoGap | null {
   };
 }
 
+/**
+ * Optional semantic-only release metadata (dispatch#1481): absent/null is
+ * null. An out-of-vocabulary kind or significance is a reader error (an
+ * invalid plan); the enum fallback only fills the returned value after the
+ * error is recorded, never to silently accept the input.
+ */
+function parseReleaseSignal(value: unknown, r: Reader): ReleaseSignal | null {
+  if (value === undefined || value === null) return null;
+  const path = "releaseSignal";
+  const s = r.object(value, path);
+  return {
+    kind: r.enumValue(s.kind, `${path}.kind`, RELEASE_SIGNAL_KIND_VALUES, "internal"),
+    headline: r.text(s.headline, `${path}.headline`, PLAN_LIMITS.releaseHeadline),
+    significance: r.enumValue(s.significance, `${path}.significance`, RELEASE_SIGNAL_SIGNIFICANCE_VALUES, "routine"),
+    evidenceRefs: r.textList(s.evidenceRefs, `${path}.evidenceRefs`, PLAN_LIMITS.evidenceRefs, PLAN_LIMITS.shortText),
+  };
+}
+
 // ─── Evidence checks ──────────────────────────────────────────────────────────
 
 interface CitedRef {
@@ -549,6 +596,12 @@ interface CitedRef {
   id: string;
   /** Required subject for this position, if any. */
   subject?: EvidenceSubject;
+  /**
+   * Validated but not relied upon (dispatch#1481): a semantic-only citation
+   * must exist in the catalog but never feeds plan.citations, so it cannot
+   * drive deriveEvidenceReliance or the freshness baseline.
+   */
+  semanticOnly?: boolean;
 }
 
 function citedRefs(draft: GroomingPlanDraft): CitedRef[] {
@@ -573,6 +626,13 @@ function citedRefs(draft: GroomingPlanDraft): CitedRef[] {
     refs.push({ path: `mutations.close.criteria[${i}].evidenceRef`, id: c.evidenceRef, subject: "repository" }),
   );
   draft.relatedWork.forEach((w, i) => refs.push({ path: `relatedWork[${i}].ref`, id: w.ref, subject: "related_work" }));
+  // The release signal describes the issue's own meaning (dispatch#1481), so
+  // any evidence id it cites is acceptable — issue, comment, repo, related
+  // work — no subject is required, and the refs are validated but flagged
+  // semantic-only: they never become citations the plan is held to.
+  draft.releaseSignal?.evidenceRefs.forEach((id, i) =>
+    refs.push({ path: `releaseSignal.evidenceRefs[${i}]`, id, semanticOnly: true }),
+  );
   return refs;
 }
 
@@ -921,7 +981,12 @@ export function validateGroomingPlan(data: unknown, context: GroomingPlanValidat
     };
   }
 
-  const citationIds = [...new Set(citedRefs(draft).map((ref) => ref.id))];
+  // Citations are the ids the plan RELIES on. The release signal's refs
+  // (dispatch#1481) were validated against the catalog above but are excluded
+  // here: citations feed deriveEvidenceReliance and the freshness baseline,
+  // and letting a signal-only ref be relied on would make the semantic-only
+  // signal operational (it could change whether a groom applies or stales).
+  const citationIds = [...new Set(citedRefs(draft).filter((ref) => !ref.semanticOnly).map((ref) => ref.id))];
   const citations: GroomingPlanCitation[] = citationIds.map((id) => {
     const entry = byId.get(id)!;
     return {

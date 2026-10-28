@@ -30,7 +30,7 @@ import {
 import { getBacklogLane } from "@/lib/lane-config";
 import { isAutomationAuthor } from "./context";
 import { neutralizeMentions, sanitizeModelText } from "./sanitize";
-import { inFlightStatus, toGroomerOutput, type ChildBrief, type GroomingPlan } from "./plan";
+import { inFlightStatus, toGroomerOutput, type ChildBrief, type GroomingPlan, type ReleaseSignal } from "./plan";
 import type { EvidenceCatalog } from "./plan-evidence";
 import type { GroomerOutput } from "./schema";
 import {
@@ -42,6 +42,12 @@ import {
 } from "./mutation-validator";
 
 /**
+ * v3 (dispatch#1481): the canonical intent shape gained `releaseSignal`, so
+ * every stored v2 key was computed under the old shape. The field addition
+ * changes hashes regardless, so stored keys are deliberately invalidated once
+ * at deploy: the first post-deploy groom of an already-groomed issue is
+ * applied again under its fresh v3 key before idempotency resumes.
+ *
  * v2 (dispatch#1461): the persisted verdict reason — and the verdict action
  * that decides the field it persists to — joined the application intent, so a
  * key recorded under v1 can never match a post-deploy key. The
@@ -52,7 +58,7 @@ import {
  * comment re-posts, subject to the comment cooldown) before the new key is
  * claimed and idempotency resumes.
  */
-export const APPLICATION_KEY_VERSION = 2;
+export const APPLICATION_KEY_VERSION = 3;
 export const MAX_GITHUB_COMMENT_CHARS = 4096;
 /**
  * The largest body the applier will write to GitHub. GitHub's issue body cap
@@ -318,6 +324,14 @@ export interface GroomingMutationDiff {
   persistedReason: string | null;
   /** The plan's decomposition intent; null when the plan does not decompose. */
   children: DecompositionIntent | null;
+  /**
+   * The canonical release signal this application persists on the issue row
+   * (dispatch#1481) — the plan's projection content without provenance — null
+   * when none. Part of the application intent, so a signal-only re-groom is
+   * applied (the projection is never replayed with an obsolete signal) and an
+   * identical re-groom replays. Semantic-only: it never means shipped.
+   */
+  releaseSignal: ReleaseSignal | null;
 }
 
 export interface MutationDiffInput {
@@ -501,6 +515,7 @@ export function computeMutationDiff(input: MutationDiffInput): GroomingMutationD
     close: done && live.state === "open" && inFlightStatus(live.labels) === null,
     persistedReason,
     children,
+    releaseSignal: effective.releaseSignal ?? null,
   };
 }
 
@@ -537,6 +552,11 @@ export function computeApplicationKey(input: {
       // that leaves the reason text identical is still a new application.
       reason: diff.persistedReason,
       action: diff.output.nextGroomingAction ?? null,
+      // The release signal is part of the intent (dispatch#1481): a re-groom
+      // that changes only release semantics is applied so the projection never
+      // replays an obsolete signal; it rides the existing application key
+      // rather than a second mechanism.
+      releaseSignal: diff.releaseSignal,
       // The decomposition is part of the intent: its children are the stable
       // childBriefKeys, so a change to the split (or its withholding) changes
       // the application key. Sorted, because the brief order is not identity —
@@ -749,6 +769,13 @@ export interface ApplyResult {
   /** The run that first claimed this key, when it was not this run. */
   claimedByRunId: string | null;
   commentUrl: string | null;
+  /**
+   * Replay-only: when the applied record was last written (its finalize save),
+   * so the caller can order this application against issue writes that landed
+   * after it — e.g. a release-signal projection a newer application already
+   * owns. Null when the store does not expose a timestamp.
+   */
+  appliedRecordedAt: string | null;
   /** Labels on GitHub after this attempt, as far as the recorded steps show. */
   labels: string[];
   /** Child issues created or reused this attempt, in brief order. */
@@ -844,6 +871,7 @@ export async function applyGroomingMutations(
   const nothing = {
     claimedByRunId,
     commentUrl: null,
+    appliedRecordedAt: null as string | null,
     labels: diff.labelsBefore,
     children: [] as ChildIssueLink[],
     title: null,
@@ -879,6 +907,7 @@ export async function applyGroomingMutations(
       ...nothing,
       commentUrl,
       children,
+      appliedRecordedAt: existing.updatedAt ? new Date(existing.updatedAt).toISOString() : null,
     };
   }
 
@@ -1201,6 +1230,7 @@ export async function applyGroomingMutations(
     steps,
     claimedByRunId,
     commentUrl,
+    appliedRecordedAt: null,
     labels,
     children: appliedChildren,
     title: landed(steps.content) && diff.title !== null ? diff.title : null,

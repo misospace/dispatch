@@ -384,7 +384,14 @@ describe("callGroomerLLM transient retry", () => {
 describe("buildGroomerResponseSchema", () => {
   it("is the GroomingPlan schema: sections required, extras forbidden, lanes from config", () => {
     const schema = buildGroomerResponseSchema() as any;
-    expect(schema.required).toEqual(["verdict", "implementationBrief", "mutations", "decomposition", "relatedWork"]);
+    expect(schema.required).toEqual([
+      "verdict",
+      "implementationBrief",
+      "mutations",
+      "decomposition",
+      "relatedWork",
+      "releaseSignal",
+    ]);
     expect(schema.additionalProperties).toBe(false);
     const lane = schema.properties.verdict.properties.lane;
     expect(lane.required).toEqual(["id", "confidence", "reason"]);

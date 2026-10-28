@@ -37,7 +37,7 @@ describe("buildGroomingPlanResponseSchema", () => {
   const schema = buildGroomingPlanResponseSchema(buildEvidenceCatalog(snapshot)) as Node;
 
   it("requires every section and forbids extra properties on every object", () => {
-    expect(schema.required).toEqual(["verdict", "implementationBrief", "mutations", "decomposition", "relatedWork"]);
+    expect(schema.required).toEqual(["verdict", "implementationBrief", "mutations", "decomposition", "relatedWork", "releaseSignal"]);
     walk(schema, (n, path) => {
       if (n.type === "object" && n.properties) {
         expect(n.additionalProperties, path).toBe(false);
@@ -136,6 +136,24 @@ describe("buildGroomingPlanResponseSchema", () => {
   it("falls back to bounded strings without a catalog", () => {
     const plain = buildGroomingPlanResponseSchema() as Node;
     expect(plain.properties.verdict.properties.evidenceRefs.items).toMatchObject({ type: "string", maxLength: 300 });
+  });
+
+  it("carries the release signal as a required nullable object (dispatch#1481)", () => {
+    const releaseSignal = schema.properties.releaseSignal;
+    expect(releaseSignal.anyOf[0]).toEqual({ type: "null" });
+    const filled = releaseSignal.anyOf[1];
+    expect(filled.required).toEqual(["kind", "headline", "significance", "evidenceRefs"]);
+    expect(filled.properties.kind.enum).toEqual(["feature", "fix", "architecture", "internal"]);
+    expect(filled.properties.significance.enum).toEqual(["routine", "notable", "major"]);
+    expect(filled.properties.headline).toMatchObject({ type: "string", maxLength: 120 });
+    expect(filled.properties.evidenceRefs.items.enum).toEqual(["issue", "comment:5", "repo:src/a.ts", "github:pr:org/repo#2"]);
+  });
+
+  it("grammar-rejects an out-of-vocabulary release signal kind (dispatch#1481)", () => {
+    const kind = schema.properties.releaseSignal.anyOf[1].properties.kind;
+    expect(kind.type).toBe("string");
+    expect(kind.enum).not.toContain("shipped");
+    expect(kind.enum).not.toContain("delivered");
   });
 
   it("contains no provider or model names", () => {

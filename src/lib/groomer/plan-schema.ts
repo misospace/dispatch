@@ -10,6 +10,8 @@ import {
   PLAN_LABELS,
   PLAN_LIMITS as L,
   RELATION_VALUES,
+  RELEASE_SIGNAL_KIND_VALUES,
+  RELEASE_SIGNAL_SIGNIFICANCE_VALUES,
   UNCERTAINTY_KIND_VALUES,
   VERIFICATION_VALUES,
   WORK_TYPE_VALUES,
@@ -165,5 +167,15 @@ export function buildGroomingPlanResponseSchema(catalog?: EvidenceCatalog): Sche
     relatedWork: relatedRef && relatedRef.length === 0
       ? { type: "array", items: { type: "object" }, maxItems: 0 }
       : list(obj({ ref: ref(relatedRef), relation: enumOf(RELATION_VALUES), note: str(L.shortText) }), L.relatedWork),
+    // Semantic-only release metadata (dispatch#1481); null when the work has
+    // no release-facing meaning.
+    releaseSignal: nullable(
+      obj({
+        kind: enumOf(RELEASE_SIGNAL_KIND_VALUES),
+        headline: str(L.releaseHeadline),
+        significance: enumOf(RELEASE_SIGNAL_SIGNIFICANCE_VALUES),
+        evidenceRefs: refs(anyRef, L.evidenceRefs),
+      }),
+    ),
   });
 }
