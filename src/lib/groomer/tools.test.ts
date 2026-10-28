@@ -1090,6 +1090,17 @@ describe("executeGroomerTool read_file bounded ranges (dispatch#1451)", () => {
     expect(head.content).toContain("to continue, call again with startLine=2");
     expect(head.content).not.toContain("exceeds the byte limit");
     expect(head.bytes).toBeLessThanOrEqual(87);
+
+    // Same cut on a one-line file: the line was shown whole and there is no
+    // next line, so the marker claims no continuation.
+    const lone = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "b.ts" } },
+      { ...options, maxFileBytes: 6, maxTotalBytesRemaining: 87 },
+      makeDeps({ readFile: vi.fn().mockResolvedValue("abcdef\n") }),
+    );
+    expect(lone.content).toContain("(truncated) no further lines");
+    expect(lone.content).not.toMatch(/startLine=\d/);
+    expect(lone.bytes).toBeLessThanOrEqual(87);
   });
 
   it("caps the returned lines at the per-call line cap", async () => {

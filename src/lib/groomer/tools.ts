@@ -1223,7 +1223,9 @@ export async function executeGroomerTool(
               ? totalLines > 1
                 ? `\n… (truncated) line 1 exceeds the byte limit; call again with startLine=2`
                 : `\n… (truncated) line 1 exceeds the byte limit; no further lines`
-              : `\n… (truncated) to continue, call again with startLine=2`;
+              : totalLines > 1
+                ? `\n… (truncated) to continue, call again with startLine=2`
+                : `\n… (truncated) no further lines`;
         const content = `${prefix}${cut}${marker}`;
         return {
           ok: true,
