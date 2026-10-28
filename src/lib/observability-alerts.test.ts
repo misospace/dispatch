@@ -53,6 +53,8 @@ function makeLease(overrides: Partial<ObservabilityLeaseRow>): ObservabilityLeas
     issueId: "i1",
     expiredAt: ago(-1800),
     renewedAt: null,
+    disposition: null,
+    retryAfter: null,
     createdAt: ago(120),
     ...overrides,
   };
