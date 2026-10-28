@@ -411,3 +411,31 @@ export const GROOM_ACTION_LABELS: Record<GroomAction, string> = {
   mark_needs_info: "Mark Needs Info",
   mark_blocked: "Mark Blocked",
 };
+
+/**
+ * Which grooming verdict owns each persisted reason field (#1453).
+ */
+export const REASON_FIELD_OWNER_ACTION = {
+  needsInfoReason: "mark_needs_info",
+  blockedReason: "mark_blocked",
+  notReadyReason: "mark_not_ready",
+} as const satisfies Record<string, GroomAction>;
+
+/**
+ * True when a stored reason field is superseded legacy text rather than the
+ * issue's current explanation (#1453). A hosted-groomer action (GroomAction
+ * vocabulary) is the issue's current verdict, so a reason owned by a
+ * different verdict is stale — e.g. a promoted issue still carrying a
+ * needs-info question. An absent action or one outside the groomer
+ * vocabulary (the manual groom route's operator-authored strings, which
+ * null superseded fields at write time) supersedes nothing: the stored
+ * reason stays visible.
+ */
+export function isSupersededGroomReason(
+  nextGroomingAction: string | null | undefined,
+  field: keyof typeof REASON_FIELD_OWNER_ACTION,
+): boolean {
+  const action = nextGroomingAction?.trim();
+  if (!action || !isValidGroomAction(action)) return false;
+  return action !== REASON_FIELD_OWNER_ACTION[field];
+}

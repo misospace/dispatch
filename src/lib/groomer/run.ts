@@ -1156,10 +1156,36 @@ async function executeGroomerRun(
       groomingRetryAfter: null,
     };
     if (output.summary) issueData.groomingSummary = output.summary;
-    if (output.needsInfoReason) issueData.needsInfoReason = output.needsInfoReason;
-    if (output.blockedReason) issueData.blockedReason = output.blockedReason;
-    if (notReadyReason) issueData.notReadyReason = notReadyReason;
-    if (output.nextGroomingAction) issueData.nextGroomingAction = output.nextGroomingAction;
+    // #1453: an applied verdict is the issue's only current grooming
+    // explanation. Each verdict owns exactly one persisted reason field
+    // (needs_info → needsInfoReason, blocked → blockedReason, backlog →
+    // notReadyReason). The owned field is replaced only when this verdict
+    // carries text — a verdict never erases its own current reason without
+    // a replacement — and every reason field owned by a different verdict
+    // is superseded and cleared, so a promote_to_ready (or any verdict
+    // change) cannot leave legacy needs-info text contradicting the board.
+    // Failed, rejected, dry-run and replayed applications returned above
+    // and never reach this write. dependencyBlockReason is a read-time
+    // annotation of open blockers, not groomer verdict state, and stays.
+    const verdictAction = output.nextGroomingAction;
+    if (verdictAction === "mark_needs_info") {
+      if (output.needsInfoReason) issueData.needsInfoReason = output.needsInfoReason;
+    } else {
+      issueData.needsInfoReason = null;
+    }
+    if (verdictAction === "mark_blocked") {
+      if (output.blockedReason) issueData.blockedReason = output.blockedReason;
+    } else {
+      issueData.blockedReason = null;
+    }
+    if (verdictAction === "mark_not_ready") {
+      if (notReadyReason) issueData.notReadyReason = notReadyReason;
+    } else {
+      issueData.notReadyReason = null;
+    }
+    // An already_done verdict has no pending next action; clearing it keeps
+    // a closed issue from advertising the superseded verdict as pending.
+    issueData.nextGroomingAction = verdictAction ?? null;
     // When the groomer closes the issue, mirror the closed state locally so
     // the selector stops considering it (state: "open" is the implicit filter)
     // and the next sync confirms what we just wrote. A close that did not

@@ -1996,6 +1996,146 @@ Investigate session handling in auth module.`;
     });
   });
 
+  describe("superseded reason fields (dispatch#1453)", () => {
+    // An issue whose current row carries a needs-info question from an
+    // earlier verdict. A newer applied verdict must not leave that legacy
+    // text as the issue's current explanation.
+    const reasonFields = ["needsInfoReason", "blockedReason", "notReadyReason"] as const;
+
+    function lastIssueUpdateData(): Record<string, unknown> {
+      const calls = mocks.prisma.issue.update.mock.calls;
+      expect(calls.length).toBeGreaterThan(0);
+      return (calls[calls.length - 1][0] as { data: Record<string, unknown> }).data;
+    }
+
+    it("a promote_to_ready verdict clears the legacy needs-info question", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(planDraft()); // ready verdict
+
+      await runHostedGroomer();
+
+      const data = lastIssueUpdateData();
+      expect(data.nextGroomingAction).toBe("promote_to_ready");
+      expect(data.needsInfoReason).toBeNull();
+      expect(data.blockedReason).toBeNull();
+      expect(data.notReadyReason).toBeNull();
+    });
+
+    it("a blocked verdict carries its own reason and clears the needs-info question", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("blocked", { verdict: { rationale: "waiting on the vendor API" } }),
+      );
+
+      await runHostedGroomer();
+
+      const data = lastIssueUpdateData();
+      expect(data).toMatchObject({ nextGroomingAction: "mark_blocked", blockedReason: "waiting on the vendor API" });
+      expect(data.needsInfoReason).toBeNull();
+      expect(data.notReadyReason).toBeNull();
+    });
+
+    it("a backlog verdict carries notReadyReason and clears the needs-info question", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("backlog", { verdict: { rationale: "no acceptance criteria yet" } }),
+      );
+
+      await runHostedGroomer();
+
+      const data = lastIssueUpdateData();
+      expect(data).toMatchObject({ nextGroomingAction: "mark_not_ready", notReadyReason: "no acceptance criteria yet" });
+      expect(data.needsInfoReason).toBeNull();
+      expect(data.blockedReason).toBeNull();
+    });
+
+    it("a newer needs_info verdict updates the current question without leaving other reasons", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("needs_info", { verdict: { rationale: "which environment reproduces it?" } }),
+      );
+
+      await runHostedGroomer();
+
+      const data = lastIssueUpdateData();
+      expect(data).toMatchObject({
+        nextGroomingAction: "mark_needs_info",
+        needsInfoReason: "which environment reproduces it?",
+      });
+      expect(data.blockedReason).toBeNull();
+      expect(data.notReadyReason).toBeNull();
+    });
+
+    it("an already_done close clears every reason and the pending action", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("already_done", {
+          verdict: { lane: { id: "backlog", confidence: "high", reason: "already on main" } },
+          mutations: {
+            close: {
+              reason: "already_done",
+              rationale: "login.ts no longer has the step",
+              evidenceRefs: ["repo:src/auth/login.ts"],
+              criteria: GROUNDED_CRITERIA,
+            },
+          },
+        }),
+      );
+
+      await runHostedGroomer();
+
+      const data = lastIssueUpdateData();
+      expect(data.state).toBe("closed");
+      for (const field of reasonFields) expect(data[field]).toBeNull();
+      expect(data.nextGroomingAction).toBeNull();
+    });
+
+    it("a dry run writes no reason fields at all", async () => {
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true });
+      mocks.callGroomerLLM.mockResolvedValue(planDraft());
+
+      await runHostedGroomer();
+
+      // The dry run returns before any issue write: nothing can erase or
+      // overwrite a reason field.
+      expect(mocks.prisma.issue.update).not.toHaveBeenCalled();
+    });
+
+    it("a replayed application cannot erase the current reason", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("needs_info", { verdict: { rationale: "which tenant?" } }),
+      );
+      await runHostedGroomer();
+      expect(lastIssueUpdateData().needsInfoReason).toBe("which tenant?");
+
+      // Exact retry of the same plan: the application replays, and only the
+      // cooldown stamp moves — no reason field is written, so the current
+      // question survives untouched.
+      mocks.prisma.issue.update.mockClear();
+      const result = await runHostedGroomer();
+      expect(result!.appliedMutations?.outcome).toBe("replayed");
+
+      const calls = mocks.prisma.issue.update.mock.calls;
+      expect(calls.length).toBeGreaterThan(0);
+      for (const call of calls) {
+        const data = (call[0] as { data: Record<string, unknown> }).data;
+        for (const field of reasonFields) expect(field in data).toBe(false);
+        expect("nextGroomingAction" in data).toBe(false);
+      }
+    });
+
+    it("a failed apply cannot erase the current reason", async () => {
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      mocks.updateIssueLabels.mockRejectedValue(new Error("GitHub API error: 500"));
+      mocks.callGroomerLLM.mockResolvedValue(planDraft()); // ready verdict
+
+      await expect(runHostedGroomer()).rejects.toThrow();
+
+      // Neither the failed application nor the failure backoff writes a
+      // reason field: the issue's current explanation survives.
+      for (const call of mocks.prisma.issue.update.mock.calls) {
+        const data = (call[0] as { data: Record<string, unknown> }).data;
+        for (const field of reasonFields) expect(field in data).toBe(false);
+      }
+      errSpy.mockRestore();
+    });
+  });
+
   describe("exactly-one-status-label post-condition (dispatch#941)", () => {
     // A parked issue: it carries a status label plus the needs-human park marker.
     const parkedCandidate: GroomingCandidate = {

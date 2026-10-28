@@ -4,7 +4,7 @@ import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
-import { Issue, LABEL_COLORS, AGENT_PREFIX, OWNER_PREFIX, GROOM_ACTION_LABELS, GroomAction, isValidGroomAction, getAgentFromLabels, getOwnerFromLabels, getPriorityFromLabels } from "@/types";
+import { Issue, LABEL_COLORS, AGENT_PREFIX, OWNER_PREFIX, GROOM_ACTION_LABELS, GroomAction, isValidGroomAction, isSupersededGroomReason, getAgentFromLabels, getOwnerFromLabels, getPriorityFromLabels } from "@/types";
 
 interface LaneOption {
   id: string;
@@ -662,43 +662,54 @@ export function IssueCard({ issue, lanes, isDragging, onIssueUpdate }: IssueCard
             </a>
           )}
         </div>
-        {(issue.notReadyReason || issue.blockedReason || issue.dependencyBlockReason || issue.admissionWithheldReason || issue.needsInfoReason || issue.groomingSummary) && (
-          <div className="mt-2 space-y-1">
-            {issue.notReadyReason && (
-              <div className="flex items-start gap-1 text-xs text-amber-700">
-                <AlertTriangle className="h-3 w-3 mt-0.5 shrink-0" />
-                <span>{issue.notReadyReason}</span>
-              </div>
-            )}
-            {issue.blockedReason && (
-              <div className="flex items-start gap-1 text-xs text-red-700">
-                <Ban className="h-3 w-3 mt-0.5 shrink-0" />
-                <span>{issue.blockedReason}</span>
-              </div>
-            )}
-            {issue.dependencyBlockReason && (
-              <div className="flex items-start gap-1 text-xs text-red-700">
-                <Ban className="h-3 w-3 mt-0.5 shrink-0" />
-                <span>{issue.dependencyBlockReason}</span>
-              </div>
-            )}
-            {issue.admissionWithheldReason && (
-              <div className="flex items-start gap-1 text-xs text-amber-700" data-testid="admission-withheld-reason">
-                <AlertTriangle className="h-3 w-3 mt-0.5 shrink-0" />
-                <span>{issue.admissionWithheldReason}</span>
-              </div>
-            )}
-            {issue.needsInfoReason && (
-              <div className="flex items-start gap-1 text-xs text-blue-700">
-                <Info className="h-3 w-3 mt-0.5 shrink-0" />
-                <span>{issue.needsInfoReason}</span>
-              </div>
-            )}
-            {issue.groomingSummary && issue.groomingSummary.length > 0 && (
-              <p className="text-xs text-muted-foreground italic">{issue.groomingSummary}</p>
-            )}
-          </div>
-        )}
+        {(() => {
+          // #1453: a stored hosted-groomer verdict names the issue's current
+          // grooming decision, so a reason field owned by a different verdict
+          // is legacy text (e.g. a promoted issue still carrying a needs-info
+          // question) and must not render as the current question. The
+          // dependency and admission annotations describe live external state
+          // and always render.
+          const notReadyReason = issue.notReadyReason && !isSupersededGroomReason(issue.nextGroomingAction, "notReadyReason") ? issue.notReadyReason : null;
+          const blockedReason = issue.blockedReason && !isSupersededGroomReason(issue.nextGroomingAction, "blockedReason") ? issue.blockedReason : null;
+          const needsInfoReason = issue.needsInfoReason && !isSupersededGroomReason(issue.nextGroomingAction, "needsInfoReason") ? issue.needsInfoReason : null;
+          return notReadyReason || blockedReason || issue.dependencyBlockReason || issue.admissionWithheldReason || needsInfoReason || issue.groomingSummary ? (
+            <div className="mt-2 space-y-1">
+              {notReadyReason && (
+                <div className="flex items-start gap-1 text-xs text-amber-700" data-testid="not-ready-reason">
+                  <AlertTriangle className="h-3 w-3 mt-0.5 shrink-0" />
+                  <span>{notReadyReason}</span>
+                </div>
+              )}
+              {blockedReason && (
+                <div className="flex items-start gap-1 text-xs text-red-700" data-testid="blocked-reason">
+                  <Ban className="h-3 w-3 mt-0.5 shrink-0" />
+                  <span>{blockedReason}</span>
+                </div>
+              )}
+              {issue.dependencyBlockReason && (
+                <div className="flex items-start gap-1 text-xs text-red-700">
+                  <Ban className="h-3 w-3 mt-0.5 shrink-0" />
+                  <span>{issue.dependencyBlockReason}</span>
+                </div>
+              )}
+              {issue.admissionWithheldReason && (
+                <div className="flex items-start gap-1 text-xs text-amber-700" data-testid="admission-withheld-reason">
+                  <AlertTriangle className="h-3 w-3 mt-0.5 shrink-0" />
+                  <span>{issue.admissionWithheldReason}</span>
+                </div>
+              )}
+              {needsInfoReason && (
+                <div className="flex items-start gap-1 text-xs text-blue-700" data-testid="needs-info-reason">
+                  <Info className="h-3 w-3 mt-0.5 shrink-0" />
+                  <span>{needsInfoReason}</span>
+                </div>
+              )}
+              {issue.groomingSummary && issue.groomingSummary.length > 0 && (
+                <p className="text-xs text-muted-foreground italic">{issue.groomingSummary}</p>
+              )}
+            </div>
+          ) : null;
+        })()}
         <div className="flex items-center mt-2 text-xs text-muted-foreground">
           <span>{issue.repository.fullName}</span>
           {issue.assignees.length > 0 && (
