@@ -73,6 +73,8 @@ export interface GroomingRunPlanView {
   format: "grooming-plan" | "legacy" | "unknown";
   actionability: string | null;
   ready: boolean | null;
+  /** What a not-ready verdict waits on (dispatch#1452): "human_question" | "investigation_incomplete"; null otherwise. */
+  gapClass: string | null;
   admission: string | null;
   summary: string | null;
   citationCount: number;
@@ -421,6 +423,7 @@ export function buildGroomingRunView(run: unknown): GroomingRunView {
       format: summary.format,
       actionability: summary.actionability,
       ready: summary.ready,
+      gapClass: summary.gapClass,
       admission: summary.admission,
       summary: summary.summary,
       citationCount: summary.citationCount,

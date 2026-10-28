@@ -141,6 +141,15 @@ export async function POST(request: Request) {
           data: {
             labels: labelsToSet,
             lastSyncedAt: new Date(),
+            // #1453: this transition is the current decision, so a stored
+            // hosted-groomer verdict no longer describes the issue. Retire
+            // its pending marker and the reason fields it owned: otherwise
+            // the board would hide this route's fresh blocked reason behind
+            // the stale verdict, or keep presenting a legacy needs-info
+            // question under the moved status.
+            nextGroomingAction: null,
+            needsInfoReason: null,
+            notReadyReason: null,
             ...(targetLabel === "status/blocked"
               ? { blockedReason: (blockedReason as string).trim() }
               : { blockedReason: null }),

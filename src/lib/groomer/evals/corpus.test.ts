@@ -64,6 +64,9 @@ async function assertCandidate(c: GroomingCase, candidate: CaseCandidate): Promi
     expect(outcome.accepted, `${at} expected the plan to be accepted, got:\n${outcome.errors.join("\n")}`).toBe(true);
     expect(outcome.plan?.mutations.status, `${at} derived status`).toBe(want.status);
     expect(outcome.plan?.readiness.ready, `${at} readiness.ready`).toBe(want.ready);
+    if (want.gapClass !== undefined) {
+      expect(outcome.plan?.readiness.gapClass, `${at} readiness.gapClass`).toBe(want.gapClass);
+    }
     if (want.admission !== undefined) {
       expect(outcome.plan?.readiness.admission, `${at} readiness.admission`).toBe(want.admission);
     }

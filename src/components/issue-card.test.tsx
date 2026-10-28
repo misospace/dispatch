@@ -250,3 +250,116 @@ describe("IssueCard dependency block reason", () => {
     expect(screen.queryByText(/Blocked by open/)).not.toBeInTheDocument();
   });
 });
+
+describe("IssueCard superseded grooming reasons (#1453)", () => {
+  it("renders the needs-info question while the current verdict is mark_needs_info", () => {
+    const issue = makeIssue({ nextGroomingAction: "mark_needs_info", needsInfoReason: "which tenant?" });
+
+    render(React.createElement(IssueCard, { issue }));
+
+    expect(screen.getByTestId("needs-info-reason")).toHaveTextContent("which tenant?");
+  });
+
+  it("hides a legacy needs-info question once a promote_to_ready verdict supersedes it", () => {
+    const issue = makeIssue({ nextGroomingAction: "promote_to_ready", needsInfoReason: "which tenant?" });
+
+    render(React.createElement(IssueCard, { issue }));
+
+    expect(screen.queryByTestId("needs-info-reason")).not.toBeInTheDocument();
+  });
+
+  it("hides a legacy needs-info question when the current verdict is blocked", () => {
+    const issue = makeIssue({
+      nextGroomingAction: "mark_blocked",
+      needsInfoReason: "old question",
+      blockedReason: "waiting on the vendor API",
+    });
+
+    render(React.createElement(IssueCard, { issue }));
+
+    expect(screen.queryByTestId("needs-info-reason")).not.toBeInTheDocument();
+    expect(screen.getByTestId("blocked-reason")).toHaveTextContent("waiting on the vendor API");
+  });
+
+  it("hides a legacy blocked reason when the current verdict is needs_info", () => {
+    const issue = makeIssue({
+      nextGroomingAction: "mark_needs_info",
+      blockedReason: "old block",
+      needsInfoReason: "which environment reproduces it?",
+    });
+
+    render(React.createElement(IssueCard, { issue }));
+
+    expect(screen.queryByTestId("blocked-reason")).not.toBeInTheDocument();
+    expect(screen.getByTestId("needs-info-reason")).toHaveTextContent("which environment reproduces it?");
+  });
+
+  it("renders the not-ready reason while the current verdict is mark_not_ready", () => {
+    const issue = makeIssue({ nextGroomingAction: "mark_not_ready", notReadyReason: "no acceptance criteria yet" });
+
+    render(React.createElement(IssueCard, { issue }));
+
+    expect(screen.getByTestId("not-ready-reason")).toHaveTextContent("no acceptance criteria yet");
+  });
+
+  it("keeps a stored reason visible when no hosted verdict action is recorded", () => {
+    const issue = makeIssue({ needsInfoReason: "which tenant?" });
+
+    render(React.createElement(IssueCard, { issue }));
+
+    expect(screen.getByTestId("needs-info-reason")).toHaveTextContent("which tenant?");
+  });
+
+  it("keeps reasons visible under the manual groom route's operator-authored actions", () => {
+    const issue = makeIssue({
+      nextGroomingAction: "Request missing information from the issue author or assignee",
+      needsInfoReason: "Need reproduction steps",
+    });
+
+    render(React.createElement(IssueCard, { issue }));
+
+    expect(screen.getByTestId("needs-info-reason")).toHaveTextContent("Need reproduction steps");
+  });
+
+  it("renders a machine-prefixed needs-info reason verbatim", () => {
+    // The groomer stores the gap class as a machine prefix (dispatch#1452).
+    // The card is a display-only consumer: it must show the stored text as
+    // given, prefix included, and never drop or mangle it.
+    const issue = makeIssue({
+      nextGroomingAction: "mark_needs_info",
+      needsInfoReason: "human_question(product_decision): which tenant?",
+    });
+
+    render(React.createElement(IssueCard, { issue }));
+
+    expect(screen.getByTestId("needs-info-reason")).toHaveTextContent(
+      "human_question(product_decision): which tenant?",
+    );
+  });
+
+  it("renders an investigation-incomplete needs-info reason verbatim", () => {
+    const issue = makeIssue({
+      nextGroomingAction: "mark_needs_info",
+      needsInfoReason: "investigation_incomplete: the search timed out",
+    });
+
+    render(React.createElement(IssueCard, { issue }));
+
+    expect(screen.getByTestId("needs-info-reason")).toHaveTextContent(
+      "investigation_incomplete: the search timed out",
+    );
+  });
+
+  it("still renders the dependency annotation when the verdict supersedes groomer reasons", () => {
+    const issue = makeIssue({
+      nextGroomingAction: "promote_to_ready",
+      needsInfoReason: "old question",
+      dependencyBlockReason: "Blocked by open bar/repo#20",
+    });
+
+    render(React.createElement(IssueCard, { issue }));
+
+    expect(screen.queryByTestId("needs-info-reason")).not.toBeInTheDocument();
+    expect(screen.getByText("Blocked by open bar/repo#20")).toBeInTheDocument();
+  });
+});

@@ -476,6 +476,7 @@ export async function evaluateReportClose(
       lane: null,
       evidenceDigest: catalog.binding.evidenceDigest,
       reasons: [],
+      gapClass: null,
     },
     citations: [],
   };

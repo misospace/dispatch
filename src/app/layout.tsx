@@ -93,6 +93,9 @@ export default function RootLayout({
                 <Link href="/groomer" className="text-muted-foreground hover:text-foreground">
                   Groomer
                 </Link>
+                <Link href="/delivery" className="text-muted-foreground hover:text-foreground">
+                  Delivery
+                </Link>
               </nav>
 
               {/* Mobile menu button */}

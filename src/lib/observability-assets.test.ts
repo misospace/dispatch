@@ -306,6 +306,8 @@ function emptySnapshot(): ObservabilitySnapshot {
       assigned: 0,
       activeLeases: 0,
       expiredLeases: 0,
+      terminalLeases: 0,
+      externalWaitLeases: 0,
       executionActive: 0,
       agentWorkByState: {},
       agentWorkReleasePending: 0,

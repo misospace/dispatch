@@ -116,6 +116,11 @@ export async function collectObservabilitySnapshot(
         issueId: true,
         expiredAt: true,
         renewedAt: true,
+        // Terminal ownership dispositions (#1455): the retained rows are the
+        // difference between finished work and actionable stale ownership, so
+        // the derivation needs the disposition and the external-wait marker.
+        disposition: true,
+        retryAfter: true,
         createdAt: true,
       },
     }),
@@ -242,6 +247,8 @@ export async function collectObservabilitySnapshot(
       issueId: row.issueId,
       expiredAt: row.expiredAt,
       renewedAt: row.renewedAt,
+      disposition: row.disposition,
+      retryAfter: row.retryAfter,
       createdAt: row.createdAt,
     })),
     agentWork: agentWorkRows.map((row) => ({

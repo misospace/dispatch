@@ -132,6 +132,7 @@ describe("buildGroomingRunView", () => {
     expect(view.plan.format).toBe("grooming-plan");
     expect(view.plan.actionability).toBe("ready");
     expect(view.plan.ready).toBe(true);
+    expect(view.plan.gapClass).toBeNull();
     expect(view.plan.admission).toBe("implementation");
 
     expect(view.precondition.recorded).toBe(true);
@@ -155,6 +156,27 @@ describe("buildGroomingRunView", () => {
     expect(view.decision.readyPromotion?.confidence).toBe("high");
     expect(view.decision.readyPromotion?.evidenceRefs).toEqual(["issue", "repo:src/a.ts"]);
     expect(view.decision.decomposition).toBeNull();
+  });
+
+  it("surfaces the resolved gap class of a needs_info plan (dispatch#1452)", () => {
+    const run = appliedPlanRun({
+      validatedOutput: {
+        schemaVersion: 1,
+        verdict: { actionability: "needs_info", summary: "waiting", lane: { id: "backlog" } },
+        readiness: {
+          ready: false,
+          admission: null,
+          gapClass: "investigation_incomplete",
+          reasons: ["verdict is needs_info", "investigation incomplete (tool_failure:search_code): which page?"],
+        },
+      },
+    });
+
+    const view = buildGroomingRunView(run);
+    expect(view.plan.format).toBe("grooming-plan");
+    expect(view.plan.actionability).toBe("needs_info");
+    expect(view.plan.ready).toBe(false);
+    expect(view.plan.gapClass).toBe("investigation_incomplete");
   });
 
   it("surfaces close justification with evidence refs", () => {
