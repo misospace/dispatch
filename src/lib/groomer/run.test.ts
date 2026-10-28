@@ -214,8 +214,11 @@ function notReadyDraft(
     verdict: {
       actionability,
       lane: { id: "backlog", confidence: "medium", reason: "not ready yet" },
+      ...patch.verdict,
       // A needs_info verdict must declare what it is missing (dispatch#1452);
       // give the draft a default gap so callers stay focused on their case.
+      // Applied after the patch so an explicitly-undefined `infoGap` cannot
+      // clobber it.
       ...(actionability === "needs_info" && patch.verdict?.infoGap === undefined
         ? {
             infoGap: {
@@ -225,7 +228,6 @@ function notReadyDraft(
             },
           }
         : {}),
-      ...patch.verdict,
     },
     implementationBrief: patch.implementationBrief ?? null,
   });

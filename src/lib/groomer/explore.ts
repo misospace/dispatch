@@ -37,9 +37,10 @@ export interface ExploreToolRecord {
   /** Truncated for storage; the model saw the full result. */
   preview: string;
   /**
-   * True when this call's result was clipped by a byte cap and the model saw
-   * a prefix, not the whole result (dispatch#1452). False for submit_findings
-   * and for every tool that does not truncate.
+   * True when this call's result was clipped (a read by bytes, a directory
+   * listing by entries) and the model saw a prefix, not the whole result
+   * (dispatch#1452). False for submit_findings and for every tool that does
+   * not truncate.
    */
   truncated: boolean;
 }
@@ -192,6 +193,20 @@ const MAX_GAP_FACT_CHARS = 80;
 function gapFactToken(value: string): string {
   return clampText(sanitizeModelText(value).trim(), MAX_GAP_FACT_CHARS);
 }
+
+/**
+ * The token recorded for a tool failure whose model-authored name sanitizes
+ * to nothing (dispatch#1452). Fixed and model-uncontrolled: the call did
+ * fail, and losing the fact would turn a broken investigation back into a
+ * human question.
+ */
+const UNKNOWN_TOOL_FAILURE = "unknown_tool";
+
+/**
+ * The token recorded for a truncated listing of the repository root, which
+ * has no path to name (dispatch#1452).
+ */
+const ROOT_TRUNCATED_READ = "the repository root";
 
 /**
  * The bounded lines of the findings' "## Investigation gaps" section
@@ -425,14 +440,20 @@ export async function exploreRepository(
           // plan's readiness reasons and Issue.needsInfoReason — channels the
           // model-answer sanitizer never sees. Strip control characters and
           // clamp at intake (#1130 discipline, dispatch#1452).
-          const gapName = gapFactToken(name);
-          if (gapName) gaps.toolFailures.push(gapName);
-        } else if (name === "read_file" && truncated) {
+          //
+          // A name that sanitizes to nothing still names a real failure: the
+          // call failed. Keep the fact under a fixed, model-uncontrolled
+          // token so the failure cannot be lost — the fact, not the name, is
+          // what the verdict is resolved against (dispatch#1452).
+          gaps.toolFailures.push(gapFactToken(name) || UNKNOWN_TOOL_FAILURE);
+        } else if ((name === "read_file" || name === "list_directory") && truncated) {
           // The normalized path when available, recorded argument
           // otherwise (a pinned-ref read records its pinned arguments).
           const path = result.file?.path ?? (typeof args.path === "string" ? args.path : null);
           const gapPath = path !== null ? gapFactToken(path) : "";
-          if (gapPath) gaps.truncatedReads.push(gapPath);
+          // A root listing has no path to name: keep the fact under a fixed
+          // token rather than losing it (dispatch#1452).
+          gaps.truncatedReads.push(gapPath || ROOT_TRUNCATED_READ);
         }
         messages.push({ role: "tool", tool_call_id: toolCall.id, name, content: result.content });
       }

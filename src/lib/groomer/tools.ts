@@ -65,9 +65,10 @@ export interface GroomerToolResult {
    */
   file?: { path: string; ref: string | null; content: string };
   /**
-   * read_file only: the file's text was clipped to maxFileBytes, so the model
-   * saw a prefix, not the whole file (dispatch#1452). Every other tool
-   * leaves it unset.
+   * read_file / list_directory: the result the model was shown was clipped
+   * (read_file to maxFileBytes, list_directory to maxDirEntries), so the
+   * model saw a prefix, not the whole result (dispatch#1452). Every other
+   * tool leaves it unset.
    */
   truncated?: boolean;
 }
@@ -531,7 +532,15 @@ export async function executeGroomerTool(
         const lines = shown.map((e) => `- ${e.path}${e.type === "dir" ? "/" : ""}`);
         const more = entries.length > shown.length ? `\n… ${entries.length - shown.length} more` : "";
         const content = `${path || "/"}:\n${lines.join("\n")}${more}`;
-        return { ok: true, content, bytes: Buffer.byteLength(content, "utf8"), sources: [] };
+        return {
+          ok: true,
+          content,
+          bytes: Buffer.byteLength(content, "utf8"),
+          sources: [],
+          // The listing was clipped: the model saw the first maxDirEntries
+          // entries, not the whole directory (dispatch#1452).
+          truncated: entries.length > shown.length,
+        };
       }
 
       case "search_related_work": {

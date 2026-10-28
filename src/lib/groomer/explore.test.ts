@@ -611,13 +611,46 @@ describe("exploreRepository investigation gaps (dispatch#1452)", () => {
     expect(token.startsWith("searchcode")).toBe(true);
   });
 
-  it("drops a tool failure whose model-authored name sanitizes to nothing", async () => {
+  it("keeps a tool failure whose model-authored name sanitizes to nothing, under a fixed token", async () => {
+    // The call did fail: that is the fact the verdict is resolved against.
+    // The model-authored name cannot be persisted, so the failure is recorded
+    // under a fixed token instead of being dropped (dispatch#1452).
     const fetchImpl = fetchReturning(
       { content: null, tool_calls: [toolCall("1", "\u0000\u0001", {})] },
       { content: "done", tool_calls: [] },
     );
     const result = await exploreRepository(options, makeDeps({}, fetchImpl));
 
+    expect(result.gaps.toolFailures).toEqual(["unknown_tool"]);
+  });
+
+  it("records a clipped directory listing as a truncated read", async () => {
+    const entries = Array.from({ length: 5 }, (_, i) => ({ path: `src/f${i}.ts`, type: "file" as const, size: 1 }));
+    const fetchImpl = fetchReturning(
+      { content: null, tool_calls: [toolCall("1", "list_directory", { path: "src" })] },
+      { content: "done", tool_calls: [] },
+    );
+    const deps = makeDeps({ listDir: vi.fn().mockResolvedValue(entries) }, fetchImpl);
+
+    const result = await exploreRepository({ ...options, maxDirEntries: 2 }, deps);
+
+    expect(result.gaps.truncatedReads).toEqual(["src"]);
     expect(result.gaps.toolFailures).toEqual([]);
+    expect(result.toolCalls[0].truncated).toBe(true);
+    expect(result.findings).toContain("- the read of src was truncated");
+  });
+
+  it("names the repository root when its listing was clipped", async () => {
+    const entries = Array.from({ length: 5 }, (_, i) => ({ path: `d${i}/`, type: "dir" as const, size: null }));
+    const fetchImpl = fetchReturning(
+      { content: null, tool_calls: [toolCall("1", "list_directory", { path: "" })] },
+      { content: "done", tool_calls: [] },
+    );
+    const deps = makeDeps({ listDir: vi.fn().mockResolvedValue(entries) }, fetchImpl);
+
+    const result = await exploreRepository({ ...options, maxDirEntries: 2 }, deps);
+
+    expect(result.gaps.truncatedReads).toEqual(["the repository root"]);
+    expect(result.findings).toContain("- the read of the repository root was truncated");
   });
 });

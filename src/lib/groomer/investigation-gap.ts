@@ -14,9 +14,10 @@
  *   tool calls, truncated reads, exhausted budgets, aborted or unavailable
  *   rounds. Those facts are authoritative over the declaration — a human
  *   question asserted on top of a broken investigation resolves to
- *   `investigation_incomplete`, so the issue keeps retrying on the bounded
- *   grooming schedule instead of parking on a question nobody was really
- *   asked.
+ *   `investigation_incomplete`, so the recorded reason names an unfinished
+ *   investigation instead of a question no human was ever asked. Both classes
+ *   re-groom on the same bounded cooldown: the class is the record, not a new
+ *   retry channel.
  *
  * Nothing here weakens readiness or closure evidence rules: the resolution
  * only classifies what a NOT-ready verdict is waiting on.
