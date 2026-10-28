@@ -163,7 +163,7 @@ For control actions (rerun, dispatch):
 
 ## Docker
 
-- Base image: `node:24-bookworm-slim`
+- Base image: `node:26-bookworm-slim`
 - OpenSSL and ca-certificates installed in builder stage for Prisma generation
 - Runtime image installs same packages for Prisma client operation
 - Multi-stage build: deps → builder → runner
