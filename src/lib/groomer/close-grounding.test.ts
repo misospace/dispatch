@@ -144,6 +144,20 @@ describe("collectPinnedReadContent", () => {
     expect(collectPinnedReadContent(HEAD, reads, 100).files.size).toBe(2);
   });
 
+  it("a subsuming read releases the budget its folded segments held", () => {
+    const a = "A".repeat(40);
+    const b = "B".repeat(40);
+    const c = "C".repeat(40); // does not fit while a+b hold 80 of the 100 cap
+    const fold = `${a} ${b}`; // subsumes both, costs 81
+    const d = "D".repeat(19); // fits only because the fold refunded a+b
+    const store = collectPinnedReadContent(
+      HEAD,
+      [a, b, c, fold, d].map((content) => ({ path: "a.ts", ref: HEAD, content })),
+      100,
+    );
+    expect(store.files.get("a.ts")).toEqual([fold, d]);
+  });
+
   it("normalises whitespace only", () => {
     expect(normalizeWhitespace("  a\n\t b  c ")).toBe("a b c");
   });

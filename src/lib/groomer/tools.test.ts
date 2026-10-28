@@ -913,6 +913,25 @@ describe("executeGroomerTool read_file bounded ranges (dispatch#1451)", () => {
     expect(next.content).toContain("after");
   });
 
+  it("names the over-budget line in the footer, at EOF and mid-file", async () => {
+    const deps = makeDeps({
+      readFile: vi.fn().mockResolvedValue(`small\n${"y".repeat(500)}\nafter`),
+    });
+    const mid = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "huge.ts", startLine: 2 } },
+      { ...options, maxFileBytes: 50 },
+      deps,
+    );
+    expect(mid.content).toContain("(line 2 exceeds the byte limit; continues at line 3)");
+    const atEnd = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "tail.ts", startLine: 2 } },
+      { ...options, maxFileBytes: 50 },
+      makeDeps({ readFile: vi.fn().mockResolvedValue(`small\n${"y".repeat(500)}`) }),
+    );
+    expect(atEnd.content).toContain("(line 2 exceeds the byte limit)");
+    expect(atEnd.content).not.toContain("continues at line");
+  });
+
   it("behaves exactly as before when no range arguments are given", async () => {
     const deps = makeDeps({ readFile: vi.fn().mockResolvedValue("plain content") });
     const result = await executeGroomerTool(
