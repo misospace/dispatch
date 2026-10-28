@@ -50,6 +50,8 @@ function makeLease(overrides: Partial<ObservabilityLeaseRow>): ObservabilityLeas
     issueId: "i1",
     expiredAt: ago(-1800),
     renewedAt: null,
+    disposition: null,
+    retryAfter: null,
     createdAt: ago(120),
     ...overrides,
   };
@@ -140,6 +142,8 @@ describe("exportObservabilityMetrics", () => {
     for (const alwaysPresent of [
       "dispatch_issues_open_claimable",
       "dispatch_leases_active",
+      "dispatch_leases_terminal",
+      "dispatch_leases_external_wait",
       "dispatch_execution_active",
       "dispatch_health_up",
       "dispatch_scheduler_up",

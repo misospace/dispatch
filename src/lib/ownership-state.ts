@@ -142,8 +142,10 @@ const MERGED_PR_STATE = "merged";
 /** Only CLAIMED/IN_PROGRESS/BLOCKED AgentWork count as an active claim or liveness. */
 const ACTIVE_AGENT_WORK_STATES: ReadonlySet<string> = new Set(["CLAIMED", "IN_PROGRESS", "BLOCKED"]);
 
-/** Terminal dispositions: positive evidence the owner is gone. */
-const TERMINAL_DISPOSITIONS: ReadonlySet<string> = new Set(["completed", "released", "handed_off"]);
+/** Terminal dispositions: positive evidence the owner is gone. Exported so
+ *  every read model (#1251 state derivation, #1455 observability metrics)
+ *  agrees on which dispositions are terminal. */
+export const TERMINAL_DISPOSITIONS: ReadonlySet<string> = new Set(["completed", "released", "handed_off"]);
 
 function isAgentLabel(label: string): boolean {
   return label.startsWith(AGENT_PREFIX);
