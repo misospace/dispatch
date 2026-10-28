@@ -14,10 +14,12 @@
  * dependency anchor is reconsidered on a bounded window
  * (BLOCKED_RECONSIDER_WINDOW_HOURS). Rows that DO have a typed anchor are the
  * freshness pass's territory (it marks them `dependency_changed` when the
- * recorded open blockers change), and the store query excludes them here. It
- * never auto-promotes an issue to ready and never closes one: the stale
- * mark is the reconsideration, because stale results bypass the selector's
- * blocked parking and get re-groomed, where a fresh verdict re-decides.
+ * recorded open blockers change); the store query excludes them and this pass
+ * never marks them, so an anchored row is not re-groomed on a window while
+ * nothing about its dependencies changed. The pass never auto-promotes an
+ * issue to ready and never closes one: the stale mark is the reconsideration,
+ * because stale results bypass the selector's blocked parking and get
+ * re-groomed, where a fresh verdict re-decides.
  */
 import { prisma } from "@/lib/prisma";
 import { findOpenIssueKeys } from "@/lib/issue-dependency-annotation";
@@ -81,6 +83,26 @@ export type ParkedBlockDecision =
   | { action: "none" };
 
 /**
+ * Whether the row carries a typed dependency anchor: the persisted
+ * `groomedDependencyKeys` its verdict (or its body) recorded. Anchored rows
+ * are the freshness pass's territory — it compares their recorded open blockers
+ * against the current open set and marks them `dependency_changed` when they
+ * change — so this pass never re-grooms them on a window.
+ */
+export function hasTypedDependencyAnchor(row: Pick<ParkedBlockedIssueRow, "groomedDependencyKeys">): boolean {
+  return row.groomedDependencyKeys.length > 0;
+}
+
+/**
+ * The store clause that keeps anchored rows out of this pass. The anchor —
+ * not the recorded open-blocker set — decides ownership: a dependency that was
+ * unknown or already closed at verdict time leaves the open-blocker set empty
+ * while the anchor stands, and re-grooming such a row every window would be
+ * model churn with nothing changed.
+ */
+export const NO_TYPED_DEPENDENCY_ANCHOR = { groomedDependencyKeys: { isEmpty: true } };
+
+/**
  * Every dependency candidate a parked explained block could rely on: the
  * saved baseline keys, the body's `depends on #N` refs as of now, and the
  * native blocked-by list. Deduped first, then capped like the baseline —
@@ -106,10 +128,9 @@ export function parkedBlockCandidateKeys(row: ParkedBlockedIssueRow, repoFullNam
 /**
  * Decide what this pass does with one parked explained block, against the
  * cached openness of its candidate dependencies. Pure; tests target it
- * directly. Callers must not feed it rows that carry a freshness baseline AND
- * a non-empty open-blocker anchor — those are the freshness pass's territory
- * (it compares dependency identity for them), and the store query excludes
- * them.
+ * directly. Rows with a typed dependency anchor are the freshness pass's
+ * territory (it compares their recorded open blockers against the current open
+ * set), so they are never marked here; the store query excludes them as well.
  */
 export function evaluateParkedBlock(
   row: ParkedBlockedIssueRow,
@@ -118,6 +139,11 @@ export function evaluateParkedBlock(
   now: Date,
   windowHours: number = BLOCKED_RECONSIDER_WINDOW_HOURS,
 ): ParkedBlockDecision {
+  // An anchored row carries recorded dependency evidence: the freshness pass
+  // owns it and re-grooming it on a window would spend a model call every
+  // window while nothing about its dependencies changed.
+  if (hasTypedDependencyAnchor(row)) return { action: "none" };
+
   const candidates = parkedBlockCandidateKeys(row, repoFullName);
   const openNow = candidates.filter((key) => openKeys.has(key)).sort();
 
@@ -253,15 +279,11 @@ export function makePrismaBlockedReconciliationStore(client: typeof prisma = pri
           groomingStaleAt: null,
           AND: [
             { OR: [{ groomingRetryAfter: null }, { groomingRetryAfter: { lte: new Date() } }] },
-            // Baselined rows with a non-empty open-blocker anchor are the
-            // freshness pass's territory (it compares dependency identity for
-            // them); this pass only sees rows with no baseline or no typed
-            // anchor.
-            {
-              NOT: {
-                AND: [{ groomedIssueFingerprint: { not: null } }, { groomedOpenBlockerKeys: { isEmpty: false } }],
-              },
-            },
+            // Rows with a typed dependency anchor are the freshness pass's
+            // territory (it compares their recorded open blockers against the
+            // current open set and marks them `dependency_changed` when they
+            // change). This pass only owns anchorless rows.
+            NO_TYPED_DEPENDENCY_ANCHOR,
           ],
         },
         select: {

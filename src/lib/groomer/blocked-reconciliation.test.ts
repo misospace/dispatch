@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
+import type { PrismaClient } from "@prisma/client";
 import {
   BLOCKED_RECONSIDER_WINDOW_HOURS,
   DEFAULT_BLOCKED_RECONCILIATION_BUDGET,
   evaluateParkedBlock,
+  hasTypedDependencyAnchor,
+  makePrismaBlockedReconciliationStore,
+  NO_TYPED_DEPENDENCY_ANCHOR,
   runGroomingBlockedReconciliationPass,
   type BlockedReconciliationStore,
   type ParkedBlockedIssueRow,
@@ -49,11 +53,6 @@ function parkedRow(overrides: Partial<FakeRow> = {}): FakeRow {
   };
 }
 
-/** The real store excludes baselined rows with a non-empty open-blocker anchor. */
-function baselinedWithAnchor(row: FakeRow): boolean {
-  return row.groomedIssueFingerprint != null && row.groomedOpenBlockerKeys.length > 0;
-}
-
 interface FakeStore extends BlockedReconciliationStore {
   rows: FakeRow[];
   stale: Map<string, { reasons: string[]; detail: string }>;
@@ -78,14 +77,15 @@ function fakeStore(rows: FakeRow[], openKeys: Set<string> = new Set()): FakeStor
       // Mirror the real store's where clause: open, explained block, a park
       // the groomer itself issued (an operator hold retires
       // nextGroomingAction), no admission override, retry backoff elapsed,
-      // not already stale, and not a baselined row the freshness pass owns.
+      // not already stale, and not a row the freshness pass owns (it has a
+      // typed dependency anchor).
       return store.rows
         .filter((r) => r.state === "open" && r.blockedReason != null)
         .filter((r) => r.nextGroomingAction === "mark_blocked")
         .filter((r) => r.admissionOverrideId == null)
         .filter((r) => r.groomingRetryAfter == null || r.groomingRetryAfter.getTime() <= NOW.getTime())
         .filter((r) => !store.stale.has(r.id))
-        .filter((r) => !baselinedWithAnchor(r))
+        .filter((r) => !hasTypedDependencyAnchor(r))
         .slice(0, take);
     },
     async findOpenIssueKeys() {
@@ -188,6 +188,21 @@ describe("evaluateParkedBlock", () => {
     );
   });
 
+  it("never marks a row with a typed dependency anchor", () => {
+    // The anchor is the recorded dependency evidence: the freshness pass owns
+    // the row and compares its open blockers, so this pass must not re-groom
+    // it on a window.
+    const row = parkedRow({
+      body: "Depends on #5.",
+      groomedRunId: "gr-1",
+      groomedIssueFingerprint: "fp",
+      groomedDependencyKeys: ["org/repo#5"],
+      groomedOpenBlockerKeys: [],
+      groomedAt: new Date(NOW.getTime() - 25 * HOUR),
+    });
+    expect(evaluateParkedBlock(row, "org/repo", new Set(), NOW)).toEqual({ action: "none" });
+  });
+
   it("counts only keys present in the open set, across repos", () => {
     const row = parkedRow({ body: "Depends on other/repo#7.", groomedAt: new Date(NOW.getTime() - 25 * HOUR) });
     // A mixed open set: the cross-repo prerequisite open means nothing changed.
@@ -216,10 +231,11 @@ describe("evaluateParkedBlock", () => {
     expect(decision.action === "mark" && decision.detail).toContain("org/repo#5");
   });
 
-  it("keeps a bounded 24h treadmill for a dependency Dispatch cannot see (untracked repo)", () => {
+  it("keeps a bounded 24h window for an anchorless dependency Dispatch cannot see (untracked repo)", () => {
     // An untracked repo is never in the cached open set, so its prerequisite
     // always reads closed; the bounded window keeps the cost at one re-groom
-    // per window instead of stranding or looping.
+    // per window instead of stranding or looping. The row is anchorless: a
+    // recorded anchor would make it the freshness pass's territory.
     const row = parkedRow({
       body: "Depends on untracked/repo#3.",
       groomedAt: new Date(NOW.getTime() - 25 * HOUR),
@@ -286,6 +302,28 @@ describe("runGroomingBlockedReconciliationPass", () => {
     const result = await pass(store);
     expect(result.issuesConsidered).toBe(1);
     expect(result.markedStale).toEqual([{ repo: "org/repo", issueNumber: 2, reasons: ["evidence_incomplete"] }]);
+  });
+
+  it("skips an anchored row whose recorded open blockers are empty: no re-groom treadmill", async () => {
+    // The dependency was unknown (or already closed) at verdict time, so the
+    // open-blocker set is empty while the anchor stands. Nothing about the
+    // dependency changed, so the row must not be re-groomed every window.
+    const store = fakeStore([
+      parkedRow({
+        id: "issue-1",
+        number: 1,
+        groomedRunId: "gr-1",
+        groomedIssueFingerprint: "fp",
+        groomedDependencyKeys: ["org/repo#5"],
+        groomedOpenBlockerKeys: [],
+        groomedAt: new Date(NOW.getTime() - 25 * HOUR),
+      }),
+    ]);
+    const result = await pass(store);
+    expect(result.issuesConsidered).toBe(0);
+    expect(result.markedStale).toEqual([]);
+    expect(store.stale.size).toBe(0);
+    expect(store.audits).toEqual([]);
   });
 
   it("defers every row with a warning when the openness read fails, without throwing", async () => {
@@ -372,5 +410,27 @@ describe("runGroomingBlockedReconciliationPass", () => {
     expect(result.warnings).toHaveLength(1);
     expect(result.warnings[0]).toContain("org/bad");
     expect(result.markedStale).toEqual([{ repo: "org/repo", issueNumber: 1, reasons: ["evidence_incomplete"] }]);
+  });
+});
+
+describe("makePrismaBlockedReconciliationStore", () => {
+  it("pins the production selection to anchorless rows", async () => {
+    let captured: { where?: { AND?: unknown[] } } = {};
+    const client = {
+      issue: {
+        findMany: async (args: { where?: { AND?: unknown[] } }) => {
+          captured = args;
+          return [];
+        },
+      },
+    } as unknown as PrismaClient;
+    const store = makePrismaBlockedReconciliationStore(client);
+    await store.findParkedBlockedIssues("repo-1", 10);
+    // The store selects anchorless rows: a typed dependency anchor
+    // (groomedDependencyKeys) makes a row the freshness pass's territory,
+    // whatever its recorded open-blocker set says. The fake store mirrors this
+    // clause, so the rule is pinned on both sides.
+    expect(NO_TYPED_DEPENDENCY_ANCHOR).toEqual({ groomedDependencyKeys: { isEmpty: true } });
+    expect(captured.where?.AND).toContainEqual(NO_TYPED_DEPENDENCY_ANCHOR);
   });
 });
