@@ -5,20 +5,15 @@ import { CSS } from "@dnd-kit/utilities";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import { Issue, LABEL_COLORS, AGENT_PREFIX, OWNER_PREFIX, GROOM_ACTION_LABELS, GroomAction, isValidGroomAction, isSupersededGroomReason, getAgentFromLabels, getOwnerFromLabels, getPriorityFromLabels } from "@/types";
+import type { LaneConfig } from "@/lib/lane-config";
 
-interface LaneOption {
-  id: string;
-  title: string;
-  claimable: boolean;
-  color?: string;
-}
 import { GitPullRequest, MessageSquare, ExternalLink, MoreVertical, User, Users, X, Scissors, AlertTriangle, Info, Ban } from "lucide-react";
 import { useState, useCallback } from "react";
 import { authedFetch } from "@/lib/client-auth";
 
 interface IssueCardProps {
   issue: Issue;
-  lanes?: LaneOption[];
+  lanes?: LaneConfig[];
   isDragging?: boolean;
   onIssueUpdate?: (updatedIssue: Issue) => void;
 }

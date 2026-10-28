@@ -79,6 +79,13 @@ export interface SyncRepoResult {
   results: { repo: string; synced: number; error: string | null }[];
 }
 
+/**
+ * Shared validation error for a missing agent identity — returned verbatim to
+ * MCP/API callers, so the wording is part of the agent-facing contract.
+ */
+export const AGENT_NAME_REQUIRED_ERROR =
+  "agentName is required. Either pass an explicit agentName argument or set the DISPATCH_AGENT_NAME environment variable. Do not use generic identities like 'Dispatch MCP'.";
+
 export class DispatchClientError extends Error {
   constructor(
     message: string,
@@ -385,9 +392,7 @@ export async function claimWork(
 ): Promise<ClaimWorkResult> {
   const resolvedAgent = resolveAgentName(agentName);
   if (!resolvedAgent) {
-    throw new DispatchClientError(
-      "agentName is required. Either pass an explicit agentName argument or set the DISPATCH_AGENT_NAME environment variable. Do not use generic identities like 'Dispatch MCP'.",
-    );
+    throw new DispatchClientError(AGENT_NAME_REQUIRED_ERROR);
   }
 
   const refreshEnabled = options?.refreshBeforeClaim ?? true;
