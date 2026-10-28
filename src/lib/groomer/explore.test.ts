@@ -274,6 +274,33 @@ describe("exploreRepository", () => {
     expect(result.warnings).toContain("repository exploration hit its byte budget");
   });
 
+  it("never spends more than the exploration total when a search fails late (dispatch#1451)", async () => {
+    // A failed search answers with a bounded fallback; that answer is charged
+    // against what is left of the run's byte budget, so a search failure after
+    // earlier reads cannot push the run past its total.
+    const fetchImpl = fetchReturning(
+      { content: null, tool_calls: [toolCall("1", "read_file", { path: "big.ts" })] },
+      { content: null, tool_calls: [toolCall("2", "search_code", { query: "enrich" })] },
+    );
+    const deps = makeDeps(
+      {
+        readFile: vi.fn().mockResolvedValue("y".repeat(400)),
+        searchCode: vi.fn().mockRejectedValue(new Error("Code search failed for org/repo: 502")),
+      },
+      fetchImpl,
+    );
+
+    const result = await exploreRepository({ ...options, maxTotalBytes: 500, maxRounds: 4 }, deps);
+
+    expect(result.bytes).toBeLessThanOrEqual(500);
+    const search = result.toolCalls.find((call) => call.name === "search_code");
+    expect(search?.ok).toBe(false);
+    // The fallback was clamped to what the run had left, and still says the
+    // search was an outage rather than an absence.
+    expect(search?.preview).toContain("not evidence the code is missing");
+    expect(search?.preview).not.toContain("list_directory");
+  });
+
   it("counts related-work bytes against the exploration byte budget", async () => {
     const big = { evidenceKey: "issue:org/repo#1", body: "x".repeat(300) };
     const fetchImpl = fetchReturning({

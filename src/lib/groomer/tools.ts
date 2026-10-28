@@ -308,6 +308,67 @@ function truncate(text: string, maxBytes: number): { text: string; truncated: bo
 }
 
 /**
+ * Cut a summary to a byte budget, marking the cut so the model can see that
+ * the line ends there instead of reading it as the whole upstream error.
+ */
+function cutSummary(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  const marker = "…";
+  const room = maxBytes - Buffer.byteLength(marker, "utf8");
+  if (room <= 0) return truncate(text, maxBytes).text;
+  return `${truncate(text, room).text}${marker}`;
+}
+
+/**
+ * The answer a failed code search gives the model (dispatch#1451): the search
+ * failed, that is an outage and not evidence the code is missing, and what to
+ * do instead.
+ *
+ * It is charged against the budget the caller has left, so a search failure
+ * late in a run cannot push the run past its total byte budget. When that
+ * budget is tight the upstream summary and the fallback instructions give way
+ * first; the outage signal does not, because an answer the model can misread
+ * as absence is worse than a short one.
+ */
+function buildSearchOutageAnswer(summary: string, cap: number): string {
+  const limit = Math.max(cap, 0);
+  const prefix = "search_code failed:";
+  const signal = "This is a search outage or timeout, not evidence the code is missing";
+  const shortSignal = "search outage, not evidence the code is missing";
+  const noRetry = "— repeating the search will not help.";
+  const fallback =
+    "Finish the investigation with bounded local reads: list_directory the directories " +
+    "the issue names, then read_file the specific paths (use startLine/lineCount to reach " +
+    "sections of a long file).";
+  const join = (parts: string[]) => parts.filter((part) => part.length > 0).join(" ");
+  const size = (parts: string[]) => Buffer.byteLength(join(parts), "utf8");
+
+  if (size([prefix, signal]) > limit) {
+    // Not even the outage signal fits: the shortest honest answer does.
+    const short = join([prefix, shortSignal]);
+    return size([prefix, shortSignal]) > limit ? truncate(short, limit).text : short;
+  }
+
+  let remaining = limit - size([prefix, signal]);
+  const tail: string[] = [];
+  const noRetryCost = 1 + Buffer.byteLength(noRetry, "utf8");
+  if (remaining >= noRetryCost) {
+    tail.push(noRetry);
+    remaining -= noRetryCost;
+  }
+  const fallbackCost = 1 + Buffer.byteLength(fallback, "utf8");
+  if (remaining >= fallbackCost) {
+    tail.push(fallback);
+    remaining -= fallbackCost;
+  }
+  // Whatever is left is the upstream summary's, and it is the first thing to go.
+  const summaryRoom = Math.min(200, remaining - 1);
+  const shortSummary = summaryRoom > 0 ? cutSummary(summary, summaryRoom) : "";
+  return join([prefix, shortSummary, signal, ...tail]);
+}
+
+/**
  * Hard cap on the lines one ranged read_file call may return (dispatch#1451).
  * The per-file byte budget still applies and usually cuts earlier; this bounds
  * the request even for files made of many tiny lines.
@@ -688,12 +749,20 @@ export async function executeGroomerTool(
   options: ExecuteToolOptions,
   deps: GroomerToolDeps = defaultGroomerToolDeps,
 ): Promise<GroomerToolResult> {
-  const fail = (message: string): GroomerToolResult => ({
-    ok: false,
-    content: message,
-    bytes: Buffer.byteLength(message, "utf8"),
-    sources: [],
-  });
+  // The budget this call may answer within: what the caller has left of its
+  // total. Every answer — content included, framing and fallback alike — is
+  // charged against it, so no answer can push the caller past that budget
+  // (dispatch#1451).
+  const totalCap = Math.max(options.maxTotalBytesRemaining ?? options.maxFileBytes, 0);
+  const fail = (message: string): GroomerToolResult => {
+    const text = truncate(message, totalCap).text;
+    return {
+      ok: false,
+      content: text,
+      bytes: Buffer.byteLength(text, "utf8"),
+      sources: [],
+    };
+  };
 
   try {
     switch (call.name) {
@@ -714,15 +783,15 @@ export async function executeGroomerTool(
           // upstream bodies in github-code-search: the fence is bytes, not
           // characters, so a body of multi-byte characters cannot carry more
           // bytes than the fence allows.
-          const message = truncate(
+          //
+          // The whole answer is charged against the budget the caller has
+          // left, so a search failure late in a run cannot push that run past
+          // its total byte budget (dispatch#1451).
+          const summary = truncate(
             (err instanceof Error ? err.message : String(err)).replace(/\s+/g, " ").trim(),
             200,
           ).text;
-          const content =
-            `search_code failed: ${message} This is a search outage or timeout, not evidence the code ` +
-            "is missing — repeating the search will not help. Finish the investigation with bounded " +
-            "local reads: list_directory the directories the issue names, then read_file the specific " +
-            "paths (use startLine/lineCount to reach sections of a long file).";
+          const content = buildSearchOutageAnswer(summary, totalCap);
           return {
             ok: false,
             content,
@@ -775,9 +844,8 @@ export async function executeGroomerTool(
         //
         // Budgets: the file content shown is capped by maxFileBytes, and the
         // whole answer — header and footer included — by the budget the caller
-        // has left. Exploration passes that remainder as
+        // has left (totalCap). Exploration passes that remainder as
         // maxTotalBytesRemaining; without it the file cap is the only bound.
-        const totalCap = options.maxTotalBytesRemaining ?? options.maxFileBytes;
         if (startLineArg !== undefined || lineCountArg !== undefined) {
           const startLine = startLineArg ?? 1;
           const totalLines = fileLines(text).length;

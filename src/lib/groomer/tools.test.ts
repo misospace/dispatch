@@ -1124,4 +1124,76 @@ describe("executeGroomerTool search failure vs true absence (dispatch#1451)", ()
     expect(result.content).toContain("No matches");
     expect(result.warnings).toBeUndefined();
   });
+
+  it("keeps the failed-search fallback inside the remaining budget", async () => {
+    // A search failure late in a run must not push the run past its total byte
+    // budget: the fallback answer is charged against what is left (dispatch#1451).
+    const deps = makeDeps({
+      searchCode: vi.fn().mockRejectedValue(new Error("Code search failed for org/repo: 502")),
+    });
+    const result = await executeGroomerTool(
+      { name: "search_code", arguments: { query: "enrich" } },
+      { ...options, maxFileBytes: 4096, maxTotalBytesRemaining: 120 },
+      deps,
+    );
+    expect(result.bytes).toBeLessThanOrEqual(120);
+    expect(result.ok).toBe(false);
+    // The outage signal survives the clamp; the fallback instructions give way.
+    expect(result.content).toContain("not evidence the code is missing");
+    expect(result.content).not.toContain("No matches");
+  });
+
+  it("still calls the failure an outage when the remaining budget is nearly gone", async () => {
+    const deps = makeDeps({
+      searchCode: vi.fn().mockRejectedValue(new Error("Code search failed for org/repo: 502")),
+    });
+    const result = await executeGroomerTool(
+      { name: "search_code", arguments: { query: "enrich" } },
+      { ...options, maxTotalBytesRemaining: 50 },
+      deps,
+    );
+    expect(result.bytes).toBeLessThanOrEqual(50);
+    expect(result.ok).toBe(false);
+    // Too little room for the full answer, but still an outage and never an
+    // absence the model can act on.
+    expect(result.content).toContain("search_code failed");
+    expect(result.content).toContain("search outage");
+    expect(result.content).not.toContain("No matches");
+  });
+
+  it("keeps a tool error inside the remaining budget", async () => {
+    // The shared error path is charged against the same budget: an upstream
+    // failure that carries a whole error page must not overrun it either.
+    const deps = makeDeps({
+      readFile: vi.fn().mockRejectedValue(new Error("x".repeat(5000))),
+    });
+    const result = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "a.ts" } },
+      { ...options, maxTotalBytesRemaining: 100 },
+      deps,
+    );
+    expect(result.bytes).toBeLessThanOrEqual(100);
+    expect(result.ok).toBe(false);
+  });
+
+  it("keeps the failed-search fallback inside every budget it is given", async () => {
+    // The clamp is a property, not a case: whatever the caller has left, the
+    // answer fits, stays on one line, and never reads as absence.
+    const deps = makeDeps({
+      searchCode: vi.fn().mockRejectedValue(new Error("x".repeat(5000))),
+    });
+    for (let cap = 0; cap <= 400; cap += 1) {
+      const result = await executeGroomerTool(
+        { name: "search_code", arguments: { query: "enrich" } },
+        { ...options, maxTotalBytesRemaining: cap },
+        deps,
+      );
+      expect(result.bytes).toBeLessThanOrEqual(cap);
+      expect(result.content).not.toContain("\n");
+      expect(result.content).not.toContain("No matches");
+      // With room for it, the answer still calls the failure an outage.
+      if (cap >= 40) expect(result.content).toContain("search outage");
+      if (cap >= 100) expect(result.content).toContain("not evidence the code is missing");
+    }
+  });
 });
