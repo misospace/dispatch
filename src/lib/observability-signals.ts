@@ -905,6 +905,12 @@ export function computeObservabilitySnapshot(
     // row survives on purpose, so it is neither live execution nor actionable
     // stale ownership — before OR after its TTL. Pickup/execution-history
     // evidence below still counts the row (createdAt is the pickup time).
+    // Checked BEFORE the wait marker on purpose: `deriveOwnershipState` orders
+    // EXTERNAL_WAIT first, but the write side makes terminal+future-retryAfter
+    // unreachable (the disposition route rejects retryAfter on non-blocked
+    // kinds and dispositionOwnership clears the marker), and gone-evidence
+    // is the stronger statement for these metrics if a legacy row ever
+    // carried both.
     if (lease.disposition !== null && TERMINAL_DISPOSITIONS.has(lease.disposition)) {
       terminalLeases += 1;
       continue;

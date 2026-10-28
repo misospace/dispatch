@@ -299,6 +299,18 @@ describe("observability signal derivation", () => {
       }
     });
 
+    it("a future retryAfter parks an undispositioned lease too (renewal externalWait)", () => {
+      // renewOwnership records an external-wait marker WITHOUT any
+      // disposition (worker-ownership.ts externalWaitData): the park is the
+      // marker itself, exactly the #1251 step-4 rule.
+      const s = snapshot({ leases: [makeLease({ disposition: null, retryAfter: ago(-600) })] });
+      expect(s.execution.externalWaitLeases).toBe(1);
+      expect(s.execution.activeLeases).toBe(0);
+      expect(s.execution.expiredLeases).toBe(0);
+      expect(s.execution.executionActive).toBe(0);
+      expect(s.observations.staleOwnership).toBe(false);
+    });
+
     it("an elapsed retryAfter falls through to the TTL classification (#1251 §4)", () => {
       const expired = snapshot({
         leases: [makeLease({ disposition: "blocked", retryAfter: ago(600), expiredAt: ago(60) })],
