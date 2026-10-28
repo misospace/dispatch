@@ -1219,4 +1219,39 @@ describe("release delta (#1480)", () => {
       }),
     );
   });
+
+  it("downgrades a stale delta to unknown when the sync fails before it is computed", async () => {
+    stubDeltaSync();
+    fetchRepoMock.mockRejectedValue(new Error("repo metadata 500"));
+
+    const result = await syncAutomationRepo("o/r");
+
+    expect(result.success).toBe(false);
+    const lastData = updateRepo.mock.calls.at(-1)?.[0] as { data: Record<string, unknown> };
+    expect(lastData.data.syncError).toContain("repo metadata 500");
+    expect(lastData.data.releaseState).toBe("unknown");
+    expect(lastData.data.releaseAheadBy).toBeNull();
+    expect(lastData.data.releaseError).toContain("sync failed before delta persisted");
+  });
+
+  it("keeps a delta persisted by the current pass when a later stage fails", async () => {
+    stubDeltaSync();
+    fetchWorkflowsMock.mockResolvedValue([
+      { id: 1, name: "ci", path: ".github/workflows/ci.yml", state: "active", created_at: "2024-01-01", updated_at: "2024-01-02", last_run: null },
+    ]);
+    transaction.mockRejectedValueOnce(new Error("workflow upsert timeout"));
+
+    const result = await syncAutomationRepo("o/r");
+
+    expect(result.success).toBe(false);
+    const deltaCall = updateRepo.mock.calls.find(
+      (call) => (call[0] as { data?: Record<string, unknown> }).data?.releaseState === "ahead",
+    );
+    expect(deltaCall).toBeDefined();
+    const lastData = updateRepo.mock.calls.at(-1)?.[0] as { data: Record<string, unknown> };
+    expect(lastData.data.syncError).toContain("workflow upsert timeout");
+    // The snapshot this pass completed stays untouched — no downgrade write.
+    expect(lastData.data.releaseState).toBeUndefined();
+    expect(lastData.data.releaseAheadBy).toBeUndefined();
+  });
 });

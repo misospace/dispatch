@@ -184,6 +184,9 @@ export async function fetchCompare(
     const text = await response.text();
     throw new Error(`Failed to compare ${basehead} for ${repoFullName}: ${response.status} ${text}`);
   }
+  // GitHub answers incomparable refs with 204 No Content — an OK status
+  // carrying no body. Treat it like the other not-comparable outcomes.
+  if (response.status === 204) return null;
   const data = (await response.json()) as {
     status?: unknown;
     ahead_by?: unknown;

@@ -1158,6 +1158,18 @@ describe("fetchCompare", () => {
     expect(await fetchCompare("o/r", "base1", "head1")).toBeNull();
   });
 
+  it("returns null on 204 No Content (incomparable refs)", async () => {
+    const { fetchCompare } = await import("./github");
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 204,
+      json: () => Promise.reject(new Error("204 carries no body")),
+      text: () => Promise.resolve(""),
+      headers: new Headers(),
+    } as Response);
+    expect(await fetchCompare("o/r", "base1", "head1")).toBeNull();
+  });
+
   it("throws on non-comparable failures (fail upward, caller degrades to unknown)", async () => {
     const { fetchCompare } = await import("./github");
     fetchMock.mockResolvedValueOnce(compareResponse({ message: "Forbidden" }, 403));

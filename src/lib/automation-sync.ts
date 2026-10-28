@@ -84,6 +84,10 @@ export async function computeReleaseDelta(
   headSha: string | null,
   deps: ReleaseDeltaDeps = defaultReleaseDeltaDeps
 ): Promise<ReleaseDeltaSnapshot> {
+  // Newest stable first (drafts/prereleases never baseline). The listing is
+  // the same bounded history the sync already persists (≤50 newest); a repo
+  // whose entire fetched window were drafts/prereleases reports no-baseline —
+  // a deliberate over-listing-trust trade-off, never a manufactured count.
   const stable = releases
     .filter((rel) => !rel.draft && !rel.prerelease)
     .sort((a, b) => new Date(b.published_at).getTime() - new Date(a.published_at).getTime())[0];
@@ -188,6 +192,13 @@ export async function syncAutomationRepo(repoFullName: string): Promise<Automati
     data: { repoId: repo.id, status: "running", reposFetched: 0, workflowsFetched: 0, runsFetched: 0 },
   });
 
+  // Once this pass's delta snapshot is persisted, later-stage failures must
+  // not downgrade it — it describes a comparison that actually completed.
+  // Before that point, a failed sync means GitHub was never fully readable,
+  // so the catch below fails the delta closed to `unknown` rather than
+  // leaving a stale count.
+  let deltaPersisted = false;
+
   try {
     const [githubRepo, workflows, runs, releases, prs, closedPrs, packages] = await Promise.all([
       fetchRepo(repoFullName),
@@ -235,6 +246,7 @@ export async function syncAutomationRepo(repoFullName: string): Promise<Automati
         releaseDeltaSyncedAt: new Date(),
       },
     });
+    deltaPersisted = true;
 
     // Batch workflow upserts in a single transaction
     if (workflows.length > 0) {
@@ -531,9 +543,25 @@ export async function syncAutomationRepo(repoFullName: string): Promise<Automati
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
 
+    // Fail the delta closed when this pass never persisted its snapshot: a
+    // half-failed sync means GitHub was not fully readable, so a previously
+    // persisted `ahead`/count must not keep presenting itself as current.
+    // Never downgrade a snapshot this same pass completed.
+    const deltaFailClosed = deltaPersisted
+      ? {}
+      : {
+          releaseState: "unknown" as const,
+          releaseAheadBy: null,
+          releaseError: boundedReleaseError(`sync failed before delta persisted: ${errorMessage}`),
+        };
+
     await prisma.automationRepo.update({
       where: { id: repo.id },
-      data: { syncError: errorMessage, lastSyncedAt: new Date() },
+      data: {
+        syncError: errorMessage,
+        lastSyncedAt: new Date(),
+        ...deltaFailClosed,
+      },
     }).catch((error) => {
       console.error(`Failed to update automation repo ${repo.id} with error state:`, error);
     });
