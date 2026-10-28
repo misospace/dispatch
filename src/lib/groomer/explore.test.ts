@@ -165,7 +165,10 @@ describe("exploreRepository", () => {
     });
     const deps = makeDeps({ readFile: vi.fn().mockResolvedValue("y".repeat(400)) }, fetchImpl);
 
-    const result = await exploreRepository({ ...options, maxTotalBytes: 100, maxRounds: 4 }, deps);
+    // 60 bytes cannot carry the path prefix and the continuation marker for
+    // this file, so the read answers with the in-budget notice, which spends
+    // exactly what was left: the budget is gone after the first read.
+    const result = await exploreRepository({ ...options, maxTotalBytes: 60, maxRounds: 4 }, deps);
 
     expect(result.warnings).toContain("repository exploration hit its byte budget");
     expect(deps.tools.readFile).toHaveBeenCalledTimes(1);
@@ -678,6 +681,55 @@ describe("exploreRepository investigation gaps (dispatch#1452)", () => {
     expect(result.toolCalls[1].truncated).toBe(true);
     expect(result.toolCalls[2].truncated).toBe(false);
     expect(result.findings).not.toContain("was truncated");
+  });
+
+  it("an answer that showed no content does not retire the truncated-read gap (dispatch#1451 review)", async () => {
+    // A past-the-end coordinate answers successfully but shows nothing: the
+    // file's body was never established, so a later ok read of the same path
+    // must not retire the earlier truncation fact.
+    const body = "y\n".repeat(11);
+    const deps = makeDeps(
+      { readFile: vi.fn().mockResolvedValue(body) },
+      fetchReturning(
+        { content: null, tool_calls: [toolCall("1", "read_file", { path: "src/big.ts" })] },
+        {
+          content: null,
+          tool_calls: [
+            toolCall("2", "read_file", { path: "src/big.ts", startLine: 999 }),
+            toolCall("3", "submit_findings", { files: ["src/big.ts"], ask: "do the thing" }),
+          ],
+        },
+      ),
+    );
+
+    const result = await exploreRepository({ ...options, maxFileBytes: 10 }, deps);
+
+    expect(result.gaps.truncatedReads).toEqual(["src/big.ts"]);
+    expect(result.findings).toContain("was truncated");
+  });
+
+  it("a budget-exhausted read answer does not retire the truncated-read gap (dispatch#1451 review)", async () => {
+    // The head read truncates; the run's remaining budget then cannot carry
+    // even the framing of a second read, so its notice shows no content and
+    // must not retire the fact.
+    const body = "y\n".repeat(11);
+    const deps = makeDeps(
+      { readFile: vi.fn().mockResolvedValue(body) },
+      fetchReturning(
+        { content: null, tool_calls: [toolCall("1", "read_file", { path: "src/big.ts" })] },
+        {
+          content: null,
+          tool_calls: [
+            toolCall("2", "read_file", { path: "src/big.ts" }),
+            toolCall("3", "submit_findings", { files: ["src/big.ts"], ask: "do the thing" }),
+          ],
+        },
+      ),
+    );
+
+    const result = await exploreRepository({ ...options, maxFileBytes: 10, maxTotalBytes: 100 }, deps);
+
+    expect(result.gaps.truncatedReads).toEqual(["src/big.ts"]);
   });
 
   it("flags an exhausted byte budget in the gaps and the findings", async () => {

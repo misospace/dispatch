@@ -634,13 +634,15 @@ describe("executeGroomerTool path handling", () => {
     // "…" is three UTF-8 bytes; the cut lands inside it, so the decoded
     // prefix ends in an incomplete character. The path prefix and the
     // continuation marker are charged to the same budget as the content, so
-    // the cut lands at byte 38 of this file.
+    // the cut lands at byte 38 of this file: the caller's remaining budget
+    // (119) minus the path prefix (6) and the marker allowance (75) leaves
+    // exactly 38 bytes of content.
     const deps = makeDeps({
-      readFile: vi.fn().mockResolvedValue(`${"y".repeat(37)}…${"z".repeat(60)}`),
+      readFile: vi.fn().mockResolvedValue(`${"y".repeat(37)}…${"z".repeat(200)}`),
     });
     const result = await executeGroomerTool(
       { name: "read_file", arguments: { path: "a.ts" } },
-      { ...options, maxFileBytes: 100 },
+      { ...options, maxFileBytes: 100, maxTotalBytesRemaining: 119 },
       deps,
     );
     expect(result.content).not.toContain("�");
@@ -1011,17 +1013,17 @@ describe("executeGroomerTool read_file bounded ranges (dispatch#1451)", () => {
   });
 
   it("a head truncation names the line a continuation read starts from", async () => {
-    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue(longFile(10)) });
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue(longFile(30)) });
     const head = await executeGroomerTool(
       { name: "read_file", arguments: { path: "c.ts" } },
-      { ...options, maxFileBytes: 70 },
+      { ...options, maxFileBytes: 140 },
       deps,
     );
     const match = /startLine=(\d+)/.exec(head.content);
     expect(match).not.toBeNull();
     // The prefix and the marker are charged to the same budget as the content,
     // so the whole answer still fits what the caller allowed.
-    expect(head.bytes).toBeLessThanOrEqual(70);
+    expect(head.bytes).toBeLessThanOrEqual(140);
     const rest = await executeGroomerTool(
       { name: "read_file", arguments: { path: "c.ts", startLine: Number(match?.[1]) } },
       { ...options, maxFileBytes: 4096 },
@@ -1029,8 +1031,65 @@ describe("executeGroomerTool read_file bounded ranges (dispatch#1451)", () => {
     );
     // Lines shown in both calls overlap at most one line; together they cover
     // the file, and the continuation ends at the tail.
-    expect(rest.content).toContain("line 10");
+    expect(rest.content).toContain("line 30");
     expect(rest.content).toContain("end of file");
+  });
+
+  it("a head cut inside the first line advances past the oversized line (dispatch#1451 review)", async () => {
+    // A cut inside line 1 can never show that line whole, so naming
+    // startLine=1 would send the continuation back over the same oversized
+    // line forever. The marker names the limit and advances to line 2,
+    // matching the ranged footer.
+    const deps = makeDeps({
+      readFile: vi.fn().mockResolvedValue(`${"y".repeat(500)}\nsecond\nthird`),
+    });
+    const head = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "w.ts" } },
+      { ...options, maxFileBytes: 200 },
+      deps,
+    );
+    expect(head.content).toContain(
+      "(truncated) line 1 exceeds the byte limit; call again with startLine=2",
+    );
+    expect(head.content).not.toMatch(/startLine=1(?!\d)/);
+    expect(head.bytes).toBeLessThanOrEqual(200);
+    // The suggested continuation advances: line 1 is never re-read.
+    const next = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "w.ts", startLine: 2 } },
+      options,
+      deps,
+    );
+    expect(next.content).toContain("second");
+    expect(next.content).toContain("(lines 2-3 of 3");
+    expect(next.content).toContain("end of file");
+  });
+
+  it("a single oversized line with no further lines says so (dispatch#1451 review)", async () => {
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue("y".repeat(500)) });
+    const head = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "s.ts" } },
+      { ...options, maxFileBytes: 200 },
+      deps,
+    );
+    expect(head.content).toContain("(truncated) line 1 exceeds the byte limit; no further lines");
+    expect(head.content).not.toMatch(/startLine=\d/);
+    expect(head.bytes).toBeLessThanOrEqual(200);
+  });
+
+  it("a head cut exactly at the end of the first line continues from line 2", async () => {
+    // The cap leaves exactly the whole first line: it was shown whole, so the
+    // marker continues from line 2 without claiming the limit was exceeded.
+    const deps = makeDeps({
+      readFile: vi.fn().mockResolvedValue(`abcdef\n${"z".repeat(200)}`),
+    });
+    const head = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "b.ts" } },
+      { ...options, maxFileBytes: 87 },
+      deps,
+    );
+    expect(head.content).toContain("to continue, call again with startLine=2");
+    expect(head.content).not.toContain("exceeds the byte limit");
+    expect(head.bytes).toBeLessThanOrEqual(87);
   });
 
   it("caps the returned lines at the per-call line cap", async () => {

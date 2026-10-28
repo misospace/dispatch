@@ -461,12 +461,17 @@ export async function exploreRepository(
             // A root listing has no path to name: keep the fact under a fixed
             // token rather than losing it (dispatch#1452).
             gaps.truncatedReads.push(gapPath);
-          } else {
+          } else if (result.established === true) {
             // A completed read retires the path's earlier truncation fact
             // (dispatch#1451): a continuation that reaches EOF — or a whole
             // file, or a listing that showed every entry — means the run did
             // establish what that file holds. Leaving the stale fact in place
             // would keep classifying a completed investigation incomplete.
+            // Only an answer that actually showed the path's content claims
+            // this (dispatch#1451 review): a past-the-end coordinate, an
+            // unreadable/empty file, a budget-exhausted notice or an empty
+            // listing shows nothing and establishes nothing, so it must
+            // never retire an earlier truncation fact.
             gaps.truncatedReads = gaps.truncatedReads.filter((p) => p !== gapPath);
           }
         }

@@ -73,6 +73,17 @@ export interface GroomerToolResult {
    * tool leaves it unset.
    */
   truncated?: boolean;
+  /**
+   * read_file / list_directory: the answer showed the whole path content
+   * (a full read or a range that reached EOF) or the complete directory
+   * listing, so the run established what that path holds and an earlier
+   * truncation fact for it can retire (dispatch#1451). An answer that
+   * showed nothing — unreadable/empty file, past-the-end coordinate,
+   * budget-exhausted notice, empty listing — never claims this: showing
+   * nothing establishes nothing, and a clipped read already carries
+   * `truncated` (review of dispatch#1451).
+   */
+  established?: boolean;
 }
 
 export interface GroomerToolDeps {
@@ -1127,6 +1138,11 @@ export async function executeGroomerTool(
             // reaches EOF ("end of file") leaves the fact unset, so a
             // completed continuation can retire an earlier truncation.
             truncated: range.hasMore || undefined,
+            // A range that reached EOF showed the requested tail whole: the
+            // run established what the file holds from there on (and the
+            // head was already read for the model to be here), so an
+            // earlier truncation fact may retire.
+            established: !range.hasMore,
           };
         }
         // Head read: the path prefix and the continuation marker are charged
@@ -1157,6 +1173,8 @@ export async function executeGroomerTool(
             sources: [path],
             file: { path, ref: ref ?? null, content: body },
             truncated: false,
+            // The whole file was shown: the run established what it holds.
+            established: true,
           };
         }
         // The truncation marker names the line to continue from, so a known
@@ -1164,11 +1182,18 @@ export async function executeGroomerTool(
         // (dispatch#1451). Substring "(truncated)" stays for existing readers.
         // The cut usually lands mid-line; naming the line it landed in (not
         // the next one) means a ranged continuation re-reads that line whole.
+        // A cut inside the first line is the exception: that line will never
+        // fit the byte cap whole, so the marker names the limit and advances
+        // past it — matching the ranged footer — instead of sending the
+        // continuation back over the same oversized line. A continuation
+        // always advances and never wedges.
         // Reserve room for the marker so it does not push the answer past the
-        // budget the caller allowed.
+        // budget the caller allowed; the "exceeds the byte limit" wording is
+        // the longest shape, so reserving for it covers every marker.
+        const totalLines = fileLines(text).length;
         const markerAllowance = Buffer.byteLength(
-          `\n… (truncated) to continue, call again with startLine=${"9".repeat(
-            String(fileLines(text).length).length,
+          `\n… (truncated) line 1 exceeds the byte limit; call again with startLine=${"9".repeat(
+            String(totalLines).length,
           )}`,
           "utf8",
         );
@@ -1189,7 +1214,16 @@ export async function executeGroomerTool(
           };
         }
         const cut = truncate(text, truncatedCap).text;
-        const marker = `\n… (truncated) to continue, call again with startLine=${cut.split("\n").length}`;
+        const shownLines = cut.split("\n").length;
+        const firstLineBytes = Buffer.byteLength(fileLines(text)[0] ?? "", "utf8");
+        const marker =
+          shownLines > 1
+            ? `\n… (truncated) to continue, call again with startLine=${shownLines}`
+            : Buffer.byteLength(cut, "utf8") < firstLineBytes
+              ? totalLines > 1
+                ? `\n… (truncated) line 1 exceeds the byte limit; call again with startLine=2`
+                : `\n… (truncated) line 1 exceeds the byte limit; no further lines`
+              : `\n… (truncated) to continue, call again with startLine=2`;
         const content = `${prefix}${cut}${marker}`;
         return {
           ok: true,
@@ -1243,6 +1277,10 @@ export async function executeGroomerTool(
           // The listing was clipped whenever the model did not see every
           // entry — by the entry cap or by the byte budget (dispatch#1452).
           truncated: list.shown.length < entries.length,
+          // A listing that showed every entry of a non-empty directory
+          // established what it holds. The empty-directory answer showed no
+          // entries, so it claims nothing (dispatch#1451 review).
+          established: entries.length > 0 && list.shown.length === entries.length,
         };
       }
 
