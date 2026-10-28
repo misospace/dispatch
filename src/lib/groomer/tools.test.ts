@@ -1220,3 +1220,155 @@ describe("executeGroomerTool search failure vs true absence (dispatch#1451)", ()
     );
   });
 });
+
+describe("executeGroomerTool answers stay inside the caller's remaining budget (dispatch#1451)", () => {
+  const manyMatches = Array.from({ length: 10 }, (_, i) => ({
+    path: `src/lib/deeply/nested/module-${i}-with-a-long-name.ts`,
+  }));
+
+  it("charges a successful search to the remaining budget", async () => {
+    // A successful search renders its match list; that list is charged against
+    // what the caller has left, so a search late in a run cannot push the run
+    // past its total byte budget.
+    const deps = makeDeps({ searchCode: vi.fn().mockResolvedValue(manyMatches) });
+    const result = await executeGroomerTool(
+      { name: "search_code", arguments: { query: "PrismaPg" } },
+      { ...options, maxTotalBytesRemaining: 200 },
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    expect(result.bytes).toBeLessThanOrEqual(200);
+    // The answer says what it left out instead of dropping matches silently.
+    expect(result.content).toMatch(/match(es)? not shown \(byte budget exhausted\)/);
+    // Only the paths the model actually saw are surfaced as sources.
+    const shown = result.content
+      .split("\n")
+      .filter((line) => line.startsWith("- "))
+      .map((line) => line.slice(2));
+    expect(shown.length).toBeGreaterThan(0);
+    expect(shown.length).toBeLessThan(manyMatches.length);
+    expect(result.sources).toEqual(shown);
+  });
+
+  it("tells the model a cut search was a spent budget, never that the code is missing", async () => {
+    // Too little budget for even one path: the model still learns that the
+    // matches exist and that the budget is what cut them.
+    const deps = makeDeps({ searchCode: vi.fn().mockResolvedValue(manyMatches) });
+    const result = await executeGroomerTool(
+      { name: "search_code", arguments: { query: "PrismaPg" } },
+      { ...options, maxTotalBytesRemaining: 120 },
+      deps,
+    );
+    expect(result.bytes).toBeLessThanOrEqual(120);
+    expect(result.content).toContain("matches not shown (byte budget exhausted)");
+    expect(result.content).not.toContain("No matches");
+    expect(result.sources).toEqual([]);
+  });
+
+  it("keeps a successful search inside every budget it is given", async () => {
+    // The clamp is a property, not a case: whatever the caller has left, the
+    // answer fits.
+    const deps = makeDeps({ searchCode: vi.fn().mockResolvedValue(manyMatches) });
+    for (let cap = 0; cap <= 400; cap += 1) {
+      const result = await executeGroomerTool(
+        { name: "search_code", arguments: { query: "PrismaPg" } },
+        { ...options, maxTotalBytesRemaining: cap },
+        deps,
+      );
+      expect(result.bytes).toBeLessThanOrEqual(cap);
+      // A search that found matches never reads as the negative-evidence
+      // signature (`ok && bytes === 0`): that shape means "found nothing".
+      expect(result.ok && result.bytes === 0).toBe(false);
+    }
+  });
+
+  it("still shows every match when the budget is roomy", async () => {
+    const deps = makeDeps({ searchCode: vi.fn().mockResolvedValue(manyMatches) });
+    const result = await executeGroomerTool(
+      { name: "search_code", arguments: { query: "PrismaPg" } },
+      { ...options, maxTotalBytesRemaining: 4096 },
+      deps,
+    );
+    expect(result.content).toBe(
+      `Matches for "PrismaPg":\n${manyMatches.map((m) => `- ${m.path}`).join("\n")}`,
+    );
+    expect(result.sources).toEqual(manyMatches.map((m) => m.path));
+  });
+
+  it("keeps a past-the-end read inside the remaining budget", async () => {
+    // Nothing was shown, but the answer is still charged to the budget the
+    // caller has left: a long path must not overrun it.
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue("a\nb\nc") });
+    const result = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "x".repeat(200), startLine: 9 } },
+      { ...options, maxTotalBytesRemaining: 60 },
+      deps,
+    );
+    expect(result.bytes).toBeLessThanOrEqual(60);
+    // The signal the model needs survives; the path is what gives way.
+    expect(result.content).toContain("past the end of the file (3 line(s))");
+    // Nothing was shown, so no path is claimed read.
+    expect(result.sources).toEqual([]);
+    expect(result.file).toBeUndefined();
+  });
+
+  it("keeps a directory listing inside the remaining budget", async () => {
+    const deps = makeDeps({
+      listDir: vi.fn().mockResolvedValue(
+        Array.from({ length: 20 }, (_, i) => ({
+          path: `src/deeply/nested/directory-entry-${i}.ts`,
+          type: "file" as const,
+          size: 1,
+        })),
+      ),
+    });
+    const result = await executeGroomerTool(
+      { name: "list_directory", arguments: { path: "src" } },
+      { ...options, maxTotalBytesRemaining: 200 },
+      deps,
+    );
+    expect(result.bytes).toBeLessThanOrEqual(200);
+    expect(result.content).toContain("… ");
+  });
+
+  it("keeps the zero-byte answers inside the remaining budget", async () => {
+    // A successful empty search still reads as possible absence (bytes 0),
+    // and every answer still fits the budget the caller has left.
+    const emptySearch = makeDeps({ searchCode: vi.fn().mockResolvedValue([]) });
+    const emptyFile = makeDeps({ readFile: vi.fn().mockResolvedValue("") });
+    const emptyDir = makeDeps({ listDir: vi.fn().mockResolvedValue([]) });
+    for (let cap = 0; cap <= 200; cap += 1) {
+      const search = await executeGroomerTool(
+        { name: "search_code", arguments: { query: "ghostSymbol" } },
+        { ...options, maxTotalBytesRemaining: cap },
+        emptySearch,
+      );
+      expect(search.bytes).toBe(0);
+      expect(Buffer.byteLength(search.content, "utf8")).toBeLessThanOrEqual(cap);
+      const file = await executeGroomerTool(
+        { name: "read_file", arguments: { path: "x".repeat(300) } },
+        { ...options, maxTotalBytesRemaining: cap },
+        emptyFile,
+      );
+      expect(Buffer.byteLength(file.content, "utf8")).toBeLessThanOrEqual(cap);
+      const dir = await executeGroomerTool(
+        { name: "list_directory", arguments: { path: "x".repeat(300) } },
+        { ...options, maxTotalBytesRemaining: cap },
+        emptyDir,
+      );
+      expect(Buffer.byteLength(dir.content, "utf8")).toBeLessThanOrEqual(cap);
+    }
+  });
+
+  it("still reads as absence when the no-match answer is squeezed", async () => {
+    const deps = makeDeps({ searchCode: vi.fn().mockResolvedValue([]) });
+    const result = await executeGroomerTool(
+      { name: "search_code", arguments: { query: "ghostSymbol" } },
+      { ...options, maxTotalBytesRemaining: 40 },
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    expect(result.bytes).toBe(0);
+    expect(result.content).toContain("No matches");
+  });
+});

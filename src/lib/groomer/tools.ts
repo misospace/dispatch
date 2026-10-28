@@ -383,6 +383,169 @@ function buildSearchOutageAnswer(
 }
 
 /**
+ * How much of the model's own query is echoed back in an answer. A query is
+ * model-authored and can be arbitrarily long; the answer only needs enough of
+ * it to be recognizable.
+ */
+const MAX_ECHOED_QUERY_BYTES = 200;
+
+/**
+ * The answer a successful empty search gives the model (dispatch#1451): the
+ * thing is not in the repository.
+ *
+ * It is the negative-evidence signal — the freshness layer reads a successful
+ * search with zero bytes as possible absence (dispatch#1091) — so it is
+ * charged as zero bytes. The wording still fits the budget the caller has
+ * left: a tight budget shortens the answer instead of overrunning it, and the
+ * "no matches" signal survives every budget that can carry it.
+ */
+function buildNoMatchAnswer(query: string, cap: number): string {
+  const limit = Math.max(cap, 0);
+  const echo = cutWithMarker(query, MAX_ECHOED_QUERY_BYTES);
+  const candidates = [
+    `No matches for "${echo}". If you expected this to exist, it may be the thing the issue says is missing.`,
+    `No matches for "${echo}".`,
+    "No matches.",
+  ];
+  for (const candidate of candidates) {
+    if (Buffer.byteLength(candidate, "utf8") <= limit) return candidate;
+  }
+  return truncate(candidates[candidates.length - 1], limit).text;
+}
+
+/**
+ * The answer a read past the end of the file gives (dispatch#1451): the
+ * coordinate is beyond the file, so nothing was shown.
+ *
+ * It is bounded by the budget the caller has left. The "past the end" signal
+ * comes first in the fallback ladder, because that is the part the model
+ * needs; the path is what gives way when the budget is tight.
+ */
+function buildPastEndAnswer(
+  path: string,
+  startLine: number,
+  totalLines: number,
+  cap: number,
+): string {
+  const limit = Math.max(cap, 0);
+  const signal = `startLine ${startLine} is past the end of the file (${totalLines} line(s))`;
+  const candidates = [`${path}: ${signal}.`, `${signal}.`, signal];
+  for (const candidate of candidates) {
+    if (Buffer.byteLength(candidate, "utf8") <= limit) return candidate;
+  }
+  return truncate(signal, limit).text;
+}
+
+/**
+ * The answer a read of something that is not a readable file gives: it is
+ * empty or not a file, and the way out is the parent directory. Bounded by
+ * the budget the caller has left, like every other answer.
+ */
+function buildUnreadableFileAnswer(path: string, cap: number): string {
+  const limit = Math.max(cap, 0);
+  const candidates = [
+    `${path} is empty or is not a file. Try list_directory on its parent.`,
+    `${path} is empty or not a file.`,
+  ];
+  for (const candidate of candidates) {
+    if (Buffer.byteLength(candidate, "utf8") <= limit) return candidate;
+  }
+  return truncate(candidates[candidates.length - 1], limit).text;
+}
+
+/**
+ * The answer a directory listing with nothing in it gives. Bounded by the
+ * budget the caller has left, like every other answer.
+ */
+function buildEmptyDirectoryAnswer(path: string, cap: number): string {
+  const limit = Math.max(cap, 0);
+  const label = path || "/";
+  const candidates = [
+    `${label} has no entries, or is a file rather than a directory.`,
+    `${label} has no entries.`,
+  ];
+  for (const candidate of candidates) {
+    if (Buffer.byteLength(candidate, "utf8") <= limit) return candidate;
+  }
+  return truncate(candidates[candidates.length - 1], limit).text;
+}
+
+/**
+ * A list answer (search matches, directory entries) bounded by the budget the
+ * caller has left: a header, the entries that fit, and a marker naming what
+ * was left out.
+ *
+ * The whole answer is charged against that budget, so a list the model asked
+ * for cannot push the run past its total byte budget (dispatch#1451). The
+ * entries that did not fit are named rather than silently dropped, so the
+ * model can narrow its own next call instead of believing it saw everything.
+ */
+interface BoundedListOptions {
+  header: string;
+  items: string[];
+  /** How one entry is rendered on its own line. */
+  renderItem: (item: string) => string;
+  /** The marker naming the entries that did not fit. */
+  omitted: (count: number) => string;
+  /** The answer when not even the header fits the budget. */
+  exhausted: string;
+  cap: number;
+  /**
+   * How many entries exist in total, when the caller already capped the list
+   * by some other rule (the directory-entry cap). The marker then names every
+   * entry the model did not see, not just the ones the byte budget dropped.
+   */
+  total?: number;
+}
+
+function renderBoundedList(options: BoundedListOptions): { content: string; shown: string[] } {
+  const limit = Math.max(options.cap, 0);
+  if (limit === 0) return { content: "", shown: [] };
+  const total = options.total ?? options.items.length;
+
+  const assemble = (lines: string[], omittedCount: number): string => {
+    const head = lines.length > 0 ? `${options.header}\n${lines.join("\n")}` : options.header;
+    return omittedCount > 0 ? `${head}\n${options.omitted(omittedCount)}` : head;
+  };
+
+  if (Buffer.byteLength(assemble([], 0), "utf8") > limit) {
+    // Not even the header fits: say so inside the budget instead of
+    // overrunning it.
+    return { content: truncate(options.exhausted, limit).text, shown: [] };
+  }
+
+  // Reserve room for the marker, so the answer can say what it left out. The
+  // marker for the count actually left out is no longer than this one, so the
+  // reservation is safe.
+  const reserve = Buffer.byteLength(options.omitted(total), "utf8") + 1;
+  const lines: string[] = [];
+  const shown: string[] = [];
+  let used = Buffer.byteLength(`${options.header}\n`, "utf8");
+  for (const item of options.items) {
+    const line = options.renderItem(item);
+    const cost = Buffer.byteLength(line, "utf8") + 1;
+    if (used + cost + reserve > limit) break;
+    lines.push(line);
+    shown.push(item);
+    used += cost;
+  }
+  let content = assemble(lines, total - shown.length);
+  // The assembled answer is measured exactly: drop an entry if it still does
+  // not fit.
+  while (Buffer.byteLength(content, "utf8") > limit && lines.length > 0) {
+    lines.pop();
+    shown.pop();
+    content = assemble(lines, total - shown.length);
+  }
+  if (Buffer.byteLength(content, "utf8") > limit) {
+    // Even the header and the marker do not fit together: say the budget is
+    // spent instead of overrunning it.
+    return { content: truncate(options.exhausted, limit).text, shown: [] };
+  }
+  return { content, shown };
+}
+
+/**
  * Hard cap on the lines one ranged read_file call may return (dispatch#1451).
  * The per-file byte budget still applies and usually cuts earlier; this bounds
  * the request even for files made of many tiny lines.
@@ -821,14 +984,45 @@ export async function executeGroomerTool(
         if (results.length === 0) {
           return {
             ok: true,
-            content: `No matches for "${query}". If you expected this to exist, it may be the thing the issue says is missing.`,
+            content: buildNoMatchAnswer(query, totalCap),
+            // The negative-evidence signal: the freshness layer reads a
+            // successful search with zero bytes as possible absence
+            // (dispatch#1091), so this answer carries no evidence bytes. It
+            // is still bounded by the budget the caller has left.
             bytes: 0,
             sources: [],
           };
         }
+        // A successful search is charged against the budget the caller has
+        // left, like every other answer (dispatch#1451): a long match list
+        // late in a run must not push the run past its total byte budget.
         const paths = results.map((r) => r.path).filter(Boolean);
-        const content = `Matches for "${query}":\n${paths.map((p) => `- ${p}`).join("\n")}`;
-        return { ok: true, content, bytes: Buffer.byteLength(content, "utf8"), sources: paths };
+        const list = renderBoundedList({
+          header: `Matches for "${cutWithMarker(query, MAX_ECHOED_QUERY_BYTES)}":`,
+          items: paths,
+          renderItem: (path) => `- ${path}`,
+          // The matches that did not fit are named, and the reason is named
+          // too: the model must read the cut as a spent budget, never as
+          // absence.
+          omitted: (count) =>
+            `… ${count} match${count === 1 ? "" : "es"} not shown (byte budget exhausted)`,
+          exhausted: "byte budget exhausted: the search results were not shown; stop searching.",
+          cap: totalCap,
+        });
+        if (!list.content) {
+          // No budget left to answer with. The call did not deliver, so it is
+          // not an absence: a successful search that found matches must never
+          // read as the negative-evidence signature (`ok && bytes === 0`).
+          return { ok: false, content: "", bytes: 0, sources: [] };
+        }
+        return {
+          ok: true,
+          content: list.content,
+          bytes: Buffer.byteLength(list.content, "utf8"),
+          // Only the paths the model actually saw are surfaced: a path the
+          // answer left out was never shown to anyone.
+          sources: list.shown,
+        };
       }
 
       case "read_file": {
@@ -851,7 +1045,7 @@ export async function executeGroomerTool(
         if (!text) {
           return {
             ok: true,
-            content: `${path} is empty or is not a file. Try list_directory on its parent.`,
+            content: buildUnreadableFileAnswer(path, totalCap),
             bytes: 0,
             sources: [],
           };
@@ -869,8 +1063,10 @@ export async function executeGroomerTool(
           const totalLines = fileLines(text).length;
           if (startLine > totalLines) {
             // Nothing was shown, so the path is not reported as read: an
-            // answered coordinate is not fetch evidence.
-            const content = `${path}: startLine ${startLine} is past the end of the file (${totalLines} line(s)).`;
+            // answered coordinate is not fetch evidence. The answer is still
+            // charged against the budget the caller has left (dispatch#1451):
+            // a path can be long, and the answer must not overrun the budget.
+            const content = buildPastEndAnswer(path, startLine, totalLines, totalCap);
             return {
               ok: true,
               content,
@@ -983,16 +1179,31 @@ export async function executeGroomerTool(
         if (entries.length === 0) {
           return {
             ok: true,
-            content: `${path || "/"} has no entries, or is a file rather than a directory.`,
+            content: buildEmptyDirectoryAnswer(path, totalCap),
             bytes: 0,
             sources: [],
           };
         }
-        const shown = entries.slice(0, options.maxDirEntries);
-        const lines = shown.map((e) => `- ${e.path}${e.type === "dir" ? "/" : ""}`);
-        const more = entries.length > shown.length ? `\n… ${entries.length - shown.length} more` : "";
-        const content = `${path || "/"}:\n${lines.join("\n")}${more}`;
-        return { ok: true, content, bytes: Buffer.byteLength(content, "utf8"), sources: [] };
+        // A listing is charged against the budget the caller has left, like
+        // every other answer (dispatch#1451): a directory of long paths must
+        // not push the run past its total byte budget. The entries that did
+        // not fit are named, so the model knows the list was cut.
+        const dirTypes = new Map(entries.map((entry) => [entry.path, entry.type]));
+        const list = renderBoundedList({
+          header: `${path || "/"}:`,
+          items: entries.slice(0, options.maxDirEntries).map((entry) => entry.path),
+          renderItem: (entryPath) => `- ${entryPath}${dirTypes.get(entryPath) === "dir" ? "/" : ""}`,
+          omitted: (count) => `… ${count} more`,
+          exhausted: "byte budget exhausted: the directory listing was not shown; stop listing.",
+          cap: totalCap,
+          total: entries.length,
+        });
+        return {
+          ok: true,
+          content: list.content,
+          bytes: Buffer.byteLength(list.content, "utf8"),
+          sources: [],
+        };
       }
 
       case "search_related_work": {

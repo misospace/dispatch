@@ -301,6 +301,33 @@ describe("exploreRepository", () => {
     expect(search?.preview).not.toContain("list_directory");
   });
 
+  it("never spends more than the exploration total when a search succeeds late (dispatch#1451)", async () => {
+    // A successful search renders its match list; that answer is charged
+    // against what is left of the run's byte budget, so a search after earlier
+    // reads cannot push the run past its total.
+    const fetchImpl = fetchReturning(
+      { content: null, tool_calls: [toolCall("1", "read_file", { path: "big.ts" })] },
+      { content: null, tool_calls: [toolCall("2", "search_code", { query: "enrich" })] },
+    );
+    const deps = makeDeps(
+      {
+        readFile: vi.fn().mockResolvedValue("y".repeat(400)),
+        searchCode: vi.fn().mockResolvedValue(
+          Array.from({ length: 10 }, (_, i) => ({ path: `src/lib/deeply/nested/module-${i}.ts` })),
+        ),
+      },
+      fetchImpl,
+    );
+
+    const result = await exploreRepository({ ...options, maxTotalBytes: 500, maxRounds: 4 }, deps);
+
+    expect(result.bytes).toBeLessThanOrEqual(500);
+    const search = result.toolCalls.find((call) => call.name === "search_code");
+    expect(search?.ok).toBe(true);
+    // The match list was clamped to what the run had left.
+    expect(search?.bytes).toBeLessThanOrEqual(500 - result.toolCalls[0].bytes);
+  });
+
   it("counts related-work bytes against the exploration byte budget", async () => {
     const big = { evidenceKey: "issue:org/repo#1", body: "x".repeat(300) };
     const fetchImpl = fetchReturning({
