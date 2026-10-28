@@ -9,7 +9,7 @@ import { callGroomerLLM } from "./llm";
 import { runModelStage } from "./model-stage";
 import { sanitizeModelJson } from "./sanitize";
 import { inFlightStatus, validateGroomingPlan, type GroomingPlan } from "./plan";
-import { buildEvidenceCatalog } from "./plan-evidence";
+import { buildEvidenceCatalog, typedVerdictDependencyKeys } from "./plan-evidence";
 import { collectPinnedReadContent } from "./close-grounding";
 import { getHostedGroomerConfig } from "./config";
 import { assessExternalEngagement } from "./trust";
@@ -1217,6 +1217,12 @@ async function executeGroomerRun(
         explorationRan: exploration !== null,
         explorationToolCalls: exploration ? explorationCallsForFreshness(exploration.toolCalls) : [],
         citations: plan.citations,
+        // #1459: a mark_blocked verdict's typed, evidence-grounded dependencies
+        // become part of the baseline's anchor, so a later closure of the real
+        // blocker can invalidate the parked result even when the body names
+        // nothing. Non-blocked verdicts pass none.
+        blockedDependencyKeys:
+          verdictAction === "mark_blocked" ? typedVerdictDependencyKeys(plan, evidenceCatalog) : [],
       }),
     );
     // The preconditions just verified the evidence against the live head.

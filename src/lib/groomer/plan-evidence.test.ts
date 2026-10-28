@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { GroomingEvidenceSnapshot } from "./evidence-snapshot";
-import { buildEvidenceCatalog, catalogIds, renderEvidenceCatalog } from "./plan-evidence";
+import { buildEvidenceCatalog, catalogIds, renderEvidenceCatalog, typedVerdictDependencyKeys } from "./plan-evidence";
+import { MAX_BASELINE_DEPENDENCIES } from "./freshness";
+import type { GroomingPlan } from "./plan";
 
 const base: GroomingEvidenceSnapshot = {
   capturedAt: "2026-09-26T00:00:00.000Z",
@@ -83,5 +85,91 @@ describe("renderEvidenceCatalog", () => {
   it("says when repository reads are unpinned", () => {
     const text = renderEvidenceCatalog(buildEvidenceCatalog({ ...base, headSha: null, pinnedRef: null }));
     expect(text).toContain("NOT pinned");
+  });
+});
+
+describe("typedVerdictDependencyKeys", () => {
+  const sources = [
+    { path: "src/a.ts", provenance: "repository" as const, via: "read" as const, ref: "abc123def4567890" },
+    { key: "github:issue:org/repo#7", provenance: "github_issue" as const, state: "open" as const, url: null, via: "read" as const, observedAt: "", ref: null },
+    { key: "github:issue:org/repo#8", provenance: "github_issue" as const, state: "closed" as const, url: null, via: "read" as const, observedAt: "", ref: null },
+    { key: "github:issue:org/repo#42", provenance: "github_issue" as const, state: "open" as const, url: null, via: "read" as const, observedAt: "", ref: null },
+    { key: "github:pr:org/repo#12", provenance: "github_pull_request" as const, state: "open" as const, url: null, via: "read" as const, observedAt: "", ref: null },
+  ];
+  const catalog = buildEvidenceCatalog({ ...base, sources });
+  type Dep = NonNullable<NonNullable<GroomingPlan["implementationBrief"]>["dependencies"]>[number];
+
+  function planWith(dependencies: Dep[]): GroomingPlan {
+    return { implementationBrief: { dependencies } } as unknown as GroomingPlan;
+  }
+
+  it("includes open and unknown states, excludes closed and merged", () => {
+    const keys = typedVerdictDependencyKeys(
+      planWith([
+        { ref: "org/repo#7", state: "open", evidenceRef: "github:issue:org/repo#7" },
+        { ref: "org/repo#7", state: "unknown", evidenceRef: "github:issue:org/repo#7" },
+        { ref: "org/repo#8", state: "closed", evidenceRef: "github:issue:org/repo#7" },
+        { ref: "org/repo#8", state: "merged", evidenceRef: "github:issue:org/repo#7" },
+      ]),
+      catalog,
+    );
+    expect(keys).toEqual(["org/repo#7"]);
+  });
+
+  it("skips a dependency with no evidenceRef (the evidence stays incomplete)", () => {
+    const keys = typedVerdictDependencyKeys(
+      planWith([{ ref: "other/repo#7", state: "open", evidenceRef: null }]),
+      catalog,
+    );
+    expect(keys).toEqual([]);
+  });
+
+  it("skips non-related-work, repository and unknown evidence refs", () => {
+    const keys = typedVerdictDependencyKeys(
+      planWith([
+        { ref: "a", state: "open", evidenceRef: "repo:src/a.ts" },
+        { ref: "b", state: "open", evidenceRef: "issue" },
+        { ref: "c", state: "open", evidenceRef: "comment:1" },
+        { ref: "d", state: "open", evidenceRef: "github:issue:nowhere/else#1" },
+      ]),
+      catalog,
+    );
+    expect(keys).toEqual([]);
+  });
+
+  it("skips pull-request evidence refs", () => {
+    const keys = typedVerdictDependencyKeys(
+      planWith([{ ref: "org/repo#12", state: "open", evidenceRef: "github:pr:org/repo#12" }]),
+      catalog,
+    );
+    expect(keys).toEqual([]);
+  });
+
+  it("dedupes, excludes the issue's own key and enforces the cap", () => {
+    const manySources = [
+      ...Array.from({ length: MAX_BASELINE_DEPENDENCIES + 5 }, (_, i) => ({
+        key: `github:issue:org/repo#${i + 1}`,
+        provenance: "github_issue" as const,
+        state: "open" as const,
+        url: null,
+        via: "read" as const,
+        observedAt: "",
+        ref: null as null,
+      })),
+      // The groomed issue itself (#42), cited twice below.
+      { key: "github:issue:org/repo#42", provenance: "github_issue" as const, state: "open" as const, url: null, via: "read" as const, observedAt: "", ref: null },
+    ];
+    const manyCatalog = buildEvidenceCatalog({ ...base, sources: manySources });
+    const deps: Dep[] = manySources.map((source) => ({
+      ref: source.key,
+      state: "open" as const,
+      evidenceRef: source.key,
+    }));
+    deps.push({ ref: "dup", state: "unknown", evidenceRef: "github:issue:org/repo#42" });
+
+    const keys = typedVerdictDependencyKeys(planWith(deps), manyCatalog);
+    expect(keys).not.toContain("org/repo#42");
+    expect(new Set(keys).size).toBe(keys.length);
+    expect(keys).toHaveLength(MAX_BASELINE_DEPENDENCIES);
   });
 });

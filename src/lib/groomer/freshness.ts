@@ -36,6 +36,7 @@ export const GROOMING_STALE_REASONS = [
   "evidence_path_changed",
   "global_evidence_commit",
   "compare_unreliable",
+  "evidence_incomplete",
 ] as const;
 export type GroomingStaleReason = (typeof GROOMING_STALE_REASONS)[number];
 
@@ -583,6 +584,14 @@ export interface GroomingFreshnessInput {
   explorationToolCalls: ExplorationToolCallLike[];
   /** The validated plan's citations (#1062), when there is a plan. */
   citations?: FreshnessCitation[];
+  /**
+   * Typed `owner/repo#N` keys a mark_blocked verdict's blocked assessment
+   * relies on (#1459), from the plan's typed implementation-brief
+   * dependencies. Merged into the body-derived keys so the baseline's open
+   * blocker anchor resolves against real cached openness even when the body
+   * itself names nothing.
+   */
+  blockedDependencyKeys?: string[];
   /** Returns the subset of dependency keys whose issue is currently open. */
   resolveOpenKeys: (keys: string[]) => Promise<Set<string>>;
 }
@@ -607,7 +616,17 @@ export async function buildGroomingFreshnessBaseline(input: GroomingFreshnessInp
     reliesOnSurfacedPath: reliance.reliesOnSurfacedPath,
   });
 
-  const dependencyKeys = dependencyKeysForIssue(body, input.repoFullName, input.issueNumber);
+  const bodyDependencyKeys = dependencyKeysForIssue(body, input.repoFullName, input.issueNumber);
+  // A mark_blocked verdict's load-bearing dependencies (#1459) may live only
+  // in the plan's typed brief (named in the assessment, not the body), so
+  // they are merged in BEFORE openness is resolved: body keys first, then
+  // verdict keys, deduped by exact string and capped like the body keys.
+  const dependencyKeys: string[] = [];
+  for (const key of [...bodyDependencyKeys, ...(input.blockedDependencyKeys ?? [])]) {
+    if (dependencyKeys.includes(key)) continue;
+    dependencyKeys.push(key);
+    if (dependencyKeys.length >= MAX_BASELINE_DEPENDENCIES) break;
+  }
   const openKeys = dependencyKeys.length > 0 ? await input.resolveOpenKeys(dependencyKeys) : new Set<string>();
 
   return {

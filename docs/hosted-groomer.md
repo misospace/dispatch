@@ -307,6 +307,7 @@ What makes a result stale (`groomingStaleAt`, `groomingStaleReasons`, `groomingS
 | `evidence_path_changed` | A default-branch commit touched a path the result relied on (exact file, or a file under an evidenced directory). |
 | `global_evidence_commit` | Any new default-branch commit, when the result relied on `global` evidence. |
 | `compare_unreliable` | The commit comparison cannot be trusted: the base SHA is gone, the histories diverged, or GitHub truncated the changed-file list. |
+| `evidence_incomplete` | (#1459) A parked explained block with no recorded dependency anchor was revisited after the reconsideration window (see below). |
 
 A commit that only touches unrelated paths does not stale a `paths` result; the issue's `groomingVerifiedSha` advances to the new head instead, so each later check compares a small range. A transient compare failure leaves the result fresh but unverified (`groomingVerifiedSha` behind the head) and is retried on the next sync. A run whose head SHA could not be pinned stays unverified rather than stale, so a repository whose head cannot be resolved does not re-groom in a loop.
 
@@ -320,6 +321,10 @@ How it runs:
 - A run skipped because the issue is `status/in-progress` or `status/in-review` records no baseline and leaves any earlier one as it was.
 
 Freshness unknown: issues groomed before this existed, or through `POST /api/issues/groom` (which carries no evidence and resets any recorded baseline), have no fingerprint. The hosted groomer backfills them at the lowest priority, only when nothing else wants grooming and outside the usual 24h cooldown; deliberately blocked issues are not backfilled. External groomers polling `next-task?mode=groom` are not offered backfill work. [Worker admission](#worker-admission) decides how unknown and unverified results are treated.
+
+### Blocked verdict reconsideration (#1459)
+
+An issue parked with an explained block (`blockedReason`, `status/blocked`) can stay parked after its named prerequisites close: a legacy park has no freshness baseline the freshness pass can evaluate, and a baselined park whose dependency evidence is incomplete (nothing saved for the body or the verdict) is skipped by the freshness pass's dependency check. A bounded reconciliation pass — read-only over the cache, run after each sync next to the freshness pass — revisits such parked blocks. Only parks carrying the groomer's own verdict marker are considered (`nextGroomingAction` is `mark_blocked`): an operator or worker block written through the status route retires that marker and is a deliberate human hold the pass never touches. Parks written before that marker existed, and manual `POST /api/issues/groom` parks (which write a prose marker), are outside this pass's reach — they remain reachable through a targeted re-groom or the operator's recovery audit. Reconsideration emits one stale reason, `evidence_incomplete`: a park with no typed dependency anchor is revisited on a bounded 24h window. A `mark_blocked` verdict's typed, evidence-grounded dependencies (the plan brief's `open`/`unknown` dependencies backed by a cited GitHub issue) are now part of the baseline, so a park WITH such an anchor is handled event-driven by the freshness pass itself (`dependency_changed` when the recorded open blockers change). Reconsideration never auto-promotes to ready and never closes: the stale mark is the selector's reconsideration path, and a fresh groom re-decides. Operator admission overrides, worker-owned statuses, retry backoff and the write race guards are preserved.
 
 ## Worker Admission
 

@@ -127,6 +127,7 @@ const GROOMING_STALE_REASON_DIMS = [
   "evidence_path_changed",
   "global_evidence_commit",
   "compare_unreliable",
+  "evidence_incomplete",
 ] as const;
 
 /**
