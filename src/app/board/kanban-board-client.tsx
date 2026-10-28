@@ -2,17 +2,11 @@
 
 import { KanbanBoard } from "@/components/kanban-board";
 import { Issue } from "@/types";
-
-interface LaneOption {
-  id: string;
-  title: string;
-  claimable: boolean;
-  color?: string;
-}
+import type { LaneConfig } from "@/lib/lane-config";
 
 interface KanbanBoardClientProps {
   initialIssues: Issue[];
-  lanes?: LaneOption[];
+  lanes?: LaneConfig[];
 }
 
 export function KanbanBoardClient({ initialIssues, lanes }: KanbanBoardClientProps) {

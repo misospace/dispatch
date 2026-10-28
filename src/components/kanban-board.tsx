@@ -37,13 +37,8 @@ const XL_GRID_COLS: Record<number, string> = {
 
 const BOARD_GRID_COLUMNS = XL_GRID_COLS[BOARD_COLUMNS.length] ?? "xl:grid-cols-6";
 
-interface LaneOption {
-  id: string;
-  title: string;
-  claimable: boolean;
-  color?: string;
-}
 import { getIssuesByStatus, getIssueStatus } from "@/lib/kanban";
+import type { LaneConfig } from "@/lib/lane-config";
 import { authedFetch } from "@/lib/client-auth";
 
 const AUTO_REFRESH_INTERVAL_MS = 30_000; // 30 seconds
@@ -54,7 +49,7 @@ const MOVE_SYNC_DEBOUNCE_MS = 10_000;
 
 interface KanbanBoardProps {
   initialIssues: Issue[];
-  lanes?: LaneOption[];
+  lanes?: LaneConfig[];
 }
 
 export interface KanbanBoardRef {
