@@ -3,18 +3,13 @@
 import { useRouter, useSearchParams } from "next/navigation";
 import { PRIORITY_LABELS, AGENT_PREFIX, OWNER_PREFIX } from "@/types";
 import { LABEL_FILTER_HELP } from "@/lib/issue-filters";
-
-interface LaneOption {
-  id: string;
-  title: string;
-  claimable: boolean;
-}
+import type { LaneConfig } from "@/lib/lane-config";
 
 interface FilterBarProps {
   repos: { fullName: string }[];
   agents: string[];
   owners: string[];
-  lanes?: LaneOption[];
+  lanes?: LaneConfig[];
   activeFilters: {
     repo: string;
     agent: string;

@@ -14,6 +14,7 @@ import {
   requeuePrFix,
   runGroomer,
   resolveAgentName,
+  AGENT_NAME_REQUIRED_ERROR,
   refreshIssue,
   syncRepo,
   resolveIssue,
@@ -61,6 +62,26 @@ async function wrapToolCall(fn: () => Promise<unknown>): Promise<ToolResult> {
   }
 }
 
+/**
+ * Error ToolResult for a missing agent identity. The message is the shared
+ * AGENT_NAME_REQUIRED_ERROR contract (see mc-client).
+ */
+function agentNameRequiredResult(): ToolResult {
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(
+          { success: false, error: AGENT_NAME_REQUIRED_ERROR },
+          null,
+          2,
+        ),
+      },
+    ],
+    isError: true,
+  };
+}
+
 export async function resolveIssueHandler(args: ExtraArgs): Promise<ToolResult> {
   return wrapToolCall(() =>
     resolveIssue(
@@ -73,20 +94,7 @@ export async function resolveIssueHandler(args: ExtraArgs): Promise<ToolResult> 
 export async function claimIssueHandler(args: ExtraArgs): Promise<ToolResult> {
   const resolvedAgentName = resolveAgentName(args.agentName as string | undefined);
 
-  if (!resolvedAgentName) {
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: JSON.stringify({
-            success: false,
-            error: "agentName is required. Either pass an explicit agentName argument or set the DISPATCH_AGENT_NAME environment variable. Do not use generic identities like 'Dispatch MCP'.",
-          }, null, 2),
-        },
-      ],
-      isError: true,
-    };
-  }
+  if (!resolvedAgentName) return agentNameRequiredResult();
 
   return wrapToolCall(() =>
     claimIssue(
@@ -101,20 +109,7 @@ export async function claimIssueHandler(args: ExtraArgs): Promise<ToolResult> {
 export async function unclaimIssueHandler(args: ExtraArgs): Promise<ToolResult> {
   const resolvedAgentName = resolveAgentName(args.agentName as string | undefined);
 
-  if (!resolvedAgentName) {
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: JSON.stringify({
-            success: false,
-            error: "agentName is required. Either pass an explicit agentName argument or set the DISPATCH_AGENT_NAME environment variable. Do not use generic identities like 'Dispatch MCP'.",
-          }, null, 2),
-        },
-      ],
-      isError: true,
-    };
-  }
+  if (!resolvedAgentName) return agentNameRequiredResult();
 
   return wrapToolCall(() =>
     unclaimIssue(
@@ -128,20 +123,7 @@ export async function unclaimIssueHandler(args: ExtraArgs): Promise<ToolResult> 
 export async function getQueueHandler(args: ExtraArgs): Promise<ToolResult> {
   const resolvedAgentName = resolveAgentName(args.agentName as string | undefined);
 
-  if (!resolvedAgentName) {
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: JSON.stringify({
-            success: false,
-            error: "agentName is required. Either pass an explicit agentName argument or set the DISPATCH_AGENT_NAME environment variable. Do not use generic identities like 'Dispatch MCP'.",
-          }, null, 2),
-        },
-      ],
-      isError: true,
-    };
-  }
+  if (!resolvedAgentName) return agentNameRequiredResult();
 
   return wrapToolCall(() =>
     getQueue(resolvedAgentName, {
