@@ -4,7 +4,7 @@ import { childBriefKey } from "@/lib/decomposition";
 import type { GroomingEvidenceSnapshot } from "./evidence-snapshot";
 import { buildEvidenceCatalog } from "./plan-evidence";
 import { collectPinnedReadContent } from "./close-grounding";
-import { validateGroomingPlan, type GroomingPlan, type GroomingPlanDraft } from "./plan";
+import { validateGroomingPlan, type GroomingPlan, type GroomingPlanDraft, type ReleaseSignal } from "./plan";
 import type { InfoGap } from "./investigation-gap";
 import type { LiveComment, LiveIssueState } from "./mutation-validator";
 import {
@@ -465,7 +465,7 @@ describe("computeApplicationKey", () => {
     const input = { repoFullName: "org/repo", issueNumber: 42, plan: planFor(d), diff: diffFor(d) };
     const v1Key = v1ApplicationKey(input);
     expect(computeApplicationKey(input)).not.toBe(v1Key);
-    expect(APPLICATION_KEY_VERSION).toBe(2);
+    expect(APPLICATION_KEY_VERSION).toBe(3);
   });
 
   it("is carried by the comment marker, which only counts at the end of a comment Dispatch posted", () => {
@@ -517,6 +517,41 @@ function v1ApplicationKey(input: {
   return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
 }
 
+/**
+ * The v2 application key, exactly as main computed it before dispatch#1481:
+ * the persisted reason and verdict action had joined the intent, but the
+ * release signal had not, and v: 2. Field order included, since the digest
+ * hashes the serialized JSON.
+ */
+function v2ApplicationKey(input: {
+  repoFullName: string;
+  issueNumber: number;
+  plan: GroomingPlan;
+  diff: GroomingMutationDiff;
+}): string {
+  const canonical = {
+    v: 2,
+    repo: input.repoFullName.toLowerCase(),
+    issue: input.issueNumber,
+    evidenceDigest: input.plan.evidence.evidenceDigest,
+    planVersion: input.plan.schemaVersion,
+    intent: {
+      labels: [...new Set(input.diff.labelsAfter)].sort(),
+      lane: input.diff.lane,
+      comment: input.diff.comment,
+      title: input.diff.title,
+      body: input.diff.body,
+      close: input.diff.close,
+      reason: input.diff.persistedReason,
+      action: input.diff.output.nextGroomingAction ?? null,
+      children: input.diff.children
+        ? input.diff.children.briefs.map((brief) => childBriefKey(input.repoFullName, input.issueNumber, brief)).sort()
+        : null,
+    },
+  };
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
 function memoryStore(initial?: ApplicationRecord): ApplicationStore & {
   rows: Map<string, ApplicationRecord>;
   children: Map<string, ChildClaimRecord>;
@@ -548,6 +583,9 @@ function memoryStore(initial?: ApplicationRecord): ApplicationStore & {
       const row = rows.get(key)!;
       row.status = data.status;
       row.steps = JSON.parse(JSON.stringify(data.steps));
+      // Mirrors @updatedAt: every write re-stamps the row, so a replay reads
+      // the finalize save's timestamp.
+      row.updatedAt = new Date();
     },
     hasRecentComment: async () => false,
     resume: async (key, seen) => {
@@ -744,29 +782,32 @@ describe("applyGroomingMutations", () => {
     const replay = await applyGroomingMutations(applyInput(fullDiff(), { groomingRunId: "run-2" }), again.github, store);
     expect(replay.outcome).toBe("replayed");
     expect(replay.claimedByRunId).toBe("run-1");
+    // The finalize save's timestamp is surfaced so the caller can order this
+    // application against issue writes that landed after it.
+    expect(replay.appliedRecordedAt).toEqual(expect.any(String));
     expect(again.calls).toEqual([]);
     expect(replay.steps.comment?.status).toBe("replayed");
     expect(replay.commentUrl).toBe("https://github.com/org/repo/issues/42#issuecomment-1");
   });
 
-  it("re-applies once under a fresh key when existing rows were recorded before the version bump (dispatch#1461 deploy decision)", async () => {
-    // Rows are not migrated: the reason text is not stored on a
-    // GroomingApplication row, so a v1 key cannot be recomputed. The first
-    // post-deploy groom claims its fresh v2 key and applies again — the
+  it("re-applies once under a fresh key when existing rows were recorded before the version bump (deploy decision)", async () => {
+    // Rows are not migrated: an older generation's key cannot be recomputed
+    // under the new shape (v3 adds releaseSignal, dispatch#1481). The first
+    // post-deploy groom claims its fresh v3 key and applies again — the
     // comment re-posts, subject to the comment cooldown — and the old row is
-    // left untouched. A second application under the same v2 key replays:
+    // left untouched. A second application under the same v3 key replays:
     // idempotency resumes after the one re-apply.
     const fullInput = applyInput(fullDiff());
-    const v1Key = v1ApplicationKey({
+    const preBumpKey = v2ApplicationKey({
       repoFullName: fullInput.repoFullName,
       issueNumber: fullInput.issueNumber,
       plan: fullPlan,
       diff: fullInput.diff,
     });
-    expect(v1Key).not.toBe(KEY);
+    expect(preBumpKey).not.toBe(KEY);
     const { github, calls } = fakeGitHub();
     const store = memoryStore({
-      applicationKey: v1Key,
+      applicationKey: preBumpKey,
       groomingRunId: "run-0",
       status: "applied",
       steps: {},
@@ -775,7 +816,7 @@ describe("applyGroomingMutations", () => {
     const result = await applyGroomingMutations(fullInput, github, store);
     expect(result.outcome).toBe("applied");
     expect(calls).toContain("comment");
-    expect(store.rows.get(v1Key)).toMatchObject({ status: "applied", groomingRunId: "run-0" });
+    expect(store.rows.get(preBumpKey)).toMatchObject({ status: "applied", groomingRunId: "run-0" });
     expect(store.rows.get(KEY)).toMatchObject({ status: "applied", groomingRunId: "run-1" });
 
     const again = fakeGitHub();
@@ -784,13 +825,13 @@ describe("applyGroomingMutations", () => {
     expect(again.calls).toEqual([]);
   });
 
-  it("a pre-bump comment still suppresses the re-applied comment inside the cooldown window (dispatch#1461 deploy decision)", async () => {
-    // The v1 comment's marker no longer matches the fresh v2 key, so it is
-    // not the application's own comment — but the cooldown counts any
+  it("a pre-bump comment still suppresses the re-applied comment inside the cooldown window (deploy decision)", async () => {
+    // The pre-bump comment's marker no longer matches the fresh v3 key, so it
+    // is not the application's own comment — but the cooldown counts any
     // Dispatch-posted groomer comment in the window, so the re-apply does not
     // double-post for a recently groomed issue.
     const fullInput = applyInput(fullDiff());
-    const v1Key = v1ApplicationKey({
+    const preBumpKey = v2ApplicationKey({
       repoFullName: fullInput.repoFullName,
       issueNumber: fullInput.issueNumber,
       plan: fullPlan,
@@ -798,7 +839,7 @@ describe("applyGroomingMutations", () => {
     });
     const { github, calls } = fakeGitHub();
     const store = memoryStore({
-      applicationKey: v1Key,
+      applicationKey: preBumpKey,
       groomingRunId: "run-0",
       status: "applied",
       steps: {},
@@ -807,7 +848,7 @@ describe("applyGroomingMutations", () => {
     const result = await applyGroomingMutations(
       applyInput(fullDiff(), {
         recentComments: [
-          { id: null, author: "itsmiso-ai", body: `old\n\n${commentMarker(v1Key)}`, url: null, createdAt: new Date().toISOString() },
+          { id: null, author: "itsmiso-ai", body: `old\n\n${commentMarker(preBumpKey)}`, url: null, createdAt: new Date().toISOString() },
         ],
       }),
       github,
@@ -1810,5 +1851,46 @@ describe("makePrismaApplicationStore", () => {
         applicationKey: KEY,
       }),
     ).rejects.toThrow("connection refused");
+  });
+});
+
+describe("release signal (dispatch#1481)", () => {
+  const signal = (headline = "Adds a tenant-scoped login redirect"): ReleaseSignal => ({
+    kind: "feature",
+    headline,
+    significance: "notable",
+    evidenceRefs: ["repo:src/auth/login.ts"],
+  });
+
+  it("carries the plan's releaseSignal in the diff, and null when the plan has none", () => {
+    expect(diffFor(draft()).releaseSignal).toBeNull();
+    const withSignal: GroomingPlanDraft = { ...draft(), releaseSignal: signal() };
+    expect(diffFor(withSignal).releaseSignal).toEqual(signal());
+  });
+
+  it("a withheld close or ready promotion still carries its signal in the diff", () => {
+    const closePlan = planFor({ ...alreadyDone(), releaseSignal: signal() });
+    const forged: GroomingPlan = { ...closePlan, verdict: { ...closePlan.verdict, confidence: "medium" } };
+    const withheldClose = computeMutationDiff({ plan: forged, live: live(), catalog: catalogFor(snapshot()) });
+    expect(withheldClose.withheld.close).toBeDefined();
+    expect(withheldClose.releaseSignal).toEqual(signal());
+
+    const readyPlan = planFor({ ...draft({}, { githubComment: "Ready!" }), releaseSignal: signal() });
+    const unpinned = catalogFor(snapshot({ headSha: null, pinnedRef: null }));
+    const withheldReady = computeMutationDiff({ plan: readyPlan, live: live(), catalog: unpinned });
+    expect(withheldReady.withheld.ready?.length).toBeGreaterThan(0);
+    expect(withheldReady.releaseSignal).toEqual(signal());
+  });
+
+  it("a signal-only change produces a new application key; an identical signal keeps the key (idempotent)", () => {
+    const plain = draft();
+    const withSignal: GroomingPlanDraft = { ...draft(), releaseSignal: signal() };
+    const changed: GroomingPlanDraft = { ...draft(), releaseSignal: signal("Renames the login redirect flow") };
+    const key = (d: GroomingPlanDraft) =>
+      computeApplicationKey({ repoFullName: "org/repo", issueNumber: 42, plan: planFor(d), diff: diffFor(d) });
+    expect(key(plain)).toBe(key(plain));
+    expect(key(plain)).not.toBe(key(withSignal));
+    expect(key(withSignal)).toBe(key(withSignal));
+    expect(key(withSignal)).not.toBe(key(changed));
   });
 });
