@@ -1144,11 +1144,30 @@ async function executeGroomerRun(
         !!stored.appliedAt &&
         !!applied.appliedRecordedAt &&
         stored.appliedAt >= applied.appliedRecordedAt;
-      if (!storedIsCurrent && !storedIsNewer && (diff.releaseSignal || !!stored)) {
+      // The heal writes the projection this application owns, in whichever
+      // shape that application owns it: a set projection, or — when the
+      // application carried no signal — the provenance-carrying tombstone
+      // (dispatch#1487). The tombstone is written even when the column is
+      // empty, because an empty column is exactly what a lost clear leaves
+      // behind: without the tombstone that lost clear carried no ownership
+      // evidence, so a later replay of an older signal-bearing key could not
+      // tell it apart from an unwritten column and re-asserted the stale
+      // signal. The ordering checks above remain the only guard — a
+      // projection this application already owns, or one a newer application
+      // owns, is never rewritten.
+      //
+      // The heal stamps the application's recorded applied-at, never wall
+      // clock time: ownership time is what orders two applications against
+      // each other, and a wall-clock stamp would outrank every recorded
+      // applied-at and block a newer application's own repair. Without a
+      // recorded applied-at there is no ordering key at all, so nothing is
+      // written (the application's `updatedAt` is non-nullable, so this
+      // only ever guards hand-written or corrupt rows).
+      if (applied.appliedRecordedAt !== null && !storedIsCurrent && !storedIsNewer) {
         const healProvenance = {
           groomingRunId: applied.claimedByRunId ?? groomingRun.id,
           applicationKey,
-          appliedAt: applied.appliedRecordedAt ?? new Date().toISOString(),
+          appliedAt: applied.appliedRecordedAt,
         };
         replayData.releaseSignal = diff.releaseSignal
           ? { ...diff.releaseSignal, provenance: healProvenance }
