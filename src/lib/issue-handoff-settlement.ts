@@ -95,12 +95,28 @@ export interface IssueHandoffSettlementRecord {
   /** The exact claim incarnation settled. */
   claimToken: string;
   settlementKey: string;
-  capacity: string;
+  capacity: string | null;
   labels: string[];
   status: string | null;
   statusNote: string | null;
   cooldownUntil: Date | null;
   settledAt: Date;
+  /**
+   * (#1491) Which settlement family wrote the row — "capacity-handoff" or
+   * "attempt-requeue". A key first committed by one family is a payload
+   * conflict for the other; the tag makes that determination exact instead
+   * of inferred.
+   */
+  operation?: string | null;
+  /**
+   * (#1491) Fingerprint of the exact committed payload. Replay requires
+   * equality (the `AgentReportDedupe` rule); writers without a fingerprint
+   * (pre-#1491 capacity-handoff rows) stay null and keep the token-equality
+   * replay fence.
+   */
+  payloadHash?: string | null;
+  /** (#1491) Attempt identity echoed with the committed success. */
+  attemptId?: string | null;
 }
 
 /**
@@ -128,6 +144,12 @@ export async function recordIssueHandoffSettlement(
       status: record.status,
       statusNote: record.statusNote,
       cooldownUntil: record.cooldownUntil,
+      // #1491: family tag + payload fingerprint + echoed attempt identity
+      // for the fenced attempt-requeue writer. First write wins, so these
+      // describe the ORIGINAL committed payload exactly.
+      operation: record.operation ?? null,
+      payloadHash: record.payloadHash ?? null,
+      attemptId: record.attemptId ?? null,
       settledAt: record.settledAt,
       expiresAt: settlementExpiresAt(record.settledAt),
     },

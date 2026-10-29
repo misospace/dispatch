@@ -309,3 +309,28 @@ Dispatch's coordination layer — never write it as if GitHub were behind.**
 | Guard remains after process crash | Operator confirms prior process stopped and reconciles GitHub before removal; no automatic timeout; a recorded settlement lets the retry answer definitively even while the guard is held |
 | PR-fix generation moved / status settled | report `skipped`, queue untouched |
 | Repeat PR-fix report | `deferred`, one cooldown window only |
+
+## Relation to the fenced attempt-requeue (#1491)
+
+The pinned retry routes (`POST /api/pr-fix-queue/attempt-requeue`,
+`POST /api/issues/requeue`) deliberately reuse this family's machinery and
+vocabulary rather than the CI-park or operator-reset ones:
+
+- The issue-requeue settlement rides the same `IssueHandoffSettlement`
+  ledger (#1262): first-write-wins, reaxed on a lease-CAS miss, bounded
+  retention. Rows are tagged `operation: "attempt-requeue"` and carry a
+  payload fingerprint — a key first committed by capacity-handoff is a
+  payload conflict for the requeue (and vice versa), never a cross-family
+  replay.
+- The human-hold rule is identical: any live `status/blocked` label refuses
+  fail-closed (`human-hold`).
+- The release is the shared `releaseIssueClaim` under the per-issue mutation
+  anchor and the fenced remote write — the current owner is never touched,
+  and a newer claim token on the lease refuses the retry
+  (`stale-generation`).
+- What differs: the capacity handoff records a capacity cooldown; the
+  requeue consumes nothing and cools nothing — it returns the work to
+  offerable. And the requeue fence validates against the durable
+  `AttemptIssuance` issuance history (a terminal report releases the live
+  receipt before the retry arrives), which the capacity handoff — issued
+  mid-run against a live lease — never needed.

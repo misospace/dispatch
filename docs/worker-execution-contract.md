@@ -344,3 +344,37 @@ boundary: [capacity-handoff.md](./capacity-handoff.md).
 - **2026-10-18** — Durable settlement replay for issue capacity handoffs (#1262): optional `settlementKey` records a first-write-wins `IssueHandoffSettlement` proof before the lease CAS; identical retries replay verbatim, expired proofs and cross-claim key reuse are refused fail-closed.
 - **2026-10-14** — Review follow-up (#1256): per-hand-out `handoutToken` receipts bind capacity-exhausted settlement to the exact issued source attempt (unrelated agents and rotated same-agent tokens are refused); the release preserves other agents' live receipts/acks and the dispatch stamps while any hand-out is live; a failed post-CAS live-label re-read now takes the ownership-only path (never a status transition).
 - **2026-10-14** — Added fenced capacity-exhaustion handoff (#1256): capacity-scoped cooldowns for PR-fix attempts and claim-token-fenced issue recovery.
+
+## Fenced attempt-requeue (#1491)
+
+Courier's explicit operator retry requeues exactly ONE terminated attempt
+through two routes whose wire contract is pinned cross-repo by Courier's
+connector fixtures (`internal/source/dispatch/retry_test.go`,
+misospace/courier#608):
+
+- `POST /api/pr-fix-queue/attempt-requeue` — reactivate one queue-backed
+  attempt: `{repo, pr, generation, agentName, fenceToken, idempotencyKey,
+  note?}` → `{success, replayed, prFixItem:{id, generation}}`. Fresh
+  generation, **no** `fixAttempts` advance, **no** reclaim-budget or recovery
+  reset (that stays the unfenced operator reset's authority), the CI repair
+  opportunity resets with the attempt state — the retry never consumes one.
+- `POST /api/issues/requeue` — release one issue claim: `{issueId,
+  repoFullName, issueNumber, agentName, claimToken, idempotencyKey, note?}`
+  → `{success, replayed, attemptId?}`. The issue returns to offerable
+  through the shared claim release (`releaseIssueClaim`, the unclaim /
+  capacity-handoff path) without consuming anything and without resolving.
+
+Fence = the receipt the run was ISSUED, validated against the durable
+`AttemptIssuance` ledger (written when the claim token or hand-out token is
+minted) — the terminal report already released the live receipt, so live
+state can never authorize a retry and an unverifiable fence is refused.
+Refusals are the closed coded-409 vocabulary `stale-generation |
+superseded | item-closed | human-hold` (`{"reason": …}`); **404 is reserved
+for route absence** — a per-item 404 would latch Courier's process-wide
+version-skew posture. A committed `idempotencyKey` replays its original
+result with zero mutation (PR-fix: `PrFixRequeueSettlement`; issue: the
+shared #1262 `IssueHandoffSettlement` with `operation: "attempt-requeue"`);
+key reuse with a different payload is refused the way `AgentReportDedupe`
+refuses it. Auth mirrors the CI-park family: maintainer-tier bearer.
+`POST /api/pr-fix-queue/requeue` stays exactly as it was: unfenced operator
+reset, budget-resetting.

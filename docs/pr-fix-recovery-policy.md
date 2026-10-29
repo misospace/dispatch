@@ -778,3 +778,21 @@ observation is recorded for audit only.
   identity, attempt-token settlement, hand-out acknowledgement/reclamation.
 - [Worker execution contract](worker-execution-contract.md) — worker-side
   settlement and completion gates.
+
+### Fenced attempt-requeue (Courier retry, #1491)
+
+`POST /api/pr-fix-queue/attempt-requeue` is a fourth control in the table
+above, distinct from the operator reset in kind, not just in caller:
+
+| Control | Effect |
+|---|---|
+| `POST /api/pr-fix-queue/attempt-requeue` (fenced, idempotent) | Reactivate exactly the generation named by an ISSUED hand-out receipt: fresh generation, **no** `fixAttempts` advance, **no** reclaim/recovery budget reset. Refuses `STALE` (`item-closed`), `IGNORED`/moved (`superseded`), `NEEDS_HUMAN` (`human-hold`), unprovable fence (`stale-generation`). |
+
+The fence validates against the durable `AttemptIssuance` ledger written at
+hand-out mint: the terminal report that failed the attempt already released
+the live receipt, so only recorded issuance can authorize the retry — the
+server never accepts an unfenced requeue, and the current owner of a newer
+generation is never touched. A committed idempotency key replays its fresh
+generation from `PrFixRequeueSettlement` with zero mutation. The
+`needs-human` disposition class stays reserved to the operator reset: a
+retry that cannot speak for a human is refused.

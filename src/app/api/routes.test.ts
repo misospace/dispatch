@@ -12,6 +12,7 @@ describe("API route smoke checks", () => {
     "src/app/api/issues/move/route.ts",
     "src/app/api/issues/claim/route.ts",
     "src/app/api/issues/unclaim/route.ts",
+    "src/app/api/issues/requeue/route.ts",
     "src/app/api/issues/untriaged/route.ts",
     "src/app/api/automation/repos/[...repo]/route.ts",
     "src/app/api/health/route.ts",
@@ -21,6 +22,7 @@ describe("API route smoke checks", () => {
     "src/app/api/pr-fix-queue/cipark/route.ts",
     "src/app/api/pr-fix-queue/cireserve/route.ts",
     "src/app/api/pr-fix-queue/cirepair/route.ts",
+    "src/app/api/pr-fix-queue/attempt-requeue/route.ts",
   ])("keeps %s present", (routePath) => {
     expect(existsSync(join(root, routePath))).toBe(true);
   });

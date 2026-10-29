@@ -16,6 +16,7 @@ import { NEEDS_HUMAN_LABEL } from "@/lib/pr-fix-surfacing";
 import { CONFLICTING_STATUSES } from "@/lib/linked-pr-health";
 import { rebaseWorkItem } from "@/lib/pr-fix-rebase";
 import { buildCapacitySkip, loadActiveCapacityHandoffs, normalizeCapacity } from "@/lib/capacity-handoff";
+import { recordAttemptIssuanceBestEffort } from "@/lib/issue-requeue";
 import type { PrFixType } from "@/types";
 import { normalizePrFixType } from "@/types";
 
@@ -506,8 +507,21 @@ export async function GET(
                ...(dispatchedLane ? { attemptType: dispatchedLane } : {}),
              },
            });
-           if (claimed.count !== 1) return null;
-         } catch (error) {
+          if (claimed.count !== 1) return null;
+          // #1491: the issuance is recorded durably the moment the hand-out
+          // landed. A terminal report releases the live receipt; the fenced
+          // attempt-requeue (#1491) proves THIS token was issued for THIS
+          // (item, agent, generation) only from this ledger row. Best-effort:
+          // losing it closes the later retry fence (operator reset stays
+          // available), never the dispatch.
+          await recordAttemptIssuanceBestEffort(client, {
+            surface: "pr-fix",
+            attemptId: candidate.id,
+            agentName,
+            token: handoutToken,
+            generation: confirmed.generation,
+          });
+        } catch (error) {
            console.error(`next-task pr-fix hand-out record failed for ${candidate.repo}#${candidate.pr}:`, error);
            return null;
          }
