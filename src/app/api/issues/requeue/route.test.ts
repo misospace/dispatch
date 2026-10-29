@@ -41,6 +41,9 @@ const { db, guard, mocks } = vi.hoisted(() => ({
     // Transaction traces: one entry per interactive transaction the requeue
     // ran, "commit" or "rollback" (pins the atomic settlement+lease commit).
     transactionCalls: [] as string[],
+    // True while the fake interactive transaction is open (outer-client
+    // writes inside the window throw — tx-escape tripwire).
+    txOpen: false,
     failLeaseDelete: false,
     // Failure toggles for the review pins: a dead settlement WRITE and a
     // dead issuance-ledger READ (both must fail closed as 503, never 409).
@@ -262,14 +265,16 @@ vi.mock("@/lib/prisma", () => {
       },
     },
     // Interactive transaction (the settlement + lease-consumption atomic
-    // commit): the callback runs against the same fake client, and a throw
-    // models the Postgres rollback — writes performed inside the transaction
-    // (the settlement upsert, the lease delete) are undone.
+    // commit): a throw models the Postgres rollback — writes performed
+    // inside the transaction (the settlement upsert, the lease delete) are
+    // undone. The snapshot restore covers reassignment-style fake writes
+    // (rows are pushed/replaced, never mutated in place).
     $transaction: async (fn: any) => {
       const settlementsSnapshot = [...db.settlements];
       const leaseSnapshot = db.lease;
+      db.txOpen = true;
       try {
-        const result = await fn(prismaMock.prisma);
+        const result = await fn(txFacade);
         db.transactionCalls.push("commit");
         return result;
       } catch (error) {
@@ -277,10 +282,33 @@ vi.mock("@/lib/prisma", () => {
         db.settlements = settlementsSnapshot;
         db.lease = leaseSnapshot;
         throw error;
+      } finally {
+        db.txOpen = false;
       }
     },
   },
   };
+  // The transaction callback receives a DISTINCT tx handle. Writes through
+  // the OUTER client while a transaction is open throw — so if the
+  // implementation ever escapes the transaction scope (a `client.` write
+  // inside the callback commits immediately in real Prisma and would strand
+  // a settlement beside an unconsumed lease, the exact defect #1491 fixes),
+  // every success-path test fails loudly instead of passing through the
+  // rollback masking it.
+  const txFacade: any = Object.fromEntries(
+    Object.entries(prismaMock.prisma).map(([table, methods]) => [table, { ...(methods as object) }]),
+  );
+  const txOpenGuard =
+    (write: any) =>
+    async (...args: any[]) => {
+      if (db.txOpen) throw new Error("outer-client write during an open transaction (tx-escape)");
+      return write(...args);
+    };
+  prismaMock.prisma.lease.deleteMany = txOpenGuard(prismaMock.prisma.lease.deleteMany);
+  prismaMock.prisma.issueHandoffSettlement.upsert = txOpenGuard(prismaMock.prisma.issueHandoffSettlement.upsert);
+  prismaMock.prisma.issueHandoffSettlement.deleteMany = txOpenGuard(
+    prismaMock.prisma.issueHandoffSettlement.deleteMany,
+  );
   return { prisma: prismaMock.prisma };
 });
 
@@ -353,6 +381,7 @@ function makeState(overrides: Record<string, unknown> = {}) {
   db.leaseDeleteCalls = [];
   db.settlementDeleteCalls = [];
   db.transactionCalls = [];
+  db.txOpen = false;
   db.failLeaseDelete = false;
   db.failSettlementRecord = false;
   db.failIssuanceLookup = false;
