@@ -38,6 +38,9 @@ const { db, guard, mocks } = vi.hoisted(() => ({
     audit: [] as any[],
     leaseDeleteCalls: [] as any[],
     settlementDeleteCalls: [] as any[],
+    // Transaction traces: one entry per interactive transaction the requeue
+    // ran, "commit" or "rollback" (pins the atomic settlement+lease commit).
+    transactionCalls: [] as string[],
     failLeaseDelete: false,
     // Failure toggles for the review pins: a dead settlement WRITE and a
     // dead issuance-ledger READ (both must fail closed as 503, never 409).
@@ -141,7 +144,8 @@ vi.mock(
     ),
 );
 
-vi.mock("@/lib/prisma", () => ({
+vi.mock("@/lib/prisma", () => {
+  const prismaMock: any = {
   prisma: {
     issue: {
       findUnique: async ({ where }: any) =>
@@ -257,8 +261,28 @@ vi.mock("@/lib/prisma", () => ({
         return { count: before - db.settlements.length };
       },
     },
+    // Interactive transaction (the settlement + lease-consumption atomic
+    // commit): the callback runs against the same fake client, and a throw
+    // models the Postgres rollback — writes performed inside the transaction
+    // (the settlement upsert, the lease delete) are undone.
+    $transaction: async (fn: any) => {
+      const settlementsSnapshot = [...db.settlements];
+      const leaseSnapshot = db.lease;
+      try {
+        const result = await fn(prismaMock.prisma);
+        db.transactionCalls.push("commit");
+        return result;
+      } catch (error) {
+        db.transactionCalls.push("rollback");
+        db.settlements = settlementsSnapshot;
+        db.lease = leaseSnapshot;
+        throw error;
+      }
+    },
   },
-}));
+  };
+  return { prisma: prismaMock.prisma };
+});
 
 import { beforeEach, afterEach, describe, expect, it } from "vitest";
 import { POST } from "./route";
@@ -328,6 +352,7 @@ function makeState(overrides: Record<string, unknown> = {}) {
   db.audit = [];
   db.leaseDeleteCalls = [];
   db.settlementDeleteCalls = [];
+  db.transactionCalls = [];
   db.failLeaseDelete = false;
   db.failSettlementRecord = false;
   db.failIssuanceLookup = false;
@@ -526,6 +551,12 @@ describe("POST /api/issues/requeue (#1491)", () => {
     });
     expect(db.settlements[0].payloadHash).toBe(payloadHash());
     expect(new Date(db.settlements[0].expiresAt).getTime()).toBeGreaterThan(Date.now());
+
+    // The settlement and the lease consumption commit in ONE interactive
+    // transaction: a committed settlement always names a consumed (or
+    // never-held) lease, so the replay branch can never acknowledge a
+    // success whose lease is still held.
+    expect(db.transactionCalls).toEqual(["commit"]);
 
     // Active AgentWork rows retire with a history entry.
     expect(db.agentWorkUpdates).toHaveLength(1);
@@ -1099,21 +1130,20 @@ describe("POST /api/issues/requeue (#1491)", () => {
     expect(db.audit[0]).toMatchObject({ action: "issue_attempt_requeue", success: false });
   });
 
-  it("retracts the settlement and returns 503 when the lease CAS misses after recording", async () => {
+  it("rolls the settlement back with the lease CAS miss (503, no stranded proof)", async () => {
     db.failLeaseDelete = true;
     const response = await postRequest();
     expect(response.status).toBe(503);
     expect((await response.json()).error).toMatch(/busy or the settlement ledger is unavailable/i);
     expect(mocks.releaseIssueClaim).toHaveBeenCalledTimes(1);
     expect(db.leaseDeleteCalls).toHaveLength(1); // the CAS was attempted…
-    // …and missed: the self-recorded proof is retracted, pinned to our token.
-    expect(db.settlementDeleteCalls).toHaveLength(1);
-    expect(db.settlementDeleteCalls[0]).toEqual({
-      agentName: AGENT,
-      issueId: ISSUE_ID,
-      settlementKey: KEY,
-      claimToken: CLAIM_TOKEN,
-    });
+    // …and missed: the settlement commits in the SAME transaction as the
+    // lease consumption, so the miss rolls the proof back with it. No
+    // best-effort retraction is needed — and none may be: a settlement that
+    // outlived an unconsumed lease would make every later retry replay
+    // success while the issue stays leased.
+    expect(db.settlementDeleteCalls).toHaveLength(0);
+    expect(db.transactionCalls).toEqual(["rollback"]);
     expect(db.settlements).toHaveLength(0);
     expect(db.lease).not.toBeNull();
     expect(db.lease.claimToken).toBe(CLAIM_TOKEN);

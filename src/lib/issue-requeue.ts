@@ -713,8 +713,14 @@ export async function attemptRequeuePrFixItem(
 // The release itself IS the shared claim release (`releaseIssueClaim`, the
 // path unclaim / capacity-handoff / the reconciler share) under the per-issue
 // mutation anchor and the fenced remote write, and the durable settlement is
-// the shared #1262 ledger (`IssueHandoffSettlement`, first write wins, retracted
-// on a lease-CAS miss) — never a parallel mechanism.
+// the shared #1262 ledger (`IssueHandoffSettlement`, first write wins,
+// committed in the SAME transaction as the lease consumption so a miss rolls
+// the proof back with it) — never a parallel mechanism.
+
+/** The settlement row the transaction found for the key is not this caller's proof. */
+class IssueRequeueSettlementForeign extends Error {}
+/** The lease CAS missed inside the settlement transaction. */
+class IssueRequeueSettlementCasLost extends Error {}
 
 export interface IssueRequeueInput {
   client: any;
@@ -954,65 +960,74 @@ export async function requeueIssueAttempt(input: IssueRequeueInput): Promise<Iss
         return { complete: true, value: { ok: false, refusal: "superseded" } };
       }
 
-      // ── Durable settlement BEFORE consuming the lease (#1262 discipline) ──
+      // ── Durable settlement AND lease consumption in ONE transaction ──────
+      // #1262 discipline, mirrored from the pr-fix surface above: the
+      // settlement commits BEFORE the lease CAS inside the SAME transaction,
+      // so a CAS miss (or a crash between the two writes) rolls the proof
+      // back with it. Without the shared transaction a stranded proof could
+      // outlive an unconsumed lease: the replay branch (and the guard-busy
+      // replay) answer the committed settlement verbatim and never re-derive
+      // the lease, so the issue would stay leased while every later retry
+      // reported success.
       const attemptId: string | null = lease?.id ?? null;
       try {
-        const recorded = await recordIssueHandoffSettlement(client, {
-          agentName,
-          issueId,
-          claimToken,
-          settlementKey: input.idempotencyKey,
-          capacity: null,
-          labels: releaseValue.labels,
-          status: releaseValue.status,
-          statusNote: releaseValue.statusNote,
-          cooldownUntil: null,
-          settledAt: now,
-          operation: ATTEMPT_REQUEUE_SETTLEMENT_OPERATION,
-          payloadHash,
-          attemptId,
+        await client.$transaction(async (tx: any) => {
+          const recorded = await recordIssueHandoffSettlement(tx, {
+            agentName,
+            issueId,
+            claimToken,
+            settlementKey: input.idempotencyKey,
+            capacity: null,
+            labels: releaseValue.labels,
+            status: releaseValue.status,
+            statusNote: releaseValue.statusNote,
+            cooldownUntil: null,
+            settledAt: now,
+            operation: ATTEMPT_REQUEUE_SETTLEMENT_OPERATION,
+            payloadHash,
+            attemptId,
+          });
+          if (
+            !recorded ||
+            recorded.claimToken !== claimToken ||
+            recorded.payloadHash !== payloadHash ||
+            !settlementRowMatchesFamily(recorded, ATTEMPT_REQUEUE_SETTLEMENT_OPERATION)
+          ) {
+            // First-write-wins: a row that won the key first is returned
+            // instead of ours. The proof this release consumes must be OURS —
+            // the same claim incarnation AND the same committed payload
+            // fingerprint. A row under the same claim token but a DIFFERENT
+            // payload (a concurrent retry with another note) is a foreign
+            // payload for this key, not our proof: consuming the lease on it
+            // would acknowledge a result this caller never committed. The
+            // throw rolls the (no-op) write back with the transaction.
+            throw new IssueRequeueSettlementForeign();
+          }
+          if (lease?.id) {
+            const { count } = await tx.lease.deleteMany({
+              where: { id: lease.id, agentName, issueId, claimToken },
+            });
+            if (count !== 1) {
+              // CAS miss: the lease moved under us. Throwing rolls the
+              // settlement back with the transaction — no proof may outlive
+              // an unconsumed lease (the previous best-effort retraction
+              // could itself fail and strand exactly such a proof).
+              throw new IssueRequeueSettlementCasLost();
+            }
+          }
         });
-        if (
-          !recorded ||
-          recorded.claimToken !== claimToken ||
-          recorded.payloadHash !== payloadHash ||
-          !settlementRowMatchesFamily(recorded, ATTEMPT_REQUEUE_SETTLEMENT_OPERATION)
-        ) {
-          // First-write-wins: a row that won the key first is returned instead
-          // of ours. The proof this release consumes must be OURS — the same
-          // claim incarnation AND the same committed payload fingerprint. A
-          // row under the same claim token but a DIFFERENT payload (a
-          // concurrent retry with another note) is a foreign payload for this
-          // key, not our proof: consuming the lease on it would acknowledge
-          // a result this caller never committed.
+      } catch (error) {
+        if (error instanceof IssueRequeueSettlementForeign) {
           return { complete: true, value: { ok: false, keyConflict: requeueKeyConflictMessage("issue requeue") } };
         }
-      } catch {
-        // Settlement write failed after the remote release. COMPLETE: the
-        // retry re-runs the whole transition idempotently (absent label is
-        // a repair, first-write-wins settlement) — a retained, unresumable
-        // guard would wedge the issue (#1367 posture).
+        // The transaction failed after the remote release (a ledger write
+        // error or the lease CAS miss). COMPLETE: the retry re-runs the whole
+        // transition idempotently (the absent label is a repair, the
+        // settlement is first-write-wins, the lease consumption is a CAS) —
+        // a retained, unresumable guard would wedge the issue (#1367
+        // posture). Nothing durable was committed by this attempt.
+        console.error(`attempt-requeue: settlement/lease transaction failed for ${issueId}:`, error);
         return { complete: true, value: { ok: false, unavailable: true } };
-      }
-
-      // ── Consume the exact lease (only when this attempt still holds one) ──
-      if (lease?.id) {
-        const { count } = await client.lease.deleteMany({
-          where: { id: lease.id, agentName, issueId, claimToken },
-        });
-        if (count !== 1) {
-          // Retract our own proof so it can never replay a success for a
-          // lease this attempt failed to consume (best-effort, pinned to our
-          // token — a concurrent exact-key record survives).
-          try {
-            await client.issueHandoffSettlement.deleteMany({
-              where: { agentName, issueId, settlementKey: input.idempotencyKey, claimToken },
-            });
-          } catch (error) {
-            console.error(`attempt-requeue: settlement retraction failed for ${issueId}:`, error);
-          }
-          return { complete: true, value: { ok: false, unavailable: true } };
-        }
       }
 
       // Retire active AgentWork rows (visibility bookkeeping, never fatal).
