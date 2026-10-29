@@ -168,6 +168,8 @@ describe("buildIssueLifecycleTimeline", () => {
         occurredAt: "2026-10-01T01:00:00.000Z",
       }),
       event({ kind: "issue_closed", source: "sync", actor: "github", occurredAt: "2026-10-02T00:00:00.000Z" }),
+      event({ kind: "issue_reopened", source: "sync", actor: "github", occurredAt: "2026-10-02T06:00:00.000Z" }),
+      event({ kind: "issue_closed", source: "sync", actor: "github", occurredAt: "2026-10-02T12:00:00.000Z" }),
       event({
         kind: "pr_merged",
         source: "reconciler",
@@ -176,11 +178,26 @@ describe("buildIssueLifecycleTimeline", () => {
         metadata: { pullRequestNumber: 5 },
       }),
     ];
-    const shuffled = [rows[2], rows[0], rows[3], rows[1]];
+    const shuffled = [rows[2], rows[0], rows[5], rows[1], rows[4], rows[3]];
 
     expect(JSON.stringify(buildIssueLifecycleTimeline(issue, shuffled))).toBe(
       JSON.stringify(buildIssueLifecycleTimeline(issue, rows)),
     );
+  });
+
+  it("picks the latest close for lastClosedAt regardless of arrival order", () => {
+    const rows = [
+      event({ kind: "issue_closed", source: "sync", actor: "github", occurredAt: "2026-10-02T00:00:00.000Z" }),
+      event({ kind: "issue_reopened", source: "sync", actor: "github", occurredAt: "2026-10-02T06:00:00.000Z" }),
+      event({ kind: "issue_closed", source: "sync", actor: "github", occurredAt: "2026-10-02T12:00:00.000Z" }),
+    ];
+    const shuffled = [rows[2], rows[0], rows[1]];
+
+    for (const arrangement of [rows, shuffled, [rows[1], rows[2], rows[0]]]) {
+      const timeline = buildIssueLifecycleTimeline(issue, arrangement);
+      expect(timeline.closedAt.at).toBe("2026-10-02T00:00:00.000Z");
+      expect(timeline.lastClosedAt.at).toBe("2026-10-02T12:00:00.000Z");
+    }
   });
 
   it("collapses an api and a webhook observation of the same transition into one, with a note", () => {
@@ -268,7 +285,37 @@ describe("buildIssueLifecycleTimeline", () => {
     expect(timeline.delivery).toBe("closed-unmerged");
     expect(timeline.closedAt.at).toBe("2026-10-02T00:00:00.000Z");
     expect(timeline.lastReopenAt.at).toBe("2026-10-03T00:00:00.000Z");
+    // The LATEST close evidence resolves against the reclose (#1482 review:
+    // durable completion must compare the reopen with the close that
+    // superseded it, not the first close).
+    expect(timeline.lastClosedAt).toEqual({
+      at: "2026-10-04T00:00:00.000Z",
+      provenance: "observed",
+      via: ["issue_closed"],
+    });
     expect(timeline.notes).toContain("delivery derived from a close after a reopen");
+  });
+
+  it("carries the issue cache into lastClosedAt when it holds the latest close", () => {
+    // Observed closes stop at 10-02 but the cache's closedAt (10-05) is later
+    // evidence of the durable close: lastClosedAt takes the max, matching the
+    // ordering delivery is derived from.
+    const timeline = buildIssueLifecycleTimeline(
+      { ...issue, state: "closed", closedAt: "2026-10-05T00:00:00.000Z" },
+      [
+        event({ kind: "issue_closed", source: "sync", actor: "github", occurredAt: "2026-10-02T00:00:00.000Z" }),
+        event({ kind: "issue_reopened", source: "sync", actor: "github", occurredAt: "2026-10-03T00:00:00.000Z" }),
+      ],
+    );
+
+    expect(timeline.lastClosedAt).toEqual({
+      at: "2026-10-05T00:00:00.000Z",
+      provenance: "observed",
+      via: ["issue_closed", "issue-cache"],
+    });
+    // The cache's later close postdates the reopen: closed-unmerged again,
+    // under the same ordering lastClosedAt reports.
+    expect(timeline.delivery).toBe("closed-unmerged");
   });
 
   it("does not claim a close-after-reopen delivery when a merged PR decided it", () => {
