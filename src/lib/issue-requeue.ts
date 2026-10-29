@@ -399,6 +399,35 @@ async function classifyAttemptRequeueItem(
   return { kind: "proceed", item };
 }
 
+/**
+ * Whether the FENCED generation currently carries a live hand-out that is NOT
+ * the presented token — i.e. the issuance was released and re-issued (the
+ * capacity-exhausted settlement and the unacknowledged reclaim both keep the
+ * generation and rotate the token, so the item stays QUEUED at the same
+ * generation). The current owner of that generation is NEVER touched by a
+ * retry of the presented token, so this is a hard refusal.
+ *
+ * A live receipt for the PRESENTED token is not "another owner": it is the
+ * fenced attempt itself, which the transition is allowed to stop.
+ */
+function fencedGenerationHasOtherOwner(
+  receipts: unknown,
+  input: AttemptRequeuePrFixInput,
+): boolean {
+  const entries: unknown[] = Array.isArray(receipts) ? receipts : [];
+  const liveIssued =
+    findHandoutReceipt(entries, {
+      agentName: input.agentName,
+      generation: input.generation,
+      token: input.fenceToken,
+    }) !== null;
+  if (liveIssued) return false;
+  return entries.some((entry) => {
+    const parsed = parseHandoutReceipt(entry);
+    return parsed !== null && parsed.generation === input.generation;
+  });
+}
+
 class AttemptRequeueCasLost extends Error {
   constructor(readonly refusal: AttemptRequeueRefusal | null) {
     super("attempt-requeue CAS lost");
@@ -465,17 +494,7 @@ export async function attemptRequeuePrFixItem(
   // authorizes NOTHING: bumping the generation would stop the CURRENT live
   // hand-out, violating the pinned "the current owner is NEVER touched" rule.
   const receipts: string[] = Array.isArray(item.handoutReceipts) ? item.handoutReceipts : [];
-  const liveIssued =
-    findHandoutReceipt(receipts, {
-      agentName: input.agentName,
-      generation: input.generation,
-      token: input.fenceToken,
-    }) !== null;
-  const ownsGeneration = receipts.some((entry) => {
-    const parsed = parseHandoutReceipt(entry);
-    return parsed !== null && parsed.generation === input.generation;
-  });
-  if (ownsGeneration && !liveIssued) {
+  if (fencedGenerationHasOtherOwner(receipts, input)) {
     // The fenced generation is owned by a DIFFERENT live hand-out: the named
     // issuance was released and re-issued. The current owner is NEVER
     // touched. The ledger cannot change this verdict (it proves the
@@ -513,6 +532,13 @@ export async function attemptRequeuePrFixItem(
       const fresh = await tx.prFixQueueItem.findUnique({ where: { id: item.id } });
       const inner = await classifyAttemptRequeueItem(tx, fresh, input);
       if (inner.kind === "refusal") throw new AttemptRequeueCasLost(inner.refusal);
+      // Re-apply the owner guard against the INSIDE read: a hand-out that
+      // landed at the fenced generation after the outside read (a different
+      // agent may be handed the item at the same generation) makes the
+      // presented token stale — that owner is NEVER touched by this retry.
+      if (fencedGenerationHasOtherOwner(fresh.handoutReceipts, input)) {
+        throw new AttemptRequeueCasLost("stale-generation");
+      }
       // First write wins: the settlement commits BEFORE the state CAS in
       // this same transaction, so any miss rolls the proof back with it
       // and a committed proof always names an applied transition.
@@ -552,6 +578,13 @@ export async function attemptRequeuePrFixItem(
           generation: input.generation,
           status: { notIn: ["STALE", "IGNORED", "FIXED"] },
           lane: { not: "NEEDS_HUMAN" },
+          // Pin the hand-out state: a concurrent hand-out (or release) that
+          // landed between the inside read and this write changes the arrays,
+          // so the CAS matches no row and the retry mutates nothing. Without
+          // the pin a same-generation hand-out would be silently erased by
+          // this transition — the current owner MUST never be touched.
+          handoutReceipts: { equals: fresh.handoutReceipts },
+          agentHandouts: { equals: fresh.agentHandouts },
         },
         data: {
           status: "QUEUED",
@@ -598,6 +631,12 @@ export async function attemptRequeuePrFixItem(
       const fresh = await client.prFixQueueItem.findUnique({ where: { id: item.id } });
       const reclass = await classifyAttemptRequeueItem(client, fresh, input);
       if (reclass.kind === "refusal") return { ok: false, refusal: reclass.refusal };
+      // A concurrent hand-out at the fenced generation is a CURRENT OWNER:
+      // the retry must never touch it — that is a per-item refusal, not a
+      // churning race.
+      if (fresh && fencedGenerationHasOtherOwner(fresh.handoutReceipts, input)) {
+        return { ok: false, refusal: "stale-generation" };
+      }
       return { ok: false, unavailable: true };
     }
     if (error instanceof AttemptRequeueSettlementRaced) {

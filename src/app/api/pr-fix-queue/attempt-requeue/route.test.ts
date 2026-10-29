@@ -82,6 +82,14 @@ function makeFakeClient() {
   const settlements: any[] = [];
   const issuances: any[] = [];
   const casLost = { value: false };
+  // Concurrency hooks: a concurrent hand-out that lands while the retry is
+  // in flight. `onRead` fires before the Nth read of the item (the
+  // outside-read / inside-transaction read), `beforeUpdate` fires before the
+  // CAS evaluates its WHERE clause. Both write to the store and are recorded
+  // in `externalHandout` so the transaction rollback does not undo them —
+  // a concurrent writer's commit is independent of ours.
+  const race = { onRead: null as null | ((item: any) => void), beforeUpdate: null as null | ((item: any) => void) };
+  const externalHandout = { value: null as null | { itemId: string; receipt: string } };
 
   const matchesWhere = (row: any, where: any): boolean => {
     if (where.id !== undefined && row.id !== where.id) return false;
@@ -99,6 +107,18 @@ function makeFakeClient() {
     if (where.lane && typeof where.lane === "object") {
       if (where.lane.not !== undefined && row.lane === where.lane.not) return false;
     }
+    // Array equality pins (the CAS hand-out pin): the row's array must equal
+    // the pinned array element by element.
+    for (const field of ["handoutReceipts", "agentHandouts"]) {
+      const pin = where[field];
+      if (pin && typeof pin === "object" && Array.isArray(pin.equals)) {
+        const actual = Array.isArray(row[field]) ? row[field] : [];
+        if (actual.length !== pin.equals.length) return false;
+        if (pin.equals.some((value: any, index: number) => value !== actual[index])) {
+          return false;
+        }
+      }
+    }
     return true;
   };
 
@@ -109,11 +129,15 @@ function makeFakeClient() {
     settlements,
     issuances,
     casLost,
+    race,
+    externalHandout,
 
     prFixQueueItem: {
       findUnique: vi.fn(async ({ where }: any) => {
         if (where.id !== undefined) {
-          return clone(items.find((i) => i.id === where.id) ?? null);
+          const row = items.find((i) => i.id === where.id) ?? null;
+          if (race.onRead && row) race.onRead(row);
+          return clone(row);
         }
         return clone(
           items.find(
@@ -122,6 +146,10 @@ function makeFakeClient() {
         );
       }),
       updateMany: vi.fn(async ({ where, data }: any) => {
+        if (race.beforeUpdate) {
+          const target = items.find((i) => i.id === where.id) ?? items[0];
+          if (target) race.beforeUpdate(target);
+        }
         let count = 0;
         for (const row of items) if (matchesWhere(row, where)) count++;
         if (casLost.value) return { count: 0 }; // concurrent mutation -> CAS lost
@@ -219,6 +247,18 @@ function makeFakeClient() {
         snapshot.history.forEach((h: any) => history.push(h));
         snapshot.settlements.forEach((s: any) => settlements.push(s));
         snapshot.issuances.forEach((i: any) => issuances.push(i));
+        // A concurrent writer's commit is INDEPENDENT of this transaction:
+        // re-apply it after the rollback so the post-rollback read sees the
+        // current owner the retry must not have touched.
+        if (externalHandout.value) {
+          const row = items.find((i) => i.id === externalHandout.value!.itemId);
+          if (row) {
+            row.handoutReceipts = [
+              ...(Array.isArray(row.handoutReceipts) ? row.handoutReceipts : []),
+              externalHandout.value!.receipt,
+            ];
+          }
+        }
         throw err;
       }
     },
@@ -1028,5 +1068,59 @@ describe("idempotency key bound", () => {
     );
     expect(holder.current.prFixQueueItem.updateMany).not.toHaveBeenCalled();
     expect(holder.current.settlements).toHaveLength(0);
+  });
+});
+
+// ===========================================================================
+// 14. A concurrent hand-out at the fenced generation is a CURRENT OWNER:
+//     the retry must never erase it, whichever side of the CAS it lands on
+// ===========================================================================
+describe("concurrent hand-out at the fenced generation", () => {
+  const OTHER_RECEIPT = "hnd_0123456789abcdef@other-agent@3";
+
+  it("refuses stale-generation when the hand-out lands before the transaction's own read", async () => {
+    seedAttempt();
+    // The concurrent hand-out commits after the outside read: the item now
+    // has a live owner at the fenced generation that is NOT the presented
+    // token. The in-transaction re-read must see it and refuse.
+    let reads = 0;
+    holder.current.race.onRead = (item: any) => {
+      reads += 1;
+      if (reads >= 1) {
+        item.handoutReceipts = [OTHER_RECEIPT];
+        holder.current.externalHandout.value = { itemId: item.id, receipt: OTHER_RECEIPT };
+      }
+    };
+    const res = await post(BASE);
+    expect(res.status).toBe(409);
+    expect(await json(res)).toEqual({ reason: "stale-generation" });
+    // Nothing settled, nothing transitioned: the concurrent owner's hand-out
+    // stands.
+    expect(holder.current.settlements).toHaveLength(0);
+    expect(holder.current.history).toHaveLength(0);
+    expect(holder.current.items[0].status).toBe("PARKED");
+    expect(holder.current.items[0].generation).toBe(3);
+  });
+
+  it("mutates nothing when the hand-out lands between the transaction's read and the CAS", async () => {
+    seedAttempt();
+    // The hand-out commits INSIDE the transaction window, after the inside
+    // read: the CAS pins the hand-out arrays, so the pinned update matches no
+    // row and the retry rolls back instead of erasing the new owner.
+    holder.current.race.beforeUpdate = (item: any) => {
+      item.handoutReceipts = [OTHER_RECEIPT];
+      holder.current.externalHandout.value = { itemId: item.id, receipt: OTHER_RECEIPT };
+    };
+    const res = await post(BASE);
+    // The CAS lost: the retry refuses (the current owner is present) and
+    // settles nothing.
+    expect(res.status).toBe(409);
+    expect(await json(res)).toEqual({ reason: "stale-generation" });
+    expect(holder.current.settlements).toHaveLength(0);
+    expect(holder.current.history).toHaveLength(0);
+    // The item was NOT requeued and the concurrent owner's receipt survived.
+    expect(holder.current.items[0].status).toBe("PARKED");
+    expect(holder.current.items[0].generation).toBe(3);
+    expect(holder.current.items[0].handoutReceipts).toEqual([OTHER_RECEIPT]);
   });
 });
