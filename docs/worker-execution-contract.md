@@ -369,17 +369,18 @@ Fence = the receipt the run was ISSUED, validated against the durable
 minted) — the terminal report already released the live receipt, so live
 state can never authorize a retry and an unverifiable fence is refused.
 Live state is a GUARD, never an authorization: a live hand-out receipt (or a
-live lease row) carrying a DIFFERENT token means the issuance was released
-and re-issued, and the retry is refused `stale-generation` without touching
-that owner; the presented token's own live receipt still needs the recorded
-issuance behind it. "Another owner" is ANY live hand-out at the fenced
-generation — a second receipt beside the presented one, or a hand-out entry
-without a receipt (legacy rows) — because the transition clears the whole
-hand-out state and would erase it; the PR-fix CAS also pins the hand-out
-arrays, so a hand-out landing inside the transaction window loses the CAS
-and the retry mutates nothing. On the PR-fix surface a `FIXED` item is refused
-`superseded` — the work already moved on, and a retry must never revert a
-landed fix to `QUEUED`.
+live lease row) that is not the exact presented (agent, generation, token)
+receipt means the issuance was released and re-issued, and the retry is refused
+`stale-generation` without touching that owner; the presented token's own live
+receipt still needs the recorded issuance behind it. "Another owner" is ANY
+live hand-out at the fenced generation — a second receipt beside the presented
+one, a receipt that carries the presented token under a different agent, or a
+hand-out entry without a receipt (legacy rows) — because the transition clears
+the whole hand-out state and would erase it; the PR-fix CAS also pins the
+hand-out arrays, so a hand-out landing inside the transaction window loses the
+CAS and the retry mutates nothing. On the PR-fix surface a `FIXED` item is
+refused `superseded` — the work already moved on, and a retry must never revert
+a landed fix to `QUEUED`.
 Refusals are the closed coded-409 vocabulary `stale-generation |
 superseded | item-closed | human-hold` (`{"reason": …}`); **404 is reserved
 for route absence** — a per-item 404 would latch Courier's process-wide

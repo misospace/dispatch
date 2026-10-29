@@ -410,12 +410,15 @@ async function classifyAttemptRequeueItem(
  * owner of that generation is NEVER touched by a retry of the presented token,
  * so this is a hard refusal.
  *
- * The PRESENTED token's own live receipt is not "another owner": it is the
- * fenced attempt itself, which the transition is allowed to stop. Any OTHER
- * live receipt at the fenced generation IS another owner — including one that
- * COEXISTS with the presented receipt (two live hand-outs at one generation):
- * the transition clears the whole hand-out state, so it would erase that
- * owner. The `agentHandouts` entries are consulted as well: a hand-out
+ * The PRESENTED attempt is identified by the EXACT (agent, generation, token)
+ * triple: its own live receipt is not "another owner" — it is the fenced
+ * attempt itself, which the transition is allowed to stop. Any OTHER live
+ * receipt at the fenced generation IS another owner — including one that
+ * COEXISTS with the presented receipt (two live hand-outs at one generation)
+ * and including one that carries the presented TOKEN under a DIFFERENT agent
+ * (a receipt is one entry per live hand-out, so that row names another
+ * owner): the transition clears the whole hand-out state, so it would erase
+ * that owner. The `agentHandouts` entries are consulted as well: a hand-out
  * recorded without a receipt (legacy rows) is still a current owner, and the
  * transition would clear it too.
  */
@@ -429,7 +432,11 @@ function fencedGenerationHasOtherOwner(
     const parsed = parseHandoutReceipt(entry);
     if (parsed === null) return false;
     if (parsed.generation !== input.generation) return false;
-    return parsed.token !== input.fenceToken;
+    // The presented attempt is the exact (agent, generation, token) triple:
+    // a receipt that carries the presented TOKEN under a DIFFERENT agent is
+    // another owner's receipt (one entry per live hand-out), so the
+    // transition — which clears the whole hand-out state — would erase it.
+    return parsed.agentName !== input.agentName || parsed.token !== input.fenceToken;
   });
   if (otherReceipt) return true;
   const handouts: unknown[] = Array.isArray(item.agentHandouts) ? item.agentHandouts : [];

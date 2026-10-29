@@ -1154,6 +1154,33 @@ describe("concurrent hand-out at the fenced generation", () => {
     expect(holder.current.items[0].agentHandouts).toEqual(["worker@3", "other-agent@3"]);
   });
 
+  it("refuses stale-generation when a same-generation receipt carries the presented token under ANOTHER agent", async () => {
+    // The presented attempt is the EXACT (agent, generation, token) triple.
+    // A receipt that carries the presented TOKEN but names a different agent
+    // is ANOTHER owner's receipt (one receipt per live hand-out), and the
+    // transition clears the whole hand-out state — so it would erase that
+    // owner. The guard must refuse even though the token matches.
+    seedAttempt({
+      item: {
+        handoutReceipts: ["hnd_deadbeefdeadbeef@other-agent@3"],
+        agentHandouts: ["worker@3"],
+      },
+    });
+    const res = await post(BASE);
+    expect(res.status).toBe(409);
+    expect(await json(res)).toEqual({ reason: "stale-generation" });
+    // Nothing settled, nothing transitioned.
+    expect(holder.current.prFixQueueItem.updateMany).not.toHaveBeenCalled();
+    expect(holder.current.prFixRequeueSettlement.create).not.toHaveBeenCalled();
+    expect(holder.current.settlements).toHaveLength(0);
+    expect(holder.current.history).toHaveLength(0);
+    // The other owner's hand-out state survives untouched.
+    expect(holder.current.items[0].status).toBe("PARKED");
+    expect(holder.current.items[0].generation).toBe(3);
+    expect(holder.current.items[0].handoutReceipts).toEqual(["hnd_deadbeefdeadbeef@other-agent@3"]);
+    expect(holder.current.items[0].agentHandouts).toEqual(["worker@3"]);
+  });
+
   it("refuses stale-generation when a legacy hand-out (no receipt) holds the fenced generation", async () => {
     // A hand-out recorded before receipts existed carries no receipt, but it
     // is still a current owner: the transition clears `agentHandouts`, so it
