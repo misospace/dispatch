@@ -12,6 +12,10 @@ const { mocks } = vi.hoisted(() => ({
     leaseUpdateMany: vi.fn(),
     issueFindUnique: vi.fn(),
     auditLogCreate: vi.fn(),
+    // The durable issuance ledger write (#1491): the fenced retry's ONLY
+    // authority. If the mint stopped recording it, every retry would answer
+    // `stale-generation` while the rest of the suite stayed green.
+    attemptIssuanceCreate: vi.fn(),
   },
 }));
 
@@ -32,6 +36,9 @@ vi.mock("@/lib/prisma", () => ({
     },
     auditLog: {
       create: mocks.auditLogCreate,
+    },
+    attemptIssuance: {
+      create: mocks.attemptIssuanceCreate,
     },
   },
 }));
@@ -142,6 +149,30 @@ describe("upsertLease", () => {
 
       expect(result.created).toBe(true);
       expect(result.mintedToken).toBe(true);
+    });
+
+    it("records the durable issuance for the minted token (#1491)", async () => {
+      // The mint IS the issuance: the fenced retry's ONLY authority is the
+      // durable ledger row written here. Without it every retry for this
+      // attempt would answer `stale-generation` — and nothing else in the
+      // suite would notice.
+      mocks.leaseFindUnique.mockImplementation(() => Promise.resolve(null));
+      mocks.leaseCreate.mockImplementation((args: any) => Promise.resolve({ id: "l-1", ...args.data }));
+
+      await upsertLease({ agentName: "saffron", issueId: "i-1" });
+
+      expect(mocks.attemptIssuanceCreate).toHaveBeenCalledTimes(1);
+      const data = (mocks.attemptIssuanceCreate.mock.calls[0] as any)[0].data;
+      expect(data).toMatchObject({
+        surface: "issue",
+        attemptId: "i-1",
+        agentName: "saffron",
+        token: expect.any(String),
+      });
+      // The recorded token IS the token the lease carries — a retry presents
+      // exactly that receipt.
+      const leaseData = (mocks.leaseCreate.mock.calls[0] as any)[0].data;
+      expect(data.token).toBe(leaseData.claimToken);
     });
   });
 
@@ -377,6 +408,16 @@ describe("upsertLease", () => {
       // #1254: the renewal minted the fresh token — the receipt is this
       // attempt's own, so a supersede cleanup may delete it.
       expect(result.mintedToken).toBe(true);
+      // #1491: a minted token IS an issuance — the durable ledger row is the
+      // fenced retry's only authority, so the mint must record it.
+      expect(mocks.attemptIssuanceCreate).toHaveBeenCalledTimes(1);
+      const issuanceData = (mocks.attemptIssuanceCreate.mock.calls[0] as any)[0].data;
+      expect(issuanceData).toMatchObject({
+        surface: "issue",
+        attemptId: "i-1",
+        agentName: "saffron",
+        token: updateData.claimToken,
+      });
     });
   });
 });

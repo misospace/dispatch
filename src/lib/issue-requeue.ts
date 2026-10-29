@@ -194,6 +194,12 @@ export async function recordAttemptIssuanceBestEffort(
  * absence is ESTABLISHED. A read failure THROWS: the fence caller must fail
  * closed with a retryable 5xx, never treat an unverifiable ledger as absent
  * proof (and never, in the other direction, as issuance).
+ *
+ * An ABSENT ledger surface throws for the same reason: an absent ledger is
+ * not an empty ledger, so it establishes nothing about the issuance. It must
+ * never answer `false` — that would report "never issued" for a ledger that
+ * was never consulted (the issue route's 503-vs-409 posture: a ledger that
+ * cannot be read is retryable, a ledger that proves nothing is a refusal).
  */
 export async function proveAttemptIssuance(
   client: AttemptIssuanceClient,
@@ -205,7 +211,9 @@ export async function proveAttemptIssuance(
     generation?: number | null;
   },
 ): Promise<boolean> {
-  if (!client.attemptIssuance) return false;
+  if (!client.attemptIssuance) {
+    throw new Error("attempt issuance ledger surface unavailable");
+  }
   const row = await client.attemptIssuance.findUnique({ where: { token: params.token } });
   if (!row) return false;
   if (row.surface !== params.surface) return false;
@@ -696,7 +704,11 @@ export async function attemptRequeuePrFixItem(
 //                              human-hold rule)
 //   another agent owns it     → `superseded`
 //   lease carries a NEWER claim token → `stale-generation`
+//   lease carries a RETIRED (null) claim token → `stale-generation` (the
+//                              reconciler's Phase A retired the epoch fence;
+//                              the row survives, the fence does not)
 //   fence not provably issued → `stale-generation`
+//   issuance ledger absent or unreadable → 503 (retryable — never a refusal)
 //
 // The release itself IS the shared claim release (`releaseIssueClaim`, the
 // path unclaim / capacity-handoff / the reconciler share) under the per-issue
@@ -840,8 +852,20 @@ export async function requeueIssueAttempt(input: IssueRequeueInput): Promise<Iss
       } catch {
         return { complete: true, value: { ok: false, unavailable: true } };
       }
-      if (lease && lease.claimToken && lease.claimToken !== claimToken) {
-        // A NEWER claim incarnation owns this work. Its row is never touched.
+      if (lease && lease.claimToken !== claimToken) {
+        // The lease row is NOT this attempt's fence:
+        //   - a DIFFERENT token → a NEWER claim incarnation owns this work
+        //     (its row is never touched);
+        //   - a NULL token → the fence was RETIRED (the reconciler's Phase A
+        //     clears `claimToken` when it releases the epoch, and a pre-#1256
+        //     row never carried one) — the presented attempt holds nothing.
+        // Either way the row is not ours, so the retry refuses BEFORE any
+        // remote write: the truthiness form (`lease.claimToken && …`) let a
+        // token-less row fall through to the release, which then could not
+        // consume the row (the lease CAS matches on the presented token) — a
+        // mutation followed by a 503 that repeated forever. The sibling
+        // fenced paths already refuse a token-less lease
+        // (`issue-capacity-handoff.ts`, `worker-ownership.ts`).
         return { complete: true, value: { ok: false, refusal: "stale-generation" } };
       }
       // Durable issuance proof — MANDATORY (#1491 pins the authority: the
@@ -915,7 +939,20 @@ export async function requeueIssueAttempt(input: IssueRequeueInput): Promise<Iss
         // Retryable — the current owner (whoever it is now) is untouched.
         return { complete: true, value: { ok: false, unavailable: true } };
       }
-      const releaseValue = released.value as { labels: string[]; status: string | null; statusNote: string | null };
+      const releaseValue = released.value as {
+        released?: boolean;
+        labels: string[];
+        status: string | null;
+        statusNote: string | null;
+      };
+      if (releaseValue.released === false) {
+        // The shared release SKIPPED: another agent owns the claim (the
+        // release refuses to remove a newer owner's label). Nothing was
+        // released, so nothing may be settled and the lease stays — a skip
+        // is never a successful retry. The route's own label gate above
+        // reads the same snapshot, so this is the defensive second line.
+        return { complete: true, value: { ok: false, refusal: "superseded" } };
+      }
 
       // ── Durable settlement BEFORE consuming the lease (#1262 discipline) ──
       const attemptId: string | null = lease?.id ?? null;

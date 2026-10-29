@@ -263,6 +263,7 @@ vi.mock("@/lib/prisma", () => ({
 import { beforeEach, afterEach, describe, expect, it } from "vitest";
 import { POST } from "./route";
 import { requeuePayloadHash } from "@/lib/issue-requeue";
+import { prisma } from "@/lib/prisma";
 import { resetAuthCaches } from "@/lib/auth";
 import { resetRateLimits } from "@/lib/rate-limit";
 
@@ -649,10 +650,13 @@ describe("POST /api/issues/requeue (#1491)", () => {
   // EVERY path (the live lease never substitutes for it). A failed read
   // establishes nothing — it must fail closed as a retryable 503, never be
   // treated as absence (409 stale-generation) or as issuance. Pinned for
-  // every lease shape: no lease row, a lease row whose claimToken is null
-  // (pre-token legacy row), and a LIVE lease carrying the presented token.
+  // every lease shape whose fence is intact or already gone: no lease row
+  // and a LIVE lease carrying the presented token. (A lease whose fence was
+  // RETIRED — `claimToken: null` — is a per-item condition, refused
+  // `stale-generation` from live state BEFORE the ledger is consulted; it
+  // is pinned by its own test below.)
   it("answers 503 (never 409) when the issuance ledger read fails", async () => {
-    for (const lease of [null, { claimToken: null }, undefined]) {
+    for (const lease of [null, undefined]) {
       makeState(lease === undefined ? {} : { lease });
       db.failIssuanceLookup = true;
       const response = await postRequest();
@@ -681,6 +685,66 @@ describe("POST /api/issues/requeue (#1491)", () => {
         value: { ok: false, unavailable: true },
       });
     }
+  });
+
+  it("refuses a lease whose fence was RETIRED (claimToken null) — stale-generation, no mutation", async () => {
+    // The reconciler's Phase A retires an epoch fence by clearing the lease
+    // token (`ownership-reconciliation.ts`): the row survives, the fence does
+    // not. The presented attempt holds nothing on that row, so the retry must
+    // refuse BEFORE any remote write — a release it could never consume
+    // (the lease CAS matches on the presented token) would mutate first and
+    // answer 503 forever after.
+    makeState({ lease: { claimToken: null } });
+    const response = await postRequest();
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ reason: "stale-generation" });
+    // Nothing is touched: no release, no supersede, no settlement, and the
+    // row is left exactly as found.
+    expect(mocks.releaseIssueClaim).not.toHaveBeenCalled();
+    expect(mocks.supersedeIntent).not.toHaveBeenCalled();
+    expect(db.leaseDeleteCalls).toHaveLength(0);
+    expect(db.settlements).toHaveLength(0);
+    expect(db.lease?.claimToken).toBeNull();
+  });
+
+  it("answers 503 (never 409) when the issuance ledger SURFACE is absent", async () => {
+    // An absent ledger is not an empty ledger: the fence authority could not
+    // be consulted, so absence is NOT established. The answer is retryable —
+    // never a coded refusal that would report "never issued" for a ledger
+    // that was never read.
+    const client = prisma as any;
+    const surface = client.attemptIssuance;
+    delete client.attemptIssuance;
+    try {
+      const response = await postRequest();
+      expect(response.status).toBe(503);
+      expect(await response.json()).not.toHaveProperty("reason");
+      expect(mocks.releaseIssueClaim).not.toHaveBeenCalled();
+      expect(mocks.supersedeIntent).not.toHaveBeenCalled();
+      expect(db.leaseDeleteCalls).toHaveLength(0);
+      expect(db.settlements).toHaveLength(0);
+    } finally {
+      client.attemptIssuance = surface;
+    }
+  });
+
+  it("never reports success when the shared release SKIPPED (another owner)", async () => {
+    // The shared release refuses to remove a newer owner's label and reports
+    // `released: false`. Nothing was released, so nothing may be settled and
+    // the lease must stay: a skip is never a successful retry.
+    mocks.releaseIssueClaim.mockResolvedValue({
+      released: false,
+      labels: [`agent/bravo`],
+      status: null,
+      statusNote: null,
+      skipReason: "agent claim belongs to agent/bravo",
+    });
+    const response = await postRequest();
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ reason: "superseded" });
+    expect(db.settlements).toHaveLength(0);
+    expect(db.leaseDeleteCalls).toHaveLength(0);
+    expect(db.lease).not.toBeNull();
   });
 
   it("refuses an issuance row minted for a different agent/issue (stale-generation)", async () => {
