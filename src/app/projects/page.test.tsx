@@ -4,6 +4,7 @@ import React from "react";
 const { mocks } = vi.hoisted(() => ({
   mocks: {
     findManyIssues: vi.fn().mockResolvedValue([]),
+    groupedIssues: [] as unknown[],
   },
 }));
 
@@ -12,6 +13,20 @@ vi.mock("@/lib/prisma", () => ({
     issue: { findMany: mocks.findManyIssues },
   },
 }));
+
+// Capture the rows the page hands to the project grouping: the projects page
+// serializes raw issue rows, so the release-signal normalization is only
+// observable there.
+vi.mock("@/lib/projects", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/projects")>();
+  return {
+    ...actual,
+    groupIssuesByProject: (issues: Parameters<typeof actual.groupIssuesByProject>[0]) => {
+      mocks.groupedIssues = issues;
+      return actual.groupIssuesByProject(issues);
+    },
+  };
+});
 
 vi.mock("@/components/ui/card", () => ({
   Card: ({ children, className }: { children: React.ReactNode; className?: string }) => (
@@ -224,5 +239,47 @@ describe("ProjectsPage empty state", () => {
 
     const allText = extractAllText(page);
     expect(allText).toContain("No issues have been synced yet");
+  });
+});
+
+describe("ProjectsPage release-signal projection", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.groupedIssues = [];
+  });
+
+  it("normalizes a cleared release-signal tombstone before the page payload (dispatch#1487)", async () => {
+    mocks.findManyIssues.mockResolvedValue([
+      mockIssue({
+        releaseSignal: {
+          tombstone: true,
+          provenance: {
+            groomingRunId: "gr-1",
+            applicationKey: "an-application",
+            appliedAt: "2026-01-01T00:00:00.000Z",
+          },
+        },
+      }),
+    ]);
+
+    await ProjectsPage({ searchParams: Promise.resolve({}) });
+
+    expect(mocks.groupedIssues).toHaveLength(1);
+    expect((mocks.groupedIssues[0] as { releaseSignal: unknown }).releaseSignal).toBeNull();
+  });
+
+  it("keeps a set release-signal projection intact", async () => {
+    const signal = {
+      kind: "feature",
+      headline: "Adds a tenant-scoped login redirect",
+      significance: "notable",
+      evidenceRefs: [],
+      provenance: { groomingRunId: "gr-1", applicationKey: "an-application" },
+    };
+    mocks.findManyIssues.mockResolvedValue([mockIssue({ releaseSignal: signal })]);
+
+    await ProjectsPage({ searchParams: Promise.resolve({}) });
+
+    expect((mocks.groupedIssues[0] as { releaseSignal: unknown }).releaseSignal).toEqual(signal);
   });
 });

@@ -3,6 +3,7 @@ import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { parseListLimit } from "@/lib/query-limit";
+import { withNormalizedReleaseSignal } from "@/lib/groomer/plan";
 
 export async function GET(request: Request) {
   const auth = await authorizeRequest(request);
@@ -26,7 +27,11 @@ export async function GET(request: Request) {
       include: { issue: { include: { repository: true } } },
     });
 
-    return NextResponse.json(logs);
+    // #1487: the nested issue row carries the release-signal projection;
+    // normalize a cleared-projection tombstone back to null for consumers.
+    return NextResponse.json(
+      logs.map((log) => (log.issue ? { ...log, issue: withNormalizedReleaseSignal(log.issue) } : log)),
+    );
   } catch (error) {
     return handleApiError("fetch audit logs", error);
   }

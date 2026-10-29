@@ -176,3 +176,43 @@ describe("BoardPage dependency block reason", () => {
     expect(initialIssues[0].dependencyBlockReason).toBe("Blocked by open bar/repo#20");
   });
 });
+
+describe("BoardPage release-signal projection", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findManyRepos.mockResolvedValue([]);
+    mocks.aggregateIssues.mockResolvedValue({ _count: { _all: 1 }, _max: { lastSyncedAt: null } });
+    mocks.getTrackedRepos.mockResolvedValue([]);
+  });
+
+  it("normalizes a cleared release-signal tombstone in the board payload (dispatch#1487)", async () => {
+    mocks.findManyIssues.mockImplementation(async (args: { select?: unknown }) => {
+      // Filter-options query selects labels only.
+      if (args.select) return [];
+      return [
+        {
+          id: "a",
+          number: 10,
+          state: "open",
+          labels: [],
+          body: "",
+          releaseSignal: {
+            tombstone: true,
+            provenance: {
+              groomingRunId: "gr-1",
+              applicationKey: "an-application",
+              appliedAt: "2026-01-01T00:00:00.000Z",
+            },
+          },
+          repository: { fullName: "foo/repo" },
+        },
+      ];
+    });
+
+    const page = await BoardPage({ searchParams: Promise.resolve({}) });
+
+    const board = findElementByType(page, KanbanBoardClient);
+    const initialIssues = (board?.props as { initialIssues: Array<{ releaseSignal: unknown }> }).initialIssues;
+    expect(initialIssues[0].releaseSignal).toBeNull();
+  });
+});

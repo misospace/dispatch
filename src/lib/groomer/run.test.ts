@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
 import type { GroomingCandidate } from "./selector";
 import type { GroomingPlanDraft, ReleaseSignal } from "./plan";
+import { clearedReleaseSignalProjection } from "./plan";
 import type { HostedGroomerConfig } from "./config";
 import type { ExploreResult } from "./explore";
 import type { GroomingEvidenceSnapshot } from "./evidence-snapshot";
@@ -4169,9 +4170,16 @@ Investigate session handling in auth module.`;
       expect(result!.mutationPlan!.releaseSignal).toEqual(signal);
     });
 
-    it("a plan without a signal persists releaseSignal null, clearing a stale projection", async () => {
-      await runHostedGroomer();
-      expect(lastIssueUpdateData().releaseSignal).toBeNull();
+    it("a plan without a signal persists a provenance-carrying clear tombstone (dispatch#1487)", async () => {
+      const result = await runHostedGroomer();
+      expect(lastIssueUpdateData().releaseSignal).toEqual({
+        tombstone: true,
+        provenance: {
+          groomingRunId: "gr-1",
+          applicationKey: result!.mutationPlan!.applicationKey,
+          appliedAt: expect.any(String),
+        },
+      });
     });
 
     it("a signal-only re-groom is applied and the projection updates with the new run's provenance", async () => {
@@ -4301,7 +4309,7 @@ Investigate session handling in auth module.`;
       }
     });
 
-    it("a replay clears a superseded stale projection when the plan carries no signal", async () => {
+    it("a replay clears a superseded stale projection with a tombstone when the plan carries no signal", async () => {
       mocks.callGroomerLLM.mockResolvedValue(planDraft());
       await runHostedGroomer();
       // The column holds an older application's projection that this
@@ -4320,27 +4328,222 @@ Investigate session handling in auth module.`;
       mocks.prisma.issue.update.mockClear();
       const result = await runHostedGroomer();
       expect(result!.appliedMutations?.outcome).toBe("replayed");
-      expect(lastIssueUpdateData().releaseSignal).toBeNull();
+      expect(lastIssueUpdateData().releaseSignal).toEqual({
+        tombstone: true,
+        provenance: {
+          groomingRunId: expect.any(String),
+          applicationKey: result!.mutationPlan!.applicationKey,
+          appliedAt: expect.any(String),
+        },
+      });
     });
 
-    it("a replay re-asserts a signal into a column a newer application cleared (documented heal limitation)", async () => {
+    it("an identical clear re-groom replays and does not rewrite its own tombstone", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(planDraft());
+      await runHostedGroomer();
+      // The fresh path's tombstone names this applicationKey, so the replay's
+      // storedIsCurrent check matches and no projection write happens.
+      expect(mocks.issueProjection).toMatchObject({ tombstone: true });
+      mocks.prisma.issue.update.mockClear();
+      const result = await runHostedGroomer();
+      expect(result!.appliedMutations?.outcome).toBe("replayed");
+      for (const call of mocks.prisma.issue.update.mock.calls) {
+        const data = (call[0] as { data: Record<string, unknown> }).data;
+        expect(Object.keys(data).sort()).toEqual(["groomedAt", "groomedBy", "groomingRetryAfter"]);
+      }
+    });
+
+    it("a replay does not re-assert a signal into a column a newer application cleared via tombstone (dispatch#1487)", async () => {
       mocks.callGroomerLLM.mockResolvedValue(planDraft({ releaseSignal: { ...signal } }));
       await runHostedGroomer();
-      // A newer application that carried no signal cleared the column: an
-      // empty column carries no ownership evidence, so the next replay of the
-      // older signal-bearing key cannot tell that clear apart from its own
-      // lost write and re-asserts the older signal. Pinned deliberately — the
-      // bounded heal prefers repairing lost writes over suppressing this
-      // resurrection window; a provenance-carrying tombstone on clear is the
-      // follow-up fix (dispatch#1487).
+      // A newer application that carried no signal cleared the column with a
+      // provenance-carrying tombstone. The heal's ordering check reads the
+      // tombstone's provenance, sees the newer appliedAt, and skips: the
+      // older signal stays cleared. (The pre-#1487 bare-null clear left no
+      // ownership evidence and this resurrection window; a legacy null
+      // column still heals as a lost write until the next fresh groom
+      // re-owns it.)
+      mocks.issueProjection = clearedReleaseSignalProjection({
+        groomingRunId: "gr-9",
+        applicationKey: "a-newer-application",
+        appliedAt: new Date(Date.now() + 60_000).toISOString(),
+      });
+      mocks.prisma.issue.update.mockClear();
+      const result = await runHostedGroomer();
+      expect(result!.appliedMutations?.outcome).toBe("replayed");
+      for (const call of mocks.prisma.issue.update.mock.calls) {
+        const data = (call[0] as { data: Record<string, unknown> }).data;
+        expect("releaseSignal" in data).toBe(false);
+      }
+    });
+
+    it("a replay of a clear persists the tombstone when the column is empty (dispatch#1487)", async () => {
+      mocks.prisma.groomingRun.create.mockImplementation(
+        async () => ({ id: `gr-${mocks.prisma.groomingRun.create.mock.calls.length}`, stage: "selected" }),
+      );
+      mocks.callGroomerLLM.mockResolvedValue(planDraft());
+      // DB blip: the fresh path's tombstone write fails after the
+      // application finalized, so the column stays empty. An empty column
+      // is exactly what a lost clear leaves behind.
+      let failProjectionWrite = true;
+      mocks.prisma.issue.update.mockImplementation(async ({ data }: { data: Record<string, unknown> }) => {
+        if ("releaseSignal" in data) {
+          if (failProjectionWrite) {
+            failProjectionWrite = false;
+            throw new Error("db blip");
+          }
+          mocks.issueProjection = JSON.parse(JSON.stringify(data.releaseSignal));
+        }
+        return { id: "issue-42" };
+      });
+      await expect(runHostedGroomer()).rejects.toThrow(/db blip/);
+      expect(mocks.issueProjection).toBeNull();
+
+      // The next scheduler tick replays the same application. The heal
+      // repairs the lost clear by writing the same provenance-carrying
+      // tombstone the fresh path writes: without it the lost clear carried
+      // no ownership evidence and stayed indistinguishable from an
+      // unwritten column.
+      const result = await runHostedGroomer();
+      expect(result!.appliedMutations?.outcome).toBe("replayed");
+      expect(lastIssueUpdateData().releaseSignal).toEqual({
+        tombstone: true,
+        provenance: {
+          groomingRunId: expect.any(String),
+          applicationKey: result!.mutationPlan!.applicationKey,
+          appliedAt: expect.any(String),
+        },
+      });
+    });
+
+    it("a healed lost clear stops an older signal-bearing replay from resurrecting the stale signal (dispatch#1487)", async () => {
+      mocks.prisma.groomingRun.create.mockImplementation(
+        async () => ({ id: `gr-${mocks.prisma.groomingRun.create.mock.calls.length}`, stage: "selected" }),
+      );
+      // Every projection write in this scenario is lost (the issue update
+      // fails after the application finalized), so the column never leaves
+      // its empty state: neither the older signal nor the newer clear
+      // leaves ownership evidence behind.
+      let failProjectionWrites = true;
+      mocks.prisma.issue.update.mockImplementation(async ({ data }: { data: Record<string, unknown> }) => {
+        if ("releaseSignal" in data) {
+          if (failProjectionWrites) throw new Error("db blip");
+          mocks.issueProjection = JSON.parse(JSON.stringify(data.releaseSignal));
+        }
+        return { id: "issue-42" };
+      });
+
+      // An older application carried a signal; its projection write was
+      // lost, so the column stayed empty.
+      mocks.callGroomerLLM.mockResolvedValue(planDraft({ releaseSignal: { ...signal } }));
+      await expect(runHostedGroomer()).rejects.toThrow(/db blip/);
+      expect(mocks.issueProjection).toBeNull();
+
+      // A newer application carried no signal: it owns the column as
+      // cleared. Its tombstone write was lost too, so the column is still
+      // empty when the next tick replays it.
+      mocks.callGroomerLLM.mockResolvedValue(planDraft());
+      await expect(runHostedGroomer()).rejects.toThrow(/db blip/);
+      expect(mocks.issueProjection).toBeNull();
+
+      // The heal repairs the lost clear with a tombstone that names the
+      // newer application.
+      failProjectionWrites = false;
+      const healed = await runHostedGroomer();
+      expect(healed!.appliedMutations?.outcome).toBe("replayed");
+      expect(mocks.issueProjection).toMatchObject({
+        tombstone: true,
+        provenance: { applicationKey: healed!.mutationPlan!.applicationKey },
+      });
+
+      // The older signal-bearing application replays afterwards: the
+      // heal's ordering check sees the newer application's tombstone and
+      // skips, so the stale signal is not resurrected.
+      mocks.callGroomerLLM.mockResolvedValue(planDraft({ releaseSignal: { ...signal } }));
+      mocks.prisma.issue.update.mockClear();
+      const older = await runHostedGroomer();
+      expect(older!.appliedMutations?.outcome).toBe("replayed");
+      for (const call of mocks.prisma.issue.update.mock.calls) {
+        const data = (call[0] as { data: Record<string, unknown> }).data;
+        expect("releaseSignal" in data).toBe(false);
+      }
+      expect(mocks.issueProjection).toMatchObject({ tombstone: true });
+    });
+
+    it("the heal orders two applications by their recorded applied-at, not by wall clock (dispatch#1487)", async () => {
+      mocks.prisma.groomingRun.create.mockImplementation(
+        async () => ({ id: `gr-${mocks.prisma.groomingRun.create.mock.calls.length}`, stage: "selected" }),
+      );
+      // An older application carried a signal; a newer one carried none.
+      mocks.callGroomerLLM.mockResolvedValue(planDraft({ releaseSignal: { ...signal } }));
+      const older = await runHostedGroomer();
+      expect(older!.appliedMutations?.outcome).toBe("applied");
+      const olderKey = older!.mutationPlan!.applicationKey as string;
+
+      mocks.callGroomerLLM.mockResolvedValue(planDraft());
+      const newer = await runHostedGroomer();
+      expect(newer!.appliedMutations?.outcome).toBe("applied");
+      const newerKey = newer!.mutationPlan!.applicationKey as string;
+      expect(newerKey).not.toBe(olderKey);
+
+      // Pin the two applications' recorded applied-at: the older one before
+      // the newer one, both in the past. Ownership time — not the moment a
+      // replay happens — is what orders them.
+      const olderAppliedAt = new Date(Date.now() - 120_000);
+      const newerAppliedAt = new Date(Date.now() - 60_000);
+      mocks.applications.get(olderKey)!.updatedAt = olderAppliedAt;
+      mocks.applications.get(newerKey)!.updatedAt = newerAppliedAt;
+
+      // The older application replays first and heals its lost write: the
+      // column holds the signal, stamped with the older application's
+      // recorded applied-at.
+      mocks.issueProjection = null;
+      mocks.callGroomerLLM.mockResolvedValue(planDraft({ releaseSignal: { ...signal } }));
+      mocks.prisma.issue.update.mockClear();
+      const olderReplay = await runHostedGroomer();
+      expect(olderReplay!.appliedMutations?.outcome).toBe("replayed");
+      expect(lastIssueUpdateData().releaseSignal).toMatchObject({
+        ...signal,
+        provenance: { applicationKey: olderKey, appliedAt: olderAppliedAt.toISOString() },
+      });
+
+      // The newer application (the clear) replays next. Its recorded
+      // applied-at is newer, so the heal owns the column and clears the
+      // stale signal — a wall-clock stamp would have made the older
+      // application's row look newer and left the stale signal standing.
+      mocks.callGroomerLLM.mockResolvedValue(planDraft());
+      mocks.prisma.issue.update.mockClear();
+      const newerReplay = await runHostedGroomer();
+      expect(newerReplay!.appliedMutations?.outcome).toBe("replayed");
+      expect(lastIssueUpdateData().releaseSignal).toEqual({
+        tombstone: true,
+        provenance: {
+          groomingRunId: expect.any(String),
+          applicationKey: newerKey,
+          appliedAt: newerAppliedAt.toISOString(),
+        },
+      });
+      expect(mocks.issueProjection).toMatchObject({ tombstone: true });
+    });
+
+    it("the heal writes nothing when the application has no recorded applied-at", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(planDraft({ releaseSignal: { ...signal } }));
+      await runHostedGroomer();
+      const key = mocks.applications.keys().next().value as string;
+      // A corrupt or hand-written application row without a recorded
+      // applied-at carries no ordering key: the heal cannot place it
+      // against the stored projection, so it writes nothing rather than a
+      // wall-clock stamp that would outrank every recorded applied-at.
+      mocks.applications.get(key)!.updatedAt = null;
       mocks.issueProjection = null;
       mocks.prisma.issue.update.mockClear();
       const result = await runHostedGroomer();
       expect(result!.appliedMutations?.outcome).toBe("replayed");
-      expect(lastIssueUpdateData().releaseSignal).toMatchObject({
-        ...signal,
-        provenance: expect.objectContaining({ applicationKey: result!.mutationPlan!.applicationKey }),
-      });
+      for (const call of mocks.prisma.issue.update.mock.calls) {
+        const data = (call[0] as { data: Record<string, unknown> }).data;
+        expect("releaseSignal" in data).toBe(false);
+      }
+      expect(mocks.issueProjection).toBeNull();
     });
   });
 });

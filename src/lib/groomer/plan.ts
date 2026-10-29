@@ -245,6 +245,61 @@ export interface ReleaseSignal {
   evidenceRefs: string[];
 }
 
+/** Provenance envelope persisted with every owned `Issue.releaseSignal` write (dispatch#1481). */
+export interface ReleaseSignalProvenance {
+  groomingRunId?: string;
+  applicationKey?: string;
+  appliedAt?: string;
+}
+
+/**
+ * A provenance-carrying tombstone persisted when an applied groom clears the
+ * release-signal projection (dispatch#1487). A bare `null` clear carried no
+ * ownership evidence, so a replay-time heal of an older signal-bearing key
+ * could not tell a deliberate clear apart from its own lost write and
+ * re-asserted the stale signal; the tombstone lets the heal's ordering check
+ * see the newer application and skip. Readers must normalize it back to
+ * "no signal" via {@link normalizeStoredReleaseSignal}.
+ */
+export interface ClearedReleaseSignalProjection {
+  tombstone: true;
+  provenance: ReleaseSignalProvenance;
+}
+
+export function clearedReleaseSignalProjection(provenance: ReleaseSignalProvenance): ClearedReleaseSignalProjection {
+  return { tombstone: true, provenance };
+}
+
+export function isClearedReleaseSignalProjection(value: unknown): value is ClearedReleaseSignalProjection {
+  return (
+    !!value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    (value as { tombstone?: unknown }).tombstone === true
+  );
+}
+
+/**
+ * Normalize a persisted `Issue.releaseSignal` column value for consumers
+ * (dispatch#1487): a tombstone or an empty column reads as "no signal"; a
+ * set projection passes through. The column is only ever written by an
+ * applied groom, so the projection shape itself is validated at plan time.
+ */
+export function normalizeStoredReleaseSignal(value: unknown): ReleaseSignal | null {
+  if (value == null || isClearedReleaseSignalProjection(value)) return null;
+  return value as ReleaseSignal;
+}
+
+/**
+ * Return an issue-shaped row with a cleared-projection tombstone normalized
+ * back to `null` (dispatch#1487), so surfaces that serialize raw `Issue` rows
+ * never expose the tombstone shape where consumers previously saw only
+ * `null` or a set projection. Rows without a tombstone are returned as-is.
+ */
+export function withNormalizedReleaseSignal<T extends { releaseSignal?: unknown }>(row: T): T {
+  return isClearedReleaseSignalProjection(row.releaseSignal) ? { ...row, releaseSignal: null } : row;
+}
+
 /** What the model emits. */
 export interface GroomingPlanDraft {
   verdict: GroomingVerdict;
