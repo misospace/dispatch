@@ -315,6 +315,86 @@ describe("buildReleasePulse", () => {
       expect(snapshot.highlights).toEqual([]);
     });
 
+    it("certifies a parent closed, reopened, then durably closed again", () => {
+      // A reopen superseded by a later close does not permanently reject the
+      // parent: the gate resolves against the LATEST close (#1482 review).
+      const { issues, events } = umbrellaFixtures();
+      events.push(
+        {
+          issueNumber: 1,
+          kind: "issue_reopened",
+          source: "webhook",
+          actor: "octocat",
+          agentName: null,
+          fromStatus: null,
+          toStatus: null,
+          sourceEventId: null,
+          occurredAt: "2026-10-11T00:00:00.000Z",
+          observedAt: "2026-10-11T00:00:00.000Z",
+          metadata: null,
+        },
+        {
+          issueNumber: 1,
+          kind: "issue_closed",
+          source: "webhook",
+          actor: "octocat",
+          agentName: null,
+          fromStatus: null,
+          toStatus: null,
+          sourceEventId: null,
+          occurredAt: "2026-10-12T00:00:00.000Z",
+          observedAt: "2026-10-12T00:00:00.000Z",
+          metadata: null,
+        },
+      );
+      const snapshot = buildReleasePulse(repoInput(), issues, events);
+      expect(snapshot.completedUmbrellaCount).toBe(1);
+      expect(snapshot.highlights).toHaveLength(1);
+      expect(snapshot.highlights[0]).toMatchObject({
+        kind: "umbrella_completed",
+        issueNumber: 1,
+        deliveredAt: "2026-10-12T00:00:00.000Z",
+      });
+    });
+
+    it("certifies a child closed, reopened, then durably closed again", () => {
+      const { issues, events } = umbrellaFixtures();
+      events.push(
+        {
+          issueNumber: 3,
+          kind: "issue_reopened",
+          source: "webhook",
+          actor: "octocat",
+          agentName: null,
+          fromStatus: null,
+          toStatus: null,
+          sourceEventId: null,
+          occurredAt: "2026-10-07T00:00:00.000Z",
+          observedAt: "2026-10-07T00:00:00.000Z",
+          metadata: null,
+        },
+        {
+          issueNumber: 3,
+          kind: "issue_closed",
+          source: "webhook",
+          actor: "octocat",
+          agentName: null,
+          fromStatus: null,
+          toStatus: null,
+          sourceEventId: null,
+          occurredAt: "2026-10-08T00:00:00.000Z",
+          observedAt: "2026-10-08T00:00:00.000Z",
+          metadata: null,
+        },
+      );
+      const snapshot = buildReleasePulse(repoInput(), issues, events);
+      expect(snapshot.completedUmbrellaCount).toBe(1);
+      expect(snapshot.highlights[0].children).toEqual([
+        { number: 2, url: issueUrl(2), closedAt: "2026-10-05T00:00:00.000Z" },
+        { number: 3, url: issueUrl(3), closedAt: "2026-10-08T00:00:00.000Z" },
+      ]);
+    });
+
     it("fails closed on an unresolvable or cross-repo child reference", () => {
       const { issues, events } = umbrellaFixtures();
       issues[0].followUpUrls = [issueUrl(2), "https://github.com/octocat/hello-world/issues/999"];

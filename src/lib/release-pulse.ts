@@ -325,7 +325,13 @@ function expectsCodeDelivery(issue: ReleasePulseIssueInput): boolean {
   return legacyKindFromLabels(issue.labels) !== null;
 }
 
-/** No reopen observable after the close time; an incomparable pair fails closed. */
+/**
+ * No reopen observable after the close time; an incomparable pair fails
+ * closed. Callers pass the timeline's `lastClosedAt` — the LATEST close
+ * evidence, the same ordering the projection's `delivery` uses — so a
+ * close→reopen→reclose sequence resolves against the reclose (durable
+ * completion), not against the superseded first close.
+ */
 function reopenedAfterClose(timeline: IssueLifecycleTimeline, closeMs: number | null): boolean {
   const reopenMs = toMillis(timeline.lastReopenAt.at);
   if (reopenMs === null) return false;
@@ -474,7 +480,7 @@ export function buildReleasePulse(
 
     const timeline = timelineFor(issue);
     if (issue.state !== "closed") continue;
-    const parentCloseMs = toMillis(timeline.closedAt.at) ?? toMillis(issue.closedAt);
+    const parentCloseMs = toMillis(timeline.lastClosedAt.at);
     if (parentCloseMs === null || parentCloseMs <= baselineMs) continue;
     if (reopenedAfterClose(timeline, parentCloseMs)) continue;
 
@@ -498,7 +504,7 @@ export function buildReleasePulse(
         allComplete = false;
         break;
       }
-      const childCloseMs = toMillis(childTimeline.closedAt.at) ?? toMillis(child.issue.closedAt);
+      const childCloseMs = toMillis(childTimeline.lastClosedAt.at);
       if (childCloseMs === null || reopenedAfterClose(childTimeline, childCloseMs) || childCloseMs > parentCloseMs) {
         allComplete = false;
         break;
