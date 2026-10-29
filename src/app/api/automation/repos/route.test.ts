@@ -11,6 +11,8 @@ const { mocks } = vi.hoisted(() => ({
     findAutomationRepos: vi.fn(),
     countWorkflowRuns: vi.fn(),
     findLastSyncRun: vi.fn(),
+    findLifecycleEvents: vi.fn(),
+    findIssues: vi.fn(),
     transaction: vi.fn((callback) =>
       callback({
         automationRepo: { create: mocks.createAutomationRepo },
@@ -31,6 +33,8 @@ vi.mock("@/lib/prisma", () => ({
     auditLog: { create: mocks.createAuditLog },
     githubWorkflowRun: { count: mocks.countWorkflowRuns },
     automationSyncRun: { findFirst: mocks.findLastSyncRun },
+    issueLifecycleEvent: { findMany: mocks.findLifecycleEvents },
+    issue: { findMany: mocks.findIssues },
   },
 }));
 
@@ -248,6 +252,8 @@ describe("GET /api/automation/repos — release-delta projection", () => {
     ]);
     mocks.countWorkflowRuns.mockResolvedValue(0);
     mocks.findLastSyncRun.mockResolvedValue(null);
+    mocks.findLifecycleEvents.mockResolvedValue([]);
+    mocks.findIssues.mockResolvedValue([]);
   });
 
   it("projects the persisted release-delta snapshot into the API response", async () => {
@@ -270,6 +276,261 @@ describe("GET /api/automation/repos — release-delta projection", () => {
       releaseAheadBy: 7,
       releaseError: null,
       releaseDeltaSyncedAt: "2024-01-02T00:00:00.000Z",
+      pulse: expect.objectContaining({ pulseState: "ready" }),
     });
+  });
+});
+
+describe("GET /api/automation/repos — release pulse", () => {
+  const BASELINE_MS = Date.parse("2024-01-01T00:00:00Z");
+
+  function readyRepo(overrides: Record<string, unknown> = {}) {
+    return {
+      id: "repo-1",
+      fullName: "myorg/myrepo",
+      name: "myrepo",
+      owner: "myorg",
+      defaultBranch: "main",
+      latestCommitSha: "headsha1",
+      releaseState: "ahead",
+      releaseBaselineTag: "v1.0.0",
+      releaseBaselineSha: "basesha1",
+      releaseBaselinePublishedAt: new Date(BASELINE_MS),
+      releaseHeadSha: "headsha1",
+      releaseAheadBy: 7,
+      releaseError: null,
+      releaseDeltaSyncedAt: new Date("2024-01-02T00:00:00Z"),
+      openPRCount: 0,
+      lastSyncedAt: new Date("2024-01-02T00:00:00Z"),
+      syncError: null,
+      source: "user",
+      workflows: [],
+      releases: [],
+      _count: { workflows: 0, releases: 1 },
+      ...overrides,
+    };
+  }
+
+  function getRequest() {
+    return GET(
+      new Request("http://localhost/api/automation/repos", {
+        headers: { Authorization: `Bearer ${mockToken}` },
+      }),
+    );
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findLifecycleEvents.mockResolvedValue([]);
+    mocks.findIssues.mockResolvedValue([]);
+    mocks.countWorkflowRuns.mockResolvedValue(0);
+    mocks.findLastSyncRun.mockResolvedValue(null);
+  });
+
+  it("computes a ready pulse from lifecycle events and issue rows", async () => {
+    mocks.findAutomationRepos.mockResolvedValue([readyRepo()]);
+    mocks.findLifecycleEvents.mockResolvedValue([
+      {
+        kind: "pr_merged",
+        source: "github-webhook",
+        actor: "myorg",
+        agentName: null,
+        fromStatus: null,
+        toStatus: null,
+        sourceEventId: "pr-101",
+        occurredAt: new Date("2024-01-05T12:00:00Z"),
+        observedAt: new Date("2024-01-05T12:00:05Z"),
+        metadata: {
+          pullRequestNumber: 101,
+          pullRequestUrl: "https://github.com/myorg/myrepo/pull/101",
+          mergeCommitSha: "mergesha1",
+          mergedAt: "2024-01-05T12:00:00Z",
+        },
+        issueNumber: 41,
+      },
+      {
+        kind: "issue_closed",
+        source: "github-webhook",
+        actor: "myorg",
+        agentName: null,
+        fromStatus: null,
+        toStatus: null,
+        sourceEventId: null,
+        occurredAt: new Date("2024-01-06T09:00:00Z"),
+        observedAt: new Date("2024-01-06T09:00:05Z"),
+        metadata: null,
+        issueNumber: 41,
+      },
+    ]);
+    mocks.findIssues.mockResolvedValue([
+      {
+        number: 41,
+        title: "Tenant-scoped login",
+        url: "https://github.com/myorg/myrepo/issues/41",
+        state: "open",
+        closedAt: null,
+        labels: ["type/feature"],
+        releaseSignal: {
+          kind: "feature",
+          headline: "Adds tenant-scoped login",
+          significance: "major",
+          evidenceRefs: [],
+        },
+        decomposed: false,
+        followUpUrls: [],
+      },
+    ]);
+
+    const res = await getRequest();
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body[0].pulse).toMatchObject({
+      schema: "dispatch.release-pulse/v1",
+      repoFullName: "myorg/myrepo",
+      pulseState: "ready",
+      baseline: {
+        tag: "v1.0.0",
+        sha: "basesha1",
+        publishedAt: "2024-01-01T00:00:00.000Z",
+      },
+      headSha: "headsha1",
+      unreleasedCommits: { state: "ahead", count: 7 },
+      deliveredIssueCount: 1,
+      completedUmbrellaCount: 0,
+      unknownDeliveryCount: 0,
+      highlightsTruncated: false,
+    });
+    expect(body[0].pulse.highlights).toHaveLength(1);
+    expect(body[0].pulse.highlights[0]).toMatchObject({
+      kind: "feature",
+      headline: "Adds tenant-scoped login",
+      issueNumber: 41,
+      issueUrl: "https://github.com/myorg/myrepo/issues/41",
+      deliveredAt: "2024-01-05T12:00:00.000Z",
+      significance: "major",
+      confidence: "high",
+      provenance: "groomer-release-signal",
+    });
+    expect(body[0].pulse.highlights[0].prs).toEqual([
+      {
+        prNumber: 101,
+        prUrl: "https://github.com/myorg/myrepo/pull/101",
+        mergeCommitSha: "mergesha1",
+        mergedAt: "2024-01-05T12:00:00.000Z",
+      },
+    ]);
+
+    expect(mocks.findLifecycleEvents).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          repoFullName: "myorg/myrepo",
+          // Merge evidence is read across every interval (pre-baseline PR
+          // links are retained on delivered highlights); close/reopen
+          // evidence stays baseline-scoped.
+          OR: [
+            { kind: "pr_merged" },
+            {
+              kind: { in: ["completed", "issue_closed", "issue_reopened"] },
+              occurredAt: { gte: new Date(BASELINE_MS) },
+            },
+          ],
+        }),
+        orderBy: { occurredAt: "asc" },
+      }),
+    );
+    expect(mocks.findIssues).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          repository: { fullName: "myorg/myrepo" },
+          OR: [
+            { number: { in: [41] } },
+            { state: "closed" },
+            { decomposed: true, followUpUrls: { isEmpty: false } },
+          ],
+        },
+      }),
+    );
+  });
+
+  it("skips the issue/event reads for a no-baseline repo and reports no-baseline", async () => {
+    mocks.findAutomationRepos.mockResolvedValue([
+      readyRepo({
+        releaseState: "no-baseline",
+        releaseBaselineTag: null,
+        releaseBaselineSha: null,
+        releaseBaselinePublishedAt: null,
+        releaseHeadSha: null,
+        releaseAheadBy: null,
+      }),
+    ]);
+
+    const res = await getRequest();
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body[0].pulse).toMatchObject({
+      schema: "dispatch.release-pulse/v1",
+      repoFullName: "myorg/myrepo",
+      pulseState: "no-baseline",
+      baseline: null,
+      headSha: null,
+      unreleasedCommits: { state: "no-baseline", count: null },
+      deliveredIssueCount: 0,
+      highlights: [],
+      completedUmbrellaCount: 0,
+      unknownDeliveryCount: 0,
+    });
+    expect(mocks.findLifecycleEvents).not.toHaveBeenCalled();
+    expect(mocks.findIssues).not.toHaveBeenCalled();
+  });
+
+  it("degrades to an unknown pulse without queries for a diverged repo", async () => {
+    mocks.findAutomationRepos.mockResolvedValue([readyRepo({ releaseState: "diverged" })]);
+
+    const res = await getRequest();
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body[0].pulse).toMatchObject({
+      pulseState: "unknown",
+      baseline: null,
+      unreleasedCommits: { state: "diverged", count: null },
+      highlights: [],
+    });
+    expect(mocks.findLifecycleEvents).not.toHaveBeenCalled();
+    expect(mocks.findIssues).not.toHaveBeenCalled();
+  });
+
+  it("drops the event-number OR arm when no post-baseline events exist", async () => {
+    mocks.findAutomationRepos.mockResolvedValue([readyRepo()]);
+    mocks.findIssues.mockResolvedValue([]);
+
+    const res = await getRequest();
+    expect(res.status).toBe(200);
+
+    expect(mocks.findIssues).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          OR: [{ state: "closed" }, { decomposed: true, followUpUrls: { isEmpty: false } }],
+        }),
+      }),
+    );
+  });
+
+  it("computes a ready pulse for an identical-state repo with zero unreleased commits", async () => {
+    mocks.findAutomationRepos.mockResolvedValue([readyRepo({ releaseState: "identical", releaseAheadBy: null })]);
+    const res = await getRequest();
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body[0].pulse).toMatchObject({
+      pulseState: "ready",
+      unreleasedCommits: { state: "identical", count: 0 },
+      deliveredIssueCount: 0,
+      highlights: [],
+    });
+    // Identical is still a computable baseline: issue/event reads happen.
+    expect(mocks.findLifecycleEvents).toHaveBeenCalledTimes(1);
+    expect(mocks.findIssues).toHaveBeenCalledTimes(1);
   });
 });

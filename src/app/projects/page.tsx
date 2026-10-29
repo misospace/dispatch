@@ -5,6 +5,7 @@ import { BOARD_COLUMNS, STATUS_LABELS } from "@/types";
 import type { IssueWithRepo } from "@/types";
 import { applyRenovateIssueExclusion, buildVisibleIssueWhere } from "@/lib/issue-filters";
 import { getProjectIssueStatus, groupIssuesByProject } from "@/lib/projects";
+import { withNormalizedReleaseSignal } from "@/lib/groomer/plan";
 
 export const dynamic = "force-dynamic";
 
@@ -24,9 +25,14 @@ async function getProjects() {
     include: { repository: true },
   });
 
+  // #1487: the projects page serializes raw issue rows, so a cleared
+  // release-signal tombstone is normalized back to null — the projection's
+  // third persisted shape never reaches a row consumer.
+  const normalized = issues.map((issue) => withNormalizedReleaseSignal(issue));
+
   return {
-    projects: groupIssuesByProject(issues),
-    issueCount: issues.length,
+    projects: groupIssuesByProject(normalized),
+    issueCount: normalized.length,
   };
 }
 

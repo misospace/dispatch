@@ -114,6 +114,24 @@ describe("GET /api/audit", () => {
     expect(call.include).toEqual({ issue: { include: { repository: true } } });
   });
 
+  it("normalizes a cleared release-signal tombstone on the nested issue row (#1487)", async () => {
+    mocks.auditLogFindMany.mockResolvedValue([
+      { id: "log-1", issue: { id: "i-1", releaseSignal: { tombstone: true, provenance: { applicationKey: "k-1" } } } },
+      { id: "log-2", issue: { id: "i-2", releaseSignal: { kind: "feature", provenance: { applicationKey: "k-2" } } } },
+      { id: "log-3", issue: { id: "i-3", releaseSignal: null } },
+      { id: "log-4", issue: null },
+    ]);
+
+    const res = await GET(request("http://localhost/api/audit"));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body[0].issue.releaseSignal).toBeNull();
+    expect(body[1].issue.releaseSignal).toMatchObject({ kind: "feature" });
+    expect(body[2].issue.releaseSignal).toBeNull();
+    expect(body[3].issue).toBeNull();
+  });
+
   it("returns 500 on database error", async () => {
     mocks.auditLogFindMany.mockRejectedValue(new Error("db connection lost"));
 

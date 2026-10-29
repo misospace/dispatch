@@ -14,6 +14,7 @@ import {
 import { getConfiguredLanes, isValidLane } from "@/lib/lane-config";
 import { withDependencyBlockReasons } from "@/lib/issue-dependency-annotation";
 import { withAdmissionAnnotations } from "@/lib/queue-admission";
+import { withNormalizedReleaseSignal } from "@/lib/groomer/plan";
 
 export const dynamic = "force-dynamic";
 
@@ -38,7 +39,12 @@ async function getIssues(repo?: string, agent?: string, owner?: string, priority
     orderBy: { updatedAt: "desc" },
   });
 
-  return withAdmissionAnnotations(await withDependencyBlockReasons(issues));
+  // #1487: the board serializes raw issue rows into the page payload, so a
+  // cleared release-signal tombstone is normalized back to null here — the
+  // projection's third persisted shape never reaches a row consumer.
+  return withAdmissionAnnotations(
+    await withDependencyBlockReasons(issues.map((issue) => withNormalizedReleaseSignal(issue))),
+  );
 }
 
 async function getRepos() {

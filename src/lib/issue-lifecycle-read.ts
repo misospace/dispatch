@@ -77,6 +77,7 @@ export interface IssueLifecycleTimeline {
   firstClaim: LifecycleTimestamp;
   doneAt: LifecycleTimestamp;
   closedAt: LifecycleTimestamp;
+  lastClosedAt: LifecycleTimestamp;
   lastReopenAt: LifecycleTimestamp;
   pullRequests: LifecyclePullRequest[];
   firstMergedAt: LifecycleTimestamp;
@@ -290,6 +291,38 @@ export function buildIssueLifecycleTimeline(
           via: ["issue_reopened"],
         };
 
+  // Last close: the LATEST close evidence, the same ordering `delivery` uses
+  // (last observed close, with the issue cache's closedAt filling a gap or —
+  // when later than every observed close — carrying the latest evidence).
+  // `closedAt` keeps reporting the FIRST close milestone; a reader that needs
+  // "the close with no reopen after it" (durable completion) reads this one,
+  // so a close→reopen→reclose sequence resolves against the reclose.
+  const lastCloseEventMs =
+    closedEvents.length > 0 ? closedEvents[closedEvents.length - 1].occurredAtMs : null;
+  // The issue cache's closedAt is close evidence too, but only where the
+  // `closedAt` milestone accepts it: the cache fills a gap for a CLOSED
+  // issue. Gating it the same way keeps delivery from certifying a close
+  // the milestone itself refuses to.
+  const cacheClosedMs = issue.state === "closed" ? toMillis(issue.closedAt) : null;
+  const latestCloseMs =
+    lastCloseEventMs === null
+      ? cacheClosedMs
+      : cacheClosedMs === null
+        ? lastCloseEventMs
+        : Math.max(lastCloseEventMs, cacheClosedMs);
+  const lastClosedAt: LifecycleTimestamp =
+    latestCloseMs === null
+      ? unknownTimestamp()
+      : lastCloseEventMs === null
+        ? { at: toIso(latestCloseMs), provenance: "observed", via: ["issue-cache"] }
+        : cacheClosedMs !== null && cacheClosedMs > lastCloseEventMs
+          ? {
+              at: toIso(latestCloseMs),
+              provenance: "observed",
+              via: ["issue_closed", "issue-cache"],
+            }
+          : { at: toIso(latestCloseMs), provenance: "observed", via: ["issue_closed"] };
+
   // Merges: one entry per PR. Repeated observations of the same PR keep the
   // earliest merge time and union the metadata, first non-null per field.
   const prGroups = new Map<number, NormalizedEvent[]>();
@@ -343,19 +376,6 @@ export function buildIssueLifecycleTimeline(
   // first close: a close after a reopen closes the item again, so it is
   // closed-unmerged again. `closedAt` keeps reporting the FIRST close
   // milestone; only `delivery` moves.
-  const lastCloseEventMs =
-    closedEvents.length > 0 ? closedEvents[closedEvents.length - 1].occurredAtMs : null;
-  // The issue cache's closedAt is close evidence too, but only where the
-  // `closedAt` milestone accepts it: the cache fills a gap for a CLOSED
-  // issue. Gating it the same way keeps delivery from certifying a close
-  // the milestone itself refuses to.
-  const cacheClosedMs = issue.state === "closed" ? toMillis(issue.closedAt) : null;
-  const latestCloseMs =
-    lastCloseEventMs === null
-      ? cacheClosedMs
-      : cacheClosedMs === null
-        ? lastCloseEventMs
-        : Math.max(lastCloseEventMs, cacheClosedMs);
   const reopenMs = lastReopenAt.at !== null ? Date.parse(lastReopenAt.at) : null;
   let delivery: LifecycleDelivery;
   if (pullRequests.length > 0) {
@@ -427,6 +447,7 @@ export function buildIssueLifecycleTimeline(
     firstClaim,
     doneAt,
     closedAt,
+    lastClosedAt,
     lastReopenAt,
     pullRequests,
     firstMergedAt,

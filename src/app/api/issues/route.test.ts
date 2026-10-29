@@ -301,6 +301,22 @@ describe("GET /api/issues — visible issue filtering", () => {
     expect(body.error).toBe("Failed to fetch issues");
   });
 
+  it("normalizes a cleared release-signal tombstone to null in listing rows (#1487)", async () => {
+    mocks.findManyIssues.mockResolvedValueOnce([
+      { id: "1", releaseSignal: { tombstone: true, provenance: { applicationKey: "k-1" } } },
+      { id: "2", releaseSignal: { kind: "fix", provenance: { applicationKey: "k-2" } } },
+      { id: "3" },
+    ]);
+
+    const res = await makeRequest("http://localhost/api/issues");
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body[0].releaseSignal).toBeNull();
+    expect(body[1].releaseSignal).toMatchObject({ kind: "fix" });
+    expect("releaseSignal" in body[2]).toBe(false);
+  });
+
   it("returns 400 for invalid lane filter", async () => {
     const res = await makeRequest("http://localhost/api/issues?lane=unknown-lane");
     const body = await res.json();
