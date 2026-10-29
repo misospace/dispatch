@@ -92,6 +92,43 @@ export async function fetchReleases(repoFullName: string, perPage = 10): Promise
   return fetchPaginated<GithubRelease>(url, 50);
 }
 
+/**
+ * Resolve the authoritative stable-release baseline for the release delta
+ * (#1480): GitHub's own "latest release" endpoint (`GET /releases/latest`),
+ * defined upstream as the most recent non-prerelease, non-draft release —
+ * the same release GitHub surfaces as "Latest".
+ *
+ * Baking the contract into a single forge read keeps the selection
+ * authoritative without trusting any locally persisted window: the release
+ * listing is ordered by release creation, not `published_at`, and a
+ * long-lived draft keeps its old position in that order when it is finally
+ * published later. A window that already holds a stable release therefore
+ * cannot prove which stable release is newest by publication time — only
+ * GitHub's own latest-release designation can. A 404 is GitHub's own
+ * verified absence ("no non-prerelease, non-draft release exists") and
+ * yields null; any other failure throws so the caller fails closed to
+ * `unknown`. The response is defensively rejected if it ever carries
+ * draft/prerelease flags, so a draft or prerelease can never become the
+ * baseline even if upstream semantics drift.
+ */
+export async function fetchStableBaselineRelease(
+  repoFullName: string
+): Promise<GithubRelease | null> {
+  const response = await fetchWithRetry(`${GITHUB_API}/repos/${repoFullName}/releases/latest`, {
+    headers: await getHeadersAsync(),
+  });
+  if (response.status === 404) return null;
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Failed to fetch latest release for ${repoFullName}: ${response.status} ${text}`);
+  }
+  const data = (await response.json()) as GithubRelease;
+  if (!data?.tag_name || !data?.published_at || data.draft || data.prerelease) {
+    throw new Error(`Latest release for ${repoFullName} is not a stable published release`);
+  }
+  return data;
+}
+
 export interface GithubPackageInfo {
   name: string;
   package_type: string;
@@ -147,9 +184,72 @@ export interface GithubCommit {
   html_url: string;
 }
 
+/**
+ * Result of GitHub's compare semantics (`base...head`, three-dot: from the
+ * merge base). `aheadBy`/`behindBy` are exact commit counts — GitHub only
+ * bounds the detailed `commits` identity list, never these counts — so a
+ * large delta keeps its correct total even though no commit list is kept.
+ */
+export interface GithubCompare {
+  status: "ahead" | "behind" | "identical" | "diverged";
+  aheadBy: number;
+  behindBy: number;
+  mergeBaseCommitSha: string | null;
+}
+
+const COMPARE_STATUSES = new Set(["ahead", "behind", "identical", "diverged"]);
+
+/**
+ * Compare two refs (branch, tag, or SHA). Returns null when the comparison
+ * is impossible — a missing ref (404), an empty/conflicted repo (409), or an
+ * unrecognized status — so callers fail closed to "unknown" instead of
+ * manufacturing a count. Other failures (rate limit, outage) throw.
+ */
+export async function fetchCompare(
+  repoFullName: string,
+  baseRef: string,
+  headRef: string
+): Promise<GithubCompare | null> {
+  const basehead = `${baseRef}...${headRef}`;
+  // per_page=1: only the counts matter; keep the commit-identity payload bounded.
+  const response = await fetchWithRetry(
+    `${GITHUB_API}/repos/${repoFullName}/compare/${encodeURIComponent(basehead)}?per_page=1`,
+    { headers: await getHeadersAsync() }
+  );
+  if (!response.ok) {
+    if (response.status === 404 || response.status === 409) return null;
+    const text = await response.text();
+    throw new Error(`Failed to compare ${basehead} for ${repoFullName}: ${response.status} ${text}`);
+  }
+  // GitHub answers incomparable refs with 204 No Content — an OK status
+  // carrying no body. Treat it like the other not-comparable outcomes.
+  if (response.status === 204) return null;
+  const data = (await response.json()) as {
+    status?: unknown;
+    ahead_by?: unknown;
+    behind_by?: unknown;
+    merge_base_commit?: { sha?: unknown };
+  };
+  if (
+    typeof data.status !== "string" ||
+    !COMPARE_STATUSES.has(data.status) ||
+    typeof data.ahead_by !== "number" ||
+    typeof data.behind_by !== "number"
+  ) {
+    return null;
+  }
+  return {
+    status: data.status as GithubCompare["status"],
+    aheadBy: data.ahead_by,
+    behindBy: data.behind_by,
+    mergeBaseCommitSha:
+      typeof data.merge_base_commit?.sha === "string" ? data.merge_base_commit.sha : null,
+  };
+}
+
 export async function fetchLatestCommit(repoFullName: string, branch: string): Promise<GithubCommit | null> {
   const response = await fetchWithRetry(
-    `${GITHUB_API}/repos/${repoFullName}/commits/${branch}?per_page=1`,
+    `${GITHUB_API}/repos/${repoFullName}/commits/${encodeURIComponent(branch)}?per_page=1`,
     { headers: await getHeadersAsync() }
   );
   if (!response.ok) {

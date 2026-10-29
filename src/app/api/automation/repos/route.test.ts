@@ -8,6 +8,9 @@ const { mocks } = vi.hoisted(() => ({
   mocks: {
     createAutomationRepo: vi.fn(),
     upsertRepository: vi.fn(),
+    findAutomationRepos: vi.fn(),
+    countWorkflowRuns: vi.fn(),
+    findLastSyncRun: vi.fn(),
     transaction: vi.fn((callback) =>
       callback({
         automationRepo: { create: mocks.createAutomationRepo },
@@ -23,9 +26,11 @@ const { mocks } = vi.hoisted(() => ({
 vi.mock("@/lib/prisma", () => ({
   prisma: {
     $transaction: mocks.transaction,
-    automationRepo: { create: mocks.createAutomationRepo },
+    automationRepo: { create: mocks.createAutomationRepo, findMany: mocks.findAutomationRepos },
     repository: { upsert: mocks.upsertRepository },
     auditLog: { create: mocks.createAuditLog },
+    githubWorkflowRun: { count: mocks.countWorkflowRuns },
+    automationSyncRun: { findFirst: mocks.findLastSyncRun },
   },
 }));
 
@@ -55,7 +60,7 @@ vi.mock("@/lib/tracked-repos", async (importOriginal) => {
   return { ...actual, createTrackedRepo: mocks.createTrackedRepo };
 });
 
-import { POST } from "./route";
+import { POST, GET } from "./route";
 import { Prisma } from "@prisma/client";
 
 // The rate limiter keeps module-global state — reset it so the per-actor
@@ -210,5 +215,61 @@ describe("POST /api/automation/repos — rate limit", () => {
     expect(await res.json()).toEqual({ error: "Rate limit exceeded" });
     // The 11th request is rejected before the tracked repo is created.
     expect(mocks.createTrackedRepo).toHaveBeenCalledTimes(10);
+  });
+});
+
+describe("GET /api/automation/repos — release-delta projection", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findAutomationRepos.mockResolvedValue([
+      {
+        id: "repo-1",
+        fullName: "myorg/myrepo",
+        name: "myrepo",
+        owner: "myorg",
+        defaultBranch: "main",
+        latestCommitSha: "headsha1",
+        releaseState: "ahead",
+        releaseBaselineTag: "v1.0.0",
+        releaseBaselineSha: "basesha1",
+        releaseBaselinePublishedAt: new Date("2024-01-01T00:00:00Z"),
+        releaseHeadSha: "headsha1",
+        releaseAheadBy: 7,
+        releaseError: null,
+        releaseDeltaSyncedAt: new Date("2024-01-02T00:00:00Z"),
+        openPRCount: 0,
+        lastSyncedAt: new Date("2024-01-02T00:00:00Z"),
+        syncError: null,
+        source: "user",
+        workflows: [],
+        releases: [],
+        _count: { workflows: 0, releases: 1 },
+      },
+    ]);
+    mocks.countWorkflowRuns.mockResolvedValue(0);
+    mocks.findLastSyncRun.mockResolvedValue(null);
+  });
+
+  it("projects the persisted release-delta snapshot into the API response", async () => {
+    const res = await GET(
+      new Request("http://localhost/api/automation/repos", {
+        headers: { Authorization: `Bearer ${mockToken}` },
+      }),
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toHaveLength(1);
+    expect(body[0]).toMatchObject({
+      fullName: "myorg/myrepo",
+      releaseState: "ahead",
+      releaseBaselineTag: "v1.0.0",
+      releaseBaselineSha: "basesha1",
+      releaseBaselinePublishedAt: "2024-01-01T00:00:00.000Z",
+      releaseHeadSha: "headsha1",
+      releaseAheadBy: 7,
+      releaseError: null,
+      releaseDeltaSyncedAt: "2024-01-02T00:00:00.000Z",
+    });
   });
 });

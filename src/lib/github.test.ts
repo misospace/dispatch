@@ -1086,3 +1086,214 @@ describe("extractLogExcerpt / jobIdFromCheckRunUrl", () => {
     expect(extractLogExcerpt(huge, 2000).length).toBeLessThanOrEqual(2002);
   });
 });
+
+describe("fetchCompare", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function compareResponse(body: unknown, status = 200): Response {
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      json: () => Promise.resolve(body),
+      text: () => Promise.resolve(JSON.stringify(body)),
+      headers: new Headers(),
+    } as Response;
+  }
+
+  it("parses status and exact counts, pinning both endpoints in the URL", async () => {
+    const { fetchCompare } = await import("./github");
+    fetchMock.mockResolvedValueOnce(
+      compareResponse({
+        status: "ahead",
+        ahead_by: 1234,
+        behind_by: 0,
+        total_commits: 250,
+        commits: [{ sha: "h1" }],
+        merge_base_commit: { sha: "mb1" },
+      }),
+    );
+
+    const result = await fetchCompare("o/r", "v1.2.3", "abc123def");
+
+    expect(result).toEqual({
+      status: "ahead",
+      aheadBy: 1234,
+      behindBy: 0,
+      mergeBaseCommitSha: "mb1",
+    });
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toContain("/repos/o/r/compare/v1.2.3...abc123def");
+    // Counts stay exact even when the commit-identity list is bounded.
+    expect(url).toContain("per_page=1");
+  });
+
+  it("returns null on 404 (ref or comparison missing) without throwing", async () => {
+    const { fetchCompare } = await import("./github");
+    fetchMock.mockResolvedValueOnce(compareResponse({ message: "Not Found" }, 404));
+    expect(await fetchCompare("o/r", "nope", "head1")).toBeNull();
+  });
+
+  it("returns null on 409 (empty/conflicted repo)", async () => {
+    const { fetchCompare } = await import("./github");
+    fetchMock.mockResolvedValueOnce(compareResponse({ message: "Conflict" }, 409));
+    expect(await fetchCompare("o/r", "base1", "head1")).toBeNull();
+  });
+
+  it("returns null on an unrecognized status or missing counts", async () => {
+    const { fetchCompare } = await import("./github");
+    fetchMock
+      .mockResolvedValueOnce(compareResponse({ status: "wibble", ahead_by: 1, behind_by: 0 }))
+      .mockResolvedValueOnce(compareResponse({ status: "ahead" }));
+
+    expect(await fetchCompare("o/r", "base1", "head1")).toBeNull();
+    expect(await fetchCompare("o/r", "base1", "head1")).toBeNull();
+  });
+
+  it("returns null on 204 No Content (incomparable refs)", async () => {
+    const { fetchCompare } = await import("./github");
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 204,
+      json: () => Promise.reject(new Error("204 carries no body")),
+      text: () => Promise.resolve(""),
+      headers: new Headers(),
+    } as Response);
+    expect(await fetchCompare("o/r", "base1", "head1")).toBeNull();
+  });
+
+  it("throws on non-comparable failures (fail upward, caller degrades to unknown)", async () => {
+    const { fetchCompare } = await import("./github");
+    fetchMock.mockResolvedValueOnce(compareResponse({ message: "Forbidden" }, 403));
+    await expect(fetchCompare("o/r", "base1", "head1")).rejects.toThrow(/403/);
+  });
+});
+
+describe("fetchLatestCommit", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("URL-encodes the ref so slash-containing tags and branches resolve", async () => {
+    const { fetchLatestCommit } = await import("./github");
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ sha: "abc123" }),
+      text: () => Promise.resolve(JSON.stringify({ sha: "abc123" })),
+      headers: new Headers(),
+    } as Response);
+
+    const result = await fetchLatestCommit("o/r", "release/v1.0.0");
+
+    expect(result).toEqual({ sha: "abc123" });
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toBe("https://api.github.com/repos/o/r/commits/release%2Fv1.0.0?per_page=1");
+  });
+});
+
+describe("fetchStableBaselineRelease", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function release(overrides: Partial<{ id: number; tag_name: string; draft: boolean; prerelease: boolean; published_at: string }> = {}) {
+    return {
+      id: overrides.id ?? 1,
+      tag_name: overrides.tag_name ?? "v1.0.0",
+      name: "Release",
+      draft: overrides.draft ?? false,
+      prerelease: overrides.prerelease ?? false,
+      target_commitish: "main",
+      html_url: "https://github.com/o/r/releases/tag/v1.0.0",
+      published_at: overrides.published_at ?? "2024-01-01T00:00:00Z",
+    };
+  }
+
+  it("binds the baseline to GitHub's authoritative latest-release endpoint", async () => {
+    const { fetchStableBaselineRelease } = await import("./github");
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve(release({ id: 7, tag_name: "v2.0.0", published_at: "2024-06-01T00:00:00Z" })),
+      headers: new Headers(),
+    } as Response);
+
+    const result = await fetchStableBaselineRelease("o/r");
+
+    expect(result).toEqual(release({ id: 7, tag_name: "v2.0.0", published_at: "2024-06-01T00:00:00Z" }));
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toBe("https://api.github.com/repos/o/r/releases/latest");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports verified absence when GitHub itself has no stable release (404)", async () => {
+    const { fetchStableBaselineRelease } = await import("./github");
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 404,
+      json: () => Promise.resolve({}),
+      text: () => Promise.resolve("not found"),
+      headers: new Headers(),
+    } as Response);
+
+    const result = await fetchStableBaselineRelease("o/r");
+
+    expect(result).toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed when the latest-release payload is not a stable published release", async () => {
+    const { fetchStableBaselineRelease } = await import("./github");
+    for (const payload of [
+      release({ draft: true }),
+      release({ prerelease: true }),
+      { ...release(), tag_name: undefined },
+      { ...release(), published_at: undefined },
+    ]) {
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve(payload),
+        headers: new Headers(),
+      } as Response);
+      await expect(fetchStableBaselineRelease("o/r")).rejects.toThrow(/not a stable published release/);
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it("propagates forge failures for the caller to fail closed", async () => {
+    const { fetchStableBaselineRelease } = await import("./github");
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 403,
+      json: () => Promise.resolve({}),
+      text: () => Promise.resolve("forbidden"),
+      headers: new Headers(),
+    } as Response);
+
+    await expect(fetchStableBaselineRelease("o/r")).rejects.toThrow(/403/);
+  });
+});
