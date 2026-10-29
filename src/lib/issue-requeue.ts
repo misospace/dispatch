@@ -48,6 +48,7 @@ import {
   freshAttemptGeneration,
   normalizeQueueRepo,
   nonEmpty,
+  parseHandoutReceipt,
   type PrFixQueueClient,
 } from "@/lib/pr-fix-queue";
 import { Prisma } from "@prisma/client";
@@ -437,25 +438,44 @@ export async function attemptRequeuePrFixItem(
     return { ok: true, replayed: true, itemId: item.id, generation: replay.generation };
   }
 
-  // Fence: issuance proof — live exact-match receipt, else the durable
-  // issuance row. An unknown, rotated, or foreign-attempt token authorizes
-  // nothing.
+  // Fence: issuance proof, with the live receipts as the FIRST authority.
+  // A live receipt at the fenced generation that is NOT the presented token
+  // means the named issuance was RELEASED AND RE-ISSUED (capacity-exhausted
+  // settlement and unacknowledged reclaim both keep the generation and
+  // rotate the token — the item stays QUEUED at the same generation). A
+  // stale token then authorizes NOTHING: bumping the generation would stop
+  // the CURRENT live hand-out, violating the pinned "the current owner is
+  // NEVER touched" rule. Only when the generation owns nobody does the
+  // durable issuance history authorize the retry.
+  const receipts: string[] = Array.isArray(item.handoutReceipts) ? item.handoutReceipts : [];
   const liveIssued =
-    findHandoutReceipt(item.handoutReceipts ?? [], {
+    findHandoutReceipt(receipts, {
       agentName: input.agentName,
       generation: input.generation,
       token: input.fenceToken,
     }) !== null;
-  const issued =
-    liveIssued ||
-    (await proveAttemptIssuance(client, {
-      surface: "pr-fix",
-      attemptId: item.id,
-      agentName: input.agentName,
-      token: input.fenceToken,
-      generation: input.generation,
-    }));
-  if (!issued) return { ok: false, refusal: "stale-generation" };
+  if (!liveIssued) {
+    const ownsGeneration = receipts.some((entry) => {
+      const parsed = parseHandoutReceipt(entry);
+      return parsed !== null && parsed.generation === input.generation;
+    });
+    if (ownsGeneration) return { ok: false, refusal: "stale-generation" };
+    let issued: boolean;
+    try {
+      issued = await proveAttemptIssuance(client, {
+        surface: "pr-fix",
+        attemptId: item.id,
+        agentName: input.agentName,
+        token: input.fenceToken,
+        generation: input.generation,
+      });
+    } catch {
+      // A failed ledger read establishes nothing: refuse retryably, mutate
+      // nothing, never accept unfenced.
+      return { ok: false, unavailable: true };
+    }
+    if (!issued) return { ok: false, refusal: "stale-generation" };
+  }
 
   const classified = await classifyAttemptRequeueItem(client, item, input);
   if (classified.kind === "refusal") return { ok: false, refusal: classified.refusal };
@@ -595,7 +615,7 @@ export async function attemptRequeuePrFixItem(
 // The release itself IS the shared claim release (`releaseIssueClaim`, the
 // path unclaim / capacity-handoff / the reconciler share) under the per-issue
 // mutation anchor and the fenced remote write, and the durable settlement is
-// the shared #1262 ledger (`IssueHandoffSettlement`, first write wins, reaxed
+// the shared #1262 ledger (`IssueHandoffSettlement`, first write wins, retracted
 // on a lease-CAS miss) — never a parallel mechanism.
 
 export interface IssueRequeueInput {
@@ -673,7 +693,12 @@ export async function requeueIssueAttempt(input: IssueRequeueInput): Promise<Iss
         // Courier); this is simply a fence for work it does not record.
         return { complete: true, value: { ok: false, refusal: "stale-generation" } };
       }
-      if (issue.repository?.fullName !== input.repoFullName || issue.number !== input.issueNumber) {
+      // Identity gate mirrors capacity-handoff (#1129): the canonical GitHub
+      // repo comes from the loaded DB record. The comparison is
+      // case-INSENSITIVE on the repo half (GitHub repo names are
+      // case-insensitive; a case-drifted body value must not 400 forever),
+      // and the canonical casing is what the release and audit see.
+      if ((issue.repository?.fullName ?? "").toLowerCase() !== input.repoFullName.toLowerCase() || issue.number !== input.issueNumber) {
         return {
           complete: true,
           value: {
@@ -726,15 +751,20 @@ export async function requeueIssueAttempt(input: IssueRequeueInput): Promise<Iss
       }
       if (!lease || !lease.claimToken) {
         // Claim already released (terminal report) or pre-token legacy row:
-        // the durable issuance history is the only proof. A failed ledger
-        // read throws — the guard callback rejecting surfaces as a 500 the
-        // route maps retryable; absence is a closed refusal.
-        const issued = await proveAttemptIssuance(client, {
-          surface: "issue",
-          attemptId: issueId,
-          agentName,
-          token: claimToken,
-        });
+        // the durable issuance history is the only proof. Absence is a
+        // closed refusal; a failed ledger read is a retryable 503 — never
+        // treated as absent, never treated as issuance.
+        let issued: boolean;
+        try {
+          issued = await proveAttemptIssuance(client, {
+            surface: "issue",
+            attemptId: issueId,
+            agentName,
+            token: claimToken,
+          });
+        } catch {
+          return { complete: true, value: { ok: false, unavailable: true } };
+        }
         if (!issued) return { complete: true, value: { ok: false, refusal: "stale-generation" } };
       }
 
@@ -754,19 +784,33 @@ export async function requeueIssueAttempt(input: IssueRequeueInput): Promise<Iss
             releaseIssueClaim({
               prisma: fencedClaimClient(tx),
               issue,
-              repoFullName: input.repoFullName,
+              // Canonical casing from the loaded record (m5): the identity
+              // gate above matched case-insensitively, so the remote label
+              // write uses the DB's canonical repo name.
+              repoFullName: issue.repository?.fullName ?? input.repoFullName,
               issueNumber: input.issueNumber,
               agentName,
-              options: { actor: input.actor },
+              // #1491: the terminal report (or the reconciler / stale-work
+              // sweep) that released this claim usually removed the `agent/*`
+              // label ALREADY — that absent label is the state this route
+              // exists for, not a caller error. `allowMissingAgent` makes the
+              // release an idempotent repair (DELETE 404 = already gone)
+              // instead of throwing `Issue is not assigned to`.
+              options: { actor: input.actor, allowMissingAgent: true },
             }),
           { timeoutMs: fencedWriteTimeoutForCalls(releaseIssueClaimWorstCaseCalls(labels)) },
         );
       } catch (error) {
-        // Remote release failed: lease and settlement stay untouched and the
-        // guard is retained (fail-closed, exactly the capacity-handoff
-        // posture for `release_failed`). Retryable for Courier.
+        // Remote release failed: nothing was settled and the lease stays
+        // intact. COMPLETE (not retained): `attempt-requeue` has no resume
+        // branch by design — every retry re-derives the whole transition
+        // idempotently (the shared release tolerates the absent label, the
+        // settlement is first-write-wins, the lease consumption is a CAS),
+        // so retaining a demoted guard here would wedge the issue (#1367
+        // posture). A leaked throw deletes the row via the guard's
+        // delete-on-throw list.
         console.error(`attempt-requeue: claim release failed for ${issueId}:`, error);
-        return { complete: false, value: { ok: false, unavailable: true } };
+        return { complete: true, value: { ok: false, unavailable: true } };
       }
       if (released.status === "guard-lost") {
         // The guard was re-owned before the remote write: NOTHING happened.
@@ -799,7 +843,11 @@ export async function requeueIssueAttempt(input: IssueRequeueInput): Promise<Iss
           return { complete: true, value: { ok: false, keyConflict: requeueKeyConflictMessage("issue requeue") } };
         }
       } catch {
-        return { complete: false, value: { ok: false, unavailable: true } };
+        // Settlement write failed after the remote release. COMPLETE: the
+        // retry re-runs the whole transition idempotently (absent label is
+        // a repair, first-write-wins settlement) — a retained, unresumable
+        // guard would wedge the issue (#1367 posture).
+        return { complete: true, value: { ok: false, unavailable: true } };
       }
 
       // ── Consume the exact lease (only when this attempt still holds one) ──

@@ -194,6 +194,17 @@ export async function upsertLease(params: {
         claimToken: newClaimToken(),
       },
     });
+    // #1491: first-generation mint — same durable issuance record as the
+    // rotation path above. Without it a plain claim's token could never be
+    // proven issued after the terminal release deleted the row.
+    if (lease.claimToken) {
+      await recordAttemptIssuanceBestEffort(prisma, {
+        surface: "issue",
+        attemptId: params.issueId,
+        agentName: params.agentName,
+        token: lease.claimToken,
+      });
+    }
     return { created: true, lease, mintedToken: true };
   } catch (err) {
     if (

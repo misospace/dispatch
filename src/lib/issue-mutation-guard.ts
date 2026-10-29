@@ -499,7 +499,14 @@ export async function withIssueMutationGuard<T>(
     // leaving a demoted `executing: false` row that no one can resume —
     // invisible to the ownership inspect surface (which lists `executing`
     // guards only) and wedging every writer on the issue, claims included.
-    if ((request.operation === "lease" || request.operation === "ownership" || request.operation === "unassign" || request.operation === "unclaim" || request.operation === "reassign") && !resuming) {
+    //
+    // #1491: same posture for "attempt-requeue" (the fenced Courier retry).
+    // It has no resume branch BY DESIGN: every retry re-derives the whole
+    // transition idempotently (the shared claim release tolerates an already
+    // absent label, the settlement is first-write-wins, the lease consumption
+    // is a CAS), and its core releases the anchor on every handled path — so
+    // a leaked throw must delete its row, never wedge the issue.
+    if ((request.operation === "lease" || request.operation === "ownership" || request.operation === "unassign" || request.operation === "unclaim" || request.operation === "reassign" || request.operation === "attempt-requeue") && !resuming) {
       await prisma.issueMutationGuard.deleteMany({ where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true } });
     } else {
       await prisma.issueMutationGuard.updateMany({ where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true }, data: { executing: false } });

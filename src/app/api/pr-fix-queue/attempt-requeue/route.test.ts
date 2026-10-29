@@ -821,3 +821,164 @@ describe("CAS lost", () => {
     ).toEqual({ count: 0 });
   });
 });
+
+// ===========================================================================
+// 10. B2 fence fix: a live receipt at the fenced generation shadows the
+//     durable ledger — a rotated token refuses, an empty generation consults
+//     the ledger
+// ===========================================================================
+describe("live-receipt fence (B2)", () => {
+  it("refuses stale-generation when the fenced generation owns a live receipt with a DIFFERENT token, even when the durable ledger proves the presented token; the ledger is never consulted", async () => {
+    // The live receipt (same agent, same generation, rotated token) means
+    // the named issuance was released and re-issued: the current owner is
+    // NEVER touched. The durable row proves the PRESENTED token, which is
+    // exactly the pre-B2 fall-through that would have authorized the bump.
+    seedAttempt({
+      item: { handoutReceipts: ["hnd_0123456789abcdef@worker@3"] },
+      issuance: {
+        id: "iss-1",
+        surface: "pr-fix",
+        attemptId: "fix-1",
+        agentName: "worker",
+        token: "hnd_deadbeefdeadbeef", // === the presented fenceToken
+        generation: 3,
+      },
+    });
+    const res = await post(BASE);
+    expect(res.status).toBe(409);
+    expect(await json(res)).toEqual({ reason: "stale-generation" });
+    // No settlement write, no transition: the current live hand-out stands.
+    expect(holder.current.prFixQueueItem.updateMany).not.toHaveBeenCalled();
+    expect(holder.current.prFixRequeueSettlement.create).not.toHaveBeenCalled();
+    expect(holder.current.settlements).toHaveLength(0);
+    expect(holder.current.history).toHaveLength(0);
+    // The B2 fix: the live-receipt shadow short-circuits BEFORE the durable
+    // ledger — the ledger is not even read in this path.
+    expect(holder.current.attemptIssuance.findUnique).not.toHaveBeenCalled();
+    // The refusal was audited with the pinned code.
+    const audit = (holder.prisma as any).audits.at(-1) as any;
+    expect(audit).toEqual(
+      expect.objectContaining({
+        action: "pr_fix_attempt_requeue",
+        success: false,
+        errorMessage: "refused: stale-generation",
+      }),
+    );
+  });
+
+  it("consults the durable issuance ledger (and can succeed) when the fenced generation owns no live receipt at all", async () => {
+    seedAttempt(); // empty handoutReceipts + a durable issuance row for the fence
+    const res = await post(BASE);
+    expect(res.status).toBe(200);
+    expect((await json(res)).replayed).toBe(false);
+    // The ledger WAS the fence authority here and proved the presented token.
+    expect(holder.current.attemptIssuance.findUnique).toHaveBeenCalledTimes(1);
+    expect(holder.current.attemptIssuance.findUnique).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ token: "hnd_deadbeefdeadbeef" }),
+      }),
+    );
+    // ...and the requeue proceeded and settled.
+    expect(holder.current.prFixQueueItem.updateMany).toHaveBeenCalledTimes(1);
+    expect(holder.current.settlements).toHaveLength(1);
+  });
+});
+
+// ===========================================================================
+// 11. m2: an unreadable issuance ledger is a retryable 503 — never a
+//     stale-generation refusal, never a mutation
+// ===========================================================================
+describe("ledger-read failure (m2)", () => {
+  it("returns 503 (never 409) and mutates nothing when the AttemptIssuance lookup throws", async () => {
+    // No live receipt and no seeded ledger row: the fence MUST consult the
+    // ledger, and that consultation is exactly where the read fails.
+    seedAttempt({ issuance: false });
+    (holder.current as any).attemptIssuance.findUnique = vi.fn(async () => {
+      throw new Error("ledger read failure");
+    });
+    const res = await post(BASE);
+    expect(res.status).toBe(503);
+    expect(res.status).not.toBe(409);
+    const body = await json(res);
+    expect(body.error).toBe(
+      "Attempt-requeue did not settle (ledger unavailable or a concurrent change landed); retry shortly",
+    );
+    expect(holder.current.prFixQueueItem.updateMany).not.toHaveBeenCalled();
+    expect(holder.current.prFixRequeueSettlement.create).not.toHaveBeenCalled();
+    expect(holder.current.settlements).toHaveLength(0);
+    expect(holder.current.history).toHaveLength(0);
+  });
+});
+
+// ===========================================================================
+// 12. m1: a failing audit row must never mask the response — the committed
+//     200 success body and the pinned 409 refusal code survive it
+// ===========================================================================
+describe("audit failure (m1)", () => {
+  // Override the shared prisma holder's audit sink for these tests only and
+  // restore it afterwards (the mock factory creates it once for the file).
+  let originalAuditCreate: any;
+
+  beforeEach(() => {
+    originalAuditCreate = (holder.prisma as any).auditLog.create;
+    (holder.prisma as any).auditLog.create = vi.fn(async () => {
+      throw new Error("audit store down");
+    });
+  });
+
+  afterEach(() => {
+    (holder.prisma as any).auditLog.create = originalAuditCreate;
+  });
+
+  it("success path: a rejecting audit sink still yields the 200 success body (the committed requeue is not masked)", async () => {
+    seedAttempt();
+    const res = await post(BASE);
+    expect(res.status).toBe(200);
+    const body = await json(res);
+    expect(body.success).toBe(true);
+    expect(body.replayed).toBe(false);
+    expect(body.prFixItem).toEqual({ id: "fix-1", generation: 4 });
+    // The requeue itself committed despite the audit failure.
+    expect(holder.current.prFixQueueItem.updateMany).toHaveBeenCalledTimes(1);
+    expect(holder.current.settlements).toHaveLength(1);
+    expect(holder.current.prFixHistory.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("refusal path: a rejecting audit sink still yields the pinned 409 refusal code", async () => {
+    seedAttempt({ item: { status: "STALE" } });
+    const res = await post(BASE);
+    expect(res.status).toBe(409);
+    expect(await json(res)).toEqual({ reason: "item-closed" });
+    // The refusal settles nothing and touches nothing.
+    expect(holder.current.prFixQueueItem.updateMany).not.toHaveBeenCalled();
+    expect(holder.current.settlements).toHaveLength(0);
+  });
+});
+
+// ===========================================================================
+// 13. Idempotency key bound: exactly 512 chars is the pinned Courier cap
+// ===========================================================================
+describe("idempotency key bound", () => {
+  it("accepts an exactly-512-character idempotencyKey and settles with it", async () => {
+    seedAttempt();
+    const key = "k".repeat(512);
+    const res = await post({ ...BASE, idempotencyKey: key });
+    expect(res.status).toBe(200);
+    const body = await json(res);
+    expect(body.success).toBe(true);
+    expect(body.replayed).toBe(false);
+    expect(holder.current.settlements).toHaveLength(1);
+    expect(holder.current.settlements[0].settlementKey).toBe(key);
+  });
+
+  it("returns 400 with the pinned message for a 513-character idempotencyKey; no mutation", async () => {
+    seedAttempt();
+    const res = await post({ ...BASE, idempotencyKey: "k".repeat(513) });
+    expect(res.status).toBe(400);
+    expect((await json(res)).error).toBe(
+      "idempotencyKey must be a non-empty string of at most 512 characters",
+    );
+    expect(holder.current.prFixQueueItem.updateMany).not.toHaveBeenCalled();
+    expect(holder.current.settlements).toHaveLength(0);
+  });
+});

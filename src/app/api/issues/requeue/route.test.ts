@@ -13,8 +13,11 @@
 //   - ledger/guard contention is retryable 503, never a partial success.
 //
 // The real `@/lib/issue-requeue` + real `@/lib/issue-handoff-settlement`
-// ledger run against a fake global prisma; the mutation guard, the reconciler
-// supersede, and the shared claim release are the mocked seams.
+// ledger run against a fake global prisma; the mutation guard (whose callback
+// results are recorded, so the COMPLETE-vs-RETAINED contract can be pinned),
+// the reconciler supersede, and the shared claim release are the mocked
+// seams. The dispatch-env mock carries the maintainer token plus an unbound
+// and a bound worker-tier credential for the auth-gate pins.
 import { vi } from "vitest";
 
 const { db, guard, mocks } = vi.hoisted(() => ({
@@ -36,12 +39,26 @@ const { db, guard, mocks } = vi.hoisted(() => ({
     leaseDeleteCalls: [] as any[],
     settlementDeleteCalls: [] as any[],
     failLeaseDelete: false,
+    // Failure toggles for the review pins: a dead settlement WRITE and a
+    // dead issuance-ledger READ (both must fail closed as 503, never 409).
+    failSettlementRecord: false,
+    failIssuanceLookup: false,
   },
-  // The fake guard's behavior for the next request.
-  guard: { behavior: "ok" as "ok" | "busy" | "guard-lost" | "throw" },
+  // The fake guard's behavior for the next request. `callbackResults`
+  // records each guard callback's `{ complete, value }` result so tests can
+  // pin the COMPLETE-vs-RETAINED contract the callback returns.
+  guard: {
+    behavior: "ok" as "ok" | "busy" | "guard-lost" | "throw",
+    callbackResults: [] as { complete: boolean; value: unknown }[],
+  },
   mocks: {
     releaseIssueClaim: vi.fn(),
     supersedeIntent: vi.fn(),
+    // Worker-tier credentials for the auth-gate pin: the legacy UNBOUND
+    // token and a BOUND credential for agent "alpha".
+    workerToken: "test-worker-token",
+    workerBoundToken: "test-worker-bound-alpha",
+    workerBoundAgent: "alpha",
   },
 }));
 
@@ -70,6 +87,9 @@ vi.mock("@/lib/issue-mutation-guard", () => ({
         return { status: "written" as const, value };
       },
     });
+    // Record the callback's own result (independent of the status label
+    // computed below) so a test can pin COMPLETE vs RETAINED.
+    guard.callbackResults.push(result);
     return { status: result.complete ? "completed" : "retained", value: result.value };
   },
 }));
@@ -108,8 +128,18 @@ vi.mock("@/lib/pr-fix-queue", () => ({
 import { authedRequest, makeDispatchEnvMock, TEST_AGENT_TOKEN as mockToken } from "@/test/route-helpers";
 
 // Maintainer-tier bearer (full rights) — the requeue route is absent from the
-// worker allowlist, so the token resolves to the full-rights path.
-vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock(mockToken));
+// worker allowlist, so the token resolves to the full-rights path. Also
+// carries an unbound and a bound worker-tier credential so the auth-gate
+// pins can exercise the worker-tier 403 path.
+vi.mock(
+  "@/lib/dispatch-env",
+  () =>
+    makeDispatchEnvMock(
+      mockToken,
+      { [mocks.workerToken]: "worker" },
+      { [mocks.workerBoundToken]: mocks.workerBoundAgent },
+    ),
+);
 
 vi.mock("@/lib/prisma", () => ({
   prisma: {
@@ -154,8 +184,10 @@ vi.mock("@/lib/prisma", () => ({
       },
     },
     attemptIssuance: {
-      findUnique: async ({ where }: any) =>
-        db.issuances.find((r: any) => r.token === where.token) ?? null,
+      findUnique: async ({ where }: any) => {
+        if (db.failIssuanceLookup) throw new Error("issuance ledger read failed");
+        return db.issuances.find((r: any) => r.token === where.token) ?? null;
+      },
       create: async ({ data }: any) => {
         db.issuances.push(data);
         return data;
@@ -180,6 +212,7 @@ vi.mock("@/lib/prisma", () => ({
         );
       },
       upsert: async ({ where, create }: any) => {
+        if (db.failSettlementRecord) throw new Error("settlement ledger write failed");
         const key = where.agentName_issueId_settlementKey;
         // A competing writer's already-committed row wins the key (the
         // pre-write read did not see it).
@@ -281,7 +314,10 @@ function makeState(overrides: Record<string, unknown> = {}) {
   db.leaseDeleteCalls = [];
   db.settlementDeleteCalls = [];
   db.failLeaseDelete = false;
+  db.failSettlementRecord = false;
+  db.failIssuanceLookup = false;
   guard.behavior = "ok";
+  guard.callbackResults = [];
   mocks.releaseIssueClaim.mockResolvedValue({
     labels: ["status/in-progress"],
     status: null,
@@ -339,6 +375,30 @@ describe("POST /api/issues/requeue (#1491)", () => {
     const response = await postRequest({}, "not-a-configured-token");
     expect(response.status).toBe(401);
     expect(db.leaseDeleteCalls).toHaveLength(0);
+  });
+
+  // The route is MAINTAINER-tier (absent from `WORKER_ALLOWLIST`), so a
+  // worker-tier credential is refused by the central tier gate before any
+  // state is read or mutated — for BOTH the legacy unbound token and a
+  // bound worker credential.
+  it("refuses worker-tier tokens (unbound and bound) with 403 and mutates nothing", async () => {
+    const unbound = await postRequest({}, mocks.workerToken);
+    expect(unbound.status).toBe(403);
+    expect((await unbound.json()).error).toMatch(/requires a maintainer token/i);
+
+    const bound = await postRequest({}, mocks.workerBoundToken);
+    expect(bound.status).toBe(403);
+    expect((await bound.json()).error).toMatch(/requires a maintainer token/i);
+
+    // The tier gate fires before the body is even parsed into a transition:
+    // no release, no supersede, no lease consumption, no settlement.
+    expect(mocks.releaseIssueClaim).not.toHaveBeenCalled();
+    expect(mocks.supersedeIntent).not.toHaveBeenCalled();
+    expect(db.lease).not.toBeNull();
+    expect(db.leaseDeleteCalls).toHaveLength(0);
+    expect(db.settlements).toHaveLength(0);
+    // The denial is best-effort audited (one row per denied credential).
+    expect(db.audit.filter((r: any) => r.action === "auth_tier_denied")).toHaveLength(2);
   });
 
   // ── validation (400) ──────────────────────────────────────────────────────
@@ -477,6 +537,31 @@ describe("POST /api/issues/requeue (#1491)", () => {
     expect(db.audit[0].notes).toContain("(committed)");
   });
 
+  // B1/B3: the shared claim release is called with the audit actor AND
+  // `allowMissingAgent: true`, so a terminal report that already removed the
+  // `agent/*` label makes the release an idempotent repair instead of
+  // throwing `Issue is not assigned to`. The exact options object is pinned
+  // (no extra keys) in the state this route exists for.
+  it("passes { actor, allowMissingAgent: true } to the shared release when the agent label is already gone", async () => {
+    // The terminal report removed the `agent/alpha` label; only the status
+    // label remains. This is the state requeue is meant to repair.
+    makeState({ issue: { labels: ["status/in-progress"] } });
+    const response = await postRequest();
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ success: true, replayed: false, attemptId: "lease-1" });
+
+    // The audit actor for a maintainer bearer is the requested (fenced)
+    // agent, and the options object carries exactly the actor + the
+    // missing-agent opt-in.
+    expect(mocks.releaseIssueClaim).toHaveBeenCalledTimes(1);
+    expect(mocks.releaseIssueClaim).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentName: AGENT,
+        options: { actor: AGENT, allowMissingAgent: true },
+      }),
+    );
+  });
+
   // ── already-released path (no live lease) ─────────────────────────────────
 
   it("releases against the durable issuance ledger when the lease is gone and omits attemptId", async () => {
@@ -526,6 +611,42 @@ describe("POST /api/issues/requeue (#1491)", () => {
     expect(mocks.releaseIssueClaim).not.toHaveBeenCalled();
     expect(db.leaseDeleteCalls).toHaveLength(0);
     expect(db.settlements).toHaveLength(0);
+  });
+
+  // m2: on the already-released path the issuance ledger read is the ONLY
+  // proof. A failed read establishes nothing — it must fail closed as a
+  // retryable 503, never be treated as absence (409 stale-generation) or as
+  // issuance. Pinned for both shapes of "no live proof": no lease row, and a
+  // lease row whose claimToken is null (pre-token legacy row).
+  it("answers 503 (never 409) when the issuance ledger read fails on the already-released path", async () => {
+    for (const lease of [null, { claimToken: null }]) {
+      makeState({ lease });
+      db.failIssuanceLookup = true;
+      const response = await postRequest();
+      // A failed ledger read is retryable, not a per-item condition.
+      expect(response.status, `lease=${JSON.stringify(lease)}`).toBe(503);
+      const json = await response.json();
+      expect(json.error, `lease=${JSON.stringify(lease)}`).toMatch(
+        /busy or the settlement ledger is unavailable/i,
+      );
+      // Never a coded refusal: 404 is reserved for route absence and 409 is
+      // the closed-vocabulary per-item refusal — neither is the answer here.
+      expect(json, `lease=${JSON.stringify(lease)}`).not.toHaveProperty("reason");
+      // Nothing is touched on the failure: no release, no supersede, no
+      // settlement, and the (absent or legacy) lease is left exactly as found.
+      expect(mocks.releaseIssueClaim).not.toHaveBeenCalled();
+      expect(mocks.supersedeIntent).not.toHaveBeenCalled();
+      expect(db.leaseDeleteCalls).toHaveLength(0);
+      expect(db.settlements).toHaveLength(0);
+      if (lease === null) expect(db.lease).toBeNull();
+      else expect(db.lease?.claimToken).toBeNull();
+      // The callback COMPLETES with the unavailable value (no retained wedge).
+      expect(guard.callbackResults).toHaveLength(1);
+      expect(guard.callbackResults[0]).toEqual({
+        complete: true,
+        value: { ok: false, unavailable: true },
+      });
+    }
   });
 
   it("refuses an issuance row minted for a different agent/issue (stale-generation)", async () => {
@@ -830,6 +951,53 @@ describe("POST /api/issues/requeue (#1491)", () => {
     expect(db.audit[0]).toMatchObject({ action: "issue_attempt_requeue", success: false });
   });
 
+  // B1: failure paths must COMPLETE the guard, not retain it. `attempt-
+  // requeue` has no resume branch by design — every retry re-derives the
+  // whole transition idempotently (absent label = repair, first-write-wins
+  // settlement, lease CAS) — so a retained, unresumable guard would wedge
+  // the issue (#1367 posture). The recorded callback result pins both the
+  // COMPLETE flag and the retryable unavailable value.
+  it("COMPLETES the guard (no retained wedge) with the unavailable value when the remote release throws", async () => {
+    guard.behavior = "throw";
+    const response = await postRequest();
+    expect(response.status).toBe(503);
+    // The release attempt was made, but the fenced region aborted: the
+    // callback returns complete:true with the retryable unavailable value —
+    // the guard is released, never retained.
+    expect(mocks.releaseIssueClaim).toHaveBeenCalledTimes(1);
+    expect(guard.callbackResults).toHaveLength(1);
+    expect(guard.callbackResults[0]).toEqual({
+      complete: true,
+      value: { ok: false, unavailable: true },
+    });
+    // Nothing was settled and the lease stays intact for the retry.
+    expect(db.settlements).toHaveLength(0);
+    expect(db.leaseDeleteCalls).toHaveLength(0);
+    expect(db.lease).not.toBeNull();
+    expect(db.lease.claimToken).toBe(CLAIM_TOKEN);
+  });
+
+  it("COMPLETES the guard (no retained wedge) with the unavailable value when the settlement record throws", async () => {
+    db.failSettlementRecord = true;
+    const response = await postRequest();
+    expect(response.status).toBe(503);
+    // The remote release landed, but the proof write failed: the callback
+    // still COMPLETES — the retry re-runs the transition idempotently.
+    expect(mocks.releaseIssueClaim).toHaveBeenCalledTimes(1);
+    expect(guard.callbackResults).toHaveLength(1);
+    expect(guard.callbackResults[0]).toEqual({
+      complete: true,
+      value: { ok: false, unavailable: true },
+    });
+    // Nothing committed: no settlement row, and the lease is not consumed
+    // on a proof that was never recorded.
+    expect(db.settlements).toHaveLength(0);
+    expect(db.settlementDeleteCalls).toHaveLength(0);
+    expect(db.leaseDeleteCalls).toHaveLength(0);
+    expect(db.lease).not.toBeNull();
+    expect(db.lease.claimToken).toBe(CLAIM_TOKEN);
+  });
+
   // ── identity mismatch (400) ───────────────────────────────────────────────
 
   it("rejects a repoFullName/issueNumber that does not match the issue (400)", async () => {
@@ -845,5 +1013,24 @@ describe("POST /api/issues/requeue (#1491)", () => {
     expect(db.leaseDeleteCalls).toHaveLength(0);
     expect(db.settlements).toHaveLength(0);
     expect(mocks.releaseIssueClaim).not.toHaveBeenCalled();
+  });
+
+  // m5: the identity gate's repo half is case-INSENSITIVE (GitHub repo names
+  // are), so a case-drifted body value must not 400 forever — and the remote
+  // label write then uses the CANONICAL (DB) casing, not the caller's.
+  it("accepts a repoFullName that matches only in case and releases with the canonical casing", async () => {
+    const response = await postRequest({ repoFullName: "Org/Repo" }); // DB has "org/repo"
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ success: true, replayed: false, attemptId: "lease-1" });
+    // The release receives the DB's canonical casing, not the request's.
+    expect(mocks.releaseIssueClaim).toHaveBeenCalledTimes(1);
+    expect(mocks.releaseIssueClaim).toHaveBeenCalledWith(
+      expect.objectContaining({ repoFullName: REPO }),
+    );
+    // The lease is consumed and the settlement committed as usual.
+    expect(db.lease).toBeNull();
+    expect(db.leaseDeleteCalls).toHaveLength(1);
+    expect(db.settlements).toHaveLength(1);
+    expect(db.audit[0]).toMatchObject({ action: "issue_attempt_requeue", success: true });
   });
 });

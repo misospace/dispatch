@@ -71,21 +71,27 @@ export async function POST(request: Request) {
   try {
     const result = await attemptRequeuePrFixItem(asPrFixQueueClient(prisma), input);
     if (result.ok) {
-      await prisma.auditLog.create({
-        data: {
-          actor: auditActor,
-          action: "pr_fix_attempt_requeue",
-          repoFullName: normalizeQueueRepo(input.repo),
-          issueNumber: null,
-          success: true,
-          beforeLabels: [],
-          afterLabels: [],
-          notes:
-            `pr=${input.pr} generation=${input.generation}->${result.generation} ` +
-            `${result.replayed ? "replayed" : "committed"} agent=${input.agentName}` +
-            (input.note ? ` note=${input.note}` : ""),
-        },
-      });
+      // Audit is best-effort: a failing audit row must never mask (or undo)
+      // the committed requeue — same rule the issue-requeue route follows.
+      try {
+        await prisma.auditLog.create({
+          data: {
+            actor: auditActor,
+            action: "pr_fix_attempt_requeue",
+            repoFullName: normalizeQueueRepo(input.repo),
+            issueNumber: null,
+            success: true,
+            beforeLabels: [],
+            afterLabels: [],
+            notes:
+              `pr=${input.pr} generation=${input.generation}->${result.generation} ` +
+              `${result.replayed ? "replayed" : "committed"} agent=${input.agentName}` +
+              (input.note ? ` note=${input.note}` : ""),
+          },
+        });
+      } catch (auditError) {
+        console.error("pr_fix_attempt_requeue success audit failed:", auditError);
+      }
       // The pinned success shape. `prFixItem` always carries the SAME item id
       // the request pivoted on and the FRESH generation the requeue issued —
       // Courier derives the successor attempt identity from it and refuses a
@@ -107,20 +113,25 @@ export async function POST(request: Request) {
       return errorResponse("Attempt-requeue did not settle (ledger unavailable or a concurrent change landed); retry shortly", 503);
     }
     // A refusal is an audit event for the coordinator's lifecycle observer;
-    // it never settles anything and never touches the current owner.
-    await prisma.auditLog.create({
-      data: {
-        actor: auditActor,
-        action: "pr_fix_attempt_requeue",
-        repoFullName: normalizeQueueRepo(input.repo),
-        issueNumber: null,
-        success: false,
-        errorMessage: `refused: ${result.refusal}`,
-        beforeLabels: [],
-        afterLabels: [],
-        notes: `pr=${input.pr} generation=${input.generation} code=${result.refusal} agent=${input.agentName}`,
-      },
-    });
+    // it never settles anything and never touches the current owner. Best
+    // effort: a failing audit row must not mask the pinned refusal code.
+    try {
+      await prisma.auditLog.create({
+        data: {
+          actor: auditActor,
+          action: "pr_fix_attempt_requeue",
+          repoFullName: normalizeQueueRepo(input.repo),
+          issueNumber: null,
+          success: false,
+          errorMessage: `refused: ${result.refusal}`,
+          beforeLabels: [],
+          afterLabels: [],
+          notes: `pr=${input.pr} generation=${input.generation} code=${result.refusal} agent=${input.agentName}`,
+        },
+      });
+    } catch (auditError) {
+      console.error("pr_fix_attempt_requeue refusal audit failed:", auditError);
+    }
     return NextResponse.json({ reason: result.refusal }, { status: 409 });
   } catch (error) {
     console.error("Failed to requeue PR fix queue attempt:", error);

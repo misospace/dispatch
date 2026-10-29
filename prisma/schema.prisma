@@ -1310,6 +1310,11 @@ model AttemptIssuance {
 
   // One lookup serves the fence: token is already globally unique; the
   // composite index serves the (surface, attempt, agent) audit read.
+  //
+  // Rows are permanent historical fact (like PrFixHistory) and are never
+  // pruned or cascaded: PR-fix queue items are never deleted, and issue
+  // rows outlive claims — so no FK/cascade is needed, and the unbounded
+  // growth is bounded by hand-out volume by design.
   @@index([surface, attemptId, agentName])
 }
 
