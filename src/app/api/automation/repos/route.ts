@@ -7,6 +7,7 @@ import { isValidRepoName } from "@/lib/config";
 import { auditTrackedRepoCreateFailure, createTrackedRepo } from "@/lib/tracked-repos";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rate-limit";
+import { collectReleasePulse, asReleaseDeltaState } from "@/lib/release-pulse-read";
 
 // 10 requests / 60s — tracked-repo creation is a DB-only write, so this
 // ceiling is generous but still caps runaway callers. The deprecated
@@ -38,12 +39,21 @@ export async function GET(request: Request) {
 
     const reposWithCounts = await Promise.all(
       repos.map(async (repo) => {
-        const [failingRuns, runningRuns] = await Promise.all([
+        const [failingRuns, runningRuns, pulse] = await Promise.all([
           prisma.githubWorkflowRun.count({
             where: { workflow: { repoId: repo.id }, conclusion: "failure" },
           }),
           prisma.githubWorkflowRun.count({
             where: { workflow: { repoId: repo.id }, status: "in_progress" },
+          }),
+          collectReleasePulse({
+            fullName: repo.fullName,
+            releaseState: asReleaseDeltaState(repo.releaseState),
+            releaseBaselineTag: repo.releaseBaselineTag,
+            releaseBaselineSha: repo.releaseBaselineSha,
+            releaseBaselinePublishedAt: repo.releaseBaselinePublishedAt,
+            releaseHeadSha: repo.releaseHeadSha,
+            releaseAheadBy: repo.releaseAheadBy,
           }),
         ]);
 
@@ -67,6 +77,7 @@ export async function GET(request: Request) {
           releaseAheadBy: repo.releaseAheadBy,
           releaseError: repo.releaseError,
           releaseDeltaSyncedAt: repo.releaseDeltaSyncedAt,
+          pulse,
           openPRCount: repo.openPRCount,
           lastSyncedAt: repo.lastSyncedAt,
           syncError: repo.syncError,
