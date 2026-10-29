@@ -898,8 +898,45 @@ describe("POST /api/issues/requeue (#1491)", () => {
     expect(db.settlements).toHaveLength(0); // our own proof was never recorded
   });
 
-  // ── guard contention / fenced-write failures (retryable 503) ──────────────
+  it("does not consume the lease when a same-token record with a DIFFERENT payload wins the key first", async () => {
+    // The competing writer committed the same key under the SAME claim
+    // incarnation but a DIFFERENT payload (another note). The proof is not
+    // ours: consuming the lease on it would acknowledge a result this caller
+    // never committed (payload-bound idempotency).
+    makeState({
+      racingSettlements: [
+        {
+          id: "settle-race",
+          agentName: AGENT,
+          issueId: ISSUE_ID,
+          settlementKey: KEY,
+          claimToken: CLAIM_TOKEN,
+          capacity: null,
+          labels: ["status/in-progress"],
+          status: null,
+          statusNote: null,
+          cooldownUntil: null,
+          settledAt: new Date(Date.now() - 60_000),
+          expiresAt: new Date(Date.now() + 7 * 24 * 3_600_000),
+          operation: "attempt-requeue",
+          payloadHash: payloadHash("a different note"),
+          attemptId: "lease-9",
+        },
+      ],
+    });
+    const response = await postRequest();
+    expect(response.status).toBe(409);
+    expect((await response.json()).error).toMatch(/already used/);
+    // The remote release landed, but the proof is not ours: the lease must
+    // NOT be consumed on a record this caller did not commit.
+    expect(mocks.releaseIssueClaim).toHaveBeenCalledTimes(1);
+    expect(db.lease).not.toBeNull();
+    expect(db.lease.claimToken).toBe(CLAIM_TOKEN);
+    expect(db.leaseDeleteCalls).toHaveLength(0);
+    expect(db.settlements).toHaveLength(0); // our own proof was never recorded
+  });
 
+  // ── guard contention / fenced-write failures (retryable 503) ──────────────
   it("returns 503 while the guard is busy, but replays a committed settlement", async () => {
     guard.behavior = "busy";
     const rejected = await postRequest();

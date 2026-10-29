@@ -372,7 +372,12 @@ Live state is a GUARD, never an authorization: a live hand-out receipt (or a
 live lease row) carrying a DIFFERENT token means the issuance was released
 and re-issued, and the retry is refused `stale-generation` without touching
 that owner; the presented token's own live receipt still needs the recorded
-issuance behind it. On the PR-fix surface a `FIXED` item is refused
+issuance behind it. "Another owner" is ANY live hand-out at the fenced
+generation — a second receipt beside the presented one, or a hand-out entry
+without a receipt (legacy rows) — because the transition clears the whole
+hand-out state and would erase it; the PR-fix CAS also pins the hand-out
+arrays, so a hand-out landing inside the transaction window loses the CAS
+and the retry mutates nothing. On the PR-fix surface a `FIXED` item is refused
 `superseded` — the work already moved on, and a retry must never revert a
 landed fix to `QUEUED`.
 Refusals are the closed coded-409 vocabulary `stale-generation |
@@ -382,6 +387,12 @@ version-skew posture. A committed `idempotencyKey` replays its original
 result with zero mutation (PR-fix: `PrFixRequeueSettlement`; issue: the
 shared #1262 `IssueHandoffSettlement` with `operation: "attempt-requeue"`);
 key reuse with a different payload is refused the way `AgentReportDedupe`
-refuses it. Auth mirrors the CI-park family: maintainer-tier bearer.
+refuses it — the issue side binds the committed proof to the claim token AND
+the payload fingerprint, so a racing writer that won the key under a
+different payload never has its proof consumed. The shared ledger is
+family-tagged: a key committed by the capacity-handoff family is a payload
+conflict for the requeue, and a requeue key is never replayed as a capacity
+handoff (that would skip the capacity cooldown). Auth mirrors the CI-park
+family: maintainer-tier bearer.
 `POST /api/pr-fix-queue/requeue` stays exactly as it was: unfenced operator
 reset, budget-resetting.

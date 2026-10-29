@@ -1123,4 +1123,53 @@ describe("concurrent hand-out at the fenced generation", () => {
     expect(holder.current.items[0].generation).toBe(3);
     expect(holder.current.items[0].handoutReceipts).toEqual([OTHER_RECEIPT]);
   });
+
+  it("refuses stale-generation when ANOTHER live receipt shares the fenced generation with the presented one", async () => {
+    // Two live hand-outs at ONE generation: the presented token is not the
+    // only owner. The transition clears the whole hand-out state, so it
+    // would erase the other owner — the retry must refuse instead, even
+    // though the presented receipt is present (the exact case the earlier
+    // guard short-circuited on).
+    seedAttempt({
+      item: {
+        handoutReceipts: ["hnd_deadbeefdeadbeef@worker@3", OTHER_RECEIPT],
+        agentHandouts: ["worker@3", "other-agent@3"],
+      },
+    });
+    const res = await post(BASE);
+    expect(res.status).toBe(409);
+    expect(await json(res)).toEqual({ reason: "stale-generation" });
+    // Nothing settled, nothing transitioned.
+    expect(holder.current.prFixQueueItem.updateMany).not.toHaveBeenCalled();
+    expect(holder.current.prFixRequeueSettlement.create).not.toHaveBeenCalled();
+    expect(holder.current.settlements).toHaveLength(0);
+    expect(holder.current.history).toHaveLength(0);
+    // BOTH owners' hand-out state survives untouched.
+    expect(holder.current.items[0].status).toBe("PARKED");
+    expect(holder.current.items[0].generation).toBe(3);
+    expect(holder.current.items[0].handoutReceipts).toEqual([
+      "hnd_deadbeefdeadbeef@worker@3",
+      OTHER_RECEIPT,
+    ]);
+    expect(holder.current.items[0].agentHandouts).toEqual(["worker@3", "other-agent@3"]);
+  });
+
+  it("refuses stale-generation when a legacy hand-out (no receipt) holds the fenced generation", async () => {
+    // A hand-out recorded before receipts existed carries no receipt, but it
+    // is still a current owner: the transition clears `agentHandouts`, so it
+    // would erase that owner.
+    seedAttempt({
+      item: {
+        handoutReceipts: ["hnd_deadbeefdeadbeef@worker@3"],
+        agentHandouts: ["worker@3", "other-agent@3"],
+      },
+    });
+    const res = await post(BASE);
+    expect(res.status).toBe(409);
+    expect(await json(res)).toEqual({ reason: "stale-generation" });
+    expect(holder.current.prFixQueueItem.updateMany).not.toHaveBeenCalled();
+    expect(holder.current.settlements).toHaveLength(0);
+    expect(holder.current.items[0].handoutReceipts).toEqual(["hnd_deadbeefdeadbeef@worker@3"]);
+    expect(holder.current.items[0].agentHandouts).toEqual(["worker@3", "other-agent@3"]);
+  });
 });

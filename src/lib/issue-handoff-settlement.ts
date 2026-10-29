@@ -19,6 +19,28 @@
 /** Bounded retention for settlement proofs; expired proofs are refused. */
 export const ISSUE_HANDOFF_SETTLEMENT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
+/**
+ * (#1491) The settlement families that share this ledger. A key committed by
+ * one family is a FOREIGN payload for the other: the tag makes that
+ * determination exact instead of inferred, so an attempt-requeue settlement is
+ * never replayed as a capacity handoff (which would skip its cooldown) and a
+ * capacity handoff is never replayed as a requeue.
+ */
+export const CAPACITY_HANDOFF_SETTLEMENT_OPERATION = "capacity-handoff";
+export const ATTEMPT_REQUEUE_SETTLEMENT_OPERATION = "attempt-requeue";
+
+/**
+ * Whether a recorded settlement row belongs to the named family. A row with
+ * NO tag predates #1491 and can only be a capacity-handoff row (the
+ * attempt-requeue family always tagged its rows), so an untagged row counts
+ * as the capacity-handoff family.
+ */
+export function settlementRowMatchesFamily(row: any, operation: string): boolean {
+  const tagged = row?.operation ?? null;
+  if (tagged === null) return operation === CAPACITY_HANDOFF_SETTLEMENT_OPERATION;
+  return tagged === operation;
+}
+
 /** Maximum accepted length for a caller settlement key. */
 export const MAX_SETTLEMENT_KEY_LENGTH = 200;
 

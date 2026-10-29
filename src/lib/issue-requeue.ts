@@ -42,12 +42,14 @@ import {
   lookupIssueHandoffSettlement,
   recordIssueHandoffSettlement,
   settlementExpiresAt,
+  settlementRowMatchesFamily,
+  ATTEMPT_REQUEUE_SETTLEMENT_OPERATION,
 } from "@/lib/issue-handoff-settlement";
 import {
-  findHandoutReceipt,
   freshAttemptGeneration,
   normalizeQueueRepo,
   nonEmpty,
+  parseAgentHandoutToken,
   parseHandoutReceipt,
   type PrFixQueueClient,
 } from "@/lib/pr-fix-queue";
@@ -400,31 +402,42 @@ async function classifyAttemptRequeueItem(
 }
 
 /**
- * Whether the FENCED generation currently carries a live hand-out that is NOT
+ * Whether the FENCED generation currently carries a live owner that is NOT
  * the presented token — i.e. the issuance was released and re-issued (the
  * capacity-exhausted settlement and the unacknowledged reclaim both keep the
  * generation and rotate the token, so the item stays QUEUED at the same
- * generation). The current owner of that generation is NEVER touched by a
- * retry of the presented token, so this is a hard refusal.
+ * generation), or a second agent was handed the same generation. The current
+ * owner of that generation is NEVER touched by a retry of the presented token,
+ * so this is a hard refusal.
  *
- * A live receipt for the PRESENTED token is not "another owner": it is the
- * fenced attempt itself, which the transition is allowed to stop.
+ * The PRESENTED token's own live receipt is not "another owner": it is the
+ * fenced attempt itself, which the transition is allowed to stop. Any OTHER
+ * live receipt at the fenced generation IS another owner — including one that
+ * COEXISTS with the presented receipt (two live hand-outs at one generation):
+ * the transition clears the whole hand-out state, so it would erase that
+ * owner. The `agentHandouts` entries are consulted as well: a hand-out
+ * recorded without a receipt (legacy rows) is still a current owner, and the
+ * transition would clear it too.
  */
 function fencedGenerationHasOtherOwner(
-  receipts: unknown,
+  item: { handoutReceipts?: unknown; agentHandouts?: unknown } | null | undefined,
   input: AttemptRequeuePrFixInput,
 ): boolean {
-  const entries: unknown[] = Array.isArray(receipts) ? receipts : [];
-  const liveIssued =
-    findHandoutReceipt(entries, {
-      agentName: input.agentName,
-      generation: input.generation,
-      token: input.fenceToken,
-    }) !== null;
-  if (liveIssued) return false;
-  return entries.some((entry) => {
+  if (!item) return false;
+  const receipts: unknown[] = Array.isArray(item.handoutReceipts) ? item.handoutReceipts : [];
+  const otherReceipt = receipts.some((entry) => {
     const parsed = parseHandoutReceipt(entry);
-    return parsed !== null && parsed.generation === input.generation;
+    if (parsed === null) return false;
+    if (parsed.generation !== input.generation) return false;
+    return parsed.token !== input.fenceToken;
+  });
+  if (otherReceipt) return true;
+  const handouts: unknown[] = Array.isArray(item.agentHandouts) ? item.agentHandouts : [];
+  return handouts.some((entry) => {
+    const parsed = parseAgentHandoutToken(entry);
+    if (parsed === null) return false;
+    if (parsed.generation !== input.generation) return false;
+    return parsed.agentName !== input.agentName;
   });
 }
 
@@ -493,8 +506,10 @@ export async function attemptRequeuePrFixItem(
   // the item stays QUEUED at the same generation). A stale token then
   // authorizes NOTHING: bumping the generation would stop the CURRENT live
   // hand-out, violating the pinned "the current owner is NEVER touched" rule.
-  const receipts: string[] = Array.isArray(item.handoutReceipts) ? item.handoutReceipts : [];
-  if (fencedGenerationHasOtherOwner(receipts, input)) {
+  // The same holds when the presented receipt coexists with ANOTHER live
+  // receipt at that generation: the transition clears the whole hand-out
+  // state, so it would erase that other owner.
+  if (fencedGenerationHasOtherOwner(item, input)) {
     // The fenced generation is owned by a DIFFERENT live hand-out: the named
     // issuance was released and re-issued. The current owner is NEVER
     // touched. The ledger cannot change this verdict (it proves the
@@ -536,7 +551,7 @@ export async function attemptRequeuePrFixItem(
       // landed at the fenced generation after the outside read (a different
       // agent may be handed the item at the same generation) makes the
       // presented token stale — that owner is NEVER touched by this retry.
-      if (fencedGenerationHasOtherOwner(fresh.handoutReceipts, input)) {
+      if (fencedGenerationHasOtherOwner(fresh, input)) {
         throw new AttemptRequeueCasLost("stale-generation");
       }
       // First write wins: the settlement commits BEFORE the state CAS in
@@ -634,7 +649,7 @@ export async function attemptRequeuePrFixItem(
       // A concurrent hand-out at the fenced generation is a CURRENT OWNER:
       // the retry must never touch it — that is a per-item refusal, not a
       // churning race.
-      if (fresh && fencedGenerationHasOtherOwner(fresh.handoutReceipts, input)) {
+      if (fresh && fencedGenerationHasOtherOwner(fresh, input)) {
         return { ok: false, refusal: "stale-generation" };
       }
       return { ok: false, unavailable: true };
@@ -782,11 +797,16 @@ export async function requeueIssueAttempt(input: IssueRequeueInput): Promise<Iss
       if (lookup.state === "error") return { complete: true, value: { ok: false, unavailable: true } };
       if (lookup.state === "found") {
         // Replay is authorized ONLY by the exact committed payload: same
-        // claim token AND the same fingerprint. A row without a fingerprint
-        // (the capacity-handoff family pre-#1491) is a foreign payload for
-        // this key — refused as a key conflict, never replayed as a requeue
-        // success the other family never committed.
-        if (lookup.record.claimToken !== claimToken || lookup.record.payloadHash !== payloadHash) {
+        // claim token AND the same fingerprint, from the SAME settlement
+        // family. A row without a fingerprint (the capacity-handoff family
+        // pre-#1491) or a row tagged for another family is a foreign payload
+        // for this key — refused as a key conflict, never replayed as a
+        // requeue success the other family never committed.
+        if (
+          lookup.record.claimToken !== claimToken ||
+          lookup.record.payloadHash !== payloadHash ||
+          !settlementRowMatchesFamily(lookup.record, ATTEMPT_REQUEUE_SETTLEMENT_OPERATION)
+        ) {
           return { complete: true, value: { ok: false, keyConflict: requeueKeyConflictMessage("issue requeue") } };
         }
         return { complete: true, value: { ok: true, replayed: true, attemptId: lookup.record.attemptId ?? null } };
@@ -900,13 +920,18 @@ export async function requeueIssueAttempt(input: IssueRequeueInput): Promise<Iss
           statusNote: releaseValue.statusNote,
           cooldownUntil: null,
           settledAt: now,
-          operation: "attempt-requeue",
+          operation: ATTEMPT_REQUEUE_SETTLEMENT_OPERATION,
           payloadHash,
           attemptId,
         });
-        if (!recorded || recorded.claimToken !== claimToken) {
-          // A foreign-token record won the key first; this release must not
-          // consume the lease on a proof it does not own.
+        if (!recorded || recorded.claimToken !== claimToken || recorded.payloadHash !== payloadHash) {
+          // First-write-wins: a row that won the key first is returned instead
+          // of ours. The proof this release consumes must be OURS — the same
+          // claim incarnation AND the same committed payload fingerprint. A
+          // row under the same claim token but a DIFFERENT payload (a
+          // concurrent retry with another note) is a foreign payload for this
+          // key, not our proof: consuming the lease on it would acknowledge
+          // a result this caller never committed.
           return { complete: true, value: { ok: false, keyConflict: requeueKeyConflictMessage("issue requeue") } };
         }
       } catch {
@@ -975,7 +1000,8 @@ export async function requeueIssueAttempt(input: IssueRequeueInput): Promise<Iss
     if (
       lookup.state === "found" &&
       lookup.record.claimToken === claimToken &&
-      lookup.record.payloadHash === payloadHash
+      lookup.record.payloadHash === payloadHash &&
+      settlementRowMatchesFamily(lookup.record, ATTEMPT_REQUEUE_SETTLEMENT_OPERATION)
     ) {
       return { ok: true, replayed: true, attemptId: lookup.record.attemptId ?? null };
     }

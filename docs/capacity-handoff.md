@@ -144,6 +144,9 @@ the existing path; callers that omit it keep the previous behavior exactly.
   bound to the exact settled `claimToken`, carrying the released
   `labels`/`status`/`statusNote`, the pinned `cooldownUntil`, and a bounded
   retention deadline (`ISSUE_HANDOFF_SETTLEMENT_RETENTION_MS`, 7 days). It is
+  tagged `operation: "capacity-handoff"` — the shared ledger also carries the
+  fenced attempt-requeue family (#1491), and a key committed by one family is
+  a foreign payload for the other. It is
   written **before** the lease CAS-delete — a crash between the two leaves
   the lease intact for the exact-token resume, and the first-write-wins
   upsert can never rewrite the original proof (a resumed attempt therefore
@@ -188,6 +191,12 @@ the existing path; callers that omit it keep the previous behavior exactly.
     409 `settlement_key_conflict` **before** the lease CAS — a lease is never
     consumed on a proof this claim does not own (stale-recovery owns
     reconciling the retained lease; retry with a fresh key).
+  * Key committed by the **fenced attempt-requeue** family (`operation:
+    "attempt-requeue"`) → 409 `settlement_key_conflict`, never a replay: the
+    recorded row carries no capacity cooldown, so replaying it would answer a
+    capacity handoff with a proof that skips its cooldown. The refusal is
+    exact and zero-mutation (the fence read rejects the key before any
+    remote work, and the upsert result is rejected before the lease CAS).
   * Settlement-record write failure after cleanup → 500 `release_failed`;
     lease and guard retained for the exact-token retry (proof must be durable
     or the release does not report success).
@@ -302,6 +311,7 @@ Dispatch's coordination layer — never write it as if GitHub were behind.**
 | Retry with same `settlementKey` + original claim token after lease release | replayed recorded success (`replayed: true`), zero ownership mutation |
 | Same replay while the issue mutation guard is held (post-release crash) | still replayed — lease absence gates the answer; a live release (lease present) stays 409 busy |
 | `settlementKey` bound to a different claim token | 409 (`no_active_claim` or `settlement_key_conflict`); no replay, no mutation |
+| `settlementKey` committed by another settlement family (the fenced attempt-requeue ledger) | 409 `settlement_key_conflict`; never replayed as a capacity handoff (its cooldown would be skipped), no remote work |
 | Settlement-key fence read fails | 503 `settlement_unavailable` before any remote work; a failed read is never "absent"; retryable with the same token + key |
 | Concurrent foreign settle wins the upsert race | 409 `settlement_key_conflict` before the lease CAS; lease retained, no success reported |
 | Settlement proof expired (7-day retention, read-time prune) | 409 `no_active_claim` with expiry note |

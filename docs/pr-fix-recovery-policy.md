@@ -797,7 +797,13 @@ authorization: it names the CURRENT holder of the generation (a rotated
 token at the same generation means the issuance was released and re-issued,
 and the retry is refused `stale-generation` without touching that owner), but
 it never substitutes for the recorded issuance — a retry whose issuance is
-not in the ledger is refused even while its receipt is still held.
+not in the ledger is refused even while its receipt is still held. "Another
+owner" is ANY live hand-out at the fenced generation: a second receipt beside
+the presented one, or a hand-out entry without a receipt (legacy rows). The
+transition clears the whole hand-out state, so it would erase that owner —
+the retry refuses `stale-generation` instead, and the CAS pins the hand-out
+arrays so a hand-out landing inside the transaction window loses the CAS and
+the retry mutates nothing.
 
 `FIXED` is refused `superseded`: the work already moved on (the fix landed),
 so a fenced retry of a stale attempt must never revert a resolved item to
