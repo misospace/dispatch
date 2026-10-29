@@ -16,6 +16,7 @@ import { isValidLane, getLaneIds, resolveRequestLane, getLaneAliases } from "@/l
 import { STATUS_LABELS } from "@/types";
 import { withDependencyBlockReasons } from "@/lib/issue-dependency-annotation";
 import { withAdmissionAnnotations } from "@/lib/queue-admission";
+import { withNormalizedReleaseSignal } from "@/lib/groomer/plan";
 
 export async function GET(request: Request) {
   const auth = await authorizeRequest(request);
@@ -94,7 +95,13 @@ export async function GET(request: Request) {
       orderBy: { updatedAt: "desc" },
     });
 
-    return NextResponse.json(await withAdmissionAnnotations(await withDependencyBlockReasons(issues)));
+    // #1487: normalize cleared release-signal tombstones to null so the
+    // projection's third persisted shape never reaches row consumers.
+    return NextResponse.json(
+      await withAdmissionAnnotations(
+        await withDependencyBlockReasons(issues.map((issue) => withNormalizedReleaseSignal(issue))),
+      ),
+    );
   } catch (error) {
     return handleApiError("fetch issues", error);
   }

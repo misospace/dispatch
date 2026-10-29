@@ -290,6 +290,16 @@ export function normalizeStoredReleaseSignal(value: unknown): ReleaseSignal | nu
   return value as ReleaseSignal;
 }
 
+/**
+ * Return an issue-shaped row with a cleared-projection tombstone normalized
+ * back to `null` (dispatch#1487), so surfaces that serialize raw `Issue` rows
+ * never expose the tombstone shape where consumers previously saw only
+ * `null` or a set projection. Rows without a tombstone are returned as-is.
+ */
+export function withNormalizedReleaseSignal<T extends { releaseSignal?: unknown }>(row: T): T {
+  return isClearedReleaseSignalProjection(row.releaseSignal) ? { ...row, releaseSignal: null } : row;
+}
+
 /** What the model emits. */
 export interface GroomingPlanDraft {
   verdict: GroomingVerdict;

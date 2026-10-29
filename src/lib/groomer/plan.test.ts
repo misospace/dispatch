@@ -13,6 +13,7 @@ import {
   normalizeStoredReleaseSignal,
   toGroomerOutput,
   validateGroomingPlan,
+  withNormalizedReleaseSignal,
   type GroomingPlan,
   type GroomingPlanDraft,
   type ReleaseSignal,
@@ -1048,5 +1049,16 @@ describe("cleared-projection tombstone (dispatch#1487)", () => {
       ...signal,
       provenance: { applicationKey: "key-1" },
     });
+  });
+
+  it("normalizes tombstoned rows immutably and returns other rows untouched", () => {
+    const tombstoned = { id: "1", releaseSignal: clearedReleaseSignalProjection({ applicationKey: "key-1" }) };
+    const set = { id: "2", releaseSignal: { ...signal, provenance: { applicationKey: "key-2" } } };
+    const empty = { id: "3", releaseSignal: null };
+    const normalized = [tombstoned, set, empty].map((row) => withNormalizedReleaseSignal(row));
+    expect(normalized[0].releaseSignal).toBeNull();
+    expect(normalized[0]).not.toBe(tombstoned);
+    expect(normalized[1]).toBe(set);
+    expect(normalized[2]).toBe(empty);
   });
 });
