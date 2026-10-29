@@ -37,7 +37,7 @@ export type ReleasePulseHighlightKind =
   | "feature"
   | "fix"
   | "architecture"
-  | "umbrella-completed";
+  | "umbrella_completed";
 
 export interface ReleasePulsePrEvidence {
   prNumber: number;
@@ -51,7 +51,7 @@ export interface ReleasePulseHighlight {
   headline: string;
   issueNumber: number;
   issueUrl: string | null;
-  /** ISO; earliest post-baseline mergedAt, or the parent close time for umbrella milestones. */
+  /** ISO; earliest post-baseline merge observation, or the parent close time for umbrella milestones. */
   deliveredAt: string | null;
   significance: "routine" | "notable" | "major" | null;
   confidence: "high" | "low";
@@ -60,9 +60,11 @@ export interface ReleasePulseHighlight {
     | "legacy-issue-metadata"
     | "lifecycle-decomposition";
   /**
-   * Every authoritative post-baseline merged PR for the issue — deliberately
-   * uncapped: #1482 requires retaining links to ALL merged PRs, and the
-   * counts must not depend on display truncation.
+   * Every authoritative merged PR for the issue across ALL release intervals
+   * — deliberately uncapped: #1482 requires retaining links to ALL merged
+   * PRs, and the counts must not depend on display truncation. Pre-baseline
+   * merges of a delivered multi-PR issue are retained as evidence; only the
+   * delivery placement (`deliveredAt`) is baseline-scoped.
    */
   prs: ReleasePulsePrEvidence[];
   /** Umbrella milestones only: durably complete child issues. */
@@ -177,9 +179,9 @@ function legacyKindFromLabels(labels: string[]): "feature" | "fix" | null {
 interface IssueDelivery {
   issue: ReleasePulseIssueInput;
   timeline: IssueLifecycleTimeline;
-  /** Post-baseline merged PR evidence, mergedAt ascending. */
+  /** All merged PR evidence (every interval), mergedAt ascending. */
   prs: ReleasePulsePrEvidence[];
-  /** Earliest post-baseline mergedAt; non-null iff merge-delivered in this interval. */
+  /** Earliest post-baseline merge observation; non-null iff merge-delivered in this interval. */
   deliveredAtMs: number | null;
   /** Merge evidence exists but cannot be placed in time (or delivery unresolvable). */
   unknown: boolean;
@@ -225,7 +227,7 @@ function firstNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
-/** One entry per PR: earliest post-baseline observation time, unioned metadata. */
+/** One entry per PR: earliest observation time, unioned metadata. */
 function mergePrEvidence(observations: UsableMergeObservation[]): ReleasePulsePrEvidence[] {
   const byPr = new Map<number, { mergedAtMs: number; prUrl: string | null; mergeCommitSha: string | null }>();
   for (const observation of observations) {
@@ -263,6 +265,14 @@ function mergePrEvidence(observations: UsableMergeObservation[]): ReleasePulsePr
  * `pr_merged` rows, not the timeline's per-PR projection: the timeline keeps
  * each PR's EARLIEST merge time, so a re-merge observation after the baseline
  * would be masked by a pre-baseline one there.
+ *
+ * PR evidence is retained across ALL intervals (#1482: a deduped multi-PR
+ * highlight keeps links to every authoritative merged PR, including
+ * pre-baseline ones); only the delivery placement is baseline-scoped. An
+ * unresolvable merge row (no usable merge time) makes delivery unknown only
+ * when it was OBSERVED after the baseline — a merge observed at or before it
+ * necessarily predates the baseline, so its placement is neither deliverable
+ * here nor unknowable.
  */
 function resolveDelivery(
   issue: ReleasePulseIssueInput,
@@ -271,30 +281,33 @@ function resolveDelivery(
   timeline: IssueLifecycleTimeline,
 ): IssueDelivery {
   const observations: UsableMergeObservation[] = [];
-  let hasUnresolvableMerge = false;
+  const postBaseline: UsableMergeObservation[] = [];
+  let unresolvableAfterBaseline = false;
   for (const event of eventsForIssue) {
     const parsed = mergeObservationOf(event);
     if (parsed === null) continue;
     if (parsed === "unresolvable") {
-      hasUnresolvableMerge = true;
+      const observedMs = toMillis(event.occurredAt);
+      if (observedMs === null || observedMs > baselineMs) unresolvableAfterBaseline = true;
       continue;
     }
-    if (parsed.occurredAtMs > baselineMs) observations.push(parsed);
+    observations.push(parsed);
+    if (parsed.occurredAtMs > baselineMs) postBaseline.push(parsed);
   }
 
   const prs = mergePrEvidence(observations);
-  if (prs.length > 0) {
+  if (postBaseline.length > 0) {
     const deliveredAtMs = Math.min(
-      ...prs.map((pr) => Date.parse(pr.mergedAt)),
+      ...postBaseline.map((observation) => observation.occurredAtMs),
     );
     return { issue, timeline, prs, deliveredAtMs, unknown: false };
   }
 
-  // No usable post-baseline merge. Merge evidence that cannot be placed in
-  // time, or a timeline whose delivery cannot be resolved, is unknown —
-  // never silently dropped, never a highlight.
-  const unknown = hasUnresolvableMerge || timeline.delivery === "unknown";
-  return { issue, timeline, prs: [], deliveredAtMs: null, unknown };
+  // No post-baseline merge. Merge evidence that cannot be placed in time, or
+  // a timeline whose delivery cannot be resolved, is unknown — never
+  // silently dropped, never a highlight.
+  const unknown = unresolvableAfterBaseline || timeline.delivery === "unknown";
+  return { issue, timeline, prs, deliveredAtMs: null, unknown };
 }
 
 /** No reopen observable after the close time; an incomparable pair fails closed. */
@@ -482,7 +495,7 @@ export function buildReleasePulse(
         ? signal.headline
         : issue.title;
     highlightsByIssue.set(issue.number, {
-      kind: "umbrella-completed",
+      kind: "umbrella_completed",
       headline,
       issueNumber: issue.number,
       issueUrl: issue.url,

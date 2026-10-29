@@ -200,13 +200,13 @@ describe("buildReleasePulse", () => {
       };
     }
 
-    it("produces exactly one umbrella-completed milestone with children listed", () => {
+    it("produces exactly one umbrella_completed milestone with children listed", () => {
       const { issues, events } = umbrellaFixtures();
       const snapshot = buildReleasePulse(repoInput(), issues, events);
       expect(snapshot.completedUmbrellaCount).toBe(1);
       expect(snapshot.highlights).toHaveLength(1);
       expect(snapshot.highlights[0]).toMatchObject({
-        kind: "umbrella-completed",
+        kind: "umbrella_completed",
         headline: "Umbrella: revamp auth",
         issueNumber: 1,
         deliveredAt: "2026-10-10T00:00:00.000Z",
@@ -320,7 +320,7 @@ describe("buildReleasePulse", () => {
       events.push(mergeEvent(1, 9, "2026-10-09T00:00:00.000Z"));
       const snapshot = buildReleasePulse(repoInput(), issues, events);
       expect(snapshot.highlights).toHaveLength(1);
-      expect(snapshot.highlights[0].kind).toBe("umbrella-completed");
+      expect(snapshot.highlights[0].kind).toBe("umbrella_completed");
       expect(snapshot.completedUmbrellaCount).toBe(1);
       // The parent is still merge-delivered.
       expect(snapshot.deliveredIssueCount).toBe(1);
@@ -603,16 +603,36 @@ describe("buildReleasePulse", () => {
     );
     expect(snapshot.deliveredIssueCount).toBe(1);
     expect(snapshot.highlights).toHaveLength(1);
-    // Evidence keeps the post-baseline observation time, not the masked
-    // earliest one the per-PR timeline projection would have shown.
+    // The evidence entry keeps the PR's earliest observed merge time, while
+    // delivery placement comes from the post-baseline re-merge observation —
+    // not the per-PR timeline projection masking it.
+    expect(snapshot.highlights[0].deliveredAt).toBe("2026-10-05T00:00:00.000Z");
     expect(snapshot.highlights[0].prs).toEqual([
       {
         prNumber: 5,
         prUrl: "https://github.com/octocat/hello-world/pull/5",
         mergeCommitSha: "merge5",
-        mergedAt: "2026-10-05T00:00:00.000Z",
+        mergedAt: "2026-09-20T00:00:00.000Z",
       },
     ]);
+  });
+
+  it("retains a pre-baseline merged PR in a delivered multi-PR issue's evidence", () => {
+    // #1482: a deduped multi-PR highlight keeps links to ALL authoritative
+    // merged PRs, including ones merged before the baseline; only the
+    // delivery placement is baseline-scoped.
+    const snapshot = buildReleasePulse(
+      repoInput(),
+      [issueInput({ number: 10, labels: ["type/feature"], releaseSignal: signal("feature", "Multi-PR") })],
+      [
+        mergeEvent(10, 5, "2026-09-20T00:00:00.000Z"),
+        mergeEvent(10, 6, "2026-10-04T00:00:00.000Z"),
+      ],
+    );
+    expect(snapshot.deliveredIssueCount).toBe(1);
+    expect(snapshot.highlights).toHaveLength(1);
+    expect(snapshot.highlights[0].deliveredAt).toBe("2026-10-04T00:00:00.000Z");
+    expect(snapshot.highlights[0].prs.map((pr) => pr.prNumber)).toEqual([5, 6]);
   });
 
   it("treats a merge observation whose source stamp was unparseable as unknown delivery, never placed at observation time", () => {
@@ -631,6 +651,25 @@ describe("buildReleasePulse", () => {
     );
     expect(snapshot.deliveredIssueCount).toBe(0);
     expect(snapshot.unknownDeliveryCount).toBe(1);
+    expect(snapshot.highlights).toEqual([]);
+  });
+
+  it("does not count a merge row observed at or before the baseline as unknown delivery", () => {
+    // Writer shape for an unparseable source stamp: occurredAt degrades to
+    // the observation time. A merge observed at or before the baseline
+    // necessarily predates it, so its placement is not unknowable — it is
+    // simply not this interval's delivery.
+    const snapshot = buildReleasePulse(
+      repoInput(),
+      [issueInput({ number: 10, labels: ["type/feature"] })],
+      [
+        mergeEvent(10, 5, "2026-09-20T00:00:00.000Z", {
+          metadata: { pullRequestNumber: 5, mergedAtRaw: "not-a-timestamp" },
+        }),
+      ],
+    );
+    expect(snapshot.deliveredIssueCount).toBe(0);
+    expect(snapshot.unknownDeliveryCount).toBe(0);
     expect(snapshot.highlights).toEqual([]);
   });
 

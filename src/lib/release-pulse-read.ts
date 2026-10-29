@@ -27,12 +27,13 @@ import type { LifecycleEventRecord } from "@/lib/issue-lifecycle-read";
 import type { ReleaseDeltaState } from "./automation-sync";
 
 /**
- * Merge/close/reopen evidence the pure pulse consumes. Post-baseline rows
- * are sufficient: delivery requires a post-baseline `pr_merged`, and
- * reopen-after-close checks only concern closes that are themselves
- * post-baseline.
+ * Merge/close/reopen evidence the pure pulse consumes. `pr_merged` rows are
+ * read across ALL intervals: a delivered issue's highlight retains links to
+ * every authoritative merged PR (#1482), including pre-baseline ones.
+ * Close/reopen rows only concern post-baseline closes, so they keep the
+ * baseline filter.
  */
-const PULSE_EVENT_KINDS = ["pr_merged", "completed", "issue_closed", "issue_reopened"];
+const POST_BASELINE_EVENT_KINDS = ["completed", "issue_closed", "issue_reopened"];
 
 /** Fail-closed narrowing of the persisted string column into the delta state. */
 export function asReleaseDeltaState(value: string): ReleaseDeltaState {
@@ -93,8 +94,13 @@ export async function collectReleasePulse(
   const eventRows = await prisma.issueLifecycleEvent.findMany({
     where: {
       repoFullName: repo.fullName,
-      kind: { in: PULSE_EVENT_KINDS },
-      occurredAt: { gte: baselineDate },
+      // Merge evidence is needed across every interval (a delivered issue's
+      // highlight retains pre-baseline PR links); close/reopen evidence is
+      // baseline-scoped.
+      OR: [
+        { kind: "pr_merged" },
+        { kind: { in: POST_BASELINE_EVENT_KINDS }, occurredAt: { gte: baselineDate } },
+      ],
     },
     orderBy: { occurredAt: "asc" },
   });
@@ -107,9 +113,9 @@ export async function collectReleasePulse(
       repository: { fullName: repo.fullName },
       OR: [
         // Open issues can still be merge-delivered (timeline delivery
-        // "merged"), so numbers with post-baseline evidence count
-        // regardless of state. The arm is dropped when no events matched —
-        // an empty `in` is built conditionally on purpose.
+        // "merged"), so numbers with merge evidence count regardless of
+        // state. The arm is dropped when no events matched — an empty `in`
+        // is built conditionally on purpose.
         ...(eventIssueNumbers.length > 0 ? [{ number: { in: eventIssueNumbers } }] : []),
         { state: "closed" },
         { decomposed: true, followUpUrls: { isEmpty: false } },

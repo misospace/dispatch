@@ -425,10 +425,16 @@ describe("GET /api/automation/repos — release pulse", () => {
       expect.objectContaining({
         where: expect.objectContaining({
           repoFullName: "myorg/myrepo",
-          kind: {
-            in: ["pr_merged", "completed", "issue_closed", "issue_reopened"],
-          },
-          occurredAt: { gte: new Date(BASELINE_MS) },
+          // Merge evidence is read across every interval (pre-baseline PR
+          // links are retained on delivered highlights); close/reopen
+          // evidence stays baseline-scoped.
+          OR: [
+            { kind: "pr_merged" },
+            {
+              kind: { in: ["completed", "issue_closed", "issue_reopened"] },
+              occurredAt: { gte: new Date(BASELINE_MS) },
+            },
+          ],
         }),
         orderBy: { occurredAt: "asc" },
       }),
