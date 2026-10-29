@@ -103,6 +103,8 @@ Work like this:
 - Search for distinctive strings from the issue: identifiers, environment variables, error text, config keys.
 - When a search returns nothing, that is information — the thing may be what is missing.
 - Read the files that look relevant. Follow what you find; a file that imports something interesting is worth opening.
+- A truncated read is not the whole file. When the output says it continues at line N (or was truncated), call read_file again with \`startLine=N\` to keep reading — never treat an unseen tail as evidence of anything.
+- If search_code reports an outage or timeout, do not retry the same search: fall back to list_directory on the directories the issue names and read_file on the specific paths. That fallback stays bounded and is usually enough to finish the investigation.
 - When verifying whether the issue's premise still holds, read against the repository's default branch (pass the branch name in the \`ref\` parameter). The issue was filed against an older snapshot; what matters is what \`main\` looks like now. If the file the issue mentions no longer exists or the situation has already been resolved, that is the answer — say so in your findings.
 - Use list_directory when you are unsure what exists, rather than guessing paths.
 
@@ -297,6 +299,15 @@ export async function exploreRepository(
   const relatedWorkQueries: string[] = [];
   const relatedWork: RelatedWorkObservation[] = [];
   let bytes = 0;
+  // Highest line shown per real path across the whole run (dispatch#1451):
+  // retirement of a truncation fact must continue from what was already shown.
+  const shownThrough = new Map<string, number>();
+  // Distinct real paths owing each truncation-fact token (dispatch#1451
+  // review): gapFactToken clamps at 80 chars, so two different long paths can
+  // share one token. The token retires only once every real path behind it
+  // has established — completing one path must not hide another's unseen
+  // content.
+  const truncatedFactPaths = new Map<string, Set<string>>();
 
   let roundsExhausted = false;
   const controller = new AbortController();
@@ -408,14 +419,22 @@ export async function exploreRepository(
           {
             repoFullName: options.repoFullName,
             maxSearchResults: options.maxSearchResults,
-            maxFileBytes: Math.min(options.maxFileBytes, remaining),
+            maxFileBytes: options.maxFileBytes,
+            // The budget this run has left. A tool answer is charged against
+            // it in full — framing included — so no answer can push the run
+            // past its total byte budget (dispatch#1451).
+            maxTotalBytesRemaining: remaining,
             maxDirEntries: options.maxDirEntries,
             pinnedRef: options.pinnedRef,
           },
           deps.tools,
         );
 
-        bytes += result.bytes;
+        // A tool answer that reports `chargedBytes` charges that instead
+        // (dispatch#1451): an empty search keeps `bytes: 0` as the freshness
+        // negative-evidence sentinel while its rendered answer still spends
+        // the run's budget.
+        bytes += result.chargedBytes ?? result.bytes;
         sources.push(...result.sources);
         if (name === "read_file" && result.ok) readSources.push(...result.sources);
         if (name === "read_file" && result.ok && result.file) readContents.push(result.file);
@@ -446,14 +465,73 @@ export async function exploreRepository(
           // token so the failure cannot be lost — the fact, not the name, is
           // what the verdict is resolved against (dispatch#1452).
           gaps.toolFailures.push(gapFactToken(name) || UNKNOWN_TOOL_FAILURE);
-        } else if ((name === "read_file" || name === "list_directory") && truncated) {
+        } else if (name === "read_file" || name === "list_directory") {
           // The normalized path when available, recorded argument
           // otherwise (a pinned-ref read records its pinned arguments).
           const path = result.file?.path ?? (typeof args.path === "string" ? args.path : null);
-          const gapPath = path !== null ? gapFactToken(path) : "";
-          // A root listing has no path to name: keep the fact under a fixed
-          // token rather than losing it (dispatch#1452).
-          gaps.truncatedReads.push(gapPath || ROOT_TRUNCATED_READ);
+          const gapPath = gapFactToken(path ?? "") || ROOT_TRUNCATED_READ;
+          // The real path behind the fact, used to judge continuity (and to
+          // retire the fact) per path rather than per token: gapFactToken
+          // clamps at 80 chars, so distinct long paths can share a token and
+          // must not lend each other shown lines or retire each other's
+          // facts (dispatch#1451 review). Sanitized but not clamped, so a
+          // path that names nothing falls to the same fixed token as its
+          // fact (a root listing), while two long paths stay distinct here
+          // even when their facts clamp together. Two spellings of one path
+          // ("src/x" vs "src/x/") owe the fact separately and can only
+          // settle it in their own spelling — fail-closed, and no wider
+          // than the token itself, which never matched across spellings.
+          const factKey = (path ? sanitizeModelText(path).trim() : "") || gapPath;
+          // Track what the run has shown of this path — truncated reads
+          // included (dispatch#1451) — so a later continuation's continuity
+          // is judged against the lines actually shown so far.
+          if (result.shownRange) {
+            const prior = shownThrough.get(factKey) ?? 0;
+            if (result.shownRange.start <= prior + 1) {
+              shownThrough.set(factKey, Math.max(prior, result.shownRange.end));
+            }
+          }
+          if (truncated) {
+            // A root listing has no path to name: keep the fact under a fixed
+            // token rather than losing it (dispatch#1452).
+            gaps.truncatedReads.push(gapPath);
+            const owners = truncatedFactPaths.get(gapPath) ?? new Set<string>();
+            owners.add(factKey);
+            truncatedFactPaths.set(gapPath, owners);
+          } else if (result.established === true) {
+            // A completed read retires the path's earlier truncation fact
+            // (dispatch#1451): a continuation that reaches EOF — or a whole
+            // file, or a listing that showed every entry — means the run did
+            // establish what that file holds. Leaving the stale fact in place
+            // would keep classifying a completed investigation incomplete.
+            // Only an answer that actually showed the path's content claims
+            // this (dispatch#1451 review): a past-the-end coordinate, an
+            // unreadable/empty file, a budget-exhausted notice or an empty
+            // listing shows nothing and establishes nothing, so it must
+            // never retire an earlier truncation fact.
+            //
+            // A read_file continuation retires the fact only when it
+            // continued from what was already shown (dispatch#1451): a read
+            // that skips unseen lines shows a tail, not the whole file, so
+            // the fact stands. A listing carries no line coordinates and
+            // retires as before.
+            if (
+              !result.shownRange ||
+              (result.shownRange.eof === true &&
+                (shownThrough.get(factKey) ?? 0) + 1 >= result.shownRange.start)
+            ) {
+              // Retire per real path (dispatch#1451 review): the token may
+              // stand for several distinct long paths that clamped to the
+              // same 80 chars; it disappears only when this read settles the
+              // last path still owing it.
+              const owners = truncatedFactPaths.get(gapPath);
+              owners?.delete(factKey);
+              if (!owners || owners.size === 0) {
+                if (owners) truncatedFactPaths.delete(gapPath);
+                gaps.truncatedReads = gaps.truncatedReads.filter((p) => p !== gapPath);
+              }
+            }
+          }
         }
         messages.push({ role: "tool", tool_call_id: toolCall.id, name, content: result.content });
       }
