@@ -278,18 +278,20 @@ A plan may carry an optional `releaseSignal`: semantic-only metadata describing 
 
 The signal affects nothing operational: no lane, priority, readiness, admission, pickup or freshness change follows from it or from its evidence refs — signal refs are validated against the run's catalog but are deliberately excluded from `plan.citations`, so they never feed evidence-reliance derivation or the freshness baseline.
 
-On a fresh applied groom, the signal is persisted wholesale on `Issue.releaseSignal` (latest applied groom owns the column; a groom with no signal clears it):
+On a fresh applied groom, the signal is persisted wholesale on `Issue.releaseSignal` (latest applied groom owns the column; a groom with no signal clears it with a **provenance-carrying tombstone**, dispatch#1487):
 
 ```
-{ kind, headline, significance, evidenceRefs,
-  provenance: { groomingRunId, applicationKey, appliedAt } }
+set:    { kind, headline, significance, evidenceRefs,
+          provenance: { groomingRunId, applicationKey, appliedAt } }
+cleared: { tombstone: true,
+           provenance: { groomingRunId, applicationKey, appliedAt } }
 ```
 
-`provenance` ties the projection to the grooming result that produced it. Because the signal is part of the application intent, a re-groom whose signal changed is applied and overwrites the projection; an identical re-groom replays and rewrites nothing.
+`provenance` ties the projection to the grooming result that produced it. Because the signal is part of the application intent, a re-groom whose signal changed is applied and overwrites the projection; an identical re-groom replays and rewrites nothing. Consumers reading the column must normalize it with `normalizeStoredReleaseSignal` (`src/lib/groomer/plan.ts`), so a tombstone reads as "no signal".
 
-The projection write happens after the application finalizes, so a failed issue update there would otherwise leave the signal missing or stale with no later run to repair it — every same-key retry replays and skips the write. A replay therefore re-asserts the projection as a bounded heal: only an empty column, or one holding a projection this application supersedes (an older `appliedAt`), is written; a replay whose key already matches the stored provenance writes nothing.
+The projection write happens after the application finalizes, so a failed issue update there would otherwise leave the signal missing or stale with no later run to repair it — every same-key retry replays and skips the write. A replay therefore re-asserts the projection as a bounded heal: only an empty column, or one holding a projection this application supersedes (an older `appliedAt`), is written; a replay whose key already matches the stored provenance writes nothing. A heal of a lost **clear** writes the same tombstone the fresh path writes.
 
-The heal is bounded, not bulletproof. It orders set projections by their provenance, but an application that carried no signal clears the column to `null` — an empty column carries no ownership evidence, so a later replay of an older signal-bearing key cannot tell that clear apart from its own lost write and may re-assert the older signal. Because the column is only ever written by an applied groom, the next application re-owns it; a provenance-carrying tombstone on clear would close the gap entirely.
+The heal orders stored writes by their provenance, and a tombstone carries provenance too: an application that carried no signal clears the column with ownership evidence, so a later replay of an older signal-bearing key sees the newer application's tombstone and skips — it no longer mistakes the deliberate clear for its own lost write (the gap closed here, dispatch#1487). One legacy window remains: a column cleared to a bare `null` by a pre-#1487 deployment carries no evidence, so a replay of an older key may still re-assert the stale signal until the next fresh groom re-owns the column.
 
 ## History and Audit
 

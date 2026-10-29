@@ -7,7 +7,10 @@ import {
   GROOMING_PLAN_SCHEMA_VERSION,
   PLAN_LIMITS,
   RELEASE_SIGNAL_KIND_VALUES,
+  clearedReleaseSignalProjection,
   evaluateReadiness,
+  isClearedReleaseSignalProjection,
+  normalizeStoredReleaseSignal,
   toGroomerOutput,
   validateGroomingPlan,
   type GroomingPlan,
@@ -1011,5 +1014,39 @@ describe("release signal (dispatch#1481)", () => {
     expect(cited).not.toContain("issue");
     expect(cited).not.toContain("github:pr:org/repo#12");
     expect(cited).toEqual(["repo:src/auth/login.ts", "comment:101", "repo:src/auth/session.ts"]);
+  });
+});
+
+describe("cleared-projection tombstone (dispatch#1487)", () => {
+  const signal: ReleaseSignal = {
+    kind: "feature",
+    headline: "Adds a tenant-scoped login redirect",
+    significance: "notable",
+    evidenceRefs: ["repo:src/auth/login.ts"],
+  };
+
+  it("builds a tombstone carrying the clear's provenance", () => {
+    const provenance = { groomingRunId: "gr-1", applicationKey: "key-1", appliedAt: "2026-10-28T00:00:00.000Z" };
+    expect(clearedReleaseSignalProjection(provenance)).toEqual({ tombstone: true, provenance });
+    expect(isClearedReleaseSignalProjection(clearedReleaseSignalProjection(provenance))).toBe(true);
+  });
+
+  it("recognizes only tombstone: true, not signals, null, or junk", () => {
+    expect(isClearedReleaseSignalProjection(null)).toBe(false);
+    expect(isClearedReleaseSignalProjection(undefined)).toBe(false);
+    expect(isClearedReleaseSignalProjection(signal)).toBe(false);
+    expect(isClearedReleaseSignalProjection({ ...signal, tombstone: false })).toBe(false);
+    expect(isClearedReleaseSignalProjection("tombstone")).toBe(false);
+    expect(isClearedReleaseSignalProjection([{ tombstone: true }])).toBe(false);
+  });
+
+  it("normalizes the column for consumers: tombstone and empty read as no signal, a set projection passes through", () => {
+    expect(normalizeStoredReleaseSignal(null)).toBeNull();
+    expect(normalizeStoredReleaseSignal(undefined)).toBeNull();
+    expect(normalizeStoredReleaseSignal(clearedReleaseSignalProjection({ applicationKey: "key-1" }))).toBeNull();
+    expect(normalizeStoredReleaseSignal({ ...signal, provenance: { applicationKey: "key-1" } })).toEqual({
+      ...signal,
+      provenance: { applicationKey: "key-1" },
+    });
   });
 });

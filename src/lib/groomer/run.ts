@@ -8,7 +8,7 @@ import { buildIssueContext, fetchIssueComments } from "./context";
 import { callGroomerLLM } from "./llm";
 import { runModelStage } from "./model-stage";
 import { sanitizeModelJson } from "./sanitize";
-import { inFlightStatus, validateGroomingPlan, type GroomingPlan } from "./plan";
+import { inFlightStatus, validateGroomingPlan, clearedReleaseSignalProjection, type GroomingPlan } from "./plan";
 import { buildEvidenceCatalog, typedVerdictDependencyKeys } from "./plan-evidence";
 import { collectPinnedReadContent } from "./close-grounding";
 import { getHostedGroomerConfig } from "./config";
@@ -1123,7 +1123,10 @@ async function executeGroomerRun(
       // forever — every same-key retry replays and returns here. The heal is
       // bounded: only an empty column, or one holding a projection this
       // application supersedes (an older appliedAt); never a projection a
-      // newer application already owns.
+      // newer application already owns. A clear (this application carries no
+      // signal) writes the same provenance-carrying tombstone the fresh path
+      // writes (dispatch#1487), so it is never mistaken for an unwritten
+      // column by a later replay of an older key.
       const replayData: Record<string, unknown> = {
         groomedAt: new Date(),
         groomedBy: "hosted-groomer",
@@ -1142,16 +1145,14 @@ async function executeGroomerRun(
         !!applied.appliedRecordedAt &&
         stored.appliedAt >= applied.appliedRecordedAt;
       if (!storedIsCurrent && !storedIsNewer && (diff.releaseSignal || !!stored)) {
+        const healProvenance = {
+          groomingRunId: applied.claimedByRunId ?? groomingRun.id,
+          applicationKey,
+          appliedAt: applied.appliedRecordedAt ?? new Date().toISOString(),
+        };
         replayData.releaseSignal = diff.releaseSignal
-          ? {
-              ...diff.releaseSignal,
-              provenance: {
-                groomingRunId: applied.claimedByRunId ?? groomingRun.id,
-                applicationKey,
-                appliedAt: applied.appliedRecordedAt ?? new Date().toISOString(),
-              },
-            }
-          : null;
+          ? { ...diff.releaseSignal, provenance: healProvenance }
+          : clearedReleaseSignalProjection(healProvenance);
       }
       await deps.prisma.issue.update({
         where: { id: candidate.id },
@@ -1236,14 +1237,17 @@ async function executeGroomerRun(
     // Durable semantic-only release projection (dispatch#1481): the latest
     // applied groom owns it wholesale (set or cleared); provenance ties it to
     // the grooming result that produced it; it never means delivered/shipped.
-    // Written on a fresh applied outcome; a replay re-asserts it only to heal
-    // a lost or superseded write (this write landing is not guaranteed — it
-    // happens after the application finalized — see the replay path), and the
+    // A clear persists a provenance-carrying tombstone rather than a bare
+    // null (dispatch#1487), so the replay-time heal below can tell this
+    // deliberate clear apart from its own lost write. Written on a fresh
+    // applied outcome; a replay re-asserts it only to heal a lost or
+    // superseded write (this write landing is not guaranteed — it happens
+    // after the application finalized — see the replay path), and the
     // in-flight skip path deletes the applicationKey and returns before this
     // block.
     issueData.releaseSignal = diff.releaseSignal
       ? { ...diff.releaseSignal, provenance: { groomingRunId: groomingRun.id, applicationKey, appliedAt: new Date().toISOString() } }
-      : null;
+      : clearedReleaseSignalProjection({ groomingRunId: groomingRun.id, applicationKey, appliedAt: new Date().toISOString() });
     // When the groomer closes the issue, mirror the closed state locally so
     // the selector stops considering it (state: "open" is the implicit filter)
     // and the next sync confirms what we just wrote. A close that did not
@@ -1499,7 +1503,11 @@ function candidateSourceOf(candidate: { selectionReason?: string }): string {
  * Read the persisted release-signal projection's provenance out of the JSONB
  * column (dispatch#1481). The column holds foreign-shaped JSON from the
  * reader's perspective, so only the fields the replay-time heal decision
- * needs are picked out; anything malformed reads as no projection.
+ * needs are picked out; anything malformed reads as no projection. A
+ * cleared-by-tombstone column (dispatch#1487) carries the same provenance
+ * envelope, so it participates in the heal's ordering check like a set
+ * projection; consumers of the signal itself must instead normalize it
+ * through normalizeStoredReleaseSignal.
  */
 function readProjectionProvenance(value: unknown): { applicationKey?: string; appliedAt?: string } | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
