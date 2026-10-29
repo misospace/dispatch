@@ -755,7 +755,11 @@ export async function requeueIssueAttempt(input: IssueRequeueInput): Promise<Iss
   const agentLabel = `${AGENT_PREFIX}${agentName}`;
   const payloadHash = requeuePayloadHash({
     issueId: input.issueId,
-    repoFullName: input.repoFullName,
+    // The identity gate below is case-INSENSITIVE on the repo half (GitHub
+    // repo names are), so the fingerprint must be too: a retry that spells
+    // the same repo differently is the SAME attempt and must replay, not
+    // collide as a foreign payload.
+    repoFullName: input.repoFullName.toLowerCase(),
     issueNumber: input.issueNumber,
     agentName: input.agentName,
     claimToken: input.claimToken,
@@ -924,7 +928,12 @@ export async function requeueIssueAttempt(input: IssueRequeueInput): Promise<Iss
           payloadHash,
           attemptId,
         });
-        if (!recorded || recorded.claimToken !== claimToken || recorded.payloadHash !== payloadHash) {
+        if (
+          !recorded ||
+          recorded.claimToken !== claimToken ||
+          recorded.payloadHash !== payloadHash ||
+          !settlementRowMatchesFamily(recorded, ATTEMPT_REQUEUE_SETTLEMENT_OPERATION)
+        ) {
           // First-write-wins: a row that won the key first is returned instead
           // of ours. The proof this release consumes must be OURS — the same
           // claim incarnation AND the same committed payload fingerprint. A

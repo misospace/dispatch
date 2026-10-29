@@ -797,6 +797,40 @@ describe("POST /api/issues/requeue (#1491)", () => {
     expect(db.audit[0].notes).toContain("replayed");
   });
 
+  it("replays the committed settlement when the retry spells the repo differently", async () => {
+    // The identity gate is case-INSENSITIVE on the repo half (GitHub repo
+    // names are), so the payload fingerprint must be too: the same attempt
+    // spelled with different casing replays instead of colliding as a
+    // foreign payload.
+    makeState({
+      lease: null,
+      settlements: [
+        {
+          id: "settle-seed",
+          agentName: AGENT,
+          issueId: ISSUE_ID,
+          settlementKey: KEY,
+          claimToken: CLAIM_TOKEN,
+          capacity: null,
+          labels: ["status/in-progress"],
+          status: null,
+          statusNote: null,
+          cooldownUntil: null,
+          settledAt: new Date(Date.now() - 60_000),
+          expiresAt: new Date(Date.now() + 7 * 24 * 3_600_000),
+          operation: "attempt-requeue",
+          payloadHash: payloadHash(),
+          attemptId: "lease-1",
+        },
+      ],
+    });
+    const response = await postRequest({ repoFullName: "Org/Repo" });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ success: true, replayed: true, attemptId: "lease-1" });
+    expect(mocks.releaseIssueClaim).not.toHaveBeenCalled();
+    expect(db.settlements).toHaveLength(1);
+  });
+
   it("refuses a key reused for a DIFFERENT payload (409 'already used')", async () => {
     makeState({
       lease: null,
