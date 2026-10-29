@@ -244,6 +244,13 @@ describe("buildReleasePulse", () => {
       expect(snapshot.highlights).toEqual([]);
     });
 
+    it("does not let an internal signal downgrade implementation type labels", () => {
+      const { issues, events } = umbrellaFixtures();
+      issues[1].labels = ["type/feature"];
+      issues[1].releaseSignal = signal("internal", "Internal plumbing");
+      expect(buildReleasePulse(repoInput(), issues, events).completedUmbrellaCount).toBe(0);
+    });
+
     it("certifies a design/docs child closing without a merge", () => {
       const { issues, events } = umbrellaFixtures();
       issues[1].labels = ["type/chore"];
