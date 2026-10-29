@@ -168,6 +168,8 @@ describe("buildIssueLifecycleTimeline", () => {
         occurredAt: "2026-10-01T01:00:00.000Z",
       }),
       event({ kind: "issue_closed", source: "sync", actor: "github", occurredAt: "2026-10-02T00:00:00.000Z" }),
+      event({ kind: "issue_reopened", source: "sync", actor: "github", occurredAt: "2026-10-02T06:00:00.000Z" }),
+      event({ kind: "issue_closed", source: "sync", actor: "github", occurredAt: "2026-10-02T12:00:00.000Z" }),
       event({
         kind: "pr_merged",
         source: "reconciler",
@@ -176,11 +178,26 @@ describe("buildIssueLifecycleTimeline", () => {
         metadata: { pullRequestNumber: 5 },
       }),
     ];
-    const shuffled = [rows[2], rows[0], rows[3], rows[1]];
+    const shuffled = [rows[2], rows[0], rows[5], rows[1], rows[4], rows[3]];
 
     expect(JSON.stringify(buildIssueLifecycleTimeline(issue, shuffled))).toBe(
       JSON.stringify(buildIssueLifecycleTimeline(issue, rows)),
     );
+  });
+
+  it("picks the latest close for lastClosedAt regardless of arrival order", () => {
+    const rows = [
+      event({ kind: "issue_closed", source: "sync", actor: "github", occurredAt: "2026-10-02T00:00:00.000Z" }),
+      event({ kind: "issue_reopened", source: "sync", actor: "github", occurredAt: "2026-10-02T06:00:00.000Z" }),
+      event({ kind: "issue_closed", source: "sync", actor: "github", occurredAt: "2026-10-02T12:00:00.000Z" }),
+    ];
+    const shuffled = [rows[2], rows[0], rows[1]];
+
+    for (const arrangement of [rows, shuffled, [rows[1], rows[2], rows[0]]]) {
+      const timeline = buildIssueLifecycleTimeline(issue, arrangement);
+      expect(timeline.closedAt.at).toBe("2026-10-02T00:00:00.000Z");
+      expect(timeline.lastClosedAt.at).toBe("2026-10-02T12:00:00.000Z");
+    }
   });
 
   it("collapses an api and a webhook observation of the same transition into one, with a note", () => {

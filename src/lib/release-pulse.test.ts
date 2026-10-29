@@ -395,6 +395,82 @@ describe("buildReleasePulse", () => {
       ]);
     });
 
+    it("blocks a child reclosed after the parent's latest close", () => {
+      // The child's durable close must be no later than the parent's: a
+      // reclose after the parent closed out is a later interval's work.
+      const { issues, events } = umbrellaFixtures();
+      events.push(
+        {
+          issueNumber: 2,
+          kind: "issue_reopened",
+          source: "webhook",
+          actor: "octocat",
+          agentName: null,
+          fromStatus: null,
+          toStatus: null,
+          sourceEventId: null,
+          occurredAt: "2026-10-06T00:00:00.000Z",
+          observedAt: "2026-10-06T00:00:00.000Z",
+          metadata: null,
+        },
+        {
+          issueNumber: 2,
+          kind: "issue_closed",
+          source: "webhook",
+          actor: "octocat",
+          agentName: null,
+          fromStatus: null,
+          toStatus: null,
+          sourceEventId: null,
+          occurredAt: "2026-10-11T00:00:00.000Z",
+          observedAt: "2026-10-11T00:00:00.000Z",
+          metadata: null,
+        },
+      );
+      expect(buildReleasePulse(repoInput(), issues, events).completedUmbrellaCount).toBe(0);
+    });
+
+    it("resolves a parent's durable reclose carried only by the issue cache", () => {
+      // Observed closes stop before the reopen; the cache's closedAt holds
+      // the durable reclose. The gate takes the latest close evidence.
+      const { issues, events } = umbrellaFixtures();
+      events.push(
+        {
+          issueNumber: 1,
+          kind: "issue_closed",
+          source: "webhook",
+          actor: "octocat",
+          agentName: null,
+          fromStatus: null,
+          toStatus: null,
+          sourceEventId: null,
+          occurredAt: "2026-10-04T00:00:00.000Z",
+          observedAt: "2026-10-04T00:00:00.000Z",
+          metadata: null,
+        },
+        {
+          issueNumber: 1,
+          kind: "issue_reopened",
+          source: "webhook",
+          actor: "octocat",
+          agentName: null,
+          fromStatus: null,
+          toStatus: null,
+          sourceEventId: null,
+          occurredAt: "2026-10-05T00:00:00.000Z",
+          observedAt: "2026-10-05T00:00:00.000Z",
+          metadata: null,
+        },
+      );
+      const snapshot = buildReleasePulse(repoInput(), issues, events);
+      expect(snapshot.completedUmbrellaCount).toBe(1);
+      expect(snapshot.highlights[0]).toMatchObject({
+        kind: "umbrella_completed",
+        issueNumber: 1,
+        deliveredAt: "2026-10-10T00:00:00.000Z",
+      });
+    });
+
     it("fails closed on an unresolvable or cross-repo child reference", () => {
       const { issues, events } = umbrellaFixtures();
       issues[0].followUpUrls = [issueUrl(2), "https://github.com/octocat/hello-world/issues/999"];
