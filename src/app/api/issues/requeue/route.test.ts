@@ -309,7 +309,21 @@ function makeState(overrides: Record<string, unknown> = {}) {
   db.agentWorkHistory = [];
   db.settlements = (overrides.settlements as any[]) ?? [];
   db.racingSettlements = (overrides.racingSettlements as any[]) ?? [];
-  db.issuances = (overrides.issuances as any[]) ?? [];
+  // The durable issuance ledger is the FENCE AUTHORITY on every path
+  // (#1491: the retry is authorized by the recorded issuance, never by live
+  // state alone). The default state therefore carries the issuance row the
+  // claim mint recorded; a test that needs an unprovable fence passes
+  // `issuances: []`.
+  db.issuances = (overrides.issuances as any[]) ?? [
+    {
+      id: "iss-default",
+      surface: "issue",
+      attemptId: ISSUE_ID,
+      agentName: AGENT,
+      token: CLAIM_TOKEN,
+      generation: null,
+    },
+  ];
   db.audit = [];
   db.leaseDeleteCalls = [];
   db.settlementDeleteCalls = [];
@@ -604,7 +618,7 @@ describe("POST /api/issues/requeue (#1491)", () => {
   });
 
   it("refuses when no lease remains and the issuance ledger proves nothing (stale-generation)", async () => {
-    makeState({ lease: null }); // no issuance row either
+    makeState({ lease: null, issuances: [] }); // no issuance row either
     const response = await postRequest();
     expect(response.status).toBe(409);
     expect(await response.json()).toEqual({ reason: "stale-generation" });
@@ -613,14 +627,33 @@ describe("POST /api/issues/requeue (#1491)", () => {
     expect(db.settlements).toHaveLength(0);
   });
 
-  // m2: on the already-released path the issuance ledger read is the ONLY
-  // proof. A failed read establishes nothing — it must fail closed as a
-  // retryable 503, never be treated as absence (409 stale-generation) or as
-  // issuance. Pinned for both shapes of "no live proof": no lease row, and a
-  // lease row whose claimToken is null (pre-token legacy row).
-  it("answers 503 (never 409) when the issuance ledger read fails on the already-released path", async () => {
-    for (const lease of [null, { claimToken: null }]) {
-      makeState({ lease });
+  it("refuses a LIVE lease whose issuance was never recorded (stale-generation)", async () => {
+    // #1491: live state never authorizes the retry by itself — the fence is
+    // validated against the RECORDED issuance. A live lease carrying the
+    // presented token proves the claim is still held, not that the token was
+    // ever issued for this attempt; without the durable issuance row the
+    // fence is unprovable and the retry is refused.
+    makeState({ issuances: [] });
+    const response = await postRequest();
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ reason: "stale-generation" });
+    // The live claim is NEVER touched by a refused retry.
+    expect(mocks.releaseIssueClaim).not.toHaveBeenCalled();
+    expect(mocks.supersedeIntent).not.toHaveBeenCalled();
+    expect(db.leaseDeleteCalls).toHaveLength(0);
+    expect(db.settlements).toHaveLength(0);
+    expect(db.lease?.claimToken).toBe(CLAIM_TOKEN);
+  });
+
+  // m2: the issuance ledger read is the ONLY proof, and it is consulted on
+  // EVERY path (the live lease never substitutes for it). A failed read
+  // establishes nothing — it must fail closed as a retryable 503, never be
+  // treated as absence (409 stale-generation) or as issuance. Pinned for
+  // every lease shape: no lease row, a lease row whose claimToken is null
+  // (pre-token legacy row), and a LIVE lease carrying the presented token.
+  it("answers 503 (never 409) when the issuance ledger read fails", async () => {
+    for (const lease of [null, { claimToken: null }, undefined]) {
+      makeState(lease === undefined ? {} : { lease });
       db.failIssuanceLookup = true;
       const response = await postRequest();
       // A failed ledger read is retryable, not a per-item condition.
@@ -639,7 +672,8 @@ describe("POST /api/issues/requeue (#1491)", () => {
       expect(db.leaseDeleteCalls).toHaveLength(0);
       expect(db.settlements).toHaveLength(0);
       if (lease === null) expect(db.lease).toBeNull();
-      else expect(db.lease?.claimToken).toBeNull();
+      else if (lease) expect(db.lease?.claimToken).toBeNull();
+      else expect(db.lease?.claimToken).toBe(CLAIM_TOKEN);
       // The callback COMPLETES with the unavailable value (no retained wedge).
       expect(guard.callbackResults).toHaveLength(1);
       expect(guard.callbackResults[0]).toEqual({

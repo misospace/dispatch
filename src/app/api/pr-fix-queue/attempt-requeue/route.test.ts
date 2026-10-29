@@ -510,7 +510,7 @@ describe("success (fresh requeue)", () => {
       expect.objectContaining({
         id: "fix-1",
         generation: 3,
-        status: { notIn: ["STALE", "IGNORED"] },
+        status: { notIn: ["STALE", "IGNORED", "FIXED"] },
         lane: { not: "NEEDS_HUMAN" },
       }),
     );
@@ -559,18 +559,27 @@ describe("success (fresh requeue)", () => {
     );
   });
 
-  it("accepts a live-receipt fence (no durable issuance row) and succeeds", async () => {
+  it("accepts a live-receipt fence ONLY with the durable issuance row, and consults the ledger", async () => {
+    // #1491 pins the authority: the fence is validated against the RECORDED
+    // issuance (the `AttemptIssuance` ledger written at hand-out mint), never
+    // against live state alone. A live receipt proves the token is still
+    // HELD, not that it was ever ISSUED for this attempt — so the ledger is
+    // consulted even when the receipt matches.
     seedAttempt({
       item: {
         handoutReceipts: ["hnd_deadbeefdeadbeef@worker@3"],
       },
-      issuance: false,
     });
     const res = await post(BASE);
     expect(res.status).toBe(200);
     expect((await json(res)).replayed).toBe(false);
-    // No issuance row was present or created; the live receipt subsumed the fence.
-    expect(holder.current.issuances).toHaveLength(0);
+    // The durable ledger was the authority that authorized the retry.
+    expect(holder.current.attemptIssuance.findUnique).toHaveBeenCalledTimes(1);
+    expect(holder.current.attemptIssuance.findUnique).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ token: "hnd_deadbeefdeadbeef" }),
+      }),
+    );
     expect(holder.current.prFixQueueItem.updateMany).toHaveBeenCalledTimes(1);
   });
 });
@@ -644,6 +653,44 @@ describe("refusals (always 409, never 404)", () => {
     seedAttempt({ issuance: false });
     const res = await post(BASE);
     await assertRefusal(res, "stale-generation");
+  });
+
+  it("fence not provable (live receipt, NO durable issuance row) -> stale-generation", async () => {
+    // #1491: the live receipt is NOT the fence authority — the recorded
+    // issuance is. A receipt that is still held proves the token was
+    // handed out, but the contract validates the retry against the durable
+    // issuance history; without that row the fence is unprovable and the
+    // retry is refused (never an unfenced requeue).
+    seedAttempt({
+      item: { handoutReceipts: ["hnd_deadbeefdeadbeef@worker@3"] },
+      issuance: false,
+    });
+    const res = await post(BASE);
+    await assertRefusal(res, "stale-generation");
+    // The ledger WAS consulted (it is the authority) and proved nothing.
+    expect(holder.current.attemptIssuance.findUnique).toHaveBeenCalledTimes(1);
+  });
+
+  it("item FIXED -> superseded (a landed fix is never reverted to QUEUED)", async () => {
+    // A `FIXED` item already resolved: the work moved on without this key.
+    // Requeueing it would revert a landed fix back to `QUEUED`.
+    seedAttempt({ item: { status: "FIXED" } });
+    const res = await post(BASE);
+    await assertRefusal(res, "superseded");
+    // The item is untouched.
+    expect(holder.current.items[0].status).toBe("FIXED");
+  });
+
+  it("item FIXED with a live receipt -> superseded (the owner guard never overrides the settled state)", async () => {
+    seedAttempt({
+      item: {
+        status: "FIXED",
+        handoutReceipts: ["hnd_deadbeefdeadbeef@worker@3"],
+      },
+    });
+    const res = await post(BASE);
+    await assertRefusal(res, "superseded");
+    expect(holder.current.items[0].status).toBe("FIXED");
   });
 
   it("fence not provable (issuance bound to another agent) -> stale-generation", async () => {
@@ -823,9 +870,10 @@ describe("CAS lost", () => {
 });
 
 // ===========================================================================
-// 10. B2 fence fix: a live receipt at the fenced generation shadows the
-//     durable ledger — a rotated token refuses, an empty generation consults
-//     the ledger
+// 10. B2 fence fix: a live receipt at the fenced generation owned by a
+//     DIFFERENT token shadows the durable ledger — a rotated token refuses
+//     without consulting it; the exact presented token does NOT shadow (the
+//     ledger still authorizes), and an empty generation consults the ledger
 // ===========================================================================
 describe("live-receipt fence (B2)", () => {
   it("refuses stale-generation when the fenced generation owns a live receipt with a DIFFERENT token, even when the durable ledger proves the presented token; the ledger is never consulted", async () => {

@@ -233,9 +233,9 @@ export async function proveAttemptIssuance(
 //
 // The fence validates against the durable ISSUANCE history: a terminal
 // report has already released the live receipt, so the `AttemptIssuance` row
-// written at hand-out mint is the proof (a live exact-match receipt — a run
-// that has not terminated yet — also passes; live issuance subsumes
-// history). An unverifiable fence is refused `stale-generation`: the server
+// written at hand-out mint is the ONLY proof that authorizes the retry — a
+// live receipt (a run that has not terminated yet) is never enough on its
+// own. An unverifiable fence is refused `stale-generation`: the server
 // never accepts an unfenced requeue.
 //
 // State → refusal mapping (pinned vocabulary, `409 {"reason": …}`; 404 is
@@ -249,6 +249,9 @@ export async function proveAttemptIssuance(
 //                              a fenced retry may not overrule a human)
 //   IGNORED status          → `superseded`    (already addressed; the work
 //                              moved on)
+//   FIXED status            → `superseded`    (the fix landed; the work moved
+//                              on — a retry must never revert a resolved
+//                              item to `QUEUED`)
 //   generation advanced AND a settlement exists for the fenced generation
 //                           under a different key → `superseded` (moved on
 //                           WITHOUT THIS KEY; Courier settles the request
@@ -368,6 +371,11 @@ async function classifyAttemptRequeueItem(
   if (item.status === "STALE") return { kind: "refusal", refusal: "item-closed" };
   if (item.lane === "NEEDS_HUMAN") return { kind: "refusal", refusal: "human-hold" };
   if (item.status === "IGNORED") return { kind: "refusal", refusal: "superseded" };
+  // A `FIXED` item already resolved: the work moved on without this key, so
+  // the retry is moot. Refusing keeps a landed fix from being reverted to
+  // `QUEUED` by a fenced retry of a stale attempt — only the evidence-driven
+  // reopen paths (#940 new-evidence) or the operator reset may revive it.
+  if (item.status === "FIXED") return { kind: "refusal", refusal: "superseded" };
   if (item.generation !== input.generation) {
     // Generation moved. Was the fenced generation requeued under a
     // DIFFERENT key? Then the work moved on WITHOUT THIS KEY — moot for
@@ -438,15 +446,24 @@ export async function attemptRequeuePrFixItem(
     return { ok: true, replayed: true, itemId: item.id, generation: replay.generation };
   }
 
-  // Fence: issuance proof, with the live receipts as the FIRST authority.
-  // A live receipt at the fenced generation that is NOT the presented token
-  // means the named issuance was RELEASED AND RE-ISSUED (capacity-exhausted
-  // settlement and unacknowledged reclaim both keep the generation and
-  // rotate the token — the item stays QUEUED at the same generation). A
-  // stale token then authorizes NOTHING: bumping the generation would stop
-  // the CURRENT live hand-out, violating the pinned "the current owner is
-  // NEVER touched" rule. Only when the generation owns nobody does the
-  // durable issuance history authorize the retry.
+  // Fence: the issuance Dispatch RECORDED for this (item, agent, generation).
+  //
+  // #1491 pins the authority: the fence is validated against the RECORDED
+  // issuance, never against live state alone. A live hand-out receipt proves
+  // the presented token is still HELD, not that it was ever ISSUED for this
+  // attempt — and the retry arrives AFTER the terminal report released the
+  // receipt, so only the durable `AttemptIssuance` ledger (written at
+  // hand-out mint) can answer "was this token issued for exactly this
+  // attempt?". A live receipt therefore never authorizes the retry by
+  // itself: an unprovable fence is refused (`stale-generation`).
+  //
+  // The live receipts stay a GUARD, never an authorization: a live owner at
+  // the fenced generation that is NOT the presented token means the named
+  // issuance was RELEASED AND RE-ISSUED (capacity-exhausted settlement and
+  // unacknowledged reclaim both keep the generation and rotate the token —
+  // the item stays QUEUED at the same generation). A stale token then
+  // authorizes NOTHING: bumping the generation would stop the CURRENT live
+  // hand-out, violating the pinned "the current owner is NEVER touched" rule.
   const receipts: string[] = Array.isArray(item.handoutReceipts) ? item.handoutReceipts : [];
   const liveIssued =
     findHandoutReceipt(receipts, {
@@ -454,28 +471,35 @@ export async function attemptRequeuePrFixItem(
       generation: input.generation,
       token: input.fenceToken,
     }) !== null;
-  if (!liveIssued) {
-    const ownsGeneration = receipts.some((entry) => {
-      const parsed = parseHandoutReceipt(entry);
-      return parsed !== null && parsed.generation === input.generation;
-    });
-    if (ownsGeneration) return { ok: false, refusal: "stale-generation" };
-    let issued: boolean;
-    try {
-      issued = await proveAttemptIssuance(client, {
-        surface: "pr-fix",
-        attemptId: item.id,
-        agentName: input.agentName,
-        token: input.fenceToken,
-        generation: input.generation,
-      });
-    } catch {
-      // A failed ledger read establishes nothing: refuse retryably, mutate
-      // nothing, never accept unfenced.
-      return { ok: false, unavailable: true };
-    }
-    if (!issued) return { ok: false, refusal: "stale-generation" };
+  const ownsGeneration = receipts.some((entry) => {
+    const parsed = parseHandoutReceipt(entry);
+    return parsed !== null && parsed.generation === input.generation;
+  });
+  if (ownsGeneration && !liveIssued) {
+    // The fenced generation is owned by a DIFFERENT live hand-out: the named
+    // issuance was released and re-issued. The current owner is NEVER
+    // touched. The ledger cannot change this verdict (it proves the
+    // PRESENTED token — exactly the stale one), so it is not read.
+    return { ok: false, refusal: "stale-generation" };
   }
+  // Durable issuance proof — MANDATORY on every path, live receipt
+  // included: the retry is authorized by the RECORDED issuance, and the
+  // server never accepts an unfenced requeue. A failed ledger read
+  // establishes nothing: refuse retryably (503), mutate nothing — never
+  // treated as proof, never treated as absence.
+  let issued: boolean;
+  try {
+    issued = await proveAttemptIssuance(client, {
+      surface: "pr-fix",
+      attemptId: item.id,
+      agentName: input.agentName,
+      token: input.fenceToken,
+      generation: input.generation,
+    });
+  } catch {
+    return { ok: false, unavailable: true };
+  }
+  if (!issued) return { ok: false, refusal: "stale-generation" };
 
   const classified = await classifyAttemptRequeueItem(client, item, input);
   if (classified.kind === "refusal") return { ok: false, refusal: classified.refusal };
@@ -526,7 +550,7 @@ export async function attemptRequeuePrFixItem(
         where: {
           id: fresh.id,
           generation: input.generation,
-          status: { notIn: ["STALE", "IGNORED"] },
+          status: { notIn: ["STALE", "IGNORED", "FIXED"] },
           lane: { not: "NEEDS_HUMAN" },
         },
         data: {
@@ -596,10 +620,11 @@ export async function attemptRequeuePrFixItem(
 // no repair opportunity) and without resolving it. The fence is the claim
 // receipt the run was ISSUED; because the terminal report already released
 // the live claim (`Lease` row deleted), the durable `AttemptIssuance` row
-// written at claim-token mint is the primary proof, with an exact-token
-// `Lease` row (live, tombstoned, or disposed) accepted as issuance evidence
-// too. An unverifiable fence is refused `stale-generation` and the current
-// owner is NEVER touched.
+// written at claim-token mint is the ONLY proof that authorizes the retry —
+// the `Lease` row is the guard against touching a newer claim incarnation
+// (its token differs), never a substitute for the recorded issuance. An
+// unverifiable fence is refused `stale-generation` and the current owner is
+// NEVER touched.
 //
 // State → refusal mapping (same pinned vocabulary; never a 404):
 //   issue state closed        → `item-closed`   (closed upstream)
@@ -738,7 +763,7 @@ export async function requeueIssueAttempt(input: IssueRequeueInput): Promise<Iss
         return { complete: true, value: { ok: false, refusal: "superseded" } };
       }
 
-      // ── Fence: lease (live or retired) exact token, else issuance ledger ──
+      // ── Fence: the recorded issuance, with the lease as the owner guard ──
       let lease: any = null;
       try {
         lease = await client.lease.findUnique({ where: { agentName_issueId: { agentName, issueId } } });
@@ -749,24 +774,27 @@ export async function requeueIssueAttempt(input: IssueRequeueInput): Promise<Iss
         // A NEWER claim incarnation owns this work. Its row is never touched.
         return { complete: true, value: { ok: false, refusal: "stale-generation" } };
       }
-      if (!lease || !lease.claimToken) {
-        // Claim already released (terminal report) or pre-token legacy row:
-        // the durable issuance history is the only proof. Absence is a
-        // closed refusal; a failed ledger read is a retryable 503 — never
-        // treated as absent, never treated as issuance.
-        let issued: boolean;
-        try {
-          issued = await proveAttemptIssuance(client, {
-            surface: "issue",
-            attemptId: issueId,
-            agentName,
-            token: claimToken,
-          });
-        } catch {
-          return { complete: true, value: { ok: false, unavailable: true } };
-        }
-        if (!issued) return { complete: true, value: { ok: false, refusal: "stale-generation" } };
+      // Durable issuance proof — MANDATORY (#1491 pins the authority: the
+      // fence is validated against the issuance Dispatch RECORDED for this
+      // claim, never against live state alone). The lease row names the
+      // CURRENT claim incarnation — it is the guard against touching another
+      // owner, not proof that the PRESENTED token was ever issued: a terminal
+      // report already released the live claim, and the durable ledger is
+      // what survives that release. Absence is a closed refusal; a failed
+      // ledger read is a retryable 503 — never treated as absent, never
+      // treated as issuance.
+      let issued: boolean;
+      try {
+        issued = await proveAttemptIssuance(client, {
+          surface: "issue",
+          attemptId: issueId,
+          agentName,
+          token: claimToken,
+        });
+      } catch {
+        return { complete: true, value: { ok: false, unavailable: true } };
       }
+      if (!issued) return { complete: true, value: { ok: false, refusal: "stale-generation" } };
 
       // §8.7 exemption (mirrors unclaim): an explicit fenced release supersedes
       // a pending reconciler release intent (audited) instead of racing it.
