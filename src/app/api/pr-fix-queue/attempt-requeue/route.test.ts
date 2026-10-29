@@ -622,6 +622,23 @@ describe("success (fresh requeue)", () => {
     );
     expect(holder.current.prFixQueueItem.updateMany).toHaveBeenCalledTimes(1);
   });
+
+  it("accepts the presented attempt when its live receipt coexists with the matching agentHandouts entry", async () => {
+    // The real live row carries BOTH surfaces: the presented receipt plus the
+    // same-agent `agentHandouts` entry it was minted with. The owner fence
+    // must treat that entry as the presented attempt itself — not as another
+    // owner — so the retry proceeds and clears the hand-out state.
+    seedAttempt({
+      item: {
+        handoutReceipts: ["hnd_deadbeefdeadbeef@worker@3"],
+        agentHandouts: ["worker@3"],
+      },
+    });
+    const res = await post(BASE);
+    expect(res.status).toBe(200);
+    expect((await json(res)).replayed).toBe(false);
+    expect(holder.current.prFixQueueItem.updateMany).toHaveBeenCalledTimes(1);
+  });
 });
 
 // ===========================================================================
