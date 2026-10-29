@@ -428,7 +428,12 @@ async function classifyAttemptRequeueItem(
  * owner): the transition clears the whole hand-out state, so it would erase
  * that owner. The `agentHandouts` entries are consulted as well: a hand-out
  * recorded without a receipt (legacy rows) is still a current owner, and the
- * transition would clear it too.
+ * transition would clear it too. The SAME-agent entry at the fenced generation
+ * is the one exception — it may be the presented attempt itself — and it only
+ * passes when the presented attempt's own live receipt ties it to the exact
+ * (agent, generation, token) triple; without that receipt the entry is
+ * indistinguishable from a newer same-agent live hand-out (release/reclaim
+ * keep the generation and rotate the token), so it is refused.
  */
 function fencedGenerationHasOtherOwner(
   item: { handoutReceipts?: unknown; agentHandouts?: unknown } | null | undefined,
@@ -436,6 +441,7 @@ function fencedGenerationHasOtherOwner(
 ): boolean {
   if (!item) return false;
   const receipts: unknown[] = Array.isArray(item.handoutReceipts) ? item.handoutReceipts : [];
+  let presentedReceiptLive = false;
   const otherReceipt = receipts.some((entry) => {
     const parsed = parseHandoutReceipt(entry);
     if (parsed === null) return false;
@@ -444,7 +450,11 @@ function fencedGenerationHasOtherOwner(
     // a receipt that carries the presented TOKEN under a DIFFERENT agent is
     // another owner's receipt (one entry per live hand-out), so the
     // transition — which clears the whole hand-out state — would erase it.
-    return parsed.agentName !== input.agentName || parsed.token !== input.fenceToken;
+    if (parsed.agentName === input.agentName && parsed.token === input.fenceToken) {
+      presentedReceiptLive = true;
+      return false;
+    }
+    return true;
   });
   if (otherReceipt) return true;
   const handouts: unknown[] = Array.isArray(item.agentHandouts) ? item.agentHandouts : [];
@@ -452,7 +462,14 @@ function fencedGenerationHasOtherOwner(
     const parsed = parseAgentHandoutToken(entry);
     if (parsed === null) return false;
     if (parsed.generation !== input.generation) return false;
-    return parsed.agentName !== input.agentName;
+    if (parsed.agentName !== input.agentName) return true;
+    // A SAME-agent entry at the fenced generation passes only when the
+    // presented attempt's own live receipt proves the hand-out is the
+    // presented (agent, generation, token) attempt. Release/reclaim keep the
+    // generation and rotate the token, and legacy rows predate receipts, so
+    // without that receipt there is no proof this entry is the presented
+    // attempt rather than a newer same-agent live hand-out — fail closed.
+    return !presentedReceiptLive;
   });
 }
 
