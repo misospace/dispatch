@@ -310,6 +310,21 @@ function resolveDelivery(
   return { issue, timeline, prs, deliveredAtMs: null, unknown };
 }
 
+/**
+ * Whether a child issue is expected to deliver code: the groomer release
+ * signal kinds it `feature`/`fix`/`architecture` (implementation intent), or
+ * — legacy issues without a signal — its type labels do (`type/feature`,
+ * `type/bug`, `type/security`). Contradictory data fails closed: a signal
+ * alone is never enough to downgrade implementation labels. Everything else
+ * (design/docs/chore/research/unlabeled) may complete by durable closure
+ * alone.
+ */
+function expectsCodeDelivery(issue: ReleasePulseIssueInput): boolean {
+  const signal = normalizeStoredReleaseSignal(issue.releaseSignal);
+  if (signal && signal.kind !== "internal") return true;
+  return legacyKindFromLabels(issue.labels) !== null;
+}
+
 /** No reopen observable after the close time; an incomparable pair fails closed. */
 function reopenedAfterClose(timeline: IssueLifecycleTimeline, closeMs: number | null): boolean {
   const reopenMs = toMillis(timeline.lastReopenAt.at);
@@ -464,8 +479,11 @@ export function buildReleasePulse(
     if (reopenedAfterClose(timeline, parentCloseMs)) continue;
 
     // A child is durably complete when it is closed, stays closed (no reopen
-    // after its close), and closed no later than the parent. Design/docs
-    // children need no merge — closure suffices.
+    // after its close), and closed no later than the parent. Per #1482 only
+    // design/docs children may complete WITHOUT a code merge — a closed
+    // implementation child (`feature`/`fix`/`architecture` signal, or legacy
+    // `type/feature`/`type/bug`/`type/security` labels) that never merged
+    // does not certify the umbrella.
     const childEntries: { number: number; url: string; closedAt: string | null }[] = [];
     let allComplete = true;
     for (const child of children) {
@@ -474,7 +492,9 @@ export function buildReleasePulse(
         allComplete = false;
         break;
       }
-      if (childTimeline.delivery !== "merged" && childTimeline.delivery !== "closed-unmerged") {
+      const closureAloneSuffices =
+        childTimeline.delivery === "closed-unmerged" && !expectsCodeDelivery(child.issue);
+      if (childTimeline.delivery !== "merged" && !closureAloneSuffices) {
         allComplete = false;
         break;
       }

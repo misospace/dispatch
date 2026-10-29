@@ -227,6 +227,38 @@ describe("buildReleasePulse", () => {
       expect(snapshot.highlights[0].headline).toBe("Auth redesigned");
     });
 
+    it("does not certify a closed implementation child that never merged (legacy type label)", () => {
+      const { issues, events } = umbrellaFixtures();
+      issues[1].labels = ["type/feature"];
+      const snapshot = buildReleasePulse(repoInput(), issues, events);
+      expect(snapshot.completedUmbrellaCount).toBe(0);
+      expect(snapshot.highlights).toEqual([]);
+    });
+
+    it("does not certify a closed implementation child that never merged (groomer signal)", () => {
+      const { issues, events } = umbrellaFixtures();
+      issues[1].labels = ["type/feature"];
+      issues[1].releaseSignal = signal("fix", "Shipped auth fix");
+      const snapshot = buildReleasePulse(repoInput(), issues, events);
+      expect(snapshot.completedUmbrellaCount).toBe(0);
+      expect(snapshot.highlights).toEqual([]);
+    });
+
+    it("certifies a design/docs child closing without a merge", () => {
+      const { issues, events } = umbrellaFixtures();
+      issues[1].labels = ["type/chore"];
+      const snapshot = buildReleasePulse(repoInput(), issues, events);
+      expect(snapshot.completedUmbrellaCount).toBe(1);
+    });
+
+    it("certifies an implementation child with merged delivery from an earlier interval", () => {
+      const { issues, events } = umbrellaFixtures();
+      issues[1].labels = ["type/feature"];
+      events.push(mergeEvent(2, 8, "2026-09-01T00:00:00.000Z"));
+      const snapshot = buildReleasePulse(repoInput(), issues, events);
+      expect(snapshot.completedUmbrellaCount).toBe(1);
+    });
+
     it("is prevented by a reopened parent", () => {
       const { issues, events } = umbrellaFixtures();
       events.push({
