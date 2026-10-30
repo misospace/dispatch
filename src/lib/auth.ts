@@ -226,6 +226,12 @@ export const WORKER_ALLOWLIST: ReadonlyArray<{ method: string | "*"; pattern: Re
   // token holder cannot spoof an ack for another agent. The reclaimer sweep
   // stays maintainer-only.
   { method: "POST", pattern: /^\/api\/pr-fix-queue\/ack$/ },
+  // Source-neutral execution observation (#1495). The route is identity-
+  // scoped in-route (`enforceWorkerAgentScope`): a bound worker may only
+  // report for its own agent; the unbound legacy token is refused there.
+  // GET stays maintainer-tier (worker tokens refused at the tier gate): the
+  // consumer is the operator Agents page, not the worker loop.
+  { method: "POST", pattern: /^\/api\/agent-executions$/ },
 ];
 
 /**

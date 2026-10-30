@@ -33,6 +33,28 @@ interface AgentWorkResponse {
   staleLeases: AgentWorkItem[];
 }
 
+interface ExecutionRow {
+  id: string;
+  agentName: string;
+  source: string;
+  executionId: string;
+  workType: string;
+  workRefUrl: string | null;
+  issueId: string | null;
+  executionState: string;
+  startedAt: string | null;
+  lastObservedAt: string;
+  endedAt: string | null;
+  summary: string | null;
+  revision: number;
+  staleness: "live" | "stale";
+}
+
+interface AgentExecutionsResponse {
+  capability: { name: string; protocolVersion: number };
+  executions: ExecutionRow[];
+}
+
 const STATE_BADGE: Record<string, { label: string; variant: "default" | "secondary" | "destructive" | "outline" }> = {
   CLAIMED: { label: "Claimed", variant: "secondary" },
   IN_PROGRESS: { label: "In Progress", variant: "default" },
@@ -40,6 +62,18 @@ const STATE_BADGE: Record<string, { label: string; variant: "default" | "seconda
   STALE: { label: "Stale", variant: "outline" },
   DONE: { label: "Done", variant: "secondary" },
   RELEASED: { label: "Released", variant: "secondary" },
+};
+
+const EXECUTION_STATE_BADGE: Record<string, { label: string; variant: "default" | "secondary" | "destructive" | "outline" }> = {
+  RUNNING: { label: "Running", variant: "default" },
+  SUCCEEDED: { label: "Succeeded", variant: "secondary" },
+  FAILED: { label: "Failed", variant: "destructive" },
+  CANCELLED: { label: "Cancelled", variant: "outline" },
+};
+
+const WORK_TYPE_BADGE: Record<string, { label: string; variant: "default" | "secondary" | "destructive" | "outline" }> = {
+  implement: { label: "Implement", variant: "secondary" },
+  pr_fix: { label: "PR Fix", variant: "outline" },
 };
 
 function formatRelative(date: Date | string): string {
@@ -67,8 +101,36 @@ function formatRepoUrl(item: AgentWorkItem): string | null {
   return null;
 }
 
+function workRefLabel(workRefUrl: string | null): string {
+  if (!workRefUrl) return "—";
+  const segments = workRefUrl.split("/").filter(Boolean);
+  return segments.length > 0 ? segments[segments.length - 1] : workRefUrl;
+}
+
+function findLinkedLegacyWork(
+  execution: ExecutionRow,
+  activeWork: AgentWorkItem[],
+): AgentWorkItem | null {
+  if (!execution.workRefUrl) return null;
+  return (
+    activeWork.find((w) => {
+      if (w.agentName.toLowerCase() !== execution.agentName.toLowerCase()) return false;
+      if (w.prUrl && w.prUrl === execution.workRefUrl) return true;
+      if (w.issueNumber && w.repoFullName) {
+        return (
+          execution.workRefUrl ===
+          `https://github.com/${w.repoFullName}/issues/${w.issueNumber}`
+        );
+      }
+      return false;
+    }) ?? null
+  );
+}
+
 export default function AgentWorkPanel() {
   const [data, setData] = useState<AgentWorkResponse | null>(null);
+  const [executions, setExecutions] = useState<ExecutionRow[] | null>(null);
+  const [executionsError, setExecutionsError] = useState(false);
   const [loading, setLoading] = useState(true);
   const [reassigning, setReassigning] = useState<string | null>(null);
   const [reassignAgent, setReassignAgent] = useState<Record<string, string>>({});
@@ -88,10 +150,29 @@ export default function AgentWorkPanel() {
     }
   }, []);
 
+  const fetchExecutions = useCallback(async () => {
+    try {
+      const res = await authedFetch("/api/agent-executions");
+      if (res.ok) {
+        const json: AgentExecutionsResponse = await res.json();
+        setExecutions(json.executions ?? []);
+        setExecutionsError(false);
+      } else {
+        setExecutions(null);
+        setExecutionsError(true);
+      }
+    } catch (e) {
+      console.error("Failed to fetch agent executions:", e);
+      setExecutions(null);
+      setExecutionsError(true);
+    }
+  }, []);
+
   useEffect(() => {
     setLoading(true);
     fetchData();
-  }, [fetchData, refreshKey]);
+    fetchExecutions();
+  }, [fetchData, fetchExecutions, refreshKey]);
 
   const handleRelease = async (workId: string | null, leaseId?: string) => {
     try {
@@ -209,6 +290,88 @@ export default function AgentWorkPanel() {
                             </div>
                           )}
                         </div>
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Source-Reported Executions</CardTitle>
+        </CardHeader>
+        <CardContent>
+          {executionsError ? (
+            <p className="text-sm text-destructive">Failed to load source-reported executions</p>
+          ) : executions === null ? (
+            <p className="text-sm text-muted-foreground">Loading source-reported executions...</p>
+          ) : executions.length === 0 ? (
+            <p className="text-sm text-muted-foreground">No source-reported executions</p>
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Agent</TableHead>
+                  <TableHead>Work</TableHead>
+                  <TableHead>State</TableHead>
+                  <TableHead>Source</TableHead>
+                  <TableHead>Last Observation</TableHead>
+                  <TableHead>Legacy session</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {executions.map((execution) => {
+                  const badge =
+                    EXECUTION_STATE_BADGE[execution.executionState] ?? {
+                      label: execution.executionState,
+                      variant: "secondary" as const,
+                    };
+                  const typeBadge = WORK_TYPE_BADGE[execution.workType] ?? {
+                    label: execution.workType,
+                    variant: "outline" as const,
+                  };
+                  const linked = findLinkedLegacyWork(execution, activeWork);
+                  return (
+                    <TableRow key={execution.id}>
+                      <TableCell className="font-medium capitalize">{execution.agentName}</TableCell>
+                      <TableCell>
+                        <div className="flex items-center gap-1">
+                          <Badge variant={typeBadge.variant}>{typeBadge.label}</Badge>
+                          {execution.workRefUrl ? (
+                            <a
+                              href={execution.workRefUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-blue-500 hover:underline"
+                            >
+                              {workRefLabel(execution.workRefUrl)}
+                            </a>
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </div>
+                      </TableCell>
+                      <TableCell><Badge variant={badge.variant}>{badge.label}</Badge></TableCell>
+                      <TableCell className="text-sm text-muted-foreground">{execution.source}</TableCell>
+                      <TableCell className="text-sm text-muted-foreground">
+                        {formatRelative(execution.lastObservedAt)}
+                        {execution.staleness === "stale" && (
+                          <Badge variant="outline" className="ml-1">Stale</Badge>
+                        )}
+                      </TableCell>
+                      <TableCell className="text-sm text-muted-foreground">
+                        {linked ? (
+                          <span>
+                            Linked
+                            {linked.state && ` (${STATE_BADGE[linked.state]?.label ?? linked.state})`}
+                          </span>
+                        ) : (
+                          "—"
+                        )}
                       </TableCell>
                     </TableRow>
                   );

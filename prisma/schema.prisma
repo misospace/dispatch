@@ -36,6 +36,7 @@ model Issue {
   lastSyncedAt          DateTime              @default(now())
   currentLane           String?
   agentRuns             AgentRun[]
+  agentExecutions       AgentExecution[]
   auditLogs             AuditLog[]
   laneHistory           IssueLane[]
   agentWork             AgentWork[]
@@ -1305,4 +1306,35 @@ model OwnershipReconcileCandidate {
   lastReasons    String?   @db.Text
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
+}
+
+// (#1495) Source-neutral "agent execution observation" surface: external
+// sources (e.g. Courier harnesses) report active executions — issue work and
+// PR-fix work — that the Agents page displays alongside legacy AgentWork
+// sessions. Observation only: never synthesizes AgentWork rows, leases, or
+// ownership state. Keyed by (agentName, executionId); `executionId` is a
+// stable attempt/run identity supplied by the source (opaque, <=200 chars).
+// `revision` is the source-supplied monotonic fencing counter — the ordering
+// authority for reports, so `lastObservedAt` is display data, never ordering.
+model AgentExecution {
+  id             String    @id @default(cuid())
+  agentName      String
+  source         String
+  executionId    String
+  workType       String    // "implement" | "pr_fix"
+  workRefUrl     String?   // issue or PR URL (http(s))
+  issueId        String?
+  issue          Issue?    @relation(fields: [issueId], references: [id])
+  executionState String    // RUNNING | SUCCEEDED | FAILED | CANCELLED
+  startedAt      DateTime?
+  lastObservedAt DateTime
+  endedAt        DateTime?
+  summary        String?
+  revision       Int       // source-supplied monotonic fencing counter
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@unique([agentName, executionId])
+  @@index([executionState, lastObservedAt])
+  @@index([agentName, lastObservedAt])
 }
