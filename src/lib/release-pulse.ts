@@ -118,6 +118,15 @@ export interface ReleasePulseSnapshot {
   deliveredIssueCount: number;
   highlights: ReleasePulseHighlight[];
   highlightsTruncated: boolean;
+  /**
+   * Semantic "feature shipped" count over the FULL highlight set, computed
+   * BEFORE the `RELEASE_PULSE_MAX_HIGHLIGHTS` cap slices the exposed list:
+   * feature/architecture highlights with notable/major significance.
+   * Consumers deciding anything from highlights must gate on this count —
+   * the cap is a presentation bound, never an evidence bound, so filtering
+   * the exposed array alone could hide a trigger past the cap.
+   */
+  notableDeliveryCount: number;
   completedUmbrellaCount: number;
   /** Issues with merge evidence but unusable/unknown merge times, or otherwise unresolvable delivery. */
   unknownDeliveryCount: number;
@@ -338,6 +347,18 @@ function reopenedAfterClose(timeline: IssueLifecycleTimeline, closeMs: number | 
   return closeMs === null || reopenMs > closeMs;
 }
 
+/**
+ * Semantic "feature shipped" delivery: a feature/architecture highlight with
+ * notable/major significance. Umbrella milestones and routine/significance-
+ * less legacy deliveries are volume evidence, never this.
+ */
+export function isNotableDelivery(highlight: ReleasePulseHighlight): boolean {
+  return (
+    (highlight.kind === "feature" || highlight.kind === "architecture") &&
+    (highlight.significance === "notable" || highlight.significance === "major")
+  );
+}
+
 export function buildReleasePulse(
   repo: ReleasePulseRepoInput,
   issues: ReleasePulseIssueInput[],
@@ -355,6 +376,7 @@ export function buildReleasePulse(
       deliveredIssueCount: 0,
       highlights: [],
       highlightsTruncated: false,
+      notableDeliveryCount: 0,
       completedUmbrellaCount: 0,
       unknownDeliveryCount: 0,
     };
@@ -541,6 +563,11 @@ export function buildReleasePulse(
     return bMs - aMs || a.issueNumber - b.issueNumber;
   });
   const highlightsTruncated = highlights.length > RELEASE_PULSE_MAX_HIGHLIGHTS;
+  // Semantic evidence is counted over the FULL set, before the cap slices
+  // the exposed list: one PR can deliver several issues, so >cap highlights
+  // does NOT imply >=volume commits — the count, not the array, is the
+  // decision evidence consumers must read.
+  const notableDeliveryCount = highlights.filter(isNotableDelivery).length;
 
   return {
     schema: "dispatch.release-pulse/v1",
@@ -559,6 +586,7 @@ export function buildReleasePulse(
     deliveredIssueCount,
     highlights: highlightsTruncated ? highlights.slice(0, RELEASE_PULSE_MAX_HIGHLIGHTS) : highlights,
     highlightsTruncated,
+    notableDeliveryCount,
     completedUmbrellaCount,
     unknownDeliveryCount,
   };

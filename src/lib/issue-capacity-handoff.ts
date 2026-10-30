@@ -20,6 +20,8 @@ import { recordCapacityHandoff, capacityCooldownMs, type CapacityHandoffClient }
 import {
   lookupIssueHandoffSettlement,
   recordIssueHandoffSettlement,
+  settlementRowMatchesFamily,
+  CAPACITY_HANDOFF_SETTLEMENT_OPERATION,
   ISSUE_HANDOFF_SETTLEMENT_RETENTION_MS,
 } from "./issue-handoff-settlement";
 import {
@@ -167,6 +169,16 @@ export async function recoverIssueCapacityHandoff(
     // genuinely in flight the lease is still present and this returns null.
     const outcome = await replayIssueHandoffSettlement(input.client, input, undefined, input.now);
     if (outcome?.kind === "replayed") return outcome.result;
+    if (outcome?.kind === "family-conflict") {
+      // The key belongs to another settlement family: permanent, not a race.
+      return {
+        ok: false,
+        httpStatus: 409,
+        code: "settlement_key_conflict",
+        message:
+          "settlementKey is already committed by another settlement family (fenced attempt-requeue); retry with a fresh settlement key",
+      };
+    }
     return {
       ok: false, httpStatus: 409, code: "handoff_race_lost",
       message: "Issue mutation is in progress; retry after recovery completes",
@@ -178,6 +190,11 @@ export async function recoverIssueCapacityHandoff(
 type ReplayOutcome =
   | { kind: "replayed"; result: IssueCapacityHandoffResult }
   | { kind: "foreign" }
+  /** (#1491) The key was committed by ANOTHER settlement family (the fenced
+   *  attempt-requeue ledger): a foreign payload for this key, never a
+   *  capacity-handoff replay — replaying it would echo a result that carries
+   *  no capacity cooldown. */
+  | { kind: "family-conflict" }
   | { kind: "expired" }
   | null;
 
@@ -239,6 +256,13 @@ async function replayIssueHandoffSettlement(
   // cleanup must not un-prove it for the retrying worker.
   if (leaseRow && leaseRow.disposition !== "expired") return null;
   if (lookup.state !== "found") return null;
+  // (#1491) Family separation: a key committed by the fenced attempt-requeue
+  // ledger is a FOREIGN payload for a capacity handoff. It never replays as
+  // one — the recorded row carries no capacity cooldown, so replaying it
+  // would answer a capacity handoff with a proof that skips its cooldown.
+  if (!settlementRowMatchesFamily(lookup.record, CAPACITY_HANDOFF_SETTLEMENT_OPERATION)) {
+    return { kind: "family-conflict" };
+  }
   if (lookup.record.claimToken !== claimToken) return { kind: "foreign" };
   try {
     await client.auditLog.create({
@@ -319,6 +343,19 @@ async function recoverIssueCapacityHandoffUnlocked(
   if (input.settlementKey) {
     const outcome = await replayIssueHandoffSettlement(client, input, lease, now);
     if (outcome?.kind === "replayed") return outcome.result;
+    if (outcome?.kind === "family-conflict") {
+      // (#1491) The key belongs to another settlement family: a foreign
+      // payload for this key. It never replays as a capacity handoff (the
+      // recorded row carries no capacity cooldown) and it is never released
+      // under: a fresh key is the caller's recovery.
+      return {
+        ok: false,
+        httpStatus: 409,
+        code: "settlement_key_conflict",
+        message:
+          "settlementKey is already committed by another settlement family (fenced attempt-requeue); retry with a fresh settlement key",
+      };
+    }
     if (outcome?.kind === "foreign" && !lease) {
       // The key is settled under a different claim incarnation: presenting a
       // foreign token to a settled key proves nothing and must never replay.
@@ -415,6 +452,20 @@ async function recoverIssueCapacityHandoffUnlocked(
         code: "settlement_key_conflict",
         message:
           "settlementKey is already bound to a different claim token; retry with a fresh settlement key (keys are never reused across claim incarnations)",
+      };
+    }
+    // (#1491) Family separation: a key committed by the fenced
+    // attempt-requeue ledger is a foreign payload for a capacity handoff.
+    // Refuse BEFORE any remote work (zero mutation) — the first-write-wins
+    // upsert can never rewrite that row, so a release continued here would
+    // consume the lease on a proof it does not own.
+    if (existing && !settlementRowMatchesFamily(existing, CAPACITY_HANDOFF_SETTLEMENT_OPERATION)) {
+      return {
+        ok: false,
+        httpStatus: 409,
+        code: "settlement_key_conflict",
+        message:
+          "settlementKey is already committed by another settlement family (fenced attempt-requeue); retry with a fresh settlement key",
       };
     }
   }
@@ -594,6 +645,10 @@ async function recoverIssueCapacityHandoffUnlocked(
         statusNote,
         cooldownUntil,
         settledAt: now,
+        // (#1491) Family tag: the shared ledger also carries the fenced
+        // attempt-requeue family, and a key committed by one family is a
+        // foreign payload for the other.
+        operation: CAPACITY_HANDOFF_SETTLEMENT_OPERATION,
       });
       // First-write-wins means a lost race against a concurrent foreign-token
       // record returns that foreign row instead of ours (a null result would
@@ -601,19 +656,23 @@ async function recoverIssueCapacityHandoffUnlocked(
       // do not own: refuse before consuming the lease so the key fence can
       // never silently pass (stale-recovery owns reconciling the retained
       // lease from here).
-      if (!recorded || recorded.claimToken !== claimToken) {
+      if (
+        !recorded ||
+        recorded.claimToken !== claimToken ||
+        !settlementRowMatchesFamily(recorded, CAPACITY_HANDOFF_SETTLEMENT_OPERATION)
+      ) {
         await writeFailureAudit(
           client,
           input,
           liveLabels,
-          "Settlement key was concurrently recorded under a different claim token; lease retained, no replay proof for this release",
+          "Settlement key was concurrently recorded under a different claim token or by another settlement family; lease retained, no replay proof for this release",
         );
         return {
           ok: false,
           httpStatus: 409,
           code: "settlement_key_conflict",
           message:
-            "settlementKey was concurrently recorded under a different claim token before the lease was consumed; no replay proof exists for this release and the lease is retained (stale-claim recovery owns reconciling it; do not reuse this settlement key)",
+            "settlementKey was concurrently recorded under a different claim token (or by another settlement family) before the lease was consumed; no replay proof exists for this release and the lease is retained (stale-claim recovery owns reconciling it; do not reuse this settlement key)",
         };
       }
     } catch (error) {

@@ -8,6 +8,7 @@ import { auditTrackedRepoCreateFailure, createTrackedRepo } from "@/lib/tracked-
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { collectReleasePulse, asReleaseDeltaState } from "@/lib/release-pulse-read";
+import { deriveReleaseReadiness, releaseCiStatus } from "@/lib/release-readiness";
 
 // 10 requests / 60s — tracked-repo creation is a DB-only write, so this
 // ceiling is generous but still caps runaway callers. The deprecated
@@ -39,12 +40,17 @@ export async function GET(request: Request) {
 
     const reposWithCounts = await Promise.all(
       repos.map(async (repo) => {
-        const [failingRuns, runningRuns, pulse] = await Promise.all([
+        const [failingRuns, runningRuns, succeededRuns, pulse] = await Promise.all([
           prisma.githubWorkflowRun.count({
             where: { workflow: { repoId: repo.id }, conclusion: "failure" },
           }),
           prisma.githubWorkflowRun.count({
             where: { workflow: { repoId: repo.id }, status: "in_progress" },
+          }),
+          // Positive success evidence separates "CI green" from "no usable
+          // run evidence" for the advisory readiness context (#1483).
+          prisma.githubWorkflowRun.count({
+            where: { workflow: { repoId: repo.id }, conclusion: "success" },
           }),
           collectReleasePulse({
             fullName: repo.fullName,
@@ -60,6 +66,15 @@ export async function GET(request: Request) {
         const lastSyncRun = await prisma.automationSyncRun.findFirst({
           where: { repoId: repo.id },
           orderBy: { startedAt: "desc" },
+        });
+
+        // Advisory release-readiness badge (#1483): pure derivation from the
+        // pulse snapshot plus the coarse CI context. No forge call, no model
+        // call, no release mutation, and no effect on queue/admission.
+        const readiness = deriveReleaseReadiness({
+          pulse,
+          now: new Date(),
+          ci: releaseCiStatus({ failingRuns, runningRuns, succeededRuns }),
         });
 
         return {
@@ -78,6 +93,7 @@ export async function GET(request: Request) {
           releaseError: repo.releaseError,
           releaseDeltaSyncedAt: repo.releaseDeltaSyncedAt,
           pulse,
+          readiness,
           openPRCount: repo.openPRCount,
           lastSyncedAt: repo.lastSyncedAt,
           syncError: repo.syncError,

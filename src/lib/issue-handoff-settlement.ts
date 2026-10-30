@@ -19,6 +19,28 @@
 /** Bounded retention for settlement proofs; expired proofs are refused. */
 export const ISSUE_HANDOFF_SETTLEMENT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
+/**
+ * (#1491) The settlement families that share this ledger. A key committed by
+ * one family is a FOREIGN payload for the other: the tag makes that
+ * determination exact instead of inferred, so an attempt-requeue settlement is
+ * never replayed as a capacity handoff (which would skip its cooldown) and a
+ * capacity handoff is never replayed as a requeue.
+ */
+export const CAPACITY_HANDOFF_SETTLEMENT_OPERATION = "capacity-handoff";
+export const ATTEMPT_REQUEUE_SETTLEMENT_OPERATION = "attempt-requeue";
+
+/**
+ * Whether a recorded settlement row belongs to the named family. A row with
+ * NO tag predates #1491 and can only be a capacity-handoff row (the
+ * attempt-requeue family always tagged its rows), so an untagged row counts
+ * as the capacity-handoff family.
+ */
+export function settlementRowMatchesFamily(row: any, operation: string): boolean {
+  const tagged = row?.operation ?? null;
+  if (tagged === null) return operation === CAPACITY_HANDOFF_SETTLEMENT_OPERATION;
+  return tagged === operation;
+}
+
 /** Maximum accepted length for a caller settlement key. */
 export const MAX_SETTLEMENT_KEY_LENGTH = 200;
 
@@ -95,12 +117,28 @@ export interface IssueHandoffSettlementRecord {
   /** The exact claim incarnation settled. */
   claimToken: string;
   settlementKey: string;
-  capacity: string;
+  capacity: string | null;
   labels: string[];
   status: string | null;
   statusNote: string | null;
   cooldownUntil: Date | null;
   settledAt: Date;
+  /**
+   * (#1491) Which settlement family wrote the row — "capacity-handoff" or
+   * "attempt-requeue". A key first committed by one family is a payload
+   * conflict for the other; the tag makes that determination exact instead
+   * of inferred.
+   */
+  operation?: string | null;
+  /**
+   * (#1491) Fingerprint of the exact committed payload. Replay requires
+   * equality (the `AgentReportDedupe` rule); writers without a fingerprint
+   * (pre-#1491 capacity-handoff rows) stay null and keep the token-equality
+   * replay fence.
+   */
+  payloadHash?: string | null;
+  /** (#1491) Attempt identity echoed with the committed success. */
+  attemptId?: string | null;
 }
 
 /**
@@ -128,6 +166,12 @@ export async function recordIssueHandoffSettlement(
       status: record.status,
       statusNote: record.statusNote,
       cooldownUntil: record.cooldownUntil,
+      // #1491: family tag + payload fingerprint + echoed attempt identity
+      // for the fenced attempt-requeue writer. First write wins, so these
+      // describe the ORIGINAL committed payload exactly.
+      operation: record.operation ?? null,
+      payloadHash: record.payloadHash ?? null,
+      attemptId: record.attemptId ?? null,
       settledAt: record.settledAt,
       expiresAt: settlementExpiresAt(record.settledAt),
     },

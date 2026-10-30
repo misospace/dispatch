@@ -10,6 +10,7 @@ import { withIssueMutationGuard } from "./issue-mutation-guard";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { newClaimToken } from "@/lib/capacity-handoff";
+import { recordAttemptIssuanceBestEffort } from "@/lib/issue-requeue";
 import type { CheckpointValue, ResumeContext, ResumeContextWithLease } from "./next-action";
 import { buildResumeContext, isValidCheckpoint } from "./next-action";
 
@@ -146,12 +147,25 @@ export async function upsertLease(params: {
               lastRenewalObservedAt: null,
               lastRenewalOccurredAt: null,
             }
-          : existing.claimToken === null || existing.claimToken === undefined
-            ? { claimToken: newClaimToken() }
-            : {}),
-      },
+        : existing.claimToken === null || existing.claimToken === undefined
+          ? { claimToken: newClaimToken() }
+          : {}),
+    },
+  });
+  // #1491: the mint IS the issuance. Record the new receipt durably (outside
+  // the guard, best-effort): a fenced retry after the terminal release can
+  // only prove this exact token was ever handed out through this ledger.
+  // Losing the row closes the retry fence (the unfenced operator reset stays
+  // available); it never affects the live claim.
+  if (mintingToken && lease.claimToken) {
+    await recordAttemptIssuanceBestEffort(prisma, {
+      surface: "issue",
+      attemptId: params.issueId,
+      agentName: params.agentName,
+      token: lease.claimToken,
     });
-    return { created: false, lease, mintedToken: mintingToken };
+  }
+  return { created: false, lease, mintedToken: mintingToken };
   }
 
   // Create new lease (checkpoint is required in the schema).
@@ -180,6 +194,17 @@ export async function upsertLease(params: {
         claimToken: newClaimToken(),
       },
     });
+    // #1491: first-generation mint — same durable issuance record as the
+    // rotation path above. Without it a plain claim's token could never be
+    // proven issued after the terminal release deleted the row.
+    if (lease.claimToken) {
+      await recordAttemptIssuanceBestEffort(prisma, {
+        surface: "issue",
+        attemptId: params.issueId,
+        agentName: params.agentName,
+        token: lease.claimToken,
+      });
+    }
     return { created: true, lease, mintedToken: true };
   } catch (err) {
     if (

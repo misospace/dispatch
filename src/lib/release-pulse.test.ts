@@ -612,6 +612,7 @@ describe("buildReleasePulse", () => {
       expect(snapshot.highlights).toEqual([]);
       expect(snapshot.deliveredIssueCount).toBe(0);
       expect(snapshot.completedUmbrellaCount).toBe(0);
+      expect(snapshot.notableDeliveryCount).toBe(0);
       expect(snapshot.unknownDeliveryCount).toBe(0);
       expect(snapshot.unreleasedCommits).toEqual({ state: releaseState, count: null });
       expect(snapshot.highlightsTruncated).toBe(false);
@@ -721,9 +722,47 @@ describe("buildReleasePulse", () => {
     expect(snapshot.highlights).toHaveLength(RELEASE_PULSE_MAX_HIGHLIGHTS);
     expect(snapshot.highlightsTruncated).toBe(true);
     expect(snapshot.deliveredIssueCount).toBe(total);
+    // The semantic count reflects the FULL set, not the capped window.
+    expect(snapshot.notableDeliveryCount).toBe(total);
     // Newest first: the kept window is the newest 50.
     expect(snapshot.highlights[0].deliveredAt).toBe("2026-10-27T00:00:00.000Z");
     expect(snapshot.highlights[0].issueNumber).toBe(25);
+  });
+
+  it("counts a semantic delivery truncated out of the exposed list", () => {
+    // The oldest delivery falls past the cap (newest-first window); a hidden
+    // notable/major feature must still surface in the pre-truncation count,
+    // because a truncated list does not imply the volume rule fires (one PR
+    // can deliver several issues).
+    const total = RELEASE_PULSE_MAX_HIGHLIGHTS + 1;
+    const issues: ReleasePulseIssueInput[] = [];
+    const events: ReleasePulseEventInput[] = [];
+    for (let i = 1; i <= total; i += 1) {
+      issues.push(
+        issueInput({
+          number: i,
+          labels: ["type/feature"],
+          // Everything the window keeps is routine volume.
+          releaseSignal: signal("feature", `Feature ${i}`, "routine"),
+        }),
+      );
+      // Days 3..28: unambiguously newer than the hidden delivery below.
+      events.push(mergeEvent(i, i, `2026-10-${String((i % 26) + 3).padStart(2, "0")}T00:00:00.000Z`));
+    }
+    // The hidden semantic delivery is the unique oldest merge.
+    issues.push(
+      issueInput({
+        number: 900,
+        labels: ["type/feature"],
+        releaseSignal: signal("architecture", "Hidden notable", "major"),
+      }),
+    );
+    events.push(mergeEvent(900, 900, "2026-10-02T00:00:00.000Z"));
+    const snapshot = buildReleasePulse(repoInput(), issues, events);
+    expect(snapshot.highlights).toHaveLength(RELEASE_PULSE_MAX_HIGHLIGHTS);
+    expect(snapshot.highlightsTruncated).toBe(true);
+    expect(snapshot.highlights.some((highlight) => highlight.issueNumber === 900)).toBe(false);
+    expect(snapshot.notableDeliveryCount).toBe(1);
   });
 
   it("sorts highlights by deliveredAt descending with issueNumber ascending tie-break", () => {

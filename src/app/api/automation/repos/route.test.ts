@@ -277,6 +277,14 @@ describe("GET /api/automation/repos — release-delta projection", () => {
       releaseError: null,
       releaseDeltaSyncedAt: "2024-01-02T00:00:00.000Z",
       pulse: expect.objectContaining({ pulseState: "ready" }),
+      // #1483: 7 commits on a 2024 baseline trips the age rule for any
+      // realistic "now"; zero run evidence keeps the CI context unknown.
+      readiness: expect.objectContaining({
+        schema: "dispatch.release-readiness/v1",
+        state: "candidate",
+        ci: "unknown",
+        reasons: expect.arrayContaining(["7 unreleased commits"]),
+      }),
     });
   });
 });
@@ -420,6 +428,13 @@ describe("GET /api/automation/repos — release pulse", () => {
         mergedAt: "2024-01-05T12:00:00.000Z",
       },
     ]);
+    // #1483: the major-signal delivery is a semantic candidate trigger.
+    expect(body[0].readiness).toMatchObject({
+      schema: "dispatch.release-readiness/v1",
+      state: "candidate",
+      ci: "unknown",
+      reasons: expect.arrayContaining(["7 unreleased commits", "1 notable delivered feature"]),
+    });
 
     expect(mocks.findLifecycleEvents).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -481,6 +496,10 @@ describe("GET /api/automation/repos — release pulse", () => {
       completedUmbrellaCount: 0,
       unknownDeliveryCount: 0,
     });
+    expect(body[0].readiness).toMatchObject({
+      state: "unknown",
+      reasons: ["No release baseline has been published."],
+    });
     expect(mocks.findLifecycleEvents).not.toHaveBeenCalled();
     expect(mocks.findIssues).not.toHaveBeenCalled();
   });
@@ -497,6 +516,10 @@ describe("GET /api/automation/repos — release pulse", () => {
       baseline: null,
       unreleasedCommits: { state: "diverged", count: null },
       highlights: [],
+    });
+    expect(body[0].readiness).toMatchObject({
+      state: "unknown",
+      reasons: ["Release delta is diverged; baseline comparison is unreliable."],
     });
     expect(mocks.findLifecycleEvents).not.toHaveBeenCalled();
     expect(mocks.findIssues).not.toHaveBeenCalled();
@@ -529,8 +552,28 @@ describe("GET /api/automation/repos — release pulse", () => {
       deliveredIssueCount: 0,
       highlights: [],
     });
+    expect(body[0].readiness).toMatchObject({
+      state: "quiet",
+      reasons: ["No unreleased commits since v1.0.0."],
+    });
     // Identical is still a computable baseline: issue/event reads happen.
     expect(mocks.findLifecycleEvents).toHaveBeenCalledTimes(1);
     expect(mocks.findIssues).toHaveBeenCalledTimes(1);
+  });
+
+  it("reflects CI run evidence in the readiness context", async () => {
+    mocks.findAutomationRepos.mockResolvedValue([readyRepo()]);
+    mocks.countWorkflowRuns.mockImplementation(({ where }: { where: Record<string, unknown> }) =>
+      Promise.resolve(where.conclusion === "failure" ? 2 : 5),
+    );
+
+    const res = await getRequest();
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body[0].readiness).toMatchObject({
+      state: "candidate",
+      ci: "failing",
+      reasons: expect.arrayContaining(["CI has failing runs (context only)"]),
+    });
   });
 });
