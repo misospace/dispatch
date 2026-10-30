@@ -573,7 +573,7 @@ describe("GET /api/automation/repos — release pulse", () => {
     expect(body[0].readiness).toMatchObject({
       state: "candidate",
       ci: "failing",
-      reasons: expect.arrayContaining(["CI currently failing (context only)"]),
+      reasons: expect.arrayContaining(["CI has failing runs (context only)"]),
     });
   });
 });

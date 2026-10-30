@@ -119,6 +119,19 @@ describe("deriveReleaseReadiness — volume/age boundaries", () => {
     expect(result.state).toBe("building");
     expect(result.reasons).toEqual(["2 unreleased commits", "0 days since v0.1.12"]);
   });
+
+  it("keeps zero commit volume quiet even with milestone evidence (literal rule order)", () => {
+    // Stale release-delta (count 0) with fresh merge/close evidence is a
+    // pulse-vs-pulse tension, not a readiness decision: "0 commits -> quiet"
+    // is the contract's first rule and nothing accumulated since the tag.
+    const result = readiness({
+      unreleasedCommits: { state: "ahead", count: 0 },
+      completedUmbrellaCount: 1,
+      highlights: [highlight()],
+    });
+    expect(result.state).toBe("quiet");
+    expect(result.reasons).toEqual(["No unreleased commits since v0.1.12."]);
+  });
 });
 
 describe("deriveReleaseReadiness — semantic milestones", () => {
@@ -283,13 +296,13 @@ describe("deriveReleaseReadiness — CI is context, never the signal", () => {
     expect(failing.reasons).toEqual([
       "12 unreleased commits",
       "5 days since v0.1.12",
-      "CI currently failing (context only)",
+      "CI has failing runs (context only)",
     ]);
     const running = deriveReleaseReadiness({ pulse: candidatePulse, now: NOW, ci: "running" });
     expect(running.reasons).toEqual([
       "12 unreleased commits",
       "5 days since v0.1.12",
-      "CI currently running (context only)",
+      "CI has a run in progress (context only)",
     ]);
     const green = deriveReleaseReadiness({ pulse: candidatePulse, now: NOW, ci: "green" });
     const unknownCi = deriveReleaseReadiness({ pulse: candidatePulse, now: NOW, ci: "unknown" });
@@ -321,11 +334,14 @@ describe("deriveReleaseReadiness — determinism", () => {
 
 describe("releaseCiStatus", () => {
   it.each([
-    [{ failingRuns: 0, runningRuns: 0, totalRuns: 0 }, "unknown"],
-    [{ failingRuns: 0, runningRuns: 0, totalRuns: 4 }, "green"],
-    [{ failingRuns: 0, runningRuns: 1, totalRuns: 4 }, "running"],
-    [{ failingRuns: 1, runningRuns: 0, totalRuns: 4 }, "failing"],
-    [{ failingRuns: 1, runningRuns: 1, totalRuns: 4 }, "failing"],
+    // No evidence of any kind is honestly unknown; non-success conclusions
+    // (skipped/neutral/cancelled/timed_out) never produce green.
+    [{ failingRuns: 0, runningRuns: 0, succeededRuns: 0 }, "unknown"],
+    [{ failingRuns: 0, runningRuns: 0, succeededRuns: 4 }, "green"],
+    [{ failingRuns: 0, runningRuns: 1, succeededRuns: 4 }, "running"],
+    [{ failingRuns: 1, runningRuns: 0, succeededRuns: 4 }, "failing"],
+    [{ failingRuns: 1, runningRuns: 1, succeededRuns: 0 }, "failing"],
+    [{ failingRuns: 0, runningRuns: 1, succeededRuns: 0 }, "running"],
   ] as const)("%j -> %s", (counts, expected) => {
     expect(releaseCiStatus(counts)).toBe(expected);
   });

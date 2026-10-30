@@ -76,25 +76,28 @@ function plural(count: number, singular: string, suffix = "s"): string {
 }
 
 /**
- * Coarse fleet CI context from the persisted run counts. Fails toward
- * `unknown` when no run evidence exists at all; a historical failure outranks
- * an in-flight run (same bias as the `failingRuns` count the fleet view
- * already shows).
+ * Coarse fleet CI context from persisted run counts. `green` requires
+ * positive success evidence: runs that are skipped/neutral/cancelled/
+ * timed_out are not evidence of a green pipeline, and no evidence at all is
+ * honestly `unknown`. A historical failure outranks an in-flight run (same
+ * bias as the `failingRuns` count the fleet view already shows).
  */
 export function releaseCiStatus(counts: {
   failingRuns: number;
   runningRuns: number;
-  totalRuns: number;
+  succeededRuns: number;
 }): ReleaseCiStatus {
-  if (counts.totalRuns <= 0) return "unknown";
   if (counts.failingRuns > 0) return "failing";
   if (counts.runningRuns > 0) return "running";
-  return "green";
+  if (counts.succeededRuns > 0) return "green";
+  return "unknown";
 }
 
 function ciContextReason(ci: ReleaseCiStatus): string | null {
-  if (ci === "failing") return "CI currently failing (context only)";
-  if (ci === "running") return "CI currently running (context only)";
+  // Wording stays honest to the evidence: failingRuns is unbounded history,
+  // so this never claims the CURRENT head failed.
+  if (ci === "failing") return "CI has failing runs (context only)";
+  if (ci === "running") return "CI has a run in progress (context only)";
   return null;
 }
 
@@ -166,7 +169,10 @@ export function deriveReleaseReadiness(input: ReleaseReadinessInput): ReleaseRea
   // Semantic milestone triggers. Only notable/major FEATURE/ARCHITECTURE
   // deliveries count: `internal`-signal issues emit no pulse highlight at
   // all, routine significance and significance-less legacy fallbacks are
-  // volume evidence, not a "feature shipped" claim.
+  // volume evidence, not a "feature shipped" claim. Past the pulse's
+  // highlight cap (highlightsTruncated) N is a lower bound; the state is
+  // unaffected because >=cap commits already clear the volume rule, and
+  // completedUmbrellaCount is never truncated.
   const notableDeliveries = pulse.highlights.filter(
     (highlight) =>
       (highlight.kind === "feature" || highlight.kind === "architecture") &&

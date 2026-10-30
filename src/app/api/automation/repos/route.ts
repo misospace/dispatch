@@ -40,17 +40,17 @@ export async function GET(request: Request) {
 
     const reposWithCounts = await Promise.all(
       repos.map(async (repo) => {
-        const [failingRuns, runningRuns, totalRuns, pulse] = await Promise.all([
+        const [failingRuns, runningRuns, succeededRuns, pulse] = await Promise.all([
           prisma.githubWorkflowRun.count({
             where: { workflow: { repoId: repo.id }, conclusion: "failure" },
           }),
           prisma.githubWorkflowRun.count({
             where: { workflow: { repoId: repo.id }, status: "in_progress" },
           }),
-          // Total-run evidence separates "CI green" from "no CI evidence at
-          // all" for the advisory readiness context (#1483).
+          // Positive success evidence separates "CI green" from "no usable
+          // run evidence" for the advisory readiness context (#1483).
           prisma.githubWorkflowRun.count({
-            where: { workflow: { repoId: repo.id } },
+            where: { workflow: { repoId: repo.id }, conclusion: "success" },
           }),
           collectReleasePulse({
             fullName: repo.fullName,
@@ -74,7 +74,7 @@ export async function GET(request: Request) {
         const readiness = deriveReleaseReadiness({
           pulse,
           now: new Date(),
-          ci: releaseCiStatus({ failingRuns, runningRuns, totalRuns }),
+          ci: releaseCiStatus({ failingRuns, runningRuns, succeededRuns }),
         });
 
         return {
