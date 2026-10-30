@@ -10,7 +10,7 @@ import {
 } from "@/lib/agent-task";
 import { isBacklogLane, prFixLaneForRequest } from "@/lib/lane-config";
 import { fetchAgentQueueData } from "@/lib/agent-queue-fetch";
-import { agentAlreadyHanded, agentHandoutToken, createLinkedPrFixItem, enforcePrFixHandoutLaneExclusivity, handoutReceipt, hasInFlightRebaseHandout, isRebaseLaneAgent, newHandoutToken, normalizeQueueRepo, withRebaseLaneAdmission, type PrFixQueueClient } from "@/lib/pr-fix-queue";
+import { agentAlreadyHanded, agentHandoutToken, createLinkedPrFixItem, enforcePrFixHandoutLaneExclusivity, handoutReceipt, hasInFlightRebaseHandout, isRebaseLaneAgent, newHandoutToken, normalizeQueueRepo, withHandoutLaneExclusivityFence, withRebaseLaneAdmission, type PrFixQueueClient } from "@/lib/pr-fix-queue";
 import { fetchPullRequestLabels, fetchPullRequestHeadSha } from "@/lib/github";
 import { NEEDS_HUMAN_LABEL } from "@/lib/pr-fix-surfacing";
 import { CONFLICTING_STATUSES } from "@/lib/linked-pr-health";
@@ -468,6 +468,19 @@ export async function GET(
         // DISPATCH_REBASE_AGENTS local-only pool, not the lane column, and
         // raising a conflicted branch's lane would strand it with no worker
         // able to take it.
+        //
+        // This pre-transaction call is a CHEAP EARLY REFUSAL + opportunistic
+        // correction (it avoids opening an issuance transaction for a
+        // candidate this poll could never hand out anyway). It is NOT the
+        // authority: the non-REBASE tail re-runs the same gate INSIDE the
+        // issuance transaction (`withHandoutLaneExclusivityFence`, #1503
+        // review), where a locked read (`SELECT ... FOR SHARE` on the Issue
+        // row) makes the final classification decision atomic with the
+        // hand-out write — a parent NORMAL→frontier flip after this read but
+        // before the append either commits before the fence's locked read
+        // (refused + corrected there) or blocks on the share lock until after
+        // the fence commits (issuance was valid at its commit; the next poll
+        // refuses + corrects).
         if (dispatchedLane !== "REBASE") {
           const exclusivity = await enforcePrFixHandoutLaneExclusivity(
             asPrFixQueueClient(prisma),
@@ -657,10 +670,27 @@ export async function GET(
            return null;
          }
        }
-       const issued = await issueHandout(asPrFixQueueClient(prisma));
-       if (issued) await flushIssuance(); // #1491: best-effort, post-write.
-       return issued;
-     };
+        // #1503 review: the non-REBASE hand-out runs inside the lane-exclusivity
+        // fence — ONE transaction re-runs the gate and holds a locked read
+        // (SELECT ... FOR SHARE) on the linked Issue row until the dispatch
+        // stamp + hand-out append commit, so a parent NORMAL→frontier flip can
+        // no longer slip a NORMAL issuance through the pre-transaction read
+        // above: a flip commits either before the locked read (refused +
+        // corrected there) or after the fence's commit (issuance was valid at
+        // its commit). Any fence failure defers the candidate (fail closed,
+        // next poll retries).
+        // #1491: `flushIssuance` stays OUTSIDE the transaction — the durable
+        // ledger row must not be inserted inside a possibly-aborted
+        // transaction; it flushes via the module client after the commit.
+        const issued = await withHandoutLaneExclusivityFence(
+          asPrFixQueueClient(prisma),
+          candidate,
+          requestPrFixLane,
+          (tx) => issueHandout(tx),
+        );
+        if (issued) await flushIssuance(); // #1491: best-effort, post-write.
+        return issued;
+      };
 
     // PR-fix items come first, but an item this agent already received at
     // its current generation is not dispatchable to it again (#1133): the

@@ -300,6 +300,32 @@ describe("ingestCommentEvent", () => {
     expect(client.items[0].lane).toBe("NORMAL");
   });
 
+  it("keeps the supplied lane when the parent classification is unverifiable (lookup fails, #1503)", async () => {
+    // UNKNOWN parent (#1503 review): enqueue is an ingestion-side
+    // convenience and may conservatively keep the supplied lane on an
+    // unavailable lookup — the hand-out gate re-reads the parent at issuance
+    // and fails closed there.
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    const client = makeClient({ body: "Concrete follow-up work.", currentLane: "frontier" });
+    client.issue.findFirst = async () => {
+      throw new Error("db down");
+    };
+    await ingestReviewEvent(client, {
+      repoFullName: "misospace/pr-reviewer-action",
+      prNumber: 1360,
+      branch: "courier/x/issue-737",
+      url: "https://github.com/misospace/pr-reviewer-action/pull/1360",
+      title: "Fix test issue",
+      author: "itsmiso-ai",
+      reviewBody: "Restore the validate job.",
+      reviewId: "r-unknown-parent",
+      reviewState: "CHANGES_REQUESTED",
+      linkedIssue: 737,
+    });
+    expect(client.items).toHaveLength(1);
+    expect(client.items[0].lane).toBe("NORMAL");
+  });
+
   it("does NOT enqueue an ambiguous comment (it no longer blocks the PR)", async () => {
     process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
     const client = makeClient();

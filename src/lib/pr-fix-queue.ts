@@ -18,9 +18,22 @@ import { evaluateRecovery, recoveryCooldownMs, type RecoveryDecision } from "./p
 import { getConfiguredLanes, laneMatchesConfigured, type LaneConfig } from "./lane-config";
 
 export type PrFixQueueClient = {
-issue: {
-findFirst: (args: any) => Promise<any>;
-};
+  issue: {
+    findFirst: (args: any) => Promise<any>;
+    // #1503 review: the hand-out fence's serialization boundary — a locking
+    // read (`SELECT ... FOR SHARE OF "Issue"`) on the linked issue row, keyed
+    // by (repo, issue number) case-insensitively, returning
+    // `{ currentLane }` or null for a missing row. The narrow contract:
+    // it MUST be issued on a transaction client (`asPrFixQueueTx` in
+    // prisma.ts) so the share lock is held until that transaction commits —
+    // a concurrent parent NORMAL→frontier write then either commits before
+    // the locked read (the fence refuses) or blocks until after issuance
+    // commits (issuance was valid at its commit; the next poll refuses and
+    // corrects). OPTIONAL on the type for legacy/test clients; the production
+    // transaction wrapper always provides it, and the fence fails CLOSED
+    // when it is absent on a candidate with a linked issue.
+    findFirstLocked?: (repo: string, issue: number) => Promise<{ currentLane: string | null } | null>;
+  };
 // #1419: agent-run liveness ledger for the dead-owner recovery probes.
 // Optional so legacy/test clients without the model keep the fail-closed
 // behavior — an absent surface resolves "live" and never authorizes a
@@ -82,6 +95,9 @@ findFirst: (args: any) => Promise<any>;
     findMany: (args: any) => Promise<any[]>;
     upsert: (args: any) => Promise<any>;
   };
+  // The parent-classification authority read runs as a MODELED findFirst;
+  // `findFirstLocked` (below) is the fence's serialization boundary and is
+  // only issued inside a transaction.
   $transaction: <T>(fn: (tx: PrFixQueueClient) => Promise<T>) => Promise<T>;
   // Raw SQL surface used by the #1327 rebase-lane advisory lock. Optional on
   // the type (legacy/test clients may omit it) but MANDATORY for a rebase
@@ -186,6 +202,108 @@ export async function withRebaseLaneAdmission<T>(
     await tx.$executeRaw(Prisma.sql`SELECT pg_advisory_xact_lock(${REBASE_LANE_ADVISORY_LOCK_KEY})`);
     return run(tx);
   });
+}
+
+/**
+ * Run a NON-rebase PR-fix hand-out issuance SERIALIZED against parent
+ * reclassification with a LOCKING READ (#1503 review, the TOCTOU fix).
+ *
+ * The hand-out gate's defense-in-depth was check-then-write: it read
+ * `Issue.currentLane`, then `confirmPrFixHandOut`/the append conditionals only
+ * on the PR-fix row — so a parent NORMAL→frontier flip between the lookup and
+ * the append let a declared-normal consumer take escalation work. This fence
+ * makes the authority decision part of the issuance transaction itself: ONE
+ * interactive transaction (DEFAULT isolation — see below) re-runs the SAME
+ * `enforcePrFixHandoutLaneExclusivity` gate and, whenever the candidate has a
+ * linked issue and an escalation lane is configured, takes a `SELECT ... FOR
+ * SHARE` lock on the Issue row (`issue.findFirstLocked`) and re-derives the
+ * verdict from the LOCKED read before running `issueHandout` (dispatch stamp +
+ * hand-out append) on the same tx.
+ *
+ * WHY A ROW LOCK, NOT SERIALIZABLE ISOLATION: the fence only READS the Issue
+ * row and WRITES the PrFixQueueItem row — a single read/write-antidependency
+ * edge is a valid serialization order (fence→flip), so SSI does NOT abort the
+ * issuance when a flip commits inside the read→write window (proven
+ * empirically on PostgreSQL 18; a Serializable fence still leaked). `FOR
+ * SHARE` is the actual boundary, held until the transaction commits:
+ * - the flip COMMITS BEFORE the locked read → the fence sees `frontier`,
+ *   refuses, and (queued row still unclaimed) applies the correction CAS;
+ * - the flip is CONCURRENT with the open fence → the UPDATE BLOCKS on the
+ *   share lock until the fence commits → the hand-out landed while the parent
+ *   was genuinely NORMAL (valid at its commit); the next poll's gate observes
+ *   the flip and refuses + corrects the queued row.
+ * There is deliberately NO unlocked fallback — an issuance whose authority
+ * read ran outside the fence is the check-then-write the review rejected —
+ * mirroring `withRebaseLaneAdmission`.
+ *
+ * FAIL CLOSED: ANY error — a lock/statement timeout, an aborted transaction,
+ * a client without the transaction surface, anything — logs and returns null
+ * (defer; the next poll retries). So does a candidate WITH a linked issue
+ * whose tx lacks `issue.findFirstLocked`: an unserializable authority read
+ * must not authorize issuance. A deferred hand-out costs one poll; a NORMAL
+ * issuance on frontier work re-creates the exact leak #1503 exists to close.
+ *
+ * Scope notes:
+ * - REBASE candidates never enter this fence: the route's REBASE branch is the
+ *   declared #1327 exception with its own advisory-lock boundary.
+ * - `flushIssuance` (the #1491 durable ledger row) stays OUTSIDE the
+ *   transaction at the call site — a ledger INSERT inside a possibly-aborted
+ *   transaction would poison it (#1491).
+ * - Residual same-generation multi-hand-out semantics are unchanged: they are
+ *   settlement-arbitrated and pre-existing (#1503 gate docblock).
+ */
+export async function withHandoutLaneExclusivityFence<T>(
+  client: PrFixQueueClient,
+  candidate: {
+    id: string;
+    repo: string;
+    pr: number;
+    issue?: number | null;
+    generation: number;
+    lane?: string | null;
+  },
+  requestPrFixLane: "NORMAL" | "ESCALATED" | null | undefined,
+  issueHandout: (tx: PrFixQueueClient) => Promise<T | null>,
+): Promise<T | null> {
+  try {
+    return await client.$transaction(async (tx) => {
+      // The authoritative decision re-made ATOMICALLY with issuance: the same
+      // gate, now reading `Issue.currentLane` (and applying the correction
+      // CAS, when it fires) inside the transaction the hand-out writes commit
+      // in. A refusal defers the candidate — null, no hand-out.
+      const exclusivity = await enforcePrFixHandoutLaneExclusivity(tx, candidate, requestPrFixLane);
+      if (exclusivity.decision === "refuse") return null;
+      // #1503 review: serialize the authority read against parent
+      // reclassification with a locking read (SELECT ... FOR SHARE) held until
+      // issuance commits — see the docblock for the two orderings this makes
+      // impossible to exploit. A plain re-read immediately before the write
+      // would NOT suffice (still check-then-write); the lock is the boundary.
+      const escalationLane = getExplicitEscalationLane();
+      if (candidate.issue !== null && candidate.issue !== undefined && escalationLane) {
+        if (typeof tx.issue.findFirstLocked !== "function") {
+          // Fail closed: an unserializable authority read must not authorize
+          // issuance. Defer; the next poll retries.
+          console.error(`[next-task-pr-fix] hand-out fence has no locked parent read for ${candidate.repo}#${candidate.pr}; deferring (fail closed, #1503)`);
+          return null;
+        }
+        const lockedRow = await tx.issue.findFirstLocked(candidate.repo, candidate.issue);
+        const lockedClass: LinkedIssueEscalationClassification = lockedRow
+          ? (laneMatchesConfigured(lockedRow.currentLane ?? null, escalationLane.id) ? "ESCALATED" : "NOT_ESCALATED")
+          : "NOT_ESCALATED"; // missing row = definitive read (see the lookup's docblock)
+        const lockedVerdict = await handoutExclusivityFromParentClass(tx, candidate, requestPrFixLane, lockedClass);
+        if (lockedVerdict.decision === "refuse") return null;
+      }
+      return issueHandout(tx);
+    });
+  } catch (error) {
+    // Fail closed (see docblock): the locking authority read and the issuance
+    // write must commit together or not at all. Defer; the next poll retries.
+    console.error(
+      `[next-task-pr-fix] hand-out lane-exclusivity fence failed for ${candidate.repo}#${candidate.pr}; deferring the hand-out (fail closed, #1503):`,
+      error instanceof Error ? error.message : error,
+    );
+    return null;
+  }
 }
 
 // #1121: upper bound on an already_addressed evidence string, shared by the
@@ -446,26 +564,49 @@ export function getExplicitEscalationLane(): LaneConfig | null {
 }
 
 /**
+ * Tri-state result of the authoritative linked-issue classification read
+ * (#1503 review): the hand-out boundary must be able to distinguish a
+ * definitive "not escalation" from an UNVERIFIABLE read — an unknown
+ * classification must never authorize the lower/shared lane.
+ */
+export type LinkedIssueEscalationClassification =
+  | "ESCALATED"
+  | "NOT_ESCALATED"
+  | "UNKNOWN";
+
+/**
  * Whether a PR-fix row's linked issue is AUTHORITATIVELY escalation-classified
  * (#1503): the issue row's `currentLane` matches the configured escalation
  * lane (aliases resolved). The issue — not the agent name, not the PR-fix
  * row's own mutable lane — is the escalation provenance, so nothing here
  * infers authority from an agent display label.
  *
- * Fail-safe FALSE: a missing linked issue, a deployment with no escalation
- * lane, or a failed lookup leaves the caller's own lane decision standing (the
- * hand-out cross-check is the second line of defense). A true result may only
- * ever RAISE a NORMAL lane toward ESCALATED; it never manufactures or clears a
- * NEEDS_HUMAN human hold.
+ * Tri-state, FAIL CLOSED on the hand-out boundary (#1503 review):
+ * - issue null/undefined → "NOT_ESCALATED" (no parent; definitive).
+ * - no explicit escalation lane configured → "NOT_ESCALATED" (the feature is
+ *   inert on this deployment; definitive).
+ * - lookup succeeds, row found → "ESCALATED"/"NOT_ESCALATED" per the row.
+ * - lookup succeeds, NO row → "NOT_ESCALATED" — deliberately a DEFINITIVE
+ *   read, not an error: a missing issue row cannot conceal a live frontier
+ *   parent (classification recreates rows via sync), and treating pruning as
+ *   UNKNOWN would strand QUEUED items forever. Enqueue may still conservatively
+ *   keep its supplied lane on it.
+ * - any thrown error → "UNKNOWN": an unverifiable classification must not
+ *   authorize the lower/shared lane. Where UNKNOWN lands per caller:
+ *   enqueue conservatively keeps the supplied lane; requeue keeps the row's
+ *   existing lane (no silent demotion); the hand-out gate refuses NORMAL
+ *   consumers (escalation/unfiltered consumers stay eligible — an escalation
+ *   consumer is authorized regardless, and the #1046 unfiltered poll is
+ *   unrestricted by contract).
  */
 export async function linkedIssueEscalationClassified(
   client: Pick<PrFixQueueClient, "issue">,
   repo: string,
   issue: number | null | undefined,
-): Promise<boolean> {
-  if (issue === null || issue === undefined) return false;
+): Promise<LinkedIssueEscalationClassification> {
+  if (issue === null || issue === undefined) return "NOT_ESCALATED";
   const escalationLane = getExplicitEscalationLane();
-  if (!escalationLane) return false;
+  if (!escalationLane) return "NOT_ESCALATED";
   try {
     // The queue folds repo casing (#1145); Issue.repository.fullName keeps the
     // GitHub casing — match case-insensitively instead of re-deriving the row.
@@ -476,14 +617,14 @@ export async function linkedIssueEscalationClassified(
       },
       select: { currentLane: true },
     });
-    return row ? laneMatchesConfigured(row.currentLane ?? null, escalationLane.id) : false;
+    return row ? (laneMatchesConfigured(row.currentLane ?? null, escalationLane.id) ? "ESCALATED" : "NOT_ESCALATED") : "NOT_ESCALATED";
   } catch (error) {
-    console.warn("[pr-fix-queue] linked-issue escalation lookup failed; keeping the caller's lane (#1503)", {
+    console.warn("[pr-fix-queue] linked-issue escalation lookup failed; deferring classification as UNKNOWN (#1503)", {
       repo,
       issue,
       errorType: error instanceof Error ? error.name : typeof error,
     });
-    return false;
+    return "UNKNOWN";
   }
 }
 
@@ -529,6 +670,14 @@ function preserveEscalationLane(lane: unknown): PrFixLane {
  *   serves every lane (#1046) — never refused, but the correction above is
  *   still applied opportunistically so misclassified rows converge no matter
  *   which consumer observes them first.
+ * - UNKNOWN parent (#1503 review): an unverifiable classification must never
+ *   authorize the lower/shared lane, so a declared-NORMAL consumer is refused
+ *   (transient — the next poll re-reads; no correction CAS, no history row,
+ *   because there is nothing verified to correct). An "ESCALATED" consumer
+ *   stays eligible — it is authorized for escalation work regardless — and the
+ *   unfiltered legacy poll is unrestricted by contract, so an unverified
+ *   classification cannot make either more authorized than it already is;
+ *   neither gets a correction either. REBASE rows are exempt upstream.
  *
  * REBASE rows are the declared mechanical exception (#1327): they are gated
  * by the DISPATCH_REBASE_AGENTS local-only pool, not this lane column, and
@@ -566,8 +715,57 @@ export async function enforcePrFixHandoutLaneExclusivity(
   }
 
   // Lane NORMAL (or a legacy null): the linked issue is the only authority.
-  const escalationLinked = await linkedIssueEscalationClassified(client, candidate.repo, candidate.issue);
-  if (!escalationLinked) {
+  // The shared verdict helper keeps the plain tri-state lookup and the fence's
+  // locked re-read (`withHandoutLaneExclusivityFence`) on the SAME semantics.
+  return handoutExclusivityFromParentClass(
+    client,
+    candidate,
+    requestPrFixLane,
+    await linkedIssueEscalationClassified(client, candidate.repo, candidate.issue),
+  );
+}
+
+/**
+ * The parent-classification verdict shared by the plain gate and the fence's
+ * locked re-read (#1503 review): NOT_ESCALATED → eligible; UNKNOWN → refused
+ * for the declared-NORMAL consumer only (fail closed, no correction — nothing
+ * was verified); ESCALATED → the safe correction CAS + history row, then
+ * refuse-for-NORMAL / eligible-otherwise. Kept internal so both authority
+ * reads can never drift apart.
+ */
+async function handoutExclusivityFromParentClass(
+  client: PrFixQueueClient,
+  candidate: {
+    id: string;
+    repo: string;
+    pr: number;
+    issue?: number | null;
+    generation: number;
+    lane?: string | null;
+  },
+  requestPrFixLane: "NORMAL" | "ESCALATED" | null | undefined,
+  parentClass: LinkedIssueEscalationClassification,
+): Promise<{ decision: "eligible" | "refuse"; correctedLane: boolean }> {
+  const escalation = parentClass;
+  if (escalation === "NOT_ESCALATED") {
+    return { decision: "eligible", correctedLane: false };
+  }
+  // UNKNOWN parent (#1503 review): fail closed for the declared-NORMAL
+  // consumer only — an unverifiable classification must not authorize the
+  // shared lane. No correction CAS and no history row: nothing was verified,
+  // so there is nothing to correct. Escalation consumers and the #1046
+  // unfiltered poll stay eligible (see docblock).
+  if (escalation === "UNKNOWN") {
+    if (requestPrFixLane === "NORMAL") {
+      console.info("[next-task-pr-fix] refusing PR-fix work with an UNVERIFIABLE escalation classification for the normal lane (#1503)", {
+        repoFullName: candidate.repo,
+        pullRequestNumber: candidate.pr,
+        generation: candidate.generation,
+        escalationLinked: "UNKNOWN",
+        correctedLane: false,
+      });
+      return { decision: "refuse", correctedLane: false };
+    }
     return { decision: "eligible", correctedLane: false };
   }
 
@@ -620,7 +818,7 @@ export async function enforcePrFixHandoutLaneExclusivity(
       repoFullName: candidate.repo,
       pullRequestNumber: candidate.pr,
       generation: candidate.generation,
-      escalationLinked,
+      escalationLinked: "ESCALATED",
       correctedLane,
     });
     return { decision: "refuse", correctedLane };
@@ -2072,14 +2270,21 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
   // a parent reclassifying inside this read→write window is refused there —
   // and a correction this enqueue races can simply be re-applied by the next
   // observation).
+  // #1503 review, tri-state: "UNKNOWN" (unavailable lookup) conservatively
+  // KEEPS the supplied lane — enqueue is an ingestion-side convenience, and
+  // the stored-ESCALATED arm in buildUpdate still protects already-raised
+  // rows — while "ESCALATED" raises a NORMAL lane and "NOT_ESCALATED" leaves
+  // it exactly as supplied.
   // REBASE is the declared mechanical exception (#1327): its exclusivity is
   // the DISPATCH_REBASE_AGENTS local-only pool, and raising a merge-conflict
   // row's lane would strand it with no eligible worker.
-  const escalationLinked = type !== "REBASE" && (await linkedIssueEscalationClassified(client, input.repo, input.issue));
+  const escalation =
+    type !== "REBASE" && (await linkedIssueEscalationClassified(client, input.repo, input.issue));
   // A NORMAL classification may be raised to the exclusive escalation lane by
   // the linked issue; it never lowers ESCALATED, and it never touches a
   // NEEDS_HUMAN human hold (BLOCKED stops dispatch anyway).
-  const authoritativeLane: PrFixLane = escalationLinked && lane === "NORMAL" ? "ESCALATED" : lane;
+  const authoritativeLane: PrFixLane =
+    escalation === "ESCALATED" && lane === "NORMAL" ? "ESCALATED" : lane;
   const nextStatus: PrFixStatus = authoritativeLane === "NEEDS_HUMAN" ? "BLOCKED" : "QUEUED";
 
   let previousStatus: PrFixStatus | undefined;
@@ -2284,12 +2489,13 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           !isTerminalStatus &&
           type !== "REBASE" &&
           resolvedLane === "NORMAL" &&
-          (escalationLinked || snapshot.lane === "ESCALATED")
+          (escalation === "ESCALATED" || snapshot.lane === "ESCALATED")
         ) {
           resolvedLane = "ESCALATED";
-          const raiseReason = escalationLinked
-            ? `linked issue #${input.issue} is escalation-classified`
-            : "the row already carries the exclusive escalation lane";
+          const raiseReason =
+            escalation === "ESCALATED"
+              ? `linked issue #${input.issue} is escalation-classified`
+              : "the row already carries the exclusive escalation lane";
           statusNote = statusNote
             ? `${statusNote} Lane held at ESCALATED: ${raiseReason} (#1503).`
             : `Lane held at ESCALATED: ${raiseReason} (#1503).`;
@@ -4474,10 +4680,13 @@ export async function requeuePrFixItem(client: PrFixQueueClient, rawInput: Reque
     // NEEDS_HUMAN — the human decision is done, the lane is not) re-enters at
     // ESCALATED; an ESCALATED row keeps its lane; everything else resets to
     // NORMAL exactly as before.
-    const requeueEscalationLinked = await linkedIssueEscalationClassified(tx, input.repo, existing.issue);
-    const requeueLane: PrFixLane = requeueEscalationLinked
-      ? "ESCALATED"
-      : preserveEscalationLane(existing.lane);
+    // #1503 review, tri-state: an "UNKNOWN" parent (lookup failed) keeps the
+    // row's EXISTING lane — no silent demotion to NORMAL on an unreadable
+    // parent, and no unverified raise either; the hand-out gate re-reads at
+    // issuance.
+    const requeueEscalation = await linkedIssueEscalationClassified(tx, input.repo, existing.issue);
+    const requeueLane: PrFixLane =
+      requeueEscalation === "ESCALATED" ? "ESCALATED" : preserveEscalationLane(existing.lane);
     const updated = await tx.prFixQueueItem.update({
       where: { id: existing.id },
       // Requeue hands the PR back to the worker loop as a fresh attempt —
