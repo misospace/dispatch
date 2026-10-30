@@ -4,7 +4,6 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableRow } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { AGENT_PREFIX } from "@/types";
 import AgentWorkPanel from "@/app/agents/agent-work-panel";
 import {
   getAgentActivityWindowMs,
@@ -115,7 +114,7 @@ export default async function AgentsPage({ searchParams }: PageProps) {
                 <CardHeader className="pb-2">
                   <div className="flex items-center justify-between gap-2">
                     <CardTitle className="text-sm font-medium capitalize">
-                      {entry.agentName.replace(AGENT_PREFIX, "")}
+                      {entry.agentName}
                     </CardTitle>
                     <Badge variant={entry.active ? "default" : "outline"}>
                       {entry.active ? "Active" : "Inactive"}

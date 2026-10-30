@@ -12,9 +12,10 @@ import { applyRenovateIssueExclusion } from "@/lib/issue-filters";
  *  1. `assigned-open` — an OPEN issue in an enabled repository (Renovate
  *     issues excluded, the same filter the board uses) carries its
  *     `agent/<name>` label;
- *  2. `executing` — it holds a non-terminal AgentWork row (CLAIMED,
+ *  2. `live-work` — it holds a non-terminal AgentWork row (CLAIMED,
  *     IN_PROGRESS or BLOCKED): the work was never released, so the identity
- *     is current even if its last run report is old;
+ *     is current even if its last run report is old (the card's separate
+ *     `Executing` count only includes CLAIMED/IN_PROGRESS);
  *  3. `recent-report` — its most recent AgentRun row (tasks/report,
  *     heartbeat or legacy run ingestion) was recorded within the activity
  *     window, `getAgentActivityWindowMs()` (default 7 days).
@@ -26,6 +27,18 @@ import { applyRenovateIssueExclusion } from "@/lib/issue-filters";
  * report, assignment or work row makes it visible again. Hiding is
  * display-only: this module reads only. It never releases leases, mutates
  * claims, or removes AgentRun/audit/label history.
+ *
+ * Scope notes: the issue signal is filtered to enabled repositories and
+ * Renovate exclusions (same filter as the board). The run-report and
+ * live-work signals are intentionally instance-global, not repo-scoped:
+ * heartbeats/reports are instance-wide ledger rows, and a non-terminal
+ * AgentWork row marks the identity current regardless of which repository
+ * its (possibly absent) issue lives in — the claim was never released.
+ *
+ * Identity join across the three sources is case-insensitive: GitHub label
+ * dedup preserves the label's ORIGINAL casing, so a repo-side `agent/Alpha`
+ * must not split one identity into two cards. The display name prefers the
+ * identity's own name as recorded on its AgentRun/AgentWork rows.
  */
 
 export const DEFAULT_AGENT_ACTIVITY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
@@ -39,7 +52,9 @@ const MAX_AGENT_ACTIVITY_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
  * invalid or unset values fall back to the 7-day default.
  */
 export function getAgentActivityWindowMs(): number {
-  const parsed = parseInt(process.env.DISPATCH_AGENT_ACTIVITY_WINDOW_MS ?? "", 10);
+  const raw = process.env.DISPATCH_AGENT_ACTIVITY_WINDOW_MS ?? "";
+  if (!/^\d+$/.test(raw)) return DEFAULT_AGENT_ACTIVITY_WINDOW_MS;
+  const parsed = parseInt(raw, 10);
   if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_AGENT_ACTIVITY_WINDOW_MS;
   return Math.min(Math.max(parsed, MIN_AGENT_ACTIVITY_WINDOW_MS), MAX_AGENT_ACTIVITY_WINDOW_MS);
 }
@@ -53,7 +68,7 @@ export const AGENT_EXECUTING_WORK_STATES = ["CLAIMED", "IN_PROGRESS"] as const;
  */
 export const AGENT_LIVE_WORK_STATES = [...AGENT_EXECUTING_WORK_STATES, "BLOCKED"] as const;
 
-export type AgentActivityReason = "assigned-open" | "executing" | "recent-report";
+export type AgentActivityReason = "assigned-open" | "live-work" | "recent-report";
 
 export interface AgentDirectoryEntry {
   /** Bare identity name (no `agent/` label prefix). */
@@ -98,7 +113,7 @@ export function classifyAgentActivity(
 ): { active: boolean; reasons: AgentActivityReason[] } {
   const reasons: AgentActivityReason[] = [];
   if (input.hasOpenAssignment) reasons.push("assigned-open");
-  if (input.liveWorkCount > 0) reasons.push("executing");
+  if (input.liveWorkCount > 0) reasons.push("live-work");
   if (input.lastSeenAt && input.lastSeenAt.getTime() > input.now.getTime() - input.windowMs) {
     reasons.push("recent-report");
   }
@@ -134,6 +149,7 @@ export async function getAgentDirectory(options: AgentDirectoryOptions = {}): Pr
   ]);
 
   interface Stats {
+    displayName: string;
     assignedOpen: number;
     ready: number;
     inProgress: number;
@@ -142,13 +158,27 @@ export async function getAgentDirectory(options: AgentDirectoryOptions = {}): Pr
     liveWork: number;
     lastSeenAt: Date | null;
   }
+  // Keyed case-insensitively (see policy note): GitHub label dedup can hand
+  // us `agent/Alpha` for an identity whose rows say `alpha`. `authoritative`
+  // sources (AgentWork/AgentRun rows) own the display name.
   const byAgent = new Map<string, Stats>();
-  const statsFor = (agentName: string): Stats => {
-    let stats = byAgent.get(agentName);
+  const statsFor = (rawName: string, authoritative: boolean): Stats => {
+    const key = rawName.toLowerCase();
+    let stats = byAgent.get(key);
     if (!stats) {
-      stats = { assignedOpen: 0, ready: 0, inProgress: 0, inReview: 0, executing: 0, liveWork: 0, lastSeenAt: null };
-      byAgent.set(agentName, stats);
+      stats = {
+        displayName: rawName,
+        assignedOpen: 0,
+        ready: 0,
+        inProgress: 0,
+        inReview: 0,
+        executing: 0,
+        liveWork: 0,
+        lastSeenAt: null,
+      };
+      byAgent.set(key, stats);
     }
+    if (authoritative) stats.displayName = rawName;
     return stats;
   };
 
@@ -157,7 +187,7 @@ export async function getAgentDirectory(options: AgentDirectoryOptions = {}): Pr
       if (!isAgentLabel(label)) continue;
       const agentName = label.slice(AGENT_PREFIX.length);
       if (!agentName) continue;
-      const stats = statsFor(agentName);
+      const stats = statsFor(agentName, false);
       stats.assignedOpen++;
       if (issue.labels.includes("status/ready")) stats.ready++;
       if (issue.labels.includes("status/in-progress")) stats.inProgress++;
@@ -167,7 +197,7 @@ export async function getAgentDirectory(options: AgentDirectoryOptions = {}): Pr
 
   for (const group of workGroups) {
     if (!group.agentName) continue;
-    const stats = statsFor(group.agentName);
+    const stats = statsFor(group.agentName, true);
     stats.liveWork += group._count._all;
     if ((AGENT_EXECUTING_WORK_STATES as readonly string[]).includes(group.state)) {
       stats.executing += group._count._all;
@@ -176,13 +206,13 @@ export async function getAgentDirectory(options: AgentDirectoryOptions = {}): Pr
 
   for (const group of runGroups) {
     if (!group.agentName) continue;
-    const stats = statsFor(group.agentName);
+    const stats = statsFor(group.agentName, true);
     const lastSeen = group._max.createdAt;
     if (lastSeen && (!stats.lastSeenAt || lastSeen > stats.lastSeenAt)) stats.lastSeenAt = lastSeen;
   }
 
   const entries: AgentDirectoryEntry[] = [...byAgent.entries()]
-    .map(([agentName, stats]) => {
+    .map(([, stats]) => {
       const { active, reasons } = classifyAgentActivity({
         hasOpenAssignment: stats.assignedOpen > 0,
         liveWorkCount: stats.liveWork,
@@ -191,7 +221,7 @@ export async function getAgentDirectory(options: AgentDirectoryOptions = {}): Pr
         now,
       });
       return {
-        agentName,
+        agentName: stats.displayName,
         active,
         reasons,
         lastSeenAt: stats.lastSeenAt,

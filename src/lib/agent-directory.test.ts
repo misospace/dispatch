@@ -79,6 +79,12 @@ describe("activity window policy", () => {
     process.env.DISPATCH_AGENT_ACTIVITY_WINDOW_MS = "not-a-number";
     expect(getAgentActivityWindowMs()).toBe(DEFAULT_AGENT_ACTIVITY_WINDOW_MS);
   });
+
+  it("rejects unit-suffixed values instead of silently reading the prefix", () => {
+    // "7d" parseInt-parses to 7, which would clamp to a 1-minute window.
+    process.env.DISPATCH_AGENT_ACTIVITY_WINDOW_MS = "7d";
+    expect(getAgentActivityWindowMs()).toBe(DEFAULT_AGENT_ACTIVITY_WINDOW_MS);
+  });
 });
 
 describe("classifyAgentActivity", () => {
@@ -93,7 +99,7 @@ describe("classifyAgentActivity", () => {
   it("marks live work active even with no reports at all", () => {
     expect(
       classifyAgentActivity({ ...base, hasOpenAssignment: false, liveWorkCount: 1, lastSeenAt: null }),
-    ).toEqual({ active: true, reasons: ["executing"] });
+    ).toEqual({ active: true, reasons: ["live-work"] });
   });
 
   it("marks a recent report active even without assignments or work", () => {
@@ -126,7 +132,7 @@ describe("classifyAgentActivity", () => {
         liveWorkCount: 2,
         lastSeenAt: new Date(NOW.getTime() - HOUR),
       }),
-    ).toEqual({ active: true, reasons: ["assigned-open", "executing", "recent-report"] });
+    ).toEqual({ active: true, reasons: ["assigned-open", "live-work", "recent-report"] });
   });
 
   it("is inactive when nothing recent is observed — an evidence gap, not proven offline", () => {
@@ -218,7 +224,7 @@ describe("getAgentDirectory", () => {
     const { agents } = await getAgentDirectory({ now: NOW });
     expect(agents[0].assignedOpen).toBe(2);
     expect(agents[0].executing).toBe(2);
-    expect(agents[0].reasons).toContain("executing");
+    expect(agents[0].reasons).toContain("live-work");
   });
 
   it("treats a blocked-parked row as current work without inflating the executing count", async () => {
@@ -227,7 +233,7 @@ describe("getAgentDirectory", () => {
     const { agents } = await getAgentDirectory({ now: NOW });
     expect(agents).toHaveLength(1);
     expect(agents[0].executing).toBe(0);
-    expect(agents[0].reasons).toEqual(["executing"]);
+    expect(agents[0].reasons).toEqual(["live-work"]);
   });
 
   it("reactivates a hidden identity as soon as it reports again", async () => {
@@ -256,12 +262,28 @@ describe("getAgentDirectory", () => {
     expect(beta.inReview).toBe(1);
   });
 
+  it("joins identities case-insensitively without losing open-assignment signals", async () => {
+    // GitHub label dedup preserves the label's original casing, so the repo
+    // can carry agent/Alpha while run/work rows say alpha: one identity.
+    mocks.issueFindMany.mockResolvedValue([issue(["agent/Alpha", "status/ready"])]);
+    mocks.agentRunGroupBy.mockResolvedValue([runGroup("alpha", new Date(NOW.getTime() - HOUR))]);
+
+    const { agents, totalIdentities } = await getAgentDirectory({ now: NOW });
+    expect(totalIdentities).toBe(1);
+    expect(agents).toHaveLength(1);
+    // The identity's own reported name wins over the label casing.
+    expect(agents[0].agentName).toBe("alpha");
+    expect(agents[0].assignedOpen).toBe(1);
+    expect(agents[0].ready).toBe(1);
+    expect(agents[0].reasons).toEqual(["assigned-open", "recent-report"]);
+  });
+
   it("returns an empty directory when no identity has ever been observed", async () => {
     const view = await getAgentDirectory({ now: NOW });
     expect(view).toEqual({ agents: [], inactiveHidden: 0, totalIdentities: 0 });
   });
 
-  it("takes the newest run row as last-seen when several rows exist per agent", async () => {
+  it("maps the per-agent run-row maximum to last-seen", async () => {
     // Last-seen provenance is the per-agent _max of AgentRun.createdAt —
     // server-recorded report/heartbeat time, never inferred liveness.
     mocks.agentRunGroupBy.mockResolvedValue([
