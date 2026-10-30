@@ -19,7 +19,11 @@
 import Link from "next/link";
 import { Badge } from "@/components/ui/badge";
 import type { ReleasePulseView } from "@/lib/release-pulse-view";
-import type { ReleasePulseHighlight, ReleasePulseSnapshot } from "@/lib/release-pulse";
+import {
+  RELEASE_PULSE_MAX_HIGHLIGHTS,
+  type ReleasePulseHighlight,
+  type ReleasePulseSnapshot,
+} from "@/lib/release-pulse";
 
 const READINESS_WORDS: Record<ReleasePulseView["readinessState"], string> = {
   quiet: "quiet",
@@ -154,7 +158,15 @@ export function ReleaseHighlightsSection({ pulse }: { pulse?: ReleasePulseSnapsh
   }
 
   const count = pulse.unreleasedCommits.count;
-  const remainder = pulse.deliveredIssueCount - pulse.highlights.length;
+  // Counts come from the producer's pre-cap totals, never `highlights.length`:
+  // the exposed array is presentation-capped, so the capped window would
+  // misreport the summary count. The remainder is the producer's delivered-set
+  // truth: subtracting `highlightCount` from `deliveredIssueCount` would net
+  // umbrella-only milestones (highlights that never were delivered issues)
+  // against it. The legacy fallback clamps at zero for the same reason.
+  const highlightCount = pulse.highlightCount ?? pulse.highlights.length;
+  const remainder =
+    pulse.deliveredWithoutHighlightCount ?? Math.max(0, pulse.deliveredIssueCount - highlightCount);
 
   return (
     <div className="space-y-2" data-testid="release-highlights">
@@ -163,7 +175,7 @@ export function ReleaseHighlightsSection({ pulse }: { pulse?: ReleasePulseSnapsh
           {count === null ? "Unknown commits" : `${count} commits`} since{" "}
           {pulse.baseline?.tag ?? "the release baseline"}
         </span>
-        <span>{`${pulse.highlights.length} highlights`}</span>
+        <span>{`${highlightCount} highlight${highlightCount === 1 ? "" : "s"}`}</span>
         {pulse.completedUmbrellaCount > 0 && <span>{`${pulse.completedUmbrellaCount} completed umbrella(s)`}</span>}
         {pulse.unknownDeliveryCount > 0 && <span>{`${pulse.unknownDeliveryCount} with unknown delivery`}</span>}
       </p>
@@ -239,10 +251,10 @@ export function ReleaseHighlightsSection({ pulse }: { pulse?: ReleasePulseSnapsh
       )}
       {pulse.highlightsTruncated && (
         <p className="text-xs text-muted-foreground">
-          and {pulse.deliveredIssueCount - pulse.highlights.length} more delivered issues
+          showing latest {RELEASE_PULSE_MAX_HIGHLIGHTS} of {highlightCount} highlights
         </p>
       )}
-      {!pulse.highlightsTruncated && remainder > 0 && (
+      {remainder > 0 && (
         <p className="text-xs text-muted-foreground">
           {remainder} more delivered {remainder === 1 ? "issue" : "issues"} without a semantic highlight
         </p>

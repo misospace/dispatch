@@ -80,6 +80,8 @@ function detailFixture(overrides: Record<string, unknown> = {}) {
         },
       ],
       highlightsTruncated: false,
+      highlightCount: 2,
+      deliveredWithoutHighlightCount: 0,
       notableDeliveryCount: 1,
       completedUmbrellaCount: 1,
       unknownDeliveryCount: 0,
@@ -159,6 +161,9 @@ describe("Repo detail page — release pulse (dispatch#1484)", () => {
             baseline: null,
             unreleasedCommits: { state: "no-baseline", count: null },
             highlights: [],
+            highlightCount: 0,
+            deliveredWithoutHighlightCount: 0,
+            notableDeliveryCount: 0,
           },
         }),
     });

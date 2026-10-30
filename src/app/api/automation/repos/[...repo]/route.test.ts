@@ -388,6 +388,8 @@ describe("GET /api/automation/repos/[...repo] — release pulse (#1484)", () => 
     expect(data.pulse.unreleasedCommits).toEqual({ state: "ahead", count: 7 });
     expect(data.pulse.deliveredIssueCount).toBe(1);
     expect(data.pulse.highlights).toHaveLength(1);
+    expect(data.pulse.highlightCount).toBe(1);
+    expect(data.pulse.deliveredWithoutHighlightCount).toBe(0);
     // Advisory readiness is present with the derived CI context (no runs → unknown).
     expect(data.readiness.state).toBeDefined();
     expect(data.readiness.ci).toBe("unknown");

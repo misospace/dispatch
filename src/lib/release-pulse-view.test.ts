@@ -22,10 +22,14 @@ function readyPulse(overrides: Partial<ReleasePulseSnapshot> = {}): ReleasePulse
     deliveredIssueCount: 3,
     highlights: [],
     highlightsTruncated: false,
+    deliveredWithoutHighlightCount: 0,
     notableDeliveryCount: 0,
     completedUmbrellaCount: 0,
     unknownDeliveryCount: 0,
     ...overrides,
+    // Producer invariant: the count mirrors the set unless a fixture states
+    // the truncated reality explicitly (capped array, larger true count).
+    highlightCount: overrides.highlightCount ?? (overrides.highlights?.length ?? 0),
   };
 }
 
@@ -33,6 +37,20 @@ function candidateReadiness() {
   return {
     state: "candidate",
     reasons: ["18 unreleased commits", "5 days since v0.1.12"],
+  };
+}
+
+function highlightEntry(i: number): ReleasePulseSnapshot["highlights"][number] {
+  return {
+    kind: "feature",
+    headline: `Feature ${i}`,
+    issueNumber: i,
+    issueUrl: null,
+    deliveredAt: "2026-10-28T10:00:00.000Z",
+    significance: null,
+    confidence: "low",
+    provenance: "legacy-issue-metadata",
+    prs: [],
   };
 }
 
@@ -93,6 +111,20 @@ describe("buildReleasePulseView — ready pulse", () => {
     expect(view({ pulse: readyPulse({ unreleasedCommits: { state: "ahead", count: null } }) }).commitsLabel).toBe(
       "unknown commits",
     );
+  });
+
+  it("counts the pre-cap highlight total, not the capped array", () => {
+    const capped = Array.from({ length: 50 }, (_, i) => highlightEntry(i));
+    const v = view({
+      pulse: readyPulse({ highlights: capped, highlightsTruncated: true, highlightCount: 61 }),
+    });
+    expect(v.highlightsLabel).toBe("61 highlights");
+  });
+
+  it("falls back to the exposed list length when a legacy snapshot omits highlightCount", () => {
+    const pulse = readyPulse({ highlights: [highlightEntry(0)] });
+    delete (pulse as Partial<ReleasePulseSnapshot>).highlightCount;
+    expect(view({ pulse }).highlightsLabel).toBe("1 highlight");
   });
 
   it("mentions completed umbrellas alongside highlights", () => {

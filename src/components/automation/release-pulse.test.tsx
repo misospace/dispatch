@@ -23,9 +23,30 @@ function readyPulse(overrides: Partial<ReleasePulseSnapshot> = {}): ReleasePulse
     highlights: [],
     highlightsTruncated: false,
     notableDeliveryCount: 0,
+    deliveredWithoutHighlightCount: Math.max(
+      0,
+      (overrides.deliveredIssueCount ?? 2) - (overrides.highlightCount ?? (overrides.highlights?.length ?? 0)),
+    ),
     completedUmbrellaCount: 0,
     unknownDeliveryCount: 0,
     ...overrides,
+    // Producer invariant: the count mirrors the set unless a fixture states
+    // the truncated reality explicitly (capped array, larger true count).
+    highlightCount: overrides.highlightCount ?? (overrides.highlights?.length ?? 0),
+  };
+}
+
+function capHighlight(i: number): ReleasePulseSnapshot["highlights"][number] {
+  return {
+    kind: "fix",
+    headline: `Fix ${i}`,
+    issueNumber: i,
+    issueUrl: null,
+    deliveredAt: "2026-10-28T10:00:00.000Z",
+    significance: null,
+    confidence: "low",
+    provenance: "legacy-issue-metadata",
+    prs: [],
   };
 }
 
@@ -199,14 +220,66 @@ describe("ReleaseHighlightsSection", () => {
     expect(screen.getByText("2 with unknown delivery")).toBeInTheDocument();
   });
 
-  it("notes truncation when the highlight cap cut the list", () => {
+  it("notes truncation with the true count and no phantom remainder", () => {
+    // 60 delivered issues, all 60 highlighted, only the newest 50 exposed:
+    // the capped window must neither understate the count nor fabricate a
+    // "more delivered issues" remainder.
     const pulse = readyPulse({
       deliveredIssueCount: 60,
+      highlights: Array.from({ length: 50 }, (_, i) => capHighlight(i)),
       highlightsTruncated: true,
-      highlights: [],
+      highlightCount: 60,
     });
     render(<ReleaseHighlightsSection pulse={pulse} />);
-    expect(screen.getByText(/and 60 more delivered issues/)).toBeInTheDocument();
+    expect(screen.getByText("60 highlights")).toBeInTheDocument();
+    expect(screen.getByText(/showing latest 50 of 60 highlights/)).toBeInTheDocument();
+    expect(screen.queryByText(/more delivered issues/)).not.toBeInTheDocument();
+  });
+
+  it("keeps the without-highlight remainder honest past the cap", () => {
+    const pulse = readyPulse({
+      deliveredIssueCount: 65,
+      highlights: Array.from({ length: 50 }, (_, i) => capHighlight(i)),
+      highlightsTruncated: true,
+      highlightCount: 60,
+    });
+    render(<ReleaseHighlightsSection pulse={pulse} />);
+    expect(screen.getByText(/showing latest 50 of 60 highlights/)).toBeInTheDocument();
+    expect(screen.getByText(/5 more delivered issues without a semantic highlight/)).toBeInTheDocument();
+  });
+
+  it("uses the producer remainder instead of netting umbrella milestones", () => {
+    // 60 delivered issues, 60 highlights — but 5 of the highlights are
+    // umbrella-only milestones that never counted as delivered. The truth is
+    // 5 delivered issues without a semantic highlight, which the naive
+    // deliveredIssueCount - highlightCount subtraction would hide entirely.
+    const pulse = readyPulse({
+      deliveredIssueCount: 60,
+      highlightCount: 60,
+      deliveredWithoutHighlightCount: 5,
+    });
+    render(<ReleaseHighlightsSection pulse={pulse} />);
+    expect(screen.getByText(/5 more delivered issues without a semantic highlight/)).toBeInTheDocument();
+  });
+
+  it("stays silent on the remainder when umbrella milestones outnumber delivered issues", () => {
+    const pulse = readyPulse({
+      deliveredIssueCount: 58,
+      highlightCount: 60,
+      deliveredWithoutHighlightCount: 0,
+      highlights: Array.from({ length: 50 }, (_, i) => capHighlight(i)),
+      highlightsTruncated: true,
+    });
+    render(<ReleaseHighlightsSection pulse={pulse} />);
+    expect(screen.getByText(/showing latest 50 of 60 highlights/)).toBeInTheDocument();
+    expect(screen.queryByText(/more delivered issues/)).not.toBeInTheDocument();
+  });
+
+  it("falls back to the exposed list length for a legacy snapshot without highlightCount", () => {
+    const pulse = readyPulse({ highlights: [capHighlight(1)] });
+    delete (pulse as Partial<ReleasePulseSnapshot>).highlightCount;
+    render(<ReleaseHighlightsSection pulse={pulse} />);
+    expect(screen.getByText("1 highlight")).toBeInTheDocument();
   });
 
   it("renders distinct empty states for non-ready pulses", () => {

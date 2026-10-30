@@ -57,6 +57,8 @@ function snapshot(overrides: Partial<ReleasePulseSnapshot> = {}): ReleasePulseSn
     deliveredIssueCount: 0,
     highlights,
     highlightsTruncated: false,
+    highlightCount: highlights.length,
+    deliveredWithoutHighlightCount: 0,
     notableDeliveryCount: highlights.filter(isNotableDelivery).length,
     completedUmbrellaCount: 0,
     unknownDeliveryCount: 0,
@@ -187,6 +189,7 @@ describe("deriveReleaseReadiness — semantic milestones", () => {
       unreleasedCommits: { state: "ahead", count: 2 },
       highlights: visible,
       highlightsTruncated: true,
+      highlightCount: RELEASE_PULSE_MAX_HIGHLIGHTS + 1,
       notableDeliveryCount: 1,
     });
     expect(result.state).toBe("candidate");
@@ -205,6 +208,7 @@ describe("deriveReleaseReadiness — semantic milestones", () => {
       unreleasedCommits: { state: "ahead", count: 2 },
       highlights: visible,
       highlightsTruncated: true,
+      highlightCount: RELEASE_PULSE_MAX_HIGHLIGHTS + 1,
       notableDeliveryCount: 0,
     });
     expect(result.state).toBe("building");

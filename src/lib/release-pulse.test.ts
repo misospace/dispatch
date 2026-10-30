@@ -218,6 +218,9 @@ describe("buildReleasePulse", () => {
         { number: 2, url: issueUrl(2), closedAt: "2026-10-05T00:00:00.000Z" },
         { number: 3, url: issueUrl(3), closedAt: "2026-10-06T00:00:00.000Z" },
       ]);
+      // An umbrella-only milestone is a highlight without a delivered issue:
+      // it must never move the delivered-without-highlight remainder.
+      expect(snapshot.deliveredWithoutHighlightCount).toBe(0);
     });
 
     it("prefers the parent's releaseSignal headline over the title", () => {
@@ -547,6 +550,7 @@ describe("buildReleasePulse", () => {
       );
       expect(snapshot.deliveredIssueCount).toBe(1);
       expect(snapshot.highlights).toEqual([]);
+      expect(snapshot.deliveredWithoutHighlightCount).toBe(1);
     });
 
     it("maps type/security to fix and type/feature to feature", () => {
@@ -591,6 +595,7 @@ describe("buildReleasePulse", () => {
     );
     expect(snapshot.deliveredIssueCount).toBe(1);
     expect(snapshot.highlights).toEqual([]);
+    expect(snapshot.deliveredWithoutHighlightCount).toBe(1);
   });
 
   it.each(["diverged", "unknown", "no-baseline"] as const)(
@@ -616,6 +621,8 @@ describe("buildReleasePulse", () => {
       expect(snapshot.unknownDeliveryCount).toBe(0);
       expect(snapshot.unreleasedCommits).toEqual({ state: releaseState, count: null });
       expect(snapshot.highlightsTruncated).toBe(false);
+      expect(snapshot.highlightCount).toBe(0);
+      expect(snapshot.deliveredWithoutHighlightCount).toBe(0);
     },
   );
 
@@ -721,6 +728,10 @@ describe("buildReleasePulse", () => {
     const snapshot = buildReleasePulse(repoInput(), issues, events);
     expect(snapshot.highlights).toHaveLength(RELEASE_PULSE_MAX_HIGHLIGHTS);
     expect(snapshot.highlightsTruncated).toBe(true);
+    // The pre-cap count is the honest highlight count, never the capped length.
+    expect(snapshot.highlightCount).toBe(total);
+    // Every delivered issue is highlighted: no remainder, truncated or not.
+    expect(snapshot.deliveredWithoutHighlightCount).toBe(0);
     expect(snapshot.deliveredIssueCount).toBe(total);
     // The semantic count reflects the FULL set, not the capped window.
     expect(snapshot.notableDeliveryCount).toBe(total);
@@ -761,6 +772,8 @@ describe("buildReleasePulse", () => {
     const snapshot = buildReleasePulse(repoInput(), issues, events);
     expect(snapshot.highlights).toHaveLength(RELEASE_PULSE_MAX_HIGHLIGHTS);
     expect(snapshot.highlightsTruncated).toBe(true);
+    // The hidden issue is counted even though the cap cut it from the list.
+    expect(snapshot.highlightCount).toBe(total + 1);
     expect(snapshot.highlights.some((highlight) => highlight.issueNumber === 900)).toBe(false);
     expect(snapshot.notableDeliveryCount).toBe(1);
   });

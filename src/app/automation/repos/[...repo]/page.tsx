@@ -35,6 +35,8 @@ interface RepoPulse {
     children?: { number: number; url: string; closedAt: string | null }[];
   }[];
   highlightsTruncated: boolean;
+  highlightCount: number;
+  deliveredWithoutHighlightCount: number;
   notableDeliveryCount: number;
   completedUmbrellaCount: number;
   unknownDeliveryCount: number;

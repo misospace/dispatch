@@ -41,6 +41,8 @@ function repoFixture(overrides: Record<string, unknown> = {}) {
       deliveredIssueCount: 2,
       highlights: [],
       highlightsTruncated: false,
+      highlightCount: 0,
+      deliveredWithoutHighlightCount: 0,
       notableDeliveryCount: 0,
       completedUmbrellaCount: 0,
       unknownDeliveryCount: 0,

@@ -126,7 +126,9 @@ export function buildReleasePulseView(input: ReleasePulseViewInput): ReleasePuls
   const commitsLabel =
     count === null ? "unknown commits" : `+${count} ${count === 1 ? "commit" : "commits"}`;
 
-  const highlightCount = pulse.highlights.length;
+  // The producer's pre-cap count, never `highlights.length`: the exposed
+  // array is presentation-capped, so it understates repos past the cap.
+  const highlightCount = pulse.highlightCount ?? pulse.highlights.length;
   let highlightsLabel = plural(highlightCount, "highlight");
   if (pulse.completedUmbrellaCount > 0) {
     highlightsLabel += ` · ${plural(pulse.completedUmbrellaCount, "umbrella")}`;
