@@ -640,6 +640,25 @@ function preserveEscalationLane(lane: unknown): PrFixLane {
 }
 
 /**
+ * Release-lane rule (#1503 review): any path that returns a held or parked
+ * row to the dispatchable loop re-derives the authoritative classification
+ * from the linked issue — a NEEDS_HUMAN hold replaced the lane column, so
+ * `preserveEscalationLane` alone cannot see a frontier parent. ESCALATED
+ * (verified) wins; otherwise the row collapses per preserveEscalationLane:
+ * a hold deliberately resets to NORMAL unless the parent verifies ESCALATED
+ * (pre-#1503 rule), and an unreadable parent (UNKNOWN) neither demotes a
+ * stored ESCALATED row nor raises an unverified one — the hand-out gate
+ * re-reads at issuance either way. Shared with requeuePrFixItem so the
+ * release semantics cannot drift between the operator and mark paths.
+ */
+function releaseLaneFromParentClass(
+  parentClass: LinkedIssueEscalationClassification,
+  existingLane: unknown,
+): PrFixLane {
+  return parentClass === "ESCALATED" ? "ESCALATED" : preserveEscalationLane(existingLane);
+}
+
+/**
  * Hand-out lane-compatibility gate (#1503), the defense-in-depth layer in
  * front of the read filter: a consumer polling the NORMAL role must never be
  * handed PR-fix work whose authoritative classification (linked issue on the
@@ -3659,9 +3678,16 @@ export async function markPrFixItem(
     data.disposedAt = new Date();
     data.disposedEvidence = null;
   } else if (nextStatus === "QUEUED") {
-    // #1503: releasing a hold back to the dispatchable loop never demotes the
-    // exclusive lane (an ESCALATED row returns to its escalation consumers).
-    data.lane = preserveEscalationLane(existing.lane);
+    // #1503 review: releasing a hold back to the dispatchable loop re-derives
+    // the authoritative classification from the linked issue, mirroring
+    // requeuePrFixItem. A NEEDS_HUMAN hold replaced the lane column, so
+    // preserveEscalationLane(existing.lane) alone cannot see a frontier
+    // parent: without the re-derivation a BLOCKED frontier row released back
+    // to QUEUED re-entered the shared queue as NORMAL.
+    data.lane = releaseLaneFromParentClass(
+      await linkedIssueEscalationClassified(client, existing.repo, existing.issue),
+      existing.lane,
+    );
     // A mark back to QUEUED releases a BLOCKED/PARKED item: clear the outcome
     // and human-decision payload (#1218). A WAITING_EXTERNAL item leaving its
     // wait also sheds the consumed external-wait contract (#1250).
@@ -3751,11 +3777,19 @@ export async function markPrFixItem(
       // nothing (#1103, #1218). The retry keeps the refused baseline: the head
       // is unchanged, so it is still the newest observed (#1104).
       const refusalCapped = (existing.fixAttempts ?? 1) >= maxPrFixAttempts();
+      // #1503 review: the refused-FIXED release re-derives the parent too —
+      // an operator reclassify (BLOCKED → FIXED) can reach this tail with the
+      // row held at NEEDS_HUMAN, and the release must not silently demote a
+      // frontier parent to the shared lane.
+      const refusalLane = releaseLaneFromParentClass(
+        await linkedIssueEscalationClassified(client, existing.repo, existing.issue),
+        existing.lane,
+      );
         const refusalData: Record<string, unknown> = refusalCapped
           ? {
               status: "PARKED",
               // #1503: the refused-attempt cap park keeps the exclusive lane.
-              lane: preserveEscalationLane(existing.lane),
+              lane: refusalLane,
             outcome: "no_progress",
             decisionDetail: null,
             // #1253: disposition audit stamp (refused-FIXED cap park).
@@ -3772,7 +3806,7 @@ export async function markPrFixItem(
         : {
             status: "QUEUED",
             // #1503: the refused-FIXED retry attempt keeps the exclusive lane.
-            lane: preserveEscalationLane(existing.lane),
+            lane: refusalLane,
             ...freshAttemptGeneration(),
             fixAttempts: { increment: 1 },
             attemptHeadSha: input.attemptHeadSha ?? baseline ?? null,
@@ -4685,8 +4719,7 @@ export async function requeuePrFixItem(client: PrFixQueueClient, rawInput: Reque
     // parent, and no unverified raise either; the hand-out gate re-reads at
     // issuance.
     const requeueEscalation = await linkedIssueEscalationClassified(tx, input.repo, existing.issue);
-    const requeueLane: PrFixLane =
-      requeueEscalation === "ESCALATED" ? "ESCALATED" : preserveEscalationLane(existing.lane);
+    const requeueLane: PrFixLane = releaseLaneFromParentClass(requeueEscalation, existing.lane);
     const updated = await tx.prFixQueueItem.update({
       where: { id: existing.id },
       // Requeue hands the PR back to the worker loop as a fresh attempt —

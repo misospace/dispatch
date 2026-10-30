@@ -6754,6 +6754,81 @@ describe("#1503 escalation-lane exclusivity", () => {
     expect(client.items[0].lane).toBe("ESCALATED");
   });
 
+  // #1503 review blocker: a BLOCKED mark replaces the lane column with
+  // NEEDS_HUMAN, so a later mark back to QUEUED must re-derive the linked
+  // issue's classification instead of collapsing the hold lane to NORMAL.
+  describe("markPrFixItem release re-derives the linked issue (#1503 review)", () => {
+    function breakIssueLookup() {
+      client.issue.findFirst = async () => {
+        throw new Error("db down");
+      };
+    }
+
+    it("releases a NEEDS_HUMAN hold of frontier work back at ESCALATED, not NORMAL", async () => {
+      client.issueRows.push(frontierIssue);
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 909, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+        reason: "r", feedback: "f", evidenceKey: "review:909", issue: 737,
+      });
+      expect(client.items[0].lane).toBe("ESCALATED");
+      await markPrFixItem(client, { repo: "org/repo", pr: 909, status: "BLOCKED", note: "human decision" });
+      expect(client.items[0].status).toBe("BLOCKED");
+      expect(client.items[0].lane).toBe("NEEDS_HUMAN");
+      const released = await markPrFixItem(client, { repo: "org/repo", pr: 909, status: "QUEUED", expectedGeneration: 1 });
+      expect(released?.mutated).toBe(true);
+      expect(client.items[0].status).toBe("QUEUED");
+      expect(client.items[0].lane).toBe("ESCALATED");
+      expect(client.history.at(-1)).toMatchObject({ action: "mark", status: "QUEUED", lane: "ESCALATED" });
+    });
+
+    it("release from a hold keeps a normal-parent row NORMAL (no unverified raise)", async () => {
+      client.issueRows.push(localIssue);
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 910, lane: "NORMAL", type: "CI_FAILURE",
+        reason: "r", feedback: "f", evidenceKey: "cr:910", issue: 100,
+      });
+      await markPrFixItem(client, { repo: "org/repo", pr: 910, status: "BLOCKED", note: "human decision" });
+      const released = await markPrFixItem(client, { repo: "org/repo", pr: 910, status: "QUEUED", expectedGeneration: 1 });
+      expect(released?.mutated).toBe(true);
+      expect(client.items[0].status).toBe("QUEUED");
+      expect(client.items[0].lane).toBe("NORMAL");
+    });
+
+    it("release on an unreadable parent keeps the held-row fallback (no unverified raise; the gate re-reads at issuance)", async () => {
+      client.issueRows.push(frontierIssue);
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 923, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+        reason: "r", feedback: "f", evidenceKey: "review:923", issue: 737,
+      });
+      await markPrFixItem(client, { repo: "org/repo", pr: 923, status: "BLOCKED", note: "human decision" });
+      breakIssueLookup();
+      const released = await markPrFixItem(client, { repo: "org/repo", pr: 923, status: "QUEUED", expectedGeneration: 1 });
+      expect(released?.mutated).toBe(true);
+      // Nothing was verified (UNKNOWN), so the hold's lane collapses exactly
+      // like the sanctioned requeue fallback — and the hand-out gate refuses
+      // a NORMAL consumer on UNKNOWN at issuance, so nothing unverified is
+      // ever handed to the shared lane.
+      expect(client.items[0].status).toBe("QUEUED");
+      expect(client.items[0].lane).toBe("NORMAL");
+    });
+
+    it("release on an unreadable parent never demotes a stored ESCALATED lane", async () => {
+      client.issueRows.push(frontierIssue);
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 924, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+        reason: "r", feedback: "f", evidenceKey: "review:924", issue: 737,
+      });
+      expect(client.items[0].lane).toBe("ESCALATED");
+      await markPrFixItem(client, { repo: "org/repo", pr: 924, status: "PARKED", outcome: "no_progress", expectedGeneration: 1 });
+      expect(client.items[0].lane).toBe("ESCALATED");
+      breakIssueLookup();
+      const released = await markPrFixItem(client, { repo: "org/repo", pr: 924, status: "QUEUED", expectedGeneration: 1 });
+      expect(released?.mutated).toBe(true);
+      expect(client.items[0].status).toBe("QUEUED");
+      expect(client.items[0].lane).toBe("ESCALATED");
+    });
+  });
+
   describe("enforcePrFixHandoutLaneExclusivity (hand-out gate)", () => {
     // A row misclassified BEFORE the fix: QUEUED, NORMAL lane, but the linked
     // issue is frontier. Create it without provenance, then attach the issue.
