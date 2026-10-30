@@ -1,10 +1,16 @@
+import Link from "next/link";
 import { prisma } from "@/lib/prisma";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableRow } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { AGENT_PREFIX } from "@/types";
 import AgentWorkPanel from "@/app/agents/agent-work-panel";
-import { applyRenovateIssueExclusion } from "@/lib/issue-filters";
+import {
+  getAgentActivityWindowMs,
+  getAgentDirectory,
+  type AgentDirectoryEntry,
+} from "@/lib/agent-directory";
 
 export const dynamic = "force-dynamic";
 
@@ -16,38 +22,6 @@ interface AgentRun {
   startedAt: Date;
   summary?: string;
   errorMessage?: string;
-}
-
-interface AgentStats {
-  assigned: number;
-  ready: number;
-  inProgress: number;
-  inReview: number;
-}
-
-async function getAgentStats() {
-  const agentMap: Record<string, AgentStats> = {};
-  const where: Record<string, unknown> = { repository: { enabled: true } };
-  applyRenovateIssueExclusion(where);
-
-  const agentIssues = await prisma.issue.findMany({
-    where,
-    select: { labels: true },
-  });
-
-  for (const issue of agentIssues) {
-    for (const label of issue.labels) {
-      if (label.startsWith(AGENT_PREFIX)) {
-        if (!agentMap[label]) agentMap[label] = { assigned: 0, ready: 0, inProgress: 0, inReview: 0 };
-        agentMap[label].assigned++;
-        if (issue.labels.includes("status/ready")) agentMap[label].ready++;
-        if (issue.labels.includes("status/in-progress")) agentMap[label].inProgress++;
-        if (issue.labels.includes("status/in-review")) agentMap[label].inReview++;
-      }
-    }
-  }
-
-  return agentMap;
 }
 
 async function getRecentRuns(): Promise<AgentRun[]> {
@@ -62,26 +36,56 @@ async function getRecentRuns(): Promise<AgentRun[]> {
   }));
 }
 
-async function getDiscoveredAgents(): Promise<string[]> {
-  const groups = await prisma.agentRun.groupBy({ by: ["agentName"] });
-  return groups.map((g: { agentName: string }) => g.agentName);
+function formatActivityWindow(windowMs: number): string {
+  const day = 24 * 60 * 60 * 1000;
+  if (windowMs % day === 0) {
+    const days = windowMs / day;
+    return `${days} day${days === 1 ? "" : "s"}`;
+  }
+  const hour = 60 * 60 * 1000;
+  if (windowMs % hour === 0) {
+    const hours = windowMs / hour;
+    return `${hours} hour${hours === 1 ? "" : "s"}`;
+  }
+  return `${Math.max(1, Math.round(windowMs / (60 * 1000)))} minutes`;
 }
 
-export default async function AgentsPage() {
-  const [agentStats, recentRuns, discoveredAgents] = await Promise.all([
-    getAgentStats(),
+interface PageProps {
+  searchParams: Promise<{ inactive?: string }>;
+}
+
+export default async function AgentsPage({ searchParams }: PageProps) {
+  const params = await searchParams;
+  const includeInactive = params.inactive === "1" || params.inactive === "true";
+  const [directory, recentRuns] = await Promise.all([
+    getAgentDirectory({ includeInactive }),
     getRecentRuns(),
-    getDiscoveredAgents(),
   ]);
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold">Agents</h1>
-        <p className="text-muted-foreground">Agent activity and assignments</p>
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <h1 className="text-2xl font-bold">Agents</h1>
+          <p className="text-muted-foreground">
+            Current agent activity and assignments. Active means an open assignment, live
+            work, or a report/heartbeat within the last {formatActivityWindow(getAgentActivityWindowMs())}.
+          </p>
+        </div>
+        {includeInactive ? (
+          <Button asChild variant="outline" size="sm">
+            <Link href="/agents">Hide inactive/history</Link>
+          </Button>
+        ) : directory.inactiveHidden > 0 ? (
+          <Button asChild variant="outline" size="sm">
+            <Link href="/agents?inactive=1">
+              Show inactive/history ({directory.inactiveHidden})
+            </Link>
+          </Button>
+        ) : null}
       </div>
 
-      {discoveredAgents.length === 0 ? (
+      {directory.totalIdentities === 0 ? (
         <Card>
           <CardContent className="pt-6">
             <p className="text-sm text-muted-foreground">
@@ -89,42 +93,79 @@ export default async function AgentsPage() {
             </p>
           </CardContent>
         </Card>
+      ) : directory.agents.length === 0 ? (
+        <Card>
+          <CardContent className="pt-6 space-y-2">
+            <p className="text-sm text-muted-foreground">
+              No active agents. {directory.inactiveHidden} inactive{" "}
+              {directory.inactiveHidden === 1 ? "identity is" : "identities are"} hidden: no open
+              assignments, no live work, and no recent report. No recent report does not prove an
+              agent is offline — history is preserved and any new activity makes it visible again.
+            </p>
+            <Button asChild variant="outline" size="sm">
+              <Link href="/agents?inactive=1">Show inactive/history</Link>
+            </Button>
+          </CardContent>
+        </Card>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-          {discoveredAgents.map((agentName: string) => {
-            const label = `${AGENT_PREFIX}${agentName}`;
-            const stats = agentStats[label] || { assigned: 0, ready: 0, inProgress: 0, inReview: 0 };
-            return (
-              <Card key={agentName}>
+        <>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+            {directory.agents.map((entry: AgentDirectoryEntry) => (
+              <Card key={entry.agentName}>
                 <CardHeader className="pb-2">
-                  <CardTitle className="text-sm font-medium capitalize">
-                    {agentName.replace(AGENT_PREFIX, "")}
-                  </CardTitle>
+                  <div className="flex items-center justify-between gap-2">
+                    <CardTitle className="text-sm font-medium capitalize">
+                      {entry.agentName.replace(AGENT_PREFIX, "")}
+                    </CardTitle>
+                    <Badge variant={entry.active ? "default" : "outline"}>
+                      {entry.active ? "Active" : "Inactive"}
+                    </Badge>
+                  </div>
                 </CardHeader>
                 <CardContent>
                   <div className="space-y-1 text-sm">
                     <div className="flex justify-between">
-                      <span className="text-muted-foreground">Assigned</span>
-                      <span className="font-medium">{stats.assigned}</span>
+                      <span className="text-muted-foreground">Assigned (open)</span>
+                      <span className="font-medium">{entry.assignedOpen}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Executing</span>
+                      <span className="font-medium">{entry.executing}</span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-muted-foreground">Ready</span>
-                      <span className="font-medium">{stats.ready}</span>
+                      <span className="font-medium">{entry.ready}</span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-muted-foreground">In Progress</span>
-                      <span className="font-medium">{stats.inProgress}</span>
+                      <span className="font-medium">{entry.inProgress}</span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-muted-foreground">In Review</span>
-                      <span className="font-medium">{stats.inReview}</span>
+                      <span className="font-medium">{entry.inReview}</span>
+                    </div>
+                    <div
+                      className="flex justify-between"
+                      title="Latest report/heartbeat Dispatch recorded for this identity. This is ledger time, not inferred execution liveness."
+                    >
+                      <span className="text-muted-foreground">Last seen</span>
+                      <span className="font-medium">
+                        {entry.lastSeenAt ? entry.lastSeenAt.toLocaleString() : "No reports recorded"}
+                      </span>
                     </div>
                   </div>
                 </CardContent>
               </Card>
-            );
-          })}
-        </div>
+            ))}
+          </div>
+          {includeInactive && directory.inactiveHidden > 0 && (
+            <p className="text-xs text-muted-foreground">
+              Inactive identities have no open assignment, no live work, and no report/heartbeat
+              within the activity window. Hiding is display-only: AgentRun and audit history stay
+              intact, and later activity makes an identity visible again.
+            </p>
+          )}
+        </>
       )}
 
       <AgentWorkPanel />
