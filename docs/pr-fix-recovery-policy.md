@@ -778,3 +778,38 @@ observation is recorded for audit only.
   identity, attempt-token settlement, hand-out acknowledgement/reclamation.
 - [Worker execution contract](worker-execution-contract.md) — worker-side
   settlement and completion gates.
+
+### Fenced attempt-requeue (Courier retry, #1491)
+
+`POST /api/pr-fix-queue/attempt-requeue` is a fourth control in the table
+above, distinct from the operator reset in kind, not just in caller:
+
+| Control | Effect |
+|---|---|
+| `POST /api/pr-fix-queue/attempt-requeue` (fenced, idempotent) | Reactivate exactly the generation named by an ISSUED hand-out receipt: fresh generation, **no** `fixAttempts` advance, **no** reclaim/recovery budget reset. Refuses `STALE` (`item-closed`), `IGNORED`/`FIXED`/moved (`superseded`), `NEEDS_HUMAN` (`human-hold`), unprovable fence (`stale-generation`). |
+
+The fence validates against the durable `AttemptIssuance` ledger written at
+hand-out mint: the terminal report that failed the attempt already released
+the live receipt, so only recorded issuance can authorize the retry — the
+server never accepts an unfenced requeue, and the current owner of a newer
+generation is never touched. A live receipt is a GUARD, never an
+authorization: it names the CURRENT holder of the generation (a rotated
+token at the same generation means the issuance was released and re-issued,
+and the retry is refused `stale-generation` without touching that owner), but
+it never substitutes for the recorded issuance — a retry whose issuance is
+not in the ledger is refused even while its receipt is still held. "Another
+owner" is ANY live hand-out at the fenced generation: a second receipt beside
+the presented one, or a hand-out entry without a receipt (legacy rows). The
+transition clears the whole hand-out state, so it would erase that owner —
+the retry refuses `stale-generation` instead, and the CAS pins the hand-out
+arrays so a hand-out landing inside the transaction window loses the CAS and
+the retry mutates nothing.
+
+`FIXED` is refused `superseded`: the work already moved on (the fix landed),
+so a fenced retry of a stale attempt must never revert a resolved item to
+`QUEUED`. Reopening a `FIXED` item stays with the evidence-driven reopen
+paths (new post-dispatch evidence) and the unfenced operator reset. A
+committed idempotency key replays its fresh generation from
+`PrFixRequeueSettlement` with zero mutation. The `needs-human` disposition
+class stays reserved to the operator reset: a retry that cannot speak for a
+human is refused.

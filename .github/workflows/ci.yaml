@@ -185,11 +185,16 @@ jobs:
       # rotation test joins it for the same class of reason: the rotation
       # guarantee ("a parked block that cannot progress must not hold the
       # capped scan") is an ORDER BY over a nullable column plus a bulk stamp,
-      # and only a real PostgreSQL proves it (#1459).
+      # and only a real PostgreSQL proves it (#1459). The fenced attempt-requeue
+      # fence joins it for the same class of reason: "a retry never touches the
+      # current owner" is a compare-and-swap guarantee — the hand-out arrays
+      # are pinned by equality and a hand-out that commits inside the
+      # transaction window must lose the CAS — and only a real PostgreSQL can
+      # prove that the pin bites (#1491).
       - name: Concurrency and idempotency against a real PostgreSQL
         env:
           RUN_DB_INTEGRATION: "1"
-        run: npx vitest run src/lib/sync-lock.integration.test.ts "src/app/api/agents/[agentName]/tasks/report/route.integration.test.ts" src/lib/groomer/apply.integration.test.ts src/lib/groomer/blocked-reconciliation.integration.test.ts src/lib/pr-fix-external-wait.integration.test.ts src/lib/issue-mutation-guard.integration.test.ts src/lib/agent-work.integration.test.ts src/lib/pr-fix-rebase-type.integration.test.ts src/lib/lease-expiry-recovery.integration.test.ts
+        run: npx vitest run src/lib/sync-lock.integration.test.ts "src/app/api/agents/[agentName]/tasks/report/route.integration.test.ts" src/lib/groomer/apply.integration.test.ts src/lib/groomer/blocked-reconciliation.integration.test.ts src/lib/pr-fix-external-wait.integration.test.ts src/lib/issue-mutation-guard.integration.test.ts src/lib/agent-work.integration.test.ts src/lib/pr-fix-rebase-type.integration.test.ts src/lib/lease-expiry-recovery.integration.test.ts src/lib/attempt-requeue-fence.integration.test.ts
 
   coverage:
     name: Coverage

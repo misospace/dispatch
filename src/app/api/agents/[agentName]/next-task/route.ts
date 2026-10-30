@@ -16,6 +16,7 @@ import { NEEDS_HUMAN_LABEL } from "@/lib/pr-fix-surfacing";
 import { CONFLICTING_STATUSES } from "@/lib/linked-pr-health";
 import { rebaseWorkItem } from "@/lib/pr-fix-rebase";
 import { buildCapacitySkip, loadActiveCapacityHandoffs, normalizeCapacity } from "@/lib/capacity-handoff";
+import { recordAttemptIssuanceBestEffort } from "@/lib/issue-requeue";
 import type { PrFixType } from "@/types";
 import { normalizePrFixType } from "@/types";
 
@@ -452,7 +453,26 @@ export async function GET(
       // `client` decides where those writes run: on the module client for
       // ordinary fix work, or on the REBASE admission transaction so the
       // writes commit atomically with the concurrency gate read (#1327).
-      const issueHandout = async (client: PrFixQueueClient) => {
+        // #1491: the durable issuance row is DEFERRED to after the commit
+        // (flushed via the module client below). A ledger INSERT inside the
+        // REBASE admission transaction could poison the whole transaction on
+        // failure even though the helper swallows the error — Postgres aborts
+        // the transaction on any failed statement, and a best-effort row must
+        // never fail the hand-out it documents.
+        let issuanceToRecord: { token: string; generation: number } | null = null;
+        const flushIssuance = async () => {
+          if (!issuanceToRecord) return;
+          await recordAttemptIssuanceBestEffort(prisma, {
+            surface: "pr-fix",
+            attemptId: candidate.id,
+            agentName,
+            token: issuanceToRecord.token,
+            generation: issuanceToRecord.generation,
+          });
+          issuanceToRecord = null;
+        };
+        const issueHandout = async (client: PrFixQueueClient) => {
+         issuanceToRecord = null;
          const confirmed = await confirmPrFixHandOut(candidate, agentName, excluded, client);
          if (!confirmed) return null;
 
@@ -506,8 +526,15 @@ export async function GET(
                ...(dispatchedLane ? { attemptType: dispatchedLane } : {}),
              },
            });
-           if (claimed.count !== 1) return null;
-         } catch (error) {
+          if (claimed.count !== 1) return null;
+          // #1491: defer the durable issuance row to after the commit —
+          // `flushIssuance` at the call sites. A terminal report releases
+          // the live receipt; the fenced attempt-requeue proves THIS token
+          // was issued for THIS (item, agent, generation) only from this
+          // ledger row. Best-effort: losing it closes the later retry fence
+          // (operator reset stays available), never the dispatch.
+          issuanceToRecord = { token: handoutToken, generation: confirmed.generation };
+        } catch (error) {
            console.error(`next-task pr-fix hand-out record failed for ${candidate.repo}#${candidate.pr}:`, error);
            return null;
          }
@@ -573,13 +600,17 @@ export async function GET(
             return null;
           }
           try {
-           return await withRebaseLaneAdmission(asPrFixQueueClient(prisma), async (tx) => {
+           const issued = await withRebaseLaneAdmission(asPrFixQueueClient(prisma), async (tx) => {
              if (await hasInFlightRebaseHandout(tx)) {
                console.info(`[next-task-pr-fix] deferring REBASE ${candidate.repo}#${candidate.pr}: another rebase hand-out is live (concurrency 1, #1327)`);
                return null;
              }
              return await issueHandout(tx);
            });
+           // #1491: the admission transaction has COMMITTED — record the
+           // issuance outside it (best-effort, never fails the hand-out).
+           if (issued) await flushIssuance();
+           return issued;
          } catch (error) {
            // Fail CLOSED (#1327 review): the lane is concurrency 1, so a
            // hand-out issued without the advisory lock is a fan-out — two
@@ -597,7 +628,9 @@ export async function GET(
            return null;
          }
        }
-       return await issueHandout(asPrFixQueueClient(prisma));
+       const issued = await issueHandout(asPrFixQueueClient(prisma));
+       if (issued) await flushIssuance(); // #1491: best-effort, post-write.
+       return issued;
      };
 
     // PR-fix items come first, but an item this agent already received at

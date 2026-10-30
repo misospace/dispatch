@@ -466,6 +466,60 @@ describe("recoverIssueCapacityHandoff", () => {
     expect(client2.lease.deleteMany).not.toHaveBeenCalled();
   });
 
+  it("never replays a settlement committed by the fenced attempt-requeue family", async () => {
+    // (#1491) The shared ledger also carries the fenced attempt-requeue
+    // family. Its rows carry no capacity cooldown, so replaying one as a
+    // capacity handoff would answer a capacity handoff with a proof that
+    // skips its cooldown: the key is a foreign payload and never replays.
+    const { client } = seededClient(
+      { operation: "attempt-requeue", capacity: null, cooldownUntil: null },
+      { lease: { findUnique: async () => null, deleteMany: vi.fn() } },
+    );
+    const result = await call(client);
+    expect(result).toMatchObject({ ok: false, httpStatus: 409, code: "settlement_key_conflict" });
+    expect(client.audits).toHaveLength(0);
+    expect(claimMocks.releaseIssueClaim).not.toHaveBeenCalled();
+    expect(client.lease.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("refuses a key committed by the fenced attempt-requeue family before any remote work", async () => {
+    // The same foreign key, but with a LIVE lease: the release must not
+    // proceed either — the first-write-wins upsert can never rewrite that
+    // row, so the lease would be consumed on a proof this family never
+    // committed.
+    const { client } = seededClient({ operation: "attempt-requeue", capacity: null });
+    const result = await call(client);
+    expect(result).toMatchObject({ ok: false, httpStatus: 409, code: "settlement_key_conflict" });
+    expect(claimGateMocks.getLiveIssueLabels).not.toHaveBeenCalled();
+    expect(claimMocks.releaseIssueClaim).not.toHaveBeenCalled();
+    expect(client.lease.deleteMany).not.toHaveBeenCalled();
+    expect(client.handoffs).toHaveLength(0);
+  });
+
+  it("does not consume the lease when the settlement upsert returns another family's row", async () => {
+    // The race variant: the key was won by the attempt-requeue family
+    // between the (absent) fence read and the first-write-wins upsert.
+    const client = makeClient();
+    client.issueHandoffSettlement.upsert.mockResolvedValueOnce({
+      id: "settle-race",
+      claimToken: TOKEN,
+      operation: "attempt-requeue",
+    });
+    const result = await call(client);
+    expect(result).toMatchObject({ ok: false, httpStatus: 409, code: "settlement_key_conflict" });
+    expect(client.lease.deleteMany).not.toHaveBeenCalled();
+    expect(client.audits.at(-1)).toMatchObject({ success: false });
+  });
+
+  it("tags its own settlement rows with the capacity-handoff family", async () => {
+    // The family tag is what makes the cross-family refusal exact instead
+    // of inferred: a row written here is a capacity-handoff row.
+    const client = makeClient();
+    await call(client);
+    expect(client.settlements).toHaveLength(1);
+    expect(client.settlements[0].operation).toBe("capacity-handoff");
+  });
+
   it("reports cooldownUntil null on fresh success when the cooldown write fails, while replay echoes the pinned deadline", async () => {
     // Documented split (#1262): the fresh response degrades to "no cooldown"
     // when the best-effort cooldown write fails, while the durable settlement

@@ -378,6 +378,9 @@ model PrFixQueueItem {
   // index is the commitment record — a retried notice whose create races
   // into a P2002 replays instead of re-applying.
   ciParkLedger             PrFixCIParkLedger[]
+  // (#1491) Fenced attempt-requeue settlements; the replay proof dies with
+  // the item it requeued.
+  requeueSettlements       PrFixRequeueSettlement[]
 
   @@unique([repo, pr])
   @@index([status])
@@ -1241,12 +1244,23 @@ model IssueHandoffSettlement {
   // most 200 chars). One settlement per (agent, issue, key); first write wins
   // so a crash-resumed attempt can never rewrite the original proof.
   settlementKey String
-  capacity      String
+  // Capacity of the handoff settled. Nullable (#1491): the replay ledger is
+  // shared with the fenced attempt-requeue family, which settles no capacity.
+  capacity      String?
   // Recorded successful release result, replayed verbatim.
   labels        String[]
   status        String?
   statusNote    String?
   cooldownUntil DateTime?
+  // (#1491) Which settlement family wrote the row (e.g. "capacity-handoff",
+  // "attempt-requeue"); distinguishes replay lookups and supersede checks.
+  operation     String?
+  // (#1491) Fingerprint of the exact committed payload; a key reused with a
+  // different payload is refused the way `AgentReportDedupe` refuses it.
+  payloadHash   String?
+  // (#1491) Attempt identity handed back with the committed success, replayed
+  // verbatim (issue-requeue has no generation; Courier forwards it as-is).
+  attemptId     String?
   settledAt     DateTime
   // Bounded retention deadline; expired rows are pruned lazily on lookup and
   // an expired proof is refused, never replayed.
@@ -1254,6 +1268,95 @@ model IssueHandoffSettlement {
   createdAt     DateTime  @default(now())
 
   @@unique([agentName, issueId, settlementKey])
+  @@index([expiresAt])
+}
+
+// ---------------------------------------------------------------------------
+// (#1491) Durable issuance history for fenced attempt receipts.
+//
+// The fenced retry routes (POST /api/pr-fix-queue/attempt-requeue and
+// POST /api/issues/requeue) fence on a receipt the run was ISSUED — the
+// PR-fix hand-out token or the issue claim token. A terminal report already
+// RELEASED that receipt by the time a retry arrives: the live slot is gone
+// (`handoutReceipts` entry removed, `Lease` row deleted), so live state can
+// never prove issuance. This append-only ledger records every issuance at
+// the moment the live receipt is minted, so the server can answer "was this
+// token ever issued for exactly this attempt?" from history rather than
+// accepting an unfenced requeue.
+//
+// The row is a proof of a past issuance, never dispatch state and never a
+// substitute for the live fences applied on top of it (generation CAS, human
+// hold, closed item). Rows are written best-effort at issuance sites; a
+// missing row fails the retry fence closed (the unfenced operator reset
+// remains available), never opens it. `@@unique([token])` makes the mint
+// collision-impossible and the issuance proof an exact token lookup.
+// ---------------------------------------------------------------------------
+
+model AttemptIssuance {
+  id         String   @id @default(cuid())
+  // "issue" (implement work, fenced by Lease.claimToken) or "pr-fix"
+  // (queue-backed follow-up, fenced by the issued hand-out token).
+  surface    String
+  // Opaque attempt-identity string (never a cross-model FK: surfaces carry
+  // different identities). For "issue": the issue id. For "pr-fix": the
+  // PR-fix queue item id.
+  attemptId  String
+  agentName  String
+  // The opaque receipt handed to the worker at issuance.
+  token      String   @unique
+  // PR-fix generations are numbered; issue claims have no generation.
+  generation Int?
+  issuedAt   DateTime @default(now())
+
+  // One lookup serves the fence: token is already globally unique; the
+  // composite index serves the (surface, attempt, agent) audit read.
+  //
+  // Rows are permanent historical fact (like PrFixHistory) and are never
+  // pruned or cascaded: PR-fix queue items are never deleted, and issue
+  // rows outlive claims — so no FK/cascade is needed, and the unbounded
+  // growth is bounded by hand-out volume by design.
+  @@index([surface, attemptId, agentName])
+}
+
+// ---------------------------------------------------------------------------
+// (#1491) Durable replay ledger for the PR-fix fenced attempt-requeue.
+//
+// Mirrors `IssueHandoffSettlement` (#1262) for the queue-backed surface: a
+// committed `POST /api/pr-fix-queue/attempt-requeue` replays its original
+// fresh generation with zero further mutation, retained for the same
+// bounded window. The row is written BEFORE the requeue CAS in the same
+// transaction and rolled back with it if the CAS misses, so a committed row
+// always names an applied transition and a lost response resolves to the
+// original success. Keyed (agent, item, key) exactly like #1262: a reused
+// key with a different payload fingerprint is refused the way
+// `AgentReportDedupe` refuses it.
+// ---------------------------------------------------------------------------
+
+model PrFixRequeueSettlement {
+  id                 String         @id @default(cuid())
+  itemId             String
+  item               PrFixQueueItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  // The queue-backed attempt settled: repo + PR + the generation fenced.
+  repo               String
+  pr                 Int
+  generation         Int
+  agentName          String
+  // Issuance receipt the requeue fenced with; recorded for the audit trail.
+  fenceToken         String
+  // Caller-chosen idempotency key (opaque, bounded); first write wins.
+  settlementKey      String
+  // Fingerprint of the exact committed payload; mismatched reuse refused.
+  payloadHash        String
+  // Fresh generation the committed transition issued; replayed verbatim.
+  requeuedGeneration Int
+  settledAt          DateTime
+  // Bounded retention deadline (same window as #1262 settlements); expired
+  // proofs are pruned lazily on lookup and refused, never replayed.
+  expiresAt          DateTime
+  createdAt          DateTime       @default(now())
+
+  @@unique([agentName, itemId, settlementKey])
+  @@index([itemId])
   @@index([expiresAt])
 }
 

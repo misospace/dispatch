@@ -55,6 +55,23 @@ findFirst: (args: any) => Promise<any>;
     findUnique: (args: any) => Promise<any>;
     create: (args: any) => Promise<any>;
   };
+  // #1491: fenced attempt-requeue replay ledger. Optional so legacy/test
+  // clients without the table keep working: the attempt-requeue path itself
+  // fails CLOSED (retryable 503) when the surface is absent — an
+  // unprovable committed key must never degrade to double-apply.
+  prFixRequeueSettlement?: {
+    findUnique: (args: any) => Promise<any>;
+    findFirst?: (args: any) => Promise<any>;
+    create: (args: any) => Promise<any>;
+    deleteMany: (args: any) => Promise<{ count: number }>;
+  };
+  // #1491: durable issuance ledger. The fenced retry fence validates here
+  // after the terminal report released the live receipt; absent surface
+  // fails the fence closed (never an unfenced requeue).
+  attemptIssuance?: {
+    create: (args: any) => Promise<any>;
+    findUnique: (args: any) => Promise<any>;
+  };
   // #1249: durable per-item evidence ledger. Optional so legacy/test clients
   // without the table keep settling: with no surface the enqueue falls back to
   // the bounded `evidenceKeys` cache (identity-only, pre-#1249 semantics) and
@@ -4272,6 +4289,7 @@ export function parseRequeuePrFixInput(body: unknown): RequeuePrFixInput | { err
     isPrMergedOrClosed: input.isPrMergedOrClosed === true,
   };
 }
+
 
 /**
  * Outcome shape used by `tasks/report`. Mirrors the `tasks/report` route's
