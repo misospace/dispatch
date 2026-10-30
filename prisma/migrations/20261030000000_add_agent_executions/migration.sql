@@ -1,28 +1,39 @@
 -- #1495: source-neutral agent execution observation surface. External
 -- sources (e.g. Courier harnesses) report active executions (issue work and
 -- PR-fix work) that the Agents page displays alongside legacy AgentWork
--- sessions. Observation only: this table never synthesizes AgentWork rows,
--- leases, or ownership state.
+-- sessions, via the Courier (#637) wire contract
+-- POST /api/agent-work/observations. Observation only: this table never
+-- synthesizes AgentWork rows, leases, or ownership state.
+--
+-- `executionId` is the durable run UID (a recreated run is a NEW uid);
+-- keyed by (agentName, executionId). `workItemId` is the source's opaque
+-- work id — deliberately NOT an Issue foreign key. `idempotencyKey` only
+-- dedupes byte-identical deliveries; it is never the storage identity.
+-- `workRefUrl` carries the wire pullRequestUrl.
 --
 -- Additive only: new table, no existing column drop or type change,
 -- `prisma migrate deploy` safe on databases already at
--- 20261028120000_issue_release_signal. The optional issueId FK follows the
--- optional-relation convention (ON DELETE SET NULL) used by AgentRun.
+-- 20261028120000_issue_release_signal.
 -- CreateTable
 CREATE TABLE "AgentExecution" (
     "id" TEXT NOT NULL,
     "agentName" TEXT NOT NULL,
     "source" TEXT NOT NULL,
     "executionId" TEXT NOT NULL,
-    "workType" TEXT NOT NULL,
+    "workType" TEXT,
     "workRefUrl" TEXT,
-    "issueId" TEXT,
+    "workItemId" TEXT,
+    "workIdentity" TEXT,
+    "mode" TEXT,
+    "runNamespace" TEXT,
+    "runName" TEXT,
+    "pullRequestNumber" INTEGER,
     "executionState" TEXT NOT NULL,
     "startedAt" TIMESTAMP(3),
     "lastObservedAt" TIMESTAMP(3) NOT NULL,
     "endedAt" TIMESTAMP(3),
     "summary" TEXT,
-    "revision" INTEGER NOT NULL,
+    "idempotencyKey" TEXT NOT NULL,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
 
@@ -37,6 +48,3 @@ CREATE INDEX "AgentExecution_executionState_lastObservedAt_idx" ON "AgentExecuti
 
 -- CreateIndex
 CREATE INDEX "AgentExecution_agentName_lastObservedAt_idx" ON "AgentExecution"("agentName", "lastObservedAt");
-
--- AddForeignKey
-ALTER TABLE "AgentExecution" ADD CONSTRAINT "AgentExecution_issueId_fkey" FOREIGN KEY ("issueId") REFERENCES "Issue"("id") ON DELETE SET NULL ON UPDATE CASCADE;

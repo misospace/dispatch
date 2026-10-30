@@ -1,26 +1,25 @@
-// (#1495) Source-neutral agent execution observation endpoint.
+// (#1495) Source-neutral agent execution observation endpoint — the Courier
+// (#637) wire contract, accepted natively.
 //
-// POST /api/agent-executions — report an execution observation (create,
-// update, or idempotent replay) keyed by (agentName, executionId). Semantics
-// and fencing live in src/lib/agent-executions.ts.
+// POST /api/agent-work/observations — report an execution observation
+// (create, update, idempotent replay, or stale-ack) keyed by the durable run
+// UID. Semantics and fencing live in src/lib/agent-executions.ts. Per-item
+// failures are 400 (invalid_report) or 409 (execution_terminal /
+// stale_report) — NEVER 404/405/501, which the source latches as "route
+// unsupported" for the whole process. Auth failures are 401/403.
 //
-// GET /api/agent-executions — capability discovery + active-execution list.
-// As a capability surface, the distinction the issue requires is structural:
-// a source that does NOT support this capability sees a 404 (route absent),
-// while an auth failure is always 401 (unknown/missing credentials) or 403
-// (known credential, insufficient tier). Consumers must treat those as
-// different answers — 404 means "unsupported", 401/403 mean "supported but
-// not authorized", never the reverse.
+// GET /api/agent-work/observations — active-execution list for the operator
+// Agents page. Maintainer-tier only: the route is absent from
+// WORKER_ALLOWLIST for GET, so worker tokens are refused at the tier gate.
 //
-// Identity boundaries:
+// Identity boundaries (POST):
 // - a BOUND worker credential may only report for its own agent
 //   (`enforceWorkerAgentScope`); the legacy UNBOUND worker token carries no
 //   identity and is refused (403);
-// - maintainers (bearer maintainer / basic / OIDC) may report any agent;
-// - GET is maintainer-tier: worker tokens are refused at the tier gate
-//   (the consumer is the operator Agents page, not the worker loop).
+// - maintainers (bearer maintainer / basic / OIDC) may report any agent.
 //
-// Nothing here synthesizes AgentWork rows, leases, or ownership state.
+// Reports carry no claim receipts, fence tokens, or lease data. Nothing
+// here synthesizes AgentWork rows, leases, or ownership state.
 
 import { NextResponse } from "next/server";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
@@ -29,11 +28,10 @@ import { enforceWorkerAgentScope } from "@/lib/worker-identity";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { prisma } from "@/lib/prisma";
 import {
-  AGENT_EXECUTION_CAPABILITY,
   AgentExecutionError,
   listActiveExecutions,
-  recordExecutionReport,
-  validateExecutionReport,
+  reportExecutionObservation,
+  validateExecutionObservation,
 } from "@/lib/agent-executions";
 
 // Generous per-credential rate limit — sources report observations
@@ -48,10 +46,7 @@ export async function GET(request: Request) {
 
   try {
     const executions = await listActiveExecutions(prisma);
-    return NextResponse.json({
-      capability: AGENT_EXECUTION_CAPABILITY,
-      executions,
-    });
+    return NextResponse.json({ executions });
   } catch (error) {
     return handleApiError("list agent executions", error);
   }
@@ -63,7 +58,10 @@ export async function POST(request: Request) {
     return authErrorResponse(auth);
   }
 
-  const limited = enforceRateLimit(`agent-executions:${auth.throttleKey}`, RATE_LIMIT);
+  const limited = enforceRateLimit(
+    `agent-work-observations:${auth.throttleKey}`,
+    RATE_LIMIT,
+  );
   if (limited) return limited;
 
   let body: unknown;
@@ -77,15 +75,18 @@ export async function POST(request: Request) {
   }
 
   // Validate before the identity gate so the scope check compares the same
-  // normalized agentName the report is keyed on.
+  // normalized agent name the report is keyed on.
   let input;
   try {
-    input = validateExecutionReport(body);
+    input = validateExecutionObservation(body);
   } catch (error) {
     if (error instanceof AgentExecutionError) {
-      return errorResponse(error.message, error.status);
+      return NextResponse.json(
+        { error: error.message, code: error.code },
+        { status: error.status },
+      );
     }
-    return handleApiError("validate agent execution report", error, 400);
+    return handleApiError("validate agent execution observation", error, 400);
   }
 
   // Identity fencing: bound workers only for their own agent; the unbound
@@ -96,19 +97,20 @@ export async function POST(request: Request) {
   const actor = getAuthorizedActor(auth, request, input.agentName);
 
   try {
-    const { outcome, execution } = await recordExecutionReport(prisma, input, {
+    const { outcome } = await reportExecutionObservation(prisma, input, {
       actor,
     });
     return NextResponse.json({
       ok: true,
-      created: outcome.status === "created",
+      ...(outcome.status === "created" ? { created: true } : {}),
+      ...(outcome.status === "updated" ? { updated: true } : {}),
       ...(outcome.status === "duplicate" ? { duplicate: true } : {}),
-      execution,
+      ...(outcome.status === "staleIgnored" ? { staleIgnored: true } : {}),
     });
   } catch (error) {
     if (error instanceof AgentExecutionError) {
       return NextResponse.json({ error: error.message, code: error.code }, { status: error.status });
     }
-    return handleApiError("record agent execution report", error);
+    return handleApiError("record agent execution observation", error);
   }
 }

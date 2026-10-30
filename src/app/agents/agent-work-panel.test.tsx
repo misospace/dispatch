@@ -33,16 +33,21 @@ const makeExecution = (overrides = {}) => ({
   id: "exec-1",
   agentName: "alpha",
   source: "courier",
-  executionId: "exec-abc",
+  executionId: "run-abc",
   workType: "implement",
   workRefUrl: "https://github.com/test/repo/issues/42",
-  issueId: "issue-1",
+  workItemId: "issue-42",
+  workIdentity: "issue-42",
+  mode: "resolve-issue",
+  runNamespace: "courier",
+  runName: "run-1",
+  pullRequestNumber: null,
   executionState: "RUNNING",
   startedAt: new Date().toISOString(),
   lastObservedAt: new Date().toISOString(),
   endedAt: null,
   summary: null,
-  revision: 1,
+  idempotencyKey: "execution/run-abc/running/1793000000000",
   createdAt: new Date().toISOString(),
   updatedAt: new Date().toISOString(),
   staleness: "live",
@@ -56,15 +61,9 @@ function mockApi({
   executionsStatus = 200,
 } = {}) {
   authedFetchMock.mockImplementation((url: string) => {
-    if (String(url).includes("/api/agent-executions")) {
+    if (String(url).includes("/api/agent-work/observations")) {
       return Promise.resolve(
-        new Response(
-          JSON.stringify({
-            capability: { name: "agent-executions", protocolVersion: 1 },
-            executions,
-          }),
-          { status: executionsStatus },
-        ),
+        new Response(JSON.stringify({ executions }), { status: executionsStatus }),
       );
     }
     return Promise.resolve(
@@ -110,6 +109,14 @@ describe("AgentWorkPanel source-reported executions (#1495)", () => {
       "href",
       "https://github.com/test/repo/issues/42",
     );
+  });
+
+  it("fetches the observations endpoint, not the retired discovery contract", async () => {
+    await renderPanel();
+
+    const urls = authedFetchMock.mock.calls.map((call) => String(call[0]));
+    expect(urls).toContain("/api/agent-work/observations");
+    expect(urls.some((u) => u.includes("/api/agent-executions"))).toBe(false);
   });
 
   it("shows an unlinked execution as em-dash when no legacy row matches", async () => {
@@ -169,5 +176,50 @@ describe("AgentWorkPanel source-reported executions (#1495)", () => {
     });
 
     expect(screen.getByText("Succeeded")).toBeInTheDocument();
+  });
+
+  it("renders a VERIFYING row and an AWAITING_REVIEW row with their badges", async () => {
+    await renderPanel({
+      executions: [
+        makeExecution({ id: "exec-verifying", executionState: "VERIFYING" }),
+        makeExecution({ id: "exec-review", executionState: "AWAITING_REVIEW" }),
+      ],
+    });
+
+    expect(screen.getByText("Verifying")).toBeInTheDocument();
+    expect(screen.getByText("Awaiting Review")).toBeInTheDocument();
+  });
+
+  it("renders a HANDED_OFF terminal row with its badge", async () => {
+    await renderPanel({
+      executions: [makeExecution({ executionState: "HANDED_OFF", endedAt: new Date().toISOString() })],
+    });
+
+    expect(screen.getByText("Handed Off")).toBeInTheDocument();
+  });
+
+  it("renders a followup-pr execution with its PR Fix badge", async () => {
+    await renderPanel({
+      executions: [
+        makeExecution({
+          workType: "followup-pr",
+          workRefUrl: "https://github.com/test/repo/pull/7",
+          pullRequestNumber: 7,
+        }),
+      ],
+    });
+
+    const table = screen.getByText("Legacy session").closest("table")!;
+    expect(within(table).getByText("PR Fix")).toBeInTheDocument();
+  });
+
+  it("falls back to the mode text when workType is null", async () => {
+    await renderPanel({
+      executions: [makeExecution({ workType: null, mode: "resolve-issue" })],
+    });
+
+    const table = screen.getByText("Legacy session").closest("table")!;
+    expect(within(table).getByText("resolve-issue")).toBeInTheDocument();
+    expect(within(table).queryByText("Implement")).not.toBeInTheDocument();
   });
 });

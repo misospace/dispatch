@@ -38,20 +38,24 @@ interface ExecutionRow {
   agentName: string;
   source: string;
   executionId: string;
-  workType: string;
+  workType: string | null;
   workRefUrl: string | null;
-  issueId: string | null;
+  workItemId: string | null;
+  workIdentity: string | null;
+  mode: string | null;
+  runNamespace: string | null;
+  runName: string | null;
+  pullRequestNumber: number | null;
   executionState: string;
   startedAt: string | null;
   lastObservedAt: string;
   endedAt: string | null;
   summary: string | null;
-  revision: number;
+  idempotencyKey: string;
   staleness: "live" | "stale";
 }
 
 interface AgentExecutionsResponse {
-  capability: { name: string; protocolVersion: number };
   executions: ExecutionRow[];
 }
 
@@ -66,14 +70,19 @@ const STATE_BADGE: Record<string, { label: string; variant: "default" | "seconda
 
 const EXECUTION_STATE_BADGE: Record<string, { label: string; variant: "default" | "secondary" | "destructive" | "outline" }> = {
   RUNNING: { label: "Running", variant: "default" },
+  VERIFYING: { label: "Verifying", variant: "default" },
+  AWAITING_REVIEW: { label: "Awaiting Review", variant: "secondary" },
   SUCCEEDED: { label: "Succeeded", variant: "secondary" },
   FAILED: { label: "Failed", variant: "destructive" },
-  CANCELLED: { label: "Cancelled", variant: "outline" },
+  BLOCKED: { label: "Blocked", variant: "destructive" },
+  BLOCKED_EXTERNAL: { label: "Blocked External", variant: "destructive" },
+  HANDED_OFF: { label: "Handed Off", variant: "outline" },
 };
 
 const WORK_TYPE_BADGE: Record<string, { label: string; variant: "default" | "secondary" | "destructive" | "outline" }> = {
   implement: { label: "Implement", variant: "secondary" },
   pr_fix: { label: "PR Fix", variant: "outline" },
+  "followup-pr": { label: "PR Fix", variant: "outline" },
 };
 
 function formatRelative(date: Date | string): string {
@@ -152,7 +161,7 @@ export default function AgentWorkPanel() {
 
   const fetchExecutions = useCallback(async () => {
     try {
-      const res = await authedFetch("/api/agent-executions");
+      const res = await authedFetch("/api/agent-work/observations");
       if (res.ok) {
         const json: AgentExecutionsResponse = await res.json();
         setExecutions(json.executions ?? []);
@@ -330,17 +339,25 @@ export default function AgentWorkPanel() {
                       label: execution.executionState,
                       variant: "secondary" as const,
                     };
-                  const typeBadge = WORK_TYPE_BADGE[execution.workType] ?? {
-                    label: execution.workType,
-                    variant: "outline" as const,
-                  };
+                  const typeBadge = execution.workType
+                    ? WORK_TYPE_BADGE[execution.workType] ?? {
+                        label: execution.workType,
+                        variant: "outline" as const,
+                      }
+                    : null;
                   const linked = findLinkedLegacyWork(execution, activeWork);
                   return (
                     <TableRow key={execution.id}>
                       <TableCell className="font-medium capitalize">{execution.agentName}</TableCell>
                       <TableCell>
                         <div className="flex items-center gap-1">
-                          <Badge variant={typeBadge.variant}>{typeBadge.label}</Badge>
+                          {typeBadge ? (
+                            <Badge variant={typeBadge.variant}>{typeBadge.label}</Badge>
+                          ) : execution.mode ? (
+                            <span className="text-xs text-muted-foreground">{execution.mode}</span>
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
                           {execution.workRefUrl ? (
                             <a
                               href={execution.workRefUrl}

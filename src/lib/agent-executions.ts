@@ -2,40 +2,36 @@
  * (#1495) Source-neutral "agent execution observation" core.
  *
  * External sources (e.g. Courier harnesses) report active executions — issue
- * work and PR-fix work — keyed by (agentName, executionId). This module owns
- * the semantics: validation, the revision-fenced upsert, and the read path
- * the Agents page consumes. Observation only: nothing here writes AgentWork
- * rows, leases, or ownership state, and nothing reads them.
+ * work and PR-fix work — keyed by the durable run UID. This module owns the
+ * semantics: validation of the Courier wire contract, the state-fenced
+ * upsert, and the read path the Agents page consumes. Observation only:
+ * nothing here writes AgentWork rows, leases, or ownership state, and
+ * nothing reads them.
  *
- * Ordering authority is the source-supplied monotonic `revision`, never
- * `lastObservedAt` — the source's clock is display data. A terminal state
- * fences the row wholesale: post-terminal reports are either idempotent
- * replays or rejected, because a restart is a NEW executionId (see
- * TERMINAL_FENCING below).
+ * Wire contract (Courier #637): current state is keyed by (runUID, state) —
+ * an upsert, not an event log. Fencing is primarily by state kind: a
+ * terminal observation is never replaced by a non-terminal one; `observedAt`
+ * orders non-terminal changes and drives staleness display. The wire
+ * `idempotencyKey` ONLY dedupes byte-identical deliveries (a retried lost
+ * response); it is NEVER the storage identity.
  */
 
 // ---------------------------------------------------------------------------
-// Capability + vocabularies
+// Vocabularies
 // ---------------------------------------------------------------------------
 
-/**
- * Capability descriptor returned by GET /api/agent-executions so consumers
- * can discover the surface. Bump `protocolVersion` only for a breaking
- * change to the report contract or the list shape.
- */
-export const AGENT_EXECUTION_CAPABILITY = {
-  name: "agent-executions",
-  protocolVersion: 1,
-} as const;
-
-export const AGENT_EXECUTION_WORK_TYPES = ["implement", "pr_fix"] as const;
+export const AGENT_EXECUTION_WORK_TYPES = ["implement", "pr_fix", "followup-pr"] as const;
 export type AgentExecutionWorkType = (typeof AGENT_EXECUTION_WORK_TYPES)[number];
 
 export const AGENT_EXECUTION_STATES = [
   "RUNNING",
+  "VERIFYING",
+  "AWAITING_REVIEW",
   "SUCCEEDED",
   "FAILED",
-  "CANCELLED",
+  "BLOCKED",
+  "BLOCKED_EXTERNAL",
+  "HANDED_OFF",
 ] as const;
 export type AgentExecutionState = (typeof AGENT_EXECUTION_STATES)[number];
 
@@ -43,8 +39,25 @@ export type AgentExecutionState = (typeof AGENT_EXECUTION_STATES)[number];
 export const TERMINAL_AGENT_EXECUTION_STATES: readonly AgentExecutionState[] = [
   "SUCCEEDED",
   "FAILED",
-  "CANCELLED",
+  "BLOCKED",
+  "BLOCKED_EXTERNAL",
+  "HANDED_OFF",
 ] as const;
+
+/**
+ * Courier wire state vocabulary (#637) → stored uppercase state. The wire
+ * states are the contract; the stored values are the internal vocabulary.
+ */
+const WIRE_STATE_TO_STORED: Record<string, AgentExecutionState> = {
+  running: "RUNNING",
+  verifying: "VERIFYING",
+  "awaiting-review": "AWAITING_REVIEW",
+  succeeded: "SUCCEEDED",
+  failed: "FAILED",
+  blocked: "BLOCKED",
+  "blocked-external": "BLOCKED_EXTERNAL",
+  "handed-off": "HANDED_OFF",
+};
 
 export function isAgentExecutionState(value: unknown): value is AgentExecutionState {
   return (
@@ -55,7 +68,7 @@ export function isAgentExecutionState(value: unknown): value is AgentExecutionSt
 
 export function isTerminalAgentExecutionState(
   value: AgentExecutionState,
-): value is Exclude<AgentExecutionState, "RUNNING"> {
+): boolean {
   return (TERMINAL_AGENT_EXECUTION_STATES as readonly string[]).includes(value);
 }
 
@@ -64,10 +77,10 @@ export function isTerminalAgentExecutionState(
 // ---------------------------------------------------------------------------
 
 /**
- * A RUNNING execution older than this since its last observation is shown as
- * "stale". Staleness is INFORMATIONAL ONLY — it never implies absence of a
- * worker, releases nothing, and mutates nothing. Only the source can retire
- * an execution (via a terminal report).
+ * A non-terminal execution older than this since its last observation is
+ * shown as "stale". Staleness is INFORMATIONAL ONLY — it never implies
+ * absence of a worker, releases nothing, and mutates nothing. Only the
+ * source can retire an execution (via a terminal report).
  */
 export const AGENT_EXECUTION_LIVENESS_MS = 15 * 60_000;
 
@@ -114,29 +127,44 @@ export class AgentExecutionError extends Error {
 
 /**
  * Why terminal rows are fenced (`execution_terminal`): a terminal state is
- * the source's final word on an executionId. Delayed old reports and
- * post-terminal rewrites are rejected rather than applied or duplicated
- * into state changes. A source that restarts the work must mint a NEW
- * executionId — the pair (agentName, executionId) is the attempt identity.
+ * the source's final word on a run UID. A delayed NON-terminal delivery must
+ * never resurrect terminal work, so it is rejected; a terminal→terminal
+ * observation is accepted as a refinement (the first terminal observation
+ * stays the end time). A source that restarts the work mints a NEW run UID —
+ * the run UID is the attempt identity.
  */
 
 // ---------------------------------------------------------------------------
-// Report input + validation
+// Observation input + validation (Courier #637 wire contract)
 // ---------------------------------------------------------------------------
 
-export interface ExecutionReportInput {
+/**
+ * The validated observation, normalized from the Courier wire body:
+ * `version` 1, `agent`, `source`, `run {uid, namespace, name}`,
+ * `work {itemId, identity, mode, type?}`, `state`, `observedAt`,
+ * optional `pullRequestNumber` / `pullRequestUrl`.
+ */
+export interface ExecutionObservationInput {
   agentName: string;
+  idempotencyKey: string;
   source: string;
-  executionId: string;
-  workType: string;
-  workRefUrl?: string | null;
-  issueId?: string | null;
-  executionState: string;
-  startedAt?: string | null;
-  /** Optional ISO timestamp of the source-side observation; display data only. */
-  observedAt?: string | null;
-  summary?: string | null;
-  revision: number;
+  /** Durable attempt identity — a recreated run is a NEW uid. */
+  runUid: string;
+  runNamespace: string | null;
+  runName: string | null;
+  /** Opaque work id — NOT a database foreign key. */
+  workItemId: string;
+  workIdentity: string | null;
+  /** Source-neutral work kind. */
+  workMode: string | null;
+  /** Present only for mapped modes: "implement" or "followup-pr" ("pr_fix" legacy-accepted). */
+  workType: string | null;
+  /** Stored uppercase state (mapped from the wire vocabulary). */
+  executionState: AgentExecutionState;
+  /** Raw wire timestamp (ISO 8601); resolved against `now` at apply time. */
+  observedAt: string;
+  pullRequestNumber: number | null;
+  pullRequestUrl: string | null;
 }
 
 /** The minimal row shape the upsert reads (existing row or null). */
@@ -145,167 +173,170 @@ export type ExistingExecutionRow = {
   agentName: string;
   source: string;
   executionId: string;
-  workType: string;
+  workType: string | null;
   workRefUrl: string | null;
-  issueId: string | null;
+  workItemId: string | null;
+  workIdentity: string | null;
+  mode: string | null;
+  runNamespace: string | null;
+  runName: string | null;
+  pullRequestNumber: number | null;
   executionState: string;
   startedAt: Date | null;
   lastObservedAt: Date;
   endedAt: Date | null;
   summary: string | null;
-  revision: number;
+  idempotencyKey: string;
 };
 
-const WORK_REF_URL_PATTERN = /^https?:\/\//;
+const URL_PATTERN = /^https?:\/\//;
 
 const MAX_AGENT_NAME = 100;
-const MAX_EXECUTION_ID = 200;
+const MAX_IDEMPOTENCY_KEY = 300;
 const MAX_SOURCE = 200;
-const MAX_SUMMARY = 2000;
-const MAX_ISSUE_ID = 200;
+const MAX_RUN_FIELD = 200;
+const MAX_WORK_ITEM_ID = 200;
+const MAX_WORK_IDENTITY = 300;
+const MAX_WORK_MODE = 100;
+const MAX_URL = 2000;
 
-/** The `revision` column is INTEGER (Int32): fence at 2**31 - 1. */
-const MAX_REVISION = 2 ** 31 - 1;
-
-function trimmedString(value: unknown, max: number): string | null {
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim();
-  if (trimmed.length === 0 || trimmed.length > max) return null;
+function requiredString(value: unknown, field: string, max: number): string {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  if (trimmed.length === 0 || trimmed.length > max) {
+    throw new AgentExecutionError(
+      "invalid_report",
+      `Missing required field: ${field} (non-empty string, max ${max} chars)`,
+    );
+  }
   return trimmed;
 }
 
-function optionalString(value: unknown, max: number): { value?: string | null; error?: string } {
-  if (value === undefined || value === null) return { value: null };
-  if (typeof value !== "string") return { error: "must be a string" };
+function optionalString(value: unknown, field: string, max: number): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") {
+    throw new AgentExecutionError("invalid_report", `${field} must be a string`);
+  }
   const trimmed = value.trim();
-  if (trimmed.length > max) return { error: `exceeds ${max} characters` };
-  return { value: trimmed.length === 0 ? null : trimmed };
+  if (trimmed.length > max) {
+    throw new AgentExecutionError("invalid_report", `${field} exceeds ${max} characters`);
+  }
+  return trimmed.length === 0 ? null : trimmed;
 }
 
 /**
- * Validate (and normalize) a report payload. Throws AgentExecutionError
- * (code "invalid_report") on any invalid field.
+ * Validate (and normalize) a Courier observation body. Throws
+ * AgentExecutionError (code "invalid_report") on any invalid field.
  */
-export function validateExecutionReport(input: unknown): ExecutionReportInput {
+export function validateExecutionObservation(input: unknown): ExecutionObservationInput {
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
     throw new AgentExecutionError("invalid_report", "Request body must be a JSON object");
   }
   const raw = input as Record<string, unknown>;
 
-  const agentName = trimmedString(raw.agentName, MAX_AGENT_NAME);
-  if (!agentName) {
+  if (raw.version !== 1) {
     throw new AgentExecutionError(
       "invalid_report",
-      `Missing required field: agentName (non-empty string, max ${MAX_AGENT_NAME} chars)`,
-    );
-  }
-  const executionId = trimmedString(raw.executionId, MAX_EXECUTION_ID);
-  if (!executionId) {
-    throw new AgentExecutionError(
-      "invalid_report",
-      `Missing required field: executionId (non-empty string, max ${MAX_EXECUTION_ID} chars)`,
-    );
-  }
-  const source = trimmedString(raw.source, MAX_SOURCE);
-  if (!source) {
-    throw new AgentExecutionError(
-      "invalid_report",
-      `Missing required field: source (non-empty string, max ${MAX_SOURCE} chars)`,
+      "Missing/invalid required field: version (must be 1)",
     );
   }
 
-  const workType = trimmedString(raw.workType, MAX_SOURCE);
-  if (!workType || !(AGENT_EXECUTION_WORK_TYPES as readonly string[]).includes(workType)) {
+  const agentName = requiredString(raw.agent, "agent", MAX_AGENT_NAME);
+  const idempotencyKey = requiredString(raw.idempotencyKey, "idempotencyKey", MAX_IDEMPOTENCY_KEY);
+  const source = requiredString(raw.source, "source", MAX_SOURCE);
+
+  if (typeof raw.run !== "object" || raw.run === null || Array.isArray(raw.run)) {
+    throw new AgentExecutionError("invalid_report", "run must be a JSON object");
+  }
+  const run = raw.run as Record<string, unknown>;
+  const runUid = requiredString(run.uid, "run.uid", MAX_RUN_FIELD);
+  const runNamespace = optionalString(run.namespace, "run.namespace", MAX_RUN_FIELD);
+  const runName = optionalString(run.name, "run.name", MAX_RUN_FIELD);
+
+  if (typeof raw.work !== "object" || raw.work === null || Array.isArray(raw.work)) {
+    throw new AgentExecutionError("invalid_report", "work must be a JSON object");
+  }
+  const work = raw.work as Record<string, unknown>;
+  const workItemId = requiredString(work.itemId, "work.itemId", MAX_WORK_ITEM_ID);
+  const workIdentity = optionalString(work.identity, "work.identity", MAX_WORK_IDENTITY);
+  const workMode = optionalString(work.mode, "work.mode", MAX_WORK_MODE);
+
+  let workType: string | null = null;
+  if (work.type !== undefined && work.type !== null) {
+    workType = optionalString(work.type, "work.type", MAX_WORK_MODE);
+    if (workType && !(AGENT_EXECUTION_WORK_TYPES as readonly string[]).includes(workType)) {
+      throw new AgentExecutionError(
+        "invalid_report",
+        `Invalid work.type: expected one of ${AGENT_EXECUTION_WORK_TYPES.join(", ")}`,
+      );
+    }
+  }
+
+  const storedState = WIRE_STATE_TO_STORED[raw.state as string];
+  if (!storedState) {
     throw new AgentExecutionError(
       "invalid_report",
-      `Invalid workType: expected one of ${AGENT_EXECUTION_WORK_TYPES.join(", ")}`,
+      `Invalid state: expected one of ${Object.keys(WIRE_STATE_TO_STORED).join(", ")}`,
     );
-  }
-
-  if (!isAgentExecutionState(raw.executionState)) {
-    throw new AgentExecutionError(
-      "invalid_report",
-      `Invalid executionState: expected one of ${AGENT_EXECUTION_STATES.join(", ")}`,
-    );
-  }
-  const executionState = raw.executionState;
-
-  const workRefUrl = optionalString(raw.workRefUrl, 2000);
-  if (workRefUrl.error) {
-    throw new AgentExecutionError("invalid_report", `workRefUrl ${workRefUrl.error}`);
-  }
-  if (workRefUrl.value && !WORK_REF_URL_PATTERN.test(workRefUrl.value)) {
-    throw new AgentExecutionError(
-      "invalid_report",
-      "workRefUrl must be an http(s) URL",
-    );
-  }
-
-  const summary = optionalString(raw.summary, MAX_SUMMARY);
-  if (summary.error) {
-    throw new AgentExecutionError("invalid_report", `summary ${summary.error}`);
-  }
-
-  const issueId = optionalString(raw.issueId, MAX_ISSUE_ID);
-  if (issueId.error) {
-    throw new AgentExecutionError("invalid_report", `issueId ${issueId.error}`);
   }
 
   if (
-    typeof raw.revision !== "number" ||
-    !Number.isInteger(raw.revision) ||
-    raw.revision < 0 ||
-    // The column is INTEGER (Int32): values above 2**31 - 1 would surface as
-    // a 500 at write time, so fence them here as an invalid report.
-    raw.revision > MAX_REVISION
+    typeof raw.observedAt !== "string" ||
+    !Number.isFinite(new Date(raw.observedAt).getTime())
   ) {
     throw new AgentExecutionError(
       "invalid_report",
-      `Missing/invalid required field: revision (integer 0..${MAX_REVISION})`,
+      "Missing/invalid required field: observedAt (ISO 8601 timestamp)",
     );
   }
 
-  let startedAt: string | null = null;
-  if (raw.startedAt !== undefined && raw.startedAt !== null) {
-    if (typeof raw.startedAt !== "string" || !Number.isFinite(new Date(raw.startedAt).getTime())) {
+  let pullRequestNumber: number | null = null;
+  if (raw.pullRequestNumber !== undefined && raw.pullRequestNumber !== null) {
+    if (
+      typeof raw.pullRequestNumber !== "number" ||
+      !Number.isInteger(raw.pullRequestNumber) ||
+      raw.pullRequestNumber < 1
+    ) {
       throw new AgentExecutionError(
         "invalid_report",
-        "startedAt must be a valid ISO 8601 timestamp",
+        "pullRequestNumber must be a positive integer",
       );
     }
-    startedAt = raw.startedAt;
+    pullRequestNumber = raw.pullRequestNumber;
   }
 
-  let observedAt: string | null = null;
-  if (raw.observedAt !== undefined && raw.observedAt !== null) {
-    if (typeof raw.observedAt !== "string" || !Number.isFinite(new Date(raw.observedAt).getTime())) {
+  let pullRequestUrl: string | null = null;
+  if (raw.pullRequestUrl !== undefined && raw.pullRequestUrl !== null) {
+    pullRequestUrl = optionalString(raw.pullRequestUrl, "pullRequestUrl", MAX_URL);
+    if (pullRequestUrl && !URL_PATTERN.test(pullRequestUrl)) {
       throw new AgentExecutionError(
         "invalid_report",
-        "observedAt must be a valid ISO 8601 timestamp",
+        "pullRequestUrl must be an http(s) URL",
       );
     }
-    observedAt = raw.observedAt;
   }
 
   return {
     agentName,
+    idempotencyKey,
     source,
-    executionId,
+    runUid,
+    runNamespace,
+    runName,
+    workItemId,
+    workIdentity,
+    workMode,
     workType,
-    workRefUrl: workRefUrl.value,
-    issueId: issueId.value,
-    executionState,
-    startedAt,
-    observedAt,
-    summary: summary.value,
-    revision: raw.revision,
+    executionState: storedState,
+    observedAt: raw.observedAt,
+    pullRequestNumber,
+    pullRequestUrl,
   };
 }
 
 /**
- * Resolve the row's lastObservedAt from a report: the optional ISO
- * `observedAt` is accepted when parseable and not in the future; otherwise
- * now. Never trusted for ordering — ordering authority is `revision`.
+ * Resolve the row's lastObservedAt from an observation: the ISO `observedAt`
+ * is accepted when parseable and not in the future; otherwise now. A future
+ * timestamp is clamped to now.
  */
 export function resolveObservedAt(observedAt: string | null | undefined, now: Date): Date {
   if (observedAt) {
@@ -317,125 +348,133 @@ export function resolveObservedAt(observedAt: string | null | undefined, now: Da
   return now;
 }
 
-/** Canonical payload of the report fields an update may carry. */
-function samePayload(a: ExistingExecutionRow, input: ExecutionReportInput): boolean {
-  return (
-    a.source === input.source &&
-    a.workType === input.workType &&
-    (a.workRefUrl ?? null) === (input.workRefUrl ?? null) &&
-    (a.issueId ?? null) === (input.issueId ?? null) &&
-    a.executionState === input.executionState &&
-    (a.startedAt?.getTime() ?? null) === (input.startedAt ? new Date(input.startedAt).getTime() : null) &&
-    (a.summary ?? null) === (input.summary ?? null)
-  );
+/** The later of two timestamps — keeps lastObservedAt monotonic on updates. */
+function laterOf(a: Date, b: Date): Date {
+  return a.getTime() >= b.getTime() ? a : b;
 }
 
 // ---------------------------------------------------------------------------
 // Upsert decision (pure) + application (injected deps)
 // ---------------------------------------------------------------------------
 
-export type ExecutionReportOutcome =
+export type ExecutionObservationOutcome =
   | { status: "created" }
   | { status: "updated" }
-  | { status: "duplicate" };
+  | { status: "duplicate" }
+  | { status: "staleIgnored" };
 
 /**
- * Pure decision for the (existing row, report) pair. Returns either the
+ * Pure decision for the (existing row, observation) pair. Returns either the
  * data to persist, or a terminal outcome. Throws AgentExecutionError for
  * fenced conflicts.
+ *
+ * - no row → created (startedAt = observedAt; endedAt = observedAt iff terminal);
+ * - idempotencyKey replay → duplicate (no mutation) — checked FIRST, so an
+ *   identical terminal delivery replays as duplicate rather than fencing;
+ * - existing terminal + incoming non-terminal → execution_terminal (409):
+ *   a delayed non-terminal must never resurrect terminal work;
+ * - existing terminal + incoming terminal → updated, KEEPING the original
+ *   endedAt (first terminal observation stays the end time) and startedAt;
+ * - existing non-terminal: observedAt >= existing.lastObservedAt → updated
+ *   (endedAt = observedAt iff incoming terminal); observedAt <
+ *   existing.lastObservedAt → staleIgnored (acknowledged, NO mutation) so
+ *   the source stops retrying without overwriting newer state.
  */
-export function applyExecutionReport(
-  input: ExecutionReportInput,
+export function applyExecutionObservation(
+  input: ExecutionObservationInput,
   existing: ExistingExecutionRow | null,
   now: Date,
-): ExecutionReportOutcome & { data?: Record<string, unknown> } {
+): ExecutionObservationOutcome & { data?: Record<string, unknown> } {
   const observedAt = resolveObservedAt(input.observedAt, now);
-  const terminal = isTerminalAgentExecutionState(
-    input.executionState as AgentExecutionState,
-  );
+  const terminal = isTerminalAgentExecutionState(input.executionState);
 
-  // No existing row: create (RUNNING or terminal accepted; a terminal
-  // creation ends at the observation time).
+  const descriptive = {
+    source: input.source,
+    workType: input.workType,
+    workRefUrl: input.pullRequestUrl,
+    workItemId: input.workItemId,
+    workIdentity: input.workIdentity,
+    mode: input.workMode,
+    runNamespace: input.runNamespace,
+    runName: input.runName,
+    pullRequestNumber: input.pullRequestNumber,
+  };
+
+  // No existing row: create (any state accepted; a terminal creation ends at
+  // the observation time).
   if (!existing) {
     return {
       status: "created",
       data: {
         agentName: input.agentName,
-        source: input.source,
-        executionId: input.executionId,
-        workType: input.workType,
-        workRefUrl: input.workRefUrl,
-        issueId: input.issueId,
+        executionId: input.runUid,
         executionState: input.executionState,
-        startedAt: input.startedAt ? new Date(input.startedAt) : null,
+        startedAt: observedAt,
         lastObservedAt: observedAt,
         endedAt: terminal ? observedAt : null,
-        summary: input.summary,
-        revision: input.revision,
+        summary: null,
+        idempotencyKey: input.idempotencyKey,
+        ...descriptive,
       },
     };
+  }
+
+  // Byte-identical delivery replay (a retried lost response): no mutation.
+  // This comes BEFORE the terminal fence so an identical terminal delivery
+  // replays as duplicate.
+  if (existing.idempotencyKey === input.idempotencyKey) {
+    return { status: "duplicate" };
   }
 
   // Existing terminal row: the attempt is over.
   if (isTerminalAgentExecutionState(existing.executionState as AgentExecutionState)) {
-    if (
-      existing.executionState === input.executionState &&
-      input.revision <= existing.revision
-    ) {
-      // Idempotent replay: no mutation, no resurrection, no endedAt drift.
-      return { status: "duplicate" };
+    if (!terminal) {
+      throw new AgentExecutionError(
+        "execution_terminal",
+        `Execution ${existing.executionId} for agent ${existing.agentName} already ended (${existing.executionState}); a delayed non-terminal observation may not resurrect it`,
+      );
     }
-    // Different state, or a newer revision trying to rewrite history: fenced.
-    // A restart is a NEW executionId (see TERMINAL_FENCING above).
-    throw new AgentExecutionError(
-      "execution_terminal",
-      `Execution ${existing.executionId} for agent ${existing.agentName} already ended (${existing.executionState}); a restart must use a new executionId`,
-    );
-  }
-
-  // Existing RUNNING row: revision is the ordering authority.
-  if (input.revision > existing.revision) {
+    // Terminal → terminal refinement: keep the original endedAt (the first
+    // terminal observation stays the end time) and startedAt. lastObservedAt
+    // never regresses: staleness display stays monotonic.
     return {
       status: "updated",
       data: {
-        source: input.source,
-        workType: input.workType,
-        workRefUrl: input.workRefUrl,
-        issueId: input.issueId,
         executionState: input.executionState,
-        startedAt: input.startedAt ? new Date(input.startedAt) : existing.startedAt,
-        lastObservedAt: observedAt,
-        endedAt: terminal ? observedAt : null,
-        summary: input.summary,
-        revision: input.revision,
+        lastObservedAt: laterOf(observedAt, existing.lastObservedAt),
+        idempotencyKey: input.idempotencyKey,
+        ...descriptive,
       },
     };
   }
 
-  if (input.revision === existing.revision) {
-    // Same revision: identical payload is an idempotent replay; anything
-    // else is a conflicting same-revision report.
-    if (samePayload(existing, input)) {
-      return { status: "duplicate" };
-    }
-    throw new AgentExecutionError(
-      "stale_report",
-      `Conflicting same-revision report for execution ${existing.executionId}: revision ${input.revision} already recorded with a different payload`,
-    );
+  // Existing non-terminal row. observedAt orders NON-terminal changes: a
+  // delayed old non-terminal delivery is acknowledged (staleIgnored, no
+  // mutation) so the source stops retrying without overwriting newer state.
+  // A terminal delivery always applies regardless of observedAt — the state
+  // kind is the fence, and the run is over; declining it on clock order
+  // would leave a finished run listed as active forever.
+  if (!terminal && observedAt.getTime() < existing.lastObservedAt.getTime()) {
+    return { status: "staleIgnored" };
   }
 
-  // Lower revision: out-of-order / delayed report.
-  throw new AgentExecutionError(
-    "stale_report",
-    `Out-of-order report for execution ${existing.executionId}: revision ${input.revision} is older than recorded revision ${existing.revision}`,
-  );
+  return {
+    status: "updated",
+    data: {
+      executionState: input.executionState,
+      lastObservedAt: laterOf(observedAt, existing.lastObservedAt),
+      idempotencyKey: input.idempotencyKey,
+      endedAt: terminal ? observedAt : null,
+      ...descriptive,
+    },
+  };
 }
 
 /**
  * Injectable Prisma surface — mirrors how src/lib/agent-work.ts scopes IO.
  * `updateMany` (not `update`) is the write primitive so the upsert can fence
- * on the observed (revision, executionState) pair and detect a concurrent
- * writer via `count: 0`.
+ * on the observed idempotency key and detect a concurrent writer via
+ * `count: 0`.
  */
 export interface AgentExecutionDeps {
   agentExecution: {
@@ -453,8 +492,8 @@ export interface AgentExecutionDeps {
   };
 }
 
-export interface RecordExecutionReportResult {
-  outcome: ExecutionReportOutcome;
+export interface RecordExecutionObservationResult {
+  outcome: ExecutionObservationOutcome;
   execution: unknown;
 }
 
@@ -475,27 +514,28 @@ function isUniqueViolation(error: unknown): boolean {
 }
 
 /**
- * Apply a validated report through the injected deps, race-safe.
+ * Apply a validated observation through the injected deps, race-safe.
  *
- * The pure decision (`applyExecutionReport`) stays the single decision
+ * The pure decision (`applyExecutionObservation`) stays the single decision
  * authority; only the write mechanics serialize concurrent writers:
  *
- * - `update` becomes a conditional `updateMany` fenced on the observed
- *   `(id, revision, executionState)` — a `count: 0` means a concurrent
- *   writer moved the row, so the row is re-read and the decision re-run,
- *   bounded by REPORT_MAX_ATTEMPTS before surfacing 409 `stale_report`
- *   (a lost race is exactly a stale report from this caller's perspective);
+ * - the write is a conditional `updateMany` fenced on
+ *   `(id, idempotencyKey: existing.idempotencyKey)` — a `count: 0` means a
+ *   concurrent writer moved the row, so the row is re-read and the decision
+ *   re-run, bounded by REPORT_MAX_ATTEMPTS before surfacing 409
+ *   `stale_report` (a lost race is exactly a stale report from this
+ *   caller's perspective);
  * - a `create` that loses the unique-constraint race (P2002) re-reads and
  *   re-decides instead of bubbling the P2002 to a 500.
  *
  * The caller (route) maps AgentExecutionError to HTTP status + code. Audit
  * is best-effort: a failure to write the audit row never fails the report.
  */
-export async function recordExecutionReport(
+export async function reportExecutionObservation(
   deps: AgentExecutionDeps,
-  input: ExecutionReportInput,
+  input: ExecutionObservationInput,
   options: { actor?: string; now?: Date } = {},
-): Promise<RecordExecutionReportResult> {
+): Promise<RecordExecutionObservationResult> {
   const now = options.now ?? new Date();
 
   for (let attempt = 1; attempt <= REPORT_MAX_ATTEMPTS; attempt++) {
@@ -503,16 +543,16 @@ export async function recordExecutionReport(
       where: {
         agentName_executionId: {
           agentName: input.agentName,
-          executionId: input.executionId,
+          executionId: input.runUid,
         },
       },
     });
 
     // Single decision authority — never re-derived ad hoc.
-    const decision = applyExecutionReport(input, existing, now);
+    const decision = applyExecutionObservation(input, existing, now);
 
-    if (decision.status === "duplicate") {
-      return { outcome: { status: "duplicate" }, execution: existing };
+    if (decision.status === "duplicate" || decision.status === "staleIgnored") {
+      return { outcome: { status: decision.status }, execution: existing };
     }
 
     if (decision.status === "created") {
@@ -521,19 +561,18 @@ export async function recordExecutionReport(
         await writeExecutionAudit(deps, input, options.actor);
         return { outcome: { status: "created" }, execution };
       } catch (error) {
-        // Lost the (agentName, executionId) create race: re-read the winner
-        // and re-decide. If that still says create, loop (bounded).
+        // Lost the (agentName, runUid) create race: re-read the winner and
+        // re-decide. If that still says create, loop (bounded).
         if (isUniqueViolation(error)) continue;
         throw error;
       }
     }
 
-    // "updated": conditional write fenced on the observed pair.
+    // "updated": conditional write fenced on the observed idempotency key.
     const result = await deps.agentExecution.updateMany({
       where: {
         id: existing!.id,
-        revision: existing!.revision,
-        executionState: existing!.executionState,
+        idempotencyKey: existing!.idempotencyKey,
       },
       data: decision.data!,
     });
@@ -545,7 +584,7 @@ export async function recordExecutionReport(
         where: {
           agentName_executionId: {
             agentName: input.agentName,
-            executionId: input.executionId,
+            executionId: input.runUid,
           },
         },
       });
@@ -558,7 +597,7 @@ export async function recordExecutionReport(
 
   throw new AgentExecutionError(
     "stale_report",
-    `Execution ${input.executionId} for agent ${input.agentName} kept changing under concurrent writers after ${REPORT_MAX_ATTEMPTS} attempts; retry with a fresh observation`,
+    `Execution ${input.runUid} for agent ${input.agentName} kept changing under concurrent writers after ${REPORT_MAX_ATTEMPTS} attempts; retry with a fresh observation`,
   );
 }
 
@@ -568,7 +607,7 @@ export async function recordExecutionReport(
  */
 async function writeExecutionAudit(
   deps: AgentExecutionDeps,
-  input: ExecutionReportInput,
+  input: ExecutionObservationInput,
   actor: string | undefined,
 ): Promise<void> {
   try {

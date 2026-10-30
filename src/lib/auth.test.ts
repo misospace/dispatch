@@ -829,10 +829,10 @@ describe("bearer token tiers (#1111)", () => {
     expect(requiredTierForRoute("/api/issues/state", "GET")).toBe("worker");
   });
 
-  it("admits worker tokens to the execution report endpoint (#1495), POST only", () => {
-    expect(requiredTierForRoute("/api/agent-executions", "POST")).toBe("worker");
-    expect(requiredTierForRoute("/api/agent-executions", "GET")).toBe("maintainer");
-    expect(requiredTierForRoute("/api/agent-executions-evil", "POST")).toBe("maintainer");
+  it("admits worker tokens to the execution observation endpoint (#1495), POST only", () => {
+    expect(requiredTierForRoute("/api/agent-work/observations", "POST")).toBe("worker");
+    expect(requiredTierForRoute("/api/agent-work/observations", "GET")).toBe("maintainer");
+    expect(requiredTierForRoute("/api/agent-work/observations-evil", "POST")).toBe("maintainer");
   });
 
   it("keeps DISPATCH_AGENT_TOKEN at maintainer rights", async () => {
