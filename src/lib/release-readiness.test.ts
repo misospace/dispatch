@@ -7,9 +7,11 @@ import {
   RELEASE_READINESS_VOLUME_COMMITS,
   type ReleaseCiStatus,
 } from "./release-readiness";
-import type {
-  ReleasePulseHighlight,
-  ReleasePulseSnapshot,
+import {
+  isNotableDelivery,
+  RELEASE_PULSE_MAX_HIGHLIGHTS,
+  type ReleasePulseHighlight,
+  type ReleasePulseSnapshot,
 } from "./release-pulse";
 
 /**
@@ -41,6 +43,10 @@ function highlight(
 }
 
 function snapshot(overrides: Partial<ReleasePulseSnapshot> = {}): ReleasePulseSnapshot {
+  // Mirrors the producer invariant: the semantic count is derived from the
+  // FULL highlight set upstream (an explicit override wins, letting a test
+  // simulate a truncated list with hidden evidence).
+  const highlights = overrides.highlights ?? [];
   return {
     schema: "dispatch.release-pulse/v1",
     repoFullName: "octocat/hello-world",
@@ -49,8 +55,9 @@ function snapshot(overrides: Partial<ReleasePulseSnapshot> = {}): ReleasePulseSn
     headSha: "head0",
     unreleasedCommits: { state: "ahead", count: 3 },
     deliveredIssueCount: 0,
-    highlights: [],
+    highlights,
     highlightsTruncated: false,
+    notableDeliveryCount: highlights.filter(isNotableDelivery).length,
     completedUmbrellaCount: 0,
     unknownDeliveryCount: 0,
     ...overrides,
@@ -166,6 +173,41 @@ describe("deriveReleaseReadiness — semantic milestones", () => {
       "2 notable delivered features",
       "5 days since v0.1.12",
     ]);
+  });
+
+  it("promotes the hidden semantic delivery past the pulse's highlight cap", () => {
+    // Truncation counterexample: the pulse caps the exposed list at 50
+    // (newest-first), and one PR can deliver several issues, so a truncated
+    // list does NOT imply the volume rule fires. Readiness must read the
+    // producer's pre-truncation count, not filter the capped array.
+    const visible = Array.from({ length: RELEASE_PULSE_MAX_HIGHLIGHTS }, (_, i) =>
+      highlight({ issueNumber: 100 + i, significance: "routine" }),
+    );
+    const result = readiness({
+      unreleasedCommits: { state: "ahead", count: 2 },
+      highlights: visible,
+      highlightsTruncated: true,
+      notableDeliveryCount: 1,
+    });
+    expect(result.state).toBe("candidate");
+    expect(result.reasons).toEqual([
+      "2 unreleased commits",
+      "1 notable delivered feature",
+      "5 days since v0.1.12",
+    ]);
+  });
+
+  it("does not fabricate a semantic trigger from truncation alone", () => {
+    const visible = Array.from({ length: RELEASE_PULSE_MAX_HIGHLIGHTS }, (_, i) =>
+      highlight({ issueNumber: 100 + i, significance: "routine" }),
+    );
+    const result = readiness({
+      unreleasedCommits: { state: "ahead", count: 2 },
+      highlights: visible,
+      highlightsTruncated: true,
+      notableDeliveryCount: 0,
+    });
+    expect(result.state).toBe("building");
   });
 
   it("never turns a routine-only or legacy-only delivery into a semantic reason", () => {

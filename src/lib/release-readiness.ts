@@ -169,15 +169,13 @@ export function deriveReleaseReadiness(input: ReleaseReadinessInput): ReleaseRea
   // Semantic milestone triggers. Only notable/major FEATURE/ARCHITECTURE
   // deliveries count: `internal`-signal issues emit no pulse highlight at
   // all, routine significance and significance-less legacy fallbacks are
-  // volume evidence, not a "feature shipped" claim. Past the pulse's
-  // highlight cap (highlightsTruncated) N is a lower bound; the state is
-  // unaffected because >=cap commits already clear the volume rule, and
-  // completedUmbrellaCount is never truncated.
-  const notableDeliveries = pulse.highlights.filter(
-    (highlight) =>
-      (highlight.kind === "feature" || highlight.kind === "architecture") &&
-      (highlight.significance === "notable" || highlight.significance === "major"),
-  ).length;
+  // volume evidence, not a "feature shipped" claim. The count comes from the
+  // pulse itself (`notableDeliveryCount`), computed over the FULL highlight
+  // set BEFORE the pulse's 50-highlight presentation cap — filtering the
+  // capped `highlights` array here could hide a trigger past the cap (one PR
+  // can deliver several issues, so a truncated list does not imply the
+  // volume rule fires). `completedUmbrellaCount` is likewise never truncated.
+  const notableDeliveries = pulse.notableDeliveryCount;
   const umbrellas = pulse.completedUmbrellaCount;
 
   const milestoneReasons: string[] = [];
