@@ -8,6 +8,8 @@ vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock(mockToken, { "test-worke
 const { mocks } = vi.hoisted(() => ({
   mocks: {
     issueFindMany: vi.fn(),
+    // #1503: linked-issue escalation provenance read by the hand-out gate.
+    issueFindFirst: vi.fn(),
     prFixFindMany: vi.fn(),
     prFixCreate: vi.fn(),
     prFixHistoryCreate: vi.fn(),
@@ -72,7 +74,7 @@ vi.mock("@/lib/prisma", () => {
   };
   return {
     prisma: {
-      issue: { findMany: mocks.issueFindMany },
+      issue: { findMany: mocks.issueFindMany, findFirst: mocks.issueFindFirst },
       prFixQueueItem,
       prFixHistory: { create: mocks.prFixHistoryCreate },
       capacityHandoff: {
@@ -1098,6 +1100,9 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     });
     mocks.prFixUpdateMany.mockResolvedValue({ count: 1 });
     mocks.issueFindMany.mockResolvedValue([]);
+    // #1503: no linked issue resolves as escalation-classified unless a test
+    // opts in (keeps the hand-out gate inert for pre-existing fixtures).
+    mocks.issueFindFirst.mockResolvedValue(null);
     mocks.findLeasedIssueIds.mockResolvedValue([]);
   });
 
@@ -3898,5 +3903,121 @@ describe("GET /api/agents/[agentName]/next-task — CI park deferral suppression
     expect(body.type).toBe("idle");
     expect(row.agentHandouts).toEqual([]);
     expect(row.dispatchedGeneration ?? null).toBeNull();
+  });
+});
+
+// ─── #1503: escalation-lane (frontier) exclusivity at hand-out ──────────────
+//
+// A row linked to a frontier-classified issue is escalation-authoritative no
+// matter how it was classified at enqueue. The declared-normal poll must be
+// refused and the queued row corrected; the escalation poll keeps serving; the
+// mechanical REBASE lane (#1327) is the declared exception.
+
+describe("GET next-task escalation-lane exclusivity (#1503)", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    // REBASE admission runs for `example-agent` (the declared exception's
+    // pool), mirroring the main describe's harness defaults.
+    process.env.DISPATCH_REBASE_AGENTS = "example-agent";
+    resetAuthCaches();
+    vi.clearAllMocks();
+    mocks.prFixFindMany.mockResolvedValue([]);
+    mocks.linkedRows = [];
+    mocks.prFixTransactionError = null;
+    mocks.prFixTxSurfaces = [];
+    mocks.prFixUpdateMany.mockResolvedValue({ count: 1 });
+    mocks.prFixHistoryCreate.mockResolvedValue({});
+    mocks.issueFindMany.mockResolvedValue([]);
+    mocks.issueFindFirst.mockResolvedValue(null);
+    mocks.findLeasedIssueIds.mockResolvedValue([]);
+    mocks.fetchPullRequestLabels.mockResolvedValue([]);
+    mocks.fetchPullRequestHeadSha.mockResolvedValue(null);
+    mocks.prFixFindUniqueByRepo.mockResolvedValue(null);
+  });
+  afterEach(() => {
+    delete process.env.DISPATCH_REBASE_AGENTS;
+  });
+
+  function frontierLinkedRow(pr = 40) {
+    return {
+      id: `prfix-${pr}`, repo: "org/repo", pr, issue: 737,
+      url: `https://github.com/org/repo/pull/${pr}`, lane: "NORMAL", status: "QUEUED",
+      reason: "PR review: CHANGES_REQUESTED", feedback: [], evidenceKeys: [], author: "bot",
+      generation: 1, agentHandouts: [],
+    };
+  }
+
+  it("refuses a misclassified frontier row for the normal lane and issues the safe correction", async () => {
+    const row = frontierLinkedRow();
+    mocks.prFixFindMany.mockResolvedValue([row]);
+    mocks.issueFindFirst.mockResolvedValue({ currentLane: "frontier" });
+    const body = await (
+      await GET(request("/api/agents/example-agent/next-task?lane=local"), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })
+    ).json();
+    // Nothing handed out to the shared lane...
+    expect(body.type).toBe("idle");
+    // ...and the queued-row correction CAS fired with the live-attempt pins.
+    const cas = mocks.prFixUpdateMany.mock.calls.map(([args]: any) => args)
+      .find((args: any) => args.data?.lane === "ESCALATED");
+    expect(cas).toBeTruthy();
+    expect(cas.where).toMatchObject({
+      id: row.id,
+      lane: "NORMAL",
+      status: "QUEUED",
+      generation: 1,
+      agentHandouts: { equals: [] },
+    });
+    expect(cas.where.OR).toEqual([
+      { dispatchedGeneration: null },
+      { dispatchedGeneration: { not: 1 } },
+    ]);
+    expect(mocks.prFixHistoryCreate).toHaveBeenCalled();
+  });
+
+  it("refuses an already-ESCALATED row for the normal lane without touching it", async () => {
+    const row = { ...frontierLinkedRow(41), lane: "ESCALATED" };
+    mocks.prFixFindMany.mockResolvedValue([row]);
+    const body = await (
+      await GET(request("/api/agents/example-agent/next-task?lane=local"), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })
+    ).json();
+    expect(body.type).toBe("idle");
+    expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it("serves an ESCALATED row to the frontier lane", async () => {
+    const row = { ...frontierLinkedRow(42), lane: "ESCALATED" };
+    mocks.prFixFindMany.mockResolvedValue([row]);
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) => (where.id === row.id ? row : null));
+    const body = await (
+      await GET(request("/api/agents/example-agent/next-task?lane=frontier"), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })
+    ).json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem.id).toBe(row.id);
+  });
+
+  it("hands a REBASE row out on the normal lane despite a frontier link (#1327 exception)", async () => {
+    const row = {
+      ...frontierLinkedRow(43),
+      type: "REBASE",
+      reason: "Mechanical rebase: PR CONFLICTING against base (#1327)",
+    };
+    mocks.prFixFindMany.mockResolvedValue([row]);
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) => (where.id === row.id ? row : null));
+    mocks.issueFindFirst.mockResolvedValue({ currentLane: "frontier" });
+    const body = await (
+      await GET(request("/api/agents/example-agent/next-task?lane=local"), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })
+    ).json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem.fixType).toBe("REBASE");
+    // The mechanical lane skipped the escalation lookup entirely.
+    expect(mocks.issueFindFirst).not.toHaveBeenCalled();
   });
 });

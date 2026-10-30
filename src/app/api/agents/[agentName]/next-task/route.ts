@@ -10,7 +10,7 @@ import {
 } from "@/lib/agent-task";
 import { isBacklogLane, prFixLaneForRequest } from "@/lib/lane-config";
 import { fetchAgentQueueData } from "@/lib/agent-queue-fetch";
-import { agentAlreadyHanded, agentHandoutToken, createLinkedPrFixItem, handoutReceipt, hasInFlightRebaseHandout, isRebaseLaneAgent, newHandoutToken, normalizeQueueRepo, withRebaseLaneAdmission, type PrFixQueueClient } from "@/lib/pr-fix-queue";
+import { agentAlreadyHanded, agentHandoutToken, createLinkedPrFixItem, enforcePrFixHandoutLaneExclusivity, handoutReceipt, hasInFlightRebaseHandout, isRebaseLaneAgent, newHandoutToken, normalizeQueueRepo, withRebaseLaneAdmission, type PrFixQueueClient } from "@/lib/pr-fix-queue";
 import { fetchPullRequestLabels, fetchPullRequestHeadSha } from "@/lib/github";
 import { NEEDS_HUMAN_LABEL } from "@/lib/pr-fix-surfacing";
 import { CONFLICTING_STATUSES } from "@/lib/linked-pr-health";
@@ -417,6 +417,14 @@ export async function GET(
     // re-creating the loop this fix removes.
     const deferredIssues = new Set<string>();
 
+    // The caller's lane decides whether it may consume PR-fix work at all
+    // (#1046): `null` means a configured lane with no PR-fix equivalent (e.g.
+    // "cloud"), `undefined` an unfiltered request that serves every lane.
+    // Computed once up front: the PR-fix hand-out gate below (#1503) and the
+    // linked-PR materialization path further down must decide from the SAME
+    // derivation, never re-derive independently.
+    const requestPrFixLane = prFixLaneForRequest(resolvedLane);
+
       const dispatchPrFixCandidate = async (candidate: PrFixCandidate) => {
         // #495: an active CI park deferral suppresses the hand-out PER-ITEM and
         // GLOBALLY — any polling agent is held back while Courier's repair
@@ -447,6 +455,27 @@ export async function GET(
         // Also the gate key below — one derivation, so the gate, the pin, and
         // the stamped lane can never disagree.
         const dispatchedLane = candidate.attemptType ?? candidate.fixType;
+
+        // #1503: escalation-lane exclusivity at hand-out — defense in depth
+        // behind the read filter. Work whose linked issue is authoritatively
+        // escalation-classified, or whose stored lane is already ESCALATED,
+        // never goes to a declared-normal consumer: not stale/misclassified
+        // rows, and not a parent reclassified between the queue read and this
+        // write. The gate refuses the hand-out and applies the safe queued-row
+        // correction (CAS; a live attempt is left exactly as issued — no
+        // stolen claim, no competing writer). REBASE candidates are the
+        // declared mechanical exception (#1327): their exclusivity is the
+        // DISPATCH_REBASE_AGENTS local-only pool, not the lane column, and
+        // raising a conflicted branch's lane would strand it with no worker
+        // able to take it.
+        if (dispatchedLane !== "REBASE") {
+          const exclusivity = await enforcePrFixHandoutLaneExclusivity(
+            asPrFixQueueClient(prisma),
+            candidate,
+            requestPrFixLane,
+          );
+          if (exclusivity.decision === "refuse") return null;
+        }
 
 
       // Stamp-confirm the live row, then push the hand-out/receipt pair.
@@ -651,12 +680,9 @@ export async function GET(
 
     // Linked-PR follow-up is PR work, not implementation pickup, so it scans
     // the queue before grooming admission (#1065); in off/audit mode the two
-    // queues are the same list.
-    //
-    // The caller's lane decides whether it may consume PR-fix work at all
-    // (#1046): `null` means a configured lane with no PR-fix equivalent (e.g.
-    // "cloud"), `undefined` an unfiltered request that serves every lane.
-    const requestPrFixLane = prFixLaneForRequest(resolvedLane);
+    // queues are the same list. The caller's PR-fix lane (`requestPrFixLane`,
+    // derived above for the #1503 gate) decides here too whether this poll may
+    // consume/materialize PR-fix work at all (#1046).
     const dispatchedLinkedPrs = new Set<string>();
 
     for (const followupItem of fullQueue) {

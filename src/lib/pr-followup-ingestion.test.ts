@@ -50,7 +50,11 @@ function makeClient(issue?: { body: string | null; currentLane: string | null } 
   return {
     items,
     issue: {
-      findFirst: async () => issue,
+      // The escalation-provenance lookup (#1503) must scope by repo AND
+      // issue number; a regression that drops either predicate gets null
+      // here instead of the fixture.
+      findFirst: async ({ where }: any) =>
+        where?.number != null && where?.repository?.fullName != null ? (issue ?? null) : null,
     },
     $transaction: async (fn: any) => fn({ issue: { findFirst: async () => issue }, prFixQueueItem: { findUnique: async () => null, create: async ({ data }: any) => { const item = { id: `item-${++seq}`, queuedAt: new Date(), updatedAt: new Date(), ...data }; items.push(item); return item; }, update: async () => items[0] ?? {} }, prFixHistory: { create: async () => ({}) } }),
     prFixQueueItem: {
@@ -246,7 +250,54 @@ describe("ingestCommentEvent", () => {
     expect(client.items).toHaveLength(1);
     expect(client.items[0].lane).toBe("NORMAL");
     expect(client.items[0].type).toBe("REVIEW_FEEDBACK");
-    expect(client.items[0].reason).toContain("actionable feedback");
+  });
+
+  // #1503 (production regression: misospace/pr-reviewer-action#737 / PR 1359):
+  // a CHANGES_REQUESTED review on a PR linked to a frontier-classified issue
+  // must enqueue ESCALATED work, never NORMAL — the frontier lane is
+  // exclusive, and the shared local/MiniMax queue must never receive it.
+  it("enqueues a CHANGES_REQUESTED review on a frontier-linked issue as ESCALATED (#1503)", async () => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    const client = makeClient({ body: "Concrete follow-up work.", currentLane: "frontier" });
+
+    await ingestReviewEvent(client, {
+      repoFullName: "misospace/pr-reviewer-action",
+      prNumber: 1359,
+      branch: "courier/x/issue-737",
+      url: "https://github.com/misospace/pr-reviewer-action/pull/1359",
+      title: "Fix test issue",
+      author: "itsmiso-ai",
+      reviewBody: "Restore the validate job; ci.yaml:20 does not catch duplicate keys.",
+      reviewId: "r-5713818652",
+      reviewState: "CHANGES_REQUESTED",
+      linkedIssue: 737,
+    });
+
+    expect(client.items).toHaveLength(1);
+    expect(client.items[0].lane).toBe("ESCALATED");
+    expect(client.items[0].type).toBe("REVIEW_FEEDBACK");
+    expect(client.items[0].issue).toBe(737);
+  });
+
+  it("keeps a CHANGES_REQUESTED review on a normal-lane issue in NORMAL (#1503)", async () => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    const client = makeClient({ body: "Concrete follow-up work.", currentLane: "local" });
+
+    await ingestReviewEvent(client, {
+      repoFullName: "misospace/dispatch",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/misospace/dispatch/pull/42",
+      title: "Fix test issue",
+      author: "itsmiso-ai",
+      reviewBody: "Restore the validate job.",
+      reviewId: "r-local",
+      reviewState: "CHANGES_REQUESTED",
+      linkedIssue: 100,
+    });
+
+    expect(client.items).toHaveLength(1);
+    expect(client.items[0].lane).toBe("NORMAL");
   });
 
   it("does NOT enqueue an ambiguous comment (it no longer blocks the PR)", async () => {
@@ -352,7 +403,29 @@ describe("ingestReviewEvent", () => {
     expect(client.items[0].lane).toBe("NORMAL");
   });
 
-  // Contract change: even vague prose goes to the fix lane. The coder reads the
+  it("keeps the REBASE mechanical lane NORMAL even on a frontier-linked issue (#1503 exception)", async () => {
+    // #1503 declares the mechanical rebase lane as the legitimate exception:
+    // its exclusivity is the DISPATCH_REBASE_AGENTS local-only pool (#1327),
+    // and raising a conflicted branch's lane would strand it with no worker
+    // able to take it (escalation consumers do not run the rebase pool).
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    const client = makeClient({ body: "Concrete work.", currentLane: "frontier" });
+
+    await ingestMergeConflict(client, {
+      repoFullName: "misospace/pr-reviewer-action",
+      prNumber: 1359,
+      branch: "courier/x/issue-737",
+      url: "https://github.com/misospace/pr-reviewer-action/pull/1359",
+      title: "Fix test issue",
+      author: "itsmiso-ai",
+      mergeable: "CONFLICTING",
+      linkedIssue: 737,
+    });
+
+    expect(client.items).toHaveLength(1);
+    expect(client.items[0].lane).toBe("NORMAL");
+    expect(client.items[0].type).toBe("REBASE");
+  });
   // review and reports back; if it genuinely cannot act, PR_FIX_MAX_ATTEMPTS
   // escalates to NEEDS_HUMAN on evidence. Predicting unactionability with a
   // keyword list cost more than it saved — it dead-ended a detailed review with
@@ -600,7 +673,12 @@ describe("ingestCheckRunEvent", () => {
     expect(client.items[0].feedback[0]).toContain("workflow Vulnerability Scan");
   });
 
-  it("keeps a marked issue's non-scan check in NORMAL", async () => {
+  it("raises a frontier-linked issue's non-scan check to ESCALATED (#1503)", async () => {
+    // #1503: exclusivity comes from the LINKED ISSUE's classification, not
+    // the evidence kind. A frontier parent's fixes must never fall into the
+    // shared normal queue, so every ingestion event type inherits the
+    // authoritative escalation lane (the scan-recurrence branch above stays
+    // as its annotation layer).
     process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
     setLaneConfig({
       lanes: [
@@ -624,11 +702,11 @@ describe("ingestCheckRunEvent", () => {
       linkedIssue: 123,
     });
 
-    expect(client.items[0].lane).toBe("NORMAL");
+    expect(client.items[0].lane).toBe("ESCALATED");
     expect(client.items[0].feedback[0]).not.toContain("Recurrence of scan failure");
   });
 
-  it("keeps a scan check in NORMAL without a linked issue or marker", async () => {
+  it("keeps a scan check in NORMAL without a linked issue; raises an unmarked check on a frontier issue (#1503)", async () => {
     process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
     setLaneConfig({
       lanes: [
@@ -664,8 +742,10 @@ describe("ingestCheckRunEvent", () => {
       linkedIssue: 123,
     });
 
+    // No linked issue means no escalation provenance → shared queue.
     expect(noIssueClient.items[0].lane).toBe("NORMAL");
-    expect(unmarkedClient.items[0].lane).toBe("NORMAL");
+    // #1503: an unmarked failure still inherits the frontier parent's lane.
+    expect(unmarkedClient.items[0].lane).toBe("ESCALATED");
     expect(unmarkedClient.items[0].feedback[0]).not.toContain("Recurrence of scan failure");
   });
 

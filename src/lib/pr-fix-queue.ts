@@ -15,6 +15,7 @@ import {
 } from "./pr-fix-evidence";
 import { parseExternalWaitInput, parseStoredExternalWait, evaluateExternalWaitTrigger, type ExternalWaitContract } from "./pr-fix-external-wait";
 import { evaluateRecovery, recoveryCooldownMs, type RecoveryDecision } from "./pr-fix-recovery";
+import { getConfiguredLanes, laneMatchesConfigured, type LaneConfig } from "./lane-config";
 
 export type PrFixQueueClient = {
 issue: {
@@ -425,6 +426,206 @@ function parseDecisionContext(value: unknown): { decision: PrFixDecisionContext 
  */
 export function normalizeQueueRepo(repo: string): string {
   return repo.trim().toLowerCase();
+}
+
+// ─── Escalation-lane exclusivity (#1503) ────────────────────────────────────
+
+/**
+ * The explicitly configured escalation lane (claimable, role "escalation"),
+ * or null when the deployment declared none.
+ *
+ * Deliberately NOT `getEscalationLane()`, whose fallback resolves "the
+ * escalation lane" to the default claimable lane: on a single-lane deployment
+ * that would make EVERY linked issue look escalation-classified and raise
+ * every PR-fix item. Exclusivity exists only where the operator declared an
+ * escalation tier — the same explicitness rule the scan-failure recurrence
+ * branch in pr-followup-ingestion applies.
+ */
+export function getExplicitEscalationLane(): LaneConfig | null {
+  return getConfiguredLanes().find((lane) => lane.claimable && lane.role === "escalation") ?? null;
+}
+
+/**
+ * Whether a PR-fix row's linked issue is AUTHORITATIVELY escalation-classified
+ * (#1503): the issue row's `currentLane` matches the configured escalation
+ * lane (aliases resolved). The issue — not the agent name, not the PR-fix
+ * row's own mutable lane — is the escalation provenance, so nothing here
+ * infers authority from an agent display label.
+ *
+ * Fail-safe FALSE: a missing linked issue, a deployment with no escalation
+ * lane, or a failed lookup leaves the caller's own lane decision standing (the
+ * hand-out cross-check is the second line of defense). A true result may only
+ * ever RAISE a NORMAL lane toward ESCALATED; it never manufactures or clears a
+ * NEEDS_HUMAN human hold.
+ */
+export async function linkedIssueEscalationClassified(
+  client: Pick<PrFixQueueClient, "issue">,
+  repo: string,
+  issue: number | null | undefined,
+): Promise<boolean> {
+  if (issue === null || issue === undefined) return false;
+  const escalationLane = getExplicitEscalationLane();
+  if (!escalationLane) return false;
+  try {
+    // The queue folds repo casing (#1145); Issue.repository.fullName keeps the
+    // GitHub casing — match case-insensitively instead of re-deriving the row.
+    const row = await client.issue?.findFirst({
+      where: {
+        repository: { fullName: { equals: normalizeQueueRepo(repo), mode: "insensitive" } },
+        number: issue,
+      },
+      select: { currentLane: true },
+    });
+    return row ? laneMatchesConfigured(row.currentLane ?? null, escalationLane.id) : false;
+  } catch (error) {
+    console.warn("[pr-fix-queue] linked-issue escalation lookup failed; keeping the caller's lane (#1503)", {
+      repo,
+      issue,
+      errorType: error instanceof Error ? error.name : typeof error,
+    });
+    return false;
+  }
+}
+
+/**
+ * Lane-preservation rule (#1503): a row already carrying the exclusive
+ * escalation lane is never demoted to NORMAL by a recovery / fresh-attempt /
+ * requeue write. Only an explicit human hold (NEEDS_HUMAN, which blocks
+ * dispatch entirely) may replace ESCALATED. Everything else collapses to
+ * NORMAL exactly as before #1503.
+ */
+function preserveEscalationLane(lane: unknown): PrFixLane {
+  return lane === "ESCALATED" ? "ESCALATED" : "NORMAL";
+}
+
+/**
+ * Hand-out lane-compatibility gate (#1503), the defense-in-depth layer in
+ * front of the read filter: a consumer polling the NORMAL role must never be
+ * handed PR-fix work whose authoritative classification (linked issue on the
+ * escalation lane) or stored lane is ESCALATED — including rows misclassified
+ * before this fix, and parent/queue changes that raced the queue read.
+ *
+ * Request-lane semantics follow `prFixLaneForRequest`:
+ * - "NORMAL": the declared shared queue. Refuses any escalation-authoritative
+ *   candidate and applies the SAFE CLASSIFICATION CORRECTION: the stored lane
+ *   flips NORMAL → ESCALATED by CAS pinned on (id, lane, status QUEUED,
+ *   generation, empty agentHandouts, no dispatch stamp at this generation).
+ *   The CAS never touches generation, dispatch stamps, receipts, or acks, and
+ *   a LIVE attempt (any hand-out record at the current generation) or an
+ *   already-dispatched generation misses the pin and is left exactly as
+ *   issued: no stolen claim, no disturbed receipt. The residual window — a
+ *   normal poller that passed this gate on a pre-reclassification read and
+ *   stamps after this CAS re-reads — keeps its pre-#1503 meaning: same-
+ *   generation hand-outs to several agents are an existing, settlement-
+ *   arbitrated behavior; what the gate adds is that no NEW normal-lane
+ *   issuance starts on escalation-authoritative work, and every observation
+ *   retries the correction until it lands (a racing plain-lane enqueue can
+ *   undo it, and the next gate re-applies it).
+ *   Queued work self-heals for the escalation consumer on the next poll.
+ * - "ESCALATED": the read filter already handed this poller only ESCALATED
+ *   rows; a lane mismatch here can only be a stale read, and the existing
+ *   hand-out re-read pin (lane equality at stamp time) defers that race.
+ * - undefined (unfiltered poll): legacy/operator request that intentionally
+ *   serves every lane (#1046) — never refused, but the correction above is
+ *   still applied opportunistically so misclassified rows converge no matter
+ *   which consumer observes them first.
+ *
+ * REBASE rows are the declared mechanical exception (#1327): they are gated
+ * by the DISPATCH_REBASE_AGENTS local-only pool, not this lane column, and
+ * raising their lane would strand a merge conflict with nobody able to fix
+ * it. The caller skips this gate for REBASE candidates entirely.
+ */
+export async function enforcePrFixHandoutLaneExclusivity(
+  client: PrFixQueueClient,
+  candidate: {
+    id: string;
+    repo: string;
+    pr: number;
+    issue?: number | null;
+    generation: number;
+    lane?: string | null;
+  },
+  requestPrFixLane: "NORMAL" | "ESCALATED" | null | undefined,
+): Promise<{ decision: "eligible" | "refuse"; correctedLane: boolean }> {
+  // A stored ESCALATED row needs no linked-issue lookup: it is exclusive by
+  // its own classification, and a declared-normal poller must never get past
+  // it (the read filter should have kept it out of this poll's candidates —
+  // reaching here means the row was reclassified after the queue read).
+  if (candidate.lane === "ESCALATED") {
+    if (requestPrFixLane === "NORMAL") {
+      console.info("[next-task-pr-fix] refusing ESCALATED PR-fix work for the normal lane (#1503)", {
+        repoFullName: candidate.repo,
+        pullRequestNumber: candidate.pr,
+        generation: candidate.generation,
+        escalationLinked: null,
+        correctedLane: false,
+      });
+      return { decision: "refuse", correctedLane: false };
+    }
+    return { decision: "eligible", correctedLane: false };
+  }
+
+  // Lane NORMAL (or a legacy null): the linked issue is the only authority.
+  const escalationLinked = await linkedIssueEscalationClassified(client, candidate.repo, candidate.issue);
+  if (!escalationLinked) {
+    return { decision: "eligible", correctedLane: false };
+  }
+
+  // Safe correction of a stale/misclassified QUEUED row (see docblock).
+  // Pinned so it can never disturb a live attempt or a concurrently moved
+  // generation; best-effort — a refused hand-out stands either way, and the
+  // next observation retries the correction.
+  let correctedLane = false;
+  try {
+    const { count } = await client.prFixQueueItem.updateMany({
+      where: {
+        id: candidate.id,
+        lane: "NORMAL",
+        status: "QUEUED",
+        generation: candidate.generation,
+        // A hand-out record at this generation = a live attempt. Fresh
+        // attempts/reclaims reset the list, so empty means "never handed
+        // out at this generation".
+        agentHandouts: { equals: [] },
+        // And no dispatch stamp at this generation either: a poller that
+        // passed this gate on the pre-reclassification read stamps before it
+        // appends, so pinning the stamp closes the correction on the row it
+        // is about to hand out (Prisma `not` never matches NULL, hence the
+        // explicit OR).
+        OR: [{ dispatchedGeneration: null }, { dispatchedGeneration: { not: candidate.generation } }],
+      },
+      data: { lane: "ESCALATED" },
+    });
+    if (count === 1) {
+      correctedLane = true;
+      await client.prFixHistory.create({
+        data: {
+          itemId: candidate.id,
+          action: "mark",
+          status: "QUEUED",
+          lane: "ESCALATED",
+          note: `Escalation-lane correction (#1503): linked issue #${candidate.issue} is escalation-classified; queued row reclassified NORMAL → ESCALATED (no generation change, no hand-out touched).`,
+        },
+      });
+    }
+  } catch (error) {
+    console.warn(
+      `[pr-fix-queue] escalation-lane correction failed for ${candidate.repo}#${candidate.pr} (#1503):`,
+      error instanceof Error ? error.message : error,
+    );
+  }
+
+  if (requestPrFixLane === "NORMAL") {
+    console.info("[next-task-pr-fix] refusing escalation-authoritative PR-fix work for the normal lane (#1503)", {
+      repoFullName: candidate.repo,
+      pullRequestNumber: candidate.pr,
+      generation: candidate.generation,
+      escalationLinked,
+      correctedLane,
+    });
+    return { decision: "refuse", correctedLane };
+  }
+  return { decision: "eligible", correctedLane };
 }
 
 export function parseEnqueuePrFixInput(body: unknown): EnqueuePrFixInput | { error: string } {
@@ -1719,7 +1920,9 @@ export async function reclaimStalePrFixHandouts(
               },
               data: {
                 status: "PARKED",
-                lane: "NORMAL",
+                // #1503: a park is bounded exhaustion, not a human decision,
+                // and never a frontier demotion — keep the exclusive lane.
+                lane: preserveEscalationLane(item.lane),
                 outcome: "no_progress",
                 decisionDetail: null,
                 // #1253: audit stamp of the CURRENT disposition. Stamped
@@ -1747,7 +1950,7 @@ export async function reclaimStalePrFixHandouts(
                   itemId: item.id,
                   action: "mark",
                   status: "PARKED",
-                  lane: "NORMAL",
+                  lane: preserveEscalationLane(item.lane),
                   outcome: "no_progress",
                   note: ackedDead
                     ? `Dead acknowledged hand-out reclaimed ${reclaimCount} times (PR_FIX_MAX_RECLAIMS=${maxReclaims}); parked (#1419).`
@@ -1826,7 +2029,10 @@ export async function reclaimStalePrFixHandouts(
                 itemId: item.id,
                 action: "reclaim",
                 status: "QUEUED",
-                lane: "NORMAL",
+                // The reclaim write does not touch `lane` — the row keeps its
+                // lane (#1503: an ESCALATED fresh generation stays exclusive) —
+                // so the audit row echoes the row's lane, not a literal.
+                lane: item.lane,
                 note: ackedDead
               ? `Stale acknowledged hand-out recovered: acking agent showed no liveness evidence; reopened as generation ${item.generation + 1} (#1419).`
               : `Stale unacknowledged hand-out reclaimed; reopened as generation ${item.generation + 1} (#1211).`,
@@ -1860,7 +2066,21 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
   const input: EnqueuePrFixInput = { ...rawInput, repo: normalizeQueueRepo(rawInput.repo) };
   const lane = normalizePrFixLane(input.lane);
   const type = normalizePrFixType(input.type);
-  const nextStatus: PrFixStatus = lane === "NEEDS_HUMAN" ? "BLOCKED" : "QUEUED";
+  // #1503: the linked issue's authoritative escalation classification is
+  // resolved once per enqueue, BEFORE the transaction (the issue row is a
+  // separate aggregate; the hand-out gate re-checks it at every issuance, so
+  // a parent reclassifying inside this read→write window is refused there —
+  // and a correction this enqueue races can simply be re-applied by the next
+  // observation).
+  // REBASE is the declared mechanical exception (#1327): its exclusivity is
+  // the DISPATCH_REBASE_AGENTS local-only pool, and raising a merge-conflict
+  // row's lane would strand it with no eligible worker.
+  const escalationLinked = type !== "REBASE" && (await linkedIssueEscalationClassified(client, input.repo, input.issue));
+  // A NORMAL classification may be raised to the exclusive escalation lane by
+  // the linked issue; it never lowers ESCALATED, and it never touches a
+  // NEEDS_HUMAN human hold (BLOCKED stops dispatch anyway).
+  const authoritativeLane: PrFixLane = escalationLinked && lane === "NORMAL" ? "ESCALATED" : lane;
+  const nextStatus: PrFixStatus = authoritativeLane === "NEEDS_HUMAN" ? "BLOCKED" : "QUEUED";
 
   let previousStatus: PrFixStatus | undefined;
   const item = await client.$transaction(async (tx) => {
@@ -1993,7 +2213,7 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
         const nextEvidenceKeys = uniqueAppend(snapshot.evidenceKeys ?? [], input.evidenceKey, 40);
 
         let resolvedStatus: PrFixStatus;
-        let resolvedLane: PrFixLane = lane;
+        let resolvedLane: PrFixLane = authoritativeLane;
         let statusNote: string | null = null;
         let resolvedOutcome: PrFixOutcome | null = null;
         let resolvedDecision: PrFixDecisionContext | null = null;
@@ -2050,6 +2270,29 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           resolvedOutcome = normalizePrFixOutcome(input.outcome) ?? "no_progress";
           statusNote = `Bounded at ${priorAttempts} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); parked instead of re-queuing (#1001).`;
           capParked = true;
+        }
+
+        // #1503: escalation-lane exclusivity is authoritative over this
+        // enqueue's lane argument (and over the cap-park NORMAL reset above,
+        // whose intent was only "not a human lane"). A row whose linked issue
+        // is escalation-classified, or that already carries ESCALATED, never
+        // lands back on NORMAL through a generic re-enqueue: that is how a
+        // frontier parent's review fix fell into the shared normal queue.
+        // Terminal sticky rows keep their stored lane; NEEDS_HUMAN human
+        // holds are untouched; REBASE is the declared mechanical exception.
+        if (
+          !isTerminalStatus &&
+          type !== "REBASE" &&
+          resolvedLane === "NORMAL" &&
+          (escalationLinked || snapshot.lane === "ESCALATED")
+        ) {
+          resolvedLane = "ESCALATED";
+          const raiseReason = escalationLinked
+            ? `linked issue #${input.issue} is escalation-classified`
+            : "the row already carries the exclusive escalation lane";
+          statusNote = statusNote
+            ? `${statusNote} Lane held at ESCALATED: ${raiseReason} (#1503).`
+            : `Lane held at ESCALATED: ${raiseReason} (#1503).`;
         }
 
         if (resolvedStatus === "BLOCKED") {
@@ -2372,7 +2615,7 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
       data: {
         repo: input.repo,
         pr: input.pr,
-        lane,
+        lane: authoritativeLane,
         type,
         status: nextStatus,
         reason: input.reason,
@@ -2905,7 +3148,8 @@ export async function markPrFixItem(
           where: { id: existing.id, status: "QUEUED", generation: expectedGeneration },
           data: {
             status: "PARKED",
-            lane: "NORMAL",
+            // #1503: an operational park never demotes the exclusive lane.
+            lane: preserveEscalationLane(existing.lane),
             outcome: "invalid_wait",
             decisionDetail: null,
             retryAt: null,
@@ -3051,12 +3295,13 @@ export async function markPrFixItem(
   // re-decision loop below. `noteSuffix` is appended to the note when the
   // reopen is taken from the settle-gap retry.
   const writeReopen = async (tx: any, row: any, noteSuffix = ""): Promise<any | null> => {
-    const reopenCapped = (row.fixAttempts ?? 1) >= maxPrFixAttempts();
-    const reopenData: Record<string, unknown> = reopenCapped
-      ? {
-          status: "PARKED",
-          lane: "NORMAL",
-          outcome: "no_progress",
+        const reopenCapped = (row.fixAttempts ?? 1) >= maxPrFixAttempts();
+        const reopenData: Record<string, unknown> = reopenCapped
+          ? {
+              status: "PARKED",
+              // #1503: capped give-up park keeps the exclusive lane.
+              lane: preserveEscalationLane(row.lane),
+              outcome: "no_progress",
           decisionDetail: null,
           // #1253: disposition audit stamp (capped give-up park).
           disposedAt: new Date(),
@@ -3071,7 +3316,8 @@ export async function markPrFixItem(
         }
       : {
           status: "QUEUED",
-          lane: "NORMAL",
+          // #1503: the post-dispatch-evidence reopen keeps the exclusive lane.
+          lane: preserveEscalationLane(row.lane),
           ...freshAttemptGeneration(),
           fixAttempts: { increment: 1 },
           attemptHeadSha: row.headSha ?? row.attemptHeadSha ?? null,
@@ -3199,14 +3445,17 @@ export async function markPrFixItem(
     data.disposedAt = new Date();
     data.disposedEvidence = null;
   } else if (nextStatus === "PARKED") {
-    data.lane = "NORMAL";
+    // #1503: an operational park never demotes the exclusive lane.
+    data.lane = preserveEscalationLane(existing.lane);
     data.outcome = resolvePrFixOutcome("PARKED", input.outcome);
     data.decisionDetail = null;
     // #1253: disposition audit stamp (operational park).
     data.disposedAt = new Date();
     data.disposedEvidence = null;
   } else if (nextStatus === "QUEUED") {
-    data.lane = "NORMAL";
+    // #1503: releasing a hold back to the dispatchable loop never demotes the
+    // exclusive lane (an ESCALATED row returns to its escalation consumers).
+    data.lane = preserveEscalationLane(existing.lane);
     // A mark back to QUEUED releases a BLOCKED/PARKED item: clear the outcome
     // and human-decision payload (#1218). A WAITING_EXTERNAL item leaving its
     // wait also sheds the consumed external-wait contract (#1250).
@@ -3296,10 +3545,11 @@ export async function markPrFixItem(
       // nothing (#1103, #1218). The retry keeps the refused baseline: the head
       // is unchanged, so it is still the newest observed (#1104).
       const refusalCapped = (existing.fixAttempts ?? 1) >= maxPrFixAttempts();
-      const refusalData: Record<string, unknown> = refusalCapped
-        ? {
-            status: "PARKED",
-            lane: "NORMAL",
+        const refusalData: Record<string, unknown> = refusalCapped
+          ? {
+              status: "PARKED",
+              // #1503: the refused-attempt cap park keeps the exclusive lane.
+              lane: preserveEscalationLane(existing.lane),
             outcome: "no_progress",
             decisionDetail: null,
             // #1253: disposition audit stamp (refused-FIXED cap park).
@@ -3315,7 +3565,8 @@ export async function markPrFixItem(
           }
         : {
             status: "QUEUED",
-            lane: "NORMAL",
+            // #1503: the refused-FIXED retry attempt keeps the exclusive lane.
+            lane: preserveEscalationLane(existing.lane),
             ...freshAttemptGeneration(),
             fixAttempts: { increment: 1 },
             attemptHeadSha: input.attemptHeadSha ?? baseline ?? null,
@@ -3598,7 +3849,8 @@ export async function markPrFixItem(
   const forceData: Record<string, unknown> = forceCapped
     ? {
         status: "PARKED",
-        lane: "NORMAL",
+        // #1503: a cap park never demotes the exclusive lane.
+        lane: preserveEscalationLane(lastFresh.lane),
         outcome: "no_progress",
         decisionDetail: null,
         // #1253: disposition audit stamp (racing-evidence cap park).
@@ -3611,11 +3863,12 @@ export async function markPrFixItem(
         handoutAckTimes: [],
         handoutReceipts: [],
         attemptEvidenceWatermark: null,
-      }
-    : {
-        status: "QUEUED",
-        lane: "NORMAL",
-        ...freshAttemptGeneration(),
+          }
+        : {
+            status: "QUEUED",
+            // #1503: the forced-fallback retry attempt keeps the exclusive lane.
+            lane: preserveEscalationLane(lastFresh.lane),
+            ...freshAttemptGeneration(),
         fixAttempts: { increment: 1 },
         attemptHeadSha: lastFresh.headSha ?? lastFresh.attemptHeadSha ?? null,
         outcome: null,
@@ -4215,6 +4468,16 @@ export async function requeuePrFixItem(client: PrFixQueueClient, rawInput: Reque
       throw new Error(`Cannot requeue: item is ${existing.status}, not BLOCKED, PARKED, or FIXED`);
     }
     const reopenedFrom = existing.status;
+    // #1503: an operator requeue returns the work to the dispatchable loop,
+    // never to a lane the authoritative classification excludes. A row whose
+    // linked issue is escalation-classified (including one parked/BLOCKED as
+    // NEEDS_HUMAN — the human decision is done, the lane is not) re-enters at
+    // ESCALATED; an ESCALATED row keeps its lane; everything else resets to
+    // NORMAL exactly as before.
+    const requeueEscalationLinked = await linkedIssueEscalationClassified(tx, input.repo, existing.issue);
+    const requeueLane: PrFixLane = requeueEscalationLinked
+      ? "ESCALATED"
+      : preserveEscalationLane(existing.lane);
     const updated = await tx.prFixQueueItem.update({
       where: { id: existing.id },
       // Requeue hands the PR back to the worker loop as a fresh attempt —
@@ -4226,7 +4489,7 @@ export async function requeuePrFixItem(client: PrFixQueueClient, rawInput: Reque
       // overwrites with the worker's own push (#1074, #1104).
       data: {
         status: "QUEUED",
-        lane: "NORMAL",
+        lane: requeueLane,
         // The operator release clears the BLOCKED/PARKED classification (#1218).
         outcome: null,
         decisionDetail: null,
@@ -4259,7 +4522,7 @@ export async function requeuePrFixItem(client: PrFixQueueClient, rawInput: Reque
         itemId: updated.id,
         action: "requeue",
         status: "QUEUED",
-        lane: "NORMAL",
+        lane: updated.lane,
         note:
           (input.note ? `${input.note} (reopened from ${reopenedFrom})` : `operator requeue from ${reopenedFrom}`) +
           (reopenedFrom === "FIXED" ? " — #940 recovery" : reopenedFrom === "PARKED" ? " — operator release of a parked item" : ""),
@@ -4818,7 +5081,8 @@ export async function resolvePrFixFromAgentReport(
       const data: Record<string, unknown> = capped
         ? {
             status: "PARKED",
-            lane: "NORMAL",
+            // #1503: a terminal park never demotes the exclusive lane.
+            lane: preserveEscalationLane(fresh.lane),
             outcome: "no_progress",
             decisionDetail: null,
             // #1253: disposition audit stamp (failed-report cap park).
@@ -4833,7 +5097,8 @@ export async function resolvePrFixFromAgentReport(
           }
         : {
             status: "QUEUED",
-            lane: "NORMAL",
+            // #1503: the failed-report fresh attempt keeps the exclusive lane.
+            lane: preserveEscalationLane(fresh.lane),
             ...freshAttemptGeneration(),
             fixAttempts: { increment: 1 },
             attemptHeadSha: fresh.headSha ?? fresh.attemptHeadSha ?? null,
