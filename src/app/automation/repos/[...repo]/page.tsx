@@ -8,7 +8,42 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { StatusBadge, Duration } from "@/components/automation/status-badge";
+import { ReleaseHighlightsSection, ReleaseReadinessBadge } from "@/components/automation/release-pulse";
+import { buildReleasePulseView } from "@/lib/release-pulse-view";
 import { ArrowLeft, RefreshCw, ExternalLink, CheckCircle, XCircle, Clock, AlertTriangle } from "lucide-react";
+
+// Release Pulse payload shapes (dispatch#1484) as jsonSafe-serialized by the
+// repo detail API: Dates arrive as ISO strings.
+interface RepoPulse {
+  schema: "dispatch.release-pulse/v1";
+  repoFullName: string;
+  pulseState: "ready" | "unknown" | "no-baseline";
+  baseline: { tag: string | null; sha: string | null; publishedAt: string | null } | null;
+  headSha: string | null;
+  unreleasedCommits: { state: "identical" | "ahead" | "diverged" | "unknown" | "no-baseline"; count: number | null };
+  deliveredIssueCount: number;
+  highlights: {
+    kind: "feature" | "fix" | "architecture" | "umbrella_completed";
+    headline: string;
+    issueNumber: number;
+    issueUrl: string | null;
+    deliveredAt: string | null;
+    significance: "routine" | "notable" | "major" | null;
+    confidence: "high" | "low";
+    provenance: "groomer-release-signal" | "legacy-issue-metadata" | "lifecycle-decomposition";
+    prs: { prNumber: number; prUrl: string | null; mergeCommitSha: string | null; mergedAt: string }[];
+    children?: { number: number; url: string; closedAt: string | null }[];
+  }[];
+  highlightsTruncated: boolean;
+  notableDeliveryCount: number;
+  completedUmbrellaCount: number;
+  unknownDeliveryCount: number;
+}
+
+interface RepoReadiness {
+  state: "quiet" | "building" | "candidate" | "unknown";
+  reasons: string[];
+}
 
 interface RepoDetail {
   id: string;
@@ -75,6 +110,9 @@ interface RepoDetail {
     actor: string | null;
     createdAt: string;
   }[];
+  pulse: RepoPulse;
+  readiness: RepoReadiness;
+  releaseDeltaSyncedAt: string | null;
 }
 
 export default function RepoDetailPage({ params }: { params: Promise<{ repo: string[] }> }) {
@@ -162,6 +200,15 @@ export default function RepoDetailPage({ params }: { params: Promise<{ repo: str
     );
   }
 
+  // Advisory release pulse (dispatch#1484): rendered from cached API data;
+  // a stale release delta shows its sync age instead of posing as live.
+  const pulseView = buildReleasePulseView({
+    pulse: repo.pulse,
+    readiness: repo.readiness,
+    releaseDeltaSyncedAt: repo.releaseDeltaSyncedAt,
+    now: new Date(),
+  });
+
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -213,7 +260,35 @@ export default function RepoDetailPage({ params }: { params: Promise<{ repo: str
         </Card>
       )}
 
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+        <Card data-testid="unreleased-card">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm">Unreleased</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="flex items-center gap-2">
+              <ReleaseReadinessBadge state={pulseView.readinessState} reasons={pulseView.readinessReasons} />
+            </div>
+            <div className="mt-2 space-y-1 text-sm min-w-0">
+              {pulseView.kind === "ready" ? (
+                <>
+                  <div className="min-w-0 break-words">{pulseView.commitsLabel}</div>
+                  <div className="text-muted-foreground min-w-0 break-words">
+                    since {pulseView.tagLabel}
+                    {pulseView.ageLabel ? ` · ${pulseView.ageLabel}` : ""}
+                  </div>
+                </>
+              ) : (
+                <div className="text-muted-foreground min-w-0 break-words">
+                  {pulseView.kind === "no-release" ? "No release baseline" : "Release state unknown"}
+                </div>
+              )}
+              {pulseView.stale && pulseView.syncAgeLabel && (
+                <div className="text-xs text-muted-foreground min-w-0 break-words">{pulseView.syncAgeLabel}</div>
+              )}
+            </div>
+          </CardContent>
+        </Card>
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm">Workflows</CardTitle>
@@ -381,6 +456,15 @@ export default function RepoDetailPage({ params }: { params: Promise<{ repo: str
               </TableBody>
             </Table>
           )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Release highlights</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <ReleaseHighlightsSection pulse={repo.pulse} />
         </CardContent>
       </Card>
 

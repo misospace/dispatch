@@ -15,6 +15,10 @@ import { getConfiguredLanes, isValidLane } from "@/lib/lane-config";
 import { withDependencyBlockReasons } from "@/lib/issue-dependency-annotation";
 import { withAdmissionAnnotations } from "@/lib/queue-admission";
 import { withNormalizedReleaseSignal } from "@/lib/groomer/plan";
+import { asReleaseDeltaState, collectReleasePulse } from "@/lib/release-pulse-read";
+import { deriveReleaseReadiness, releaseCiStatus } from "@/lib/release-readiness";
+import { buildReleasePulseView, releasePulseStripVisible, type ReleasePulseView } from "@/lib/release-pulse-view";
+import { ReleasePulseStrip } from "@/components/automation/release-pulse";
 
 export const dynamic = "force-dynamic";
 
@@ -92,6 +96,56 @@ async function getIssueSyncStatus() {
   };
 }
 
+/**
+ * Advisory single-repo release strip (#1484): computed from the cached
+ * release delta + lifecycle rows only (no forge calls). The board must never
+ * fail because of an advisory strip, so any derivation error renders no
+ * strip at all.
+ */
+async function getReleasePulseStripView(repo: string | undefined): Promise<ReleasePulseView | null> {
+  if (!releasePulseStripVisible(repo)) return null;
+  try {
+    const automationRepo = await prisma.automationRepo.findUnique({
+      where: { fullName: repo },
+    });
+    if (!automationRepo) return null;
+    const [failingRuns, runningRuns, succeededRuns, pulse] = await Promise.all([
+      prisma.githubWorkflowRun.count({
+        where: { workflow: { repoId: automationRepo.id }, conclusion: "failure" },
+      }),
+      prisma.githubWorkflowRun.count({
+        where: { workflow: { repoId: automationRepo.id }, status: "in_progress" },
+      }),
+      prisma.githubWorkflowRun.count({
+        where: { workflow: { repoId: automationRepo.id }, conclusion: "success" },
+      }),
+      collectReleasePulse({
+        fullName: automationRepo.fullName,
+        releaseState: asReleaseDeltaState(automationRepo.releaseState),
+        releaseBaselineTag: automationRepo.releaseBaselineTag,
+        releaseBaselineSha: automationRepo.releaseBaselineSha,
+        releaseBaselinePublishedAt: automationRepo.releaseBaselinePublishedAt,
+        releaseHeadSha: automationRepo.releaseHeadSha,
+        releaseAheadBy: automationRepo.releaseAheadBy,
+      }),
+    ]);
+    const readiness = deriveReleaseReadiness({
+      pulse,
+      now: new Date(),
+      ci: releaseCiStatus({ failingRuns, runningRuns, succeededRuns }),
+    });
+    return buildReleasePulseView({
+      pulse,
+      readiness,
+      releaseDeltaSyncedAt: automationRepo.releaseDeltaSyncedAt,
+      now: new Date(),
+    });
+  } catch (error) {
+    console.error("Failed to compute release pulse strip:", error);
+    return null;
+  }
+}
+
 interface PageProps {
   searchParams: Promise<{ repo?: string; agent?: string; owner?: string; priority?: string; lane?: string; includeClosed?: string }>;
 }
@@ -99,13 +153,15 @@ interface PageProps {
 export default async function BoardPage({ searchParams }: PageProps) {
   const params = await searchParams;
   const includeClosed = params.includeClosed === "true";
-  const [issues, repos, filterOptions, syncStatus] = await Promise.all([
+  const [issues, repos, filterOptions, syncStatus, stripView] = await Promise.all([
     getIssues(params.repo, params.agent, params.owner, params.priority, params.lane, includeClosed),
     getRepos(),
     getFilterOptions(includeClosed),
     getIssueSyncStatus(),
+    getReleasePulseStripView(params.repo),
   ]);
   const lanes = getConfiguredLanes();
+  const stripRepo = releasePulseStripVisible(params.repo) ? (params.repo as string) : null;
 
   return (
     <div className="space-y-6">
@@ -136,6 +192,8 @@ export default async function BoardPage({ searchParams }: PageProps) {
           lane: params.lane || "",
         }}
       />
+
+      {stripView && stripRepo && <ReleasePulseStrip view={stripView} repoFullName={stripRepo} />}
 
       {issues.length === 0 ? (
         <Card>

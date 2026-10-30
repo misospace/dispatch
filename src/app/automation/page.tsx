@@ -7,7 +7,48 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { StatusBadge } from "@/components/automation/status-badge";
+import { ReleasePulseLine } from "@/components/automation/release-pulse";
+import { buildReleasePulseView } from "@/lib/release-pulse-view";
 import { RefreshCw, ExternalLink, AlertTriangle, CheckCircle, XCircle, Clock, GitBranch, Trash2 } from "lucide-react";
+
+// Release Pulse payload shapes (dispatch#1484) as jsonSafe-serialized by the
+// repos API: Dates arrive as ISO strings.
+interface RepoPulseBaseline {
+  tag: string | null;
+  sha: string | null;
+  publishedAt: string | null;
+}
+
+interface RepoPulse {
+  schema: "dispatch.release-pulse/v1";
+  repoFullName: string;
+  pulseState: "ready" | "unknown" | "no-baseline";
+  baseline: RepoPulseBaseline | null;
+  headSha: string | null;
+  unreleasedCommits: { state: "identical" | "ahead" | "diverged" | "unknown" | "no-baseline"; count: number | null };
+  deliveredIssueCount: number;
+  highlights: {
+    kind: "feature" | "fix" | "architecture" | "umbrella_completed";
+    headline: string;
+    issueNumber: number;
+    issueUrl: string | null;
+    deliveredAt: string | null;
+    significance: "routine" | "notable" | "major" | null;
+    confidence: "high" | "low";
+    provenance: "groomer-release-signal" | "legacy-issue-metadata" | "lifecycle-decomposition";
+    prs: { prNumber: number; prUrl: string | null; mergeCommitSha: string | null; mergedAt: string }[];
+    children?: { number: number; url: string; closedAt: string | null }[];
+  }[];
+  highlightsTruncated: boolean;
+  notableDeliveryCount: number;
+  completedUmbrellaCount: number;
+  unknownDeliveryCount: number;
+}
+
+interface RepoReadiness {
+  state: "quiet" | "building" | "candidate" | "unknown";
+  reasons: string[];
+}
 
 interface RepoOverview {
   id: string;
@@ -26,12 +67,23 @@ interface RepoOverview {
   failingRuns: number;
   runningRuns: number;
   enabled: boolean;
+  pulse: RepoPulse;
+  readiness: RepoReadiness;
+  releaseDeltaSyncedAt: string | null;
 }
 
 function RepoCard({ repo, onDelete }: { repo: RepoOverview; onDelete?: () => void }) {
   const latestWorkflow = repo.workflows[0];
   const latestRelease = repo.releases[0];
   const isStale = repo.lastSyncedAt && new Date(repo.lastSyncedAt) < new Date(Date.now() - 60 * 60 * 1000);
+  // Advisory release pulse (dispatch#1484): rendered from cached API data only;
+  // a stale release delta shows its sync age instead of posing as live.
+  const pulseView = buildReleasePulseView({
+    pulse: repo.pulse,
+    readiness: repo.readiness,
+    releaseDeltaSyncedAt: repo.releaseDeltaSyncedAt,
+    now: new Date(),
+  });
   const [syncing, setSyncing] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
 
@@ -121,6 +173,8 @@ function RepoCard({ repo, onDelete }: { repo: RepoOverview; onDelete?: () => voi
                 <span className="truncate">{latestWorkflow.name}</span>
               </div>
             )}
+
+            <ReleasePulseLine view={pulseView} repoFullName={repo.fullName} />
 
             {latestRelease && (
               <div className="text-sm min-w-0 flex items-center gap-1 flex-wrap">

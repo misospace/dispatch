@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import React from "react";
 
 const { mocks } = vi.hoisted(() => ({
@@ -8,6 +8,10 @@ const { mocks } = vi.hoisted(() => ({
     aggregateIssues: vi.fn().mockResolvedValue({ _count: { _all: 0 }, _max: { lastSyncedAt: null } }),
     getTrackedRepos: vi.fn().mockResolvedValue([]),
     filterBar: vi.fn(() => null),
+    findUniqueAutomationRepo: vi.fn().mockResolvedValue(null),
+    countWorkflowRuns: vi.fn().mockResolvedValue(0),
+    releasePulseStrip: vi.fn(() => null),
+    collectReleasePulse: vi.fn(),
   },
 }));
 
@@ -15,7 +19,19 @@ vi.mock("@/lib/prisma", () => ({
   prisma: {
     issue: { findMany: mocks.findManyIssues, aggregate: mocks.aggregateIssues },
     repository: { findMany: mocks.findManyRepos },
+    automationRepo: { findUnique: mocks.findUniqueAutomationRepo },
+    githubWorkflowRun: { count: mocks.countWorkflowRuns },
   },
+}));
+
+// The strip derivation must not touch the issue/event queries the board's
+// own assertions index into — stub the reader with a deterministic snapshot.
+vi.mock("@/lib/release-pulse-read", () => ({
+  asReleaseDeltaState: (value: string) => value,
+  collectReleasePulse: mocks.collectReleasePulse,
+}));
+vi.mock("@/components/automation/release-pulse", () => ({
+  ReleasePulseStrip: mocks.releasePulseStrip,
 }));
 
 vi.mock("@/lib/config", () => ({
@@ -214,5 +230,99 @@ describe("BoardPage release-signal projection", () => {
     const board = findElementByType(page, KanbanBoardClient);
     const initialIssues = (board?.props as { initialIssues: Array<{ releaseSignal: unknown }> }).initialIssues;
     expect(initialIssues[0].releaseSignal).toBeNull();
+  });
+});
+
+describe("BoardPage release pulse strip (#1484)", () => {
+  function readyPulse() {
+    return {
+      schema: "dispatch.release-pulse/v1" as const,
+      repoFullName: "myorg/repo1",
+      pulseState: "ready" as const,
+      baseline: { tag: "v1.0.0", sha: "basesha", publishedAt: "2026-10-25T12:00:00.000Z" },
+      headSha: "headsha",
+      unreleasedCommits: { state: "ahead" as const, count: 18 },
+      deliveredIssueCount: 2,
+      highlights: [],
+      highlightsTruncated: false,
+      notableDeliveryCount: 0,
+      completedUmbrellaCount: 0,
+      unknownDeliveryCount: 0,
+    };
+  }
+
+  function trackedAutomationRepo() {
+    return {
+      id: "repo-1",
+      fullName: "myorg/repo1",
+      releaseState: "ahead",
+      releaseBaselineTag: "v1.0.0",
+      releaseBaselineSha: "basesha",
+      releaseBaselinePublishedAt: new Date("2026-10-25T12:00:00.000Z"),
+      releaseHeadSha: "headsha",
+      releaseAheadBy: 18,
+      releaseDeltaSyncedAt: new Date("2026-10-30T11:00:00.000Z"),
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findManyIssues.mockResolvedValue([]);
+    mocks.findManyRepos.mockResolvedValue([]);
+    mocks.aggregateIssues.mockResolvedValue({ _count: { _all: 0 }, _max: { lastSyncedAt: null } });
+    mocks.getTrackedRepos.mockResolvedValue([]);
+    mocks.findUniqueAutomationRepo.mockResolvedValue(null);
+    mocks.countWorkflowRuns.mockResolvedValue(0);
+    mocks.collectReleasePulse.mockResolvedValue(readyPulse());
+    // Freeze the clock so staleness is deterministic.
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.parse("2026-10-30T12:00:00.000Z") });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("renders the strip for a single-repo filter with a tracked repo", async () => {
+    mocks.findUniqueAutomationRepo.mockResolvedValue(trackedAutomationRepo());
+
+    const page = await BoardPage({ searchParams: Promise.resolve({ repo: "myorg/repo1" }) });
+
+    // Components are not deep-rendered here; assert the strip element in the
+    // page tree and its props.
+    const strip = findElementByType(page, mocks.releasePulseStrip);
+    expect(strip).not.toBeNull();
+    const props = strip?.props as { view: { kind: string; commitsLabel: string; readinessState: string }; repoFullName: string };
+    expect(props.repoFullName).toBe("myorg/repo1");
+    expect(props.view.kind).toBe("ready");
+    expect(props.view.commitsLabel).toBe("+18 commits");
+    // 18 unreleased commits cross the volume threshold → candidate.
+    expect(props.view.readinessState).toBe("candidate");
+    // No forge calls, no extra issue/event reads from the strip path.
+    expect(mocks.collectReleasePulse).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders no strip on the all-repo board", async () => {
+    const page = await BoardPage({ searchParams: Promise.resolve({}) });
+
+    expect(findElementByType(page, mocks.releasePulseStrip)).toBeNull();
+    expect(mocks.findUniqueAutomationRepo).not.toHaveBeenCalled();
+  });
+
+  it("renders no strip when the repo is not tracked, board still renders", async () => {
+    mocks.findUniqueAutomationRepo.mockResolvedValue(null);
+
+    const page = await BoardPage({ searchParams: Promise.resolve({ repo: "myorg/repo1" }) });
+
+    expect(findElementByType(page, mocks.releasePulseStrip)).toBeNull();
+    expect(page).not.toBeNull();
+  });
+
+  it("renders no strip when the derivation fails, board still renders", async () => {
+    mocks.findUniqueAutomationRepo.mockRejectedValue(new Error("db down"));
+
+    const page = await BoardPage({ searchParams: Promise.resolve({ repo: "myorg/repo1" }) });
+
+    expect(findElementByType(page, mocks.releasePulseStrip)).toBeNull();
+    expect(page).not.toBeNull();
   });
 });

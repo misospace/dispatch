@@ -4,6 +4,8 @@ import { prisma } from "@/lib/prisma";
 import { jsonSafe } from "@/lib/json";
 import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rate-limit";
+import { collectReleasePulse, asReleaseDeltaState } from "@/lib/release-pulse-read";
+import { deriveReleaseReadiness, releaseCiStatus } from "@/lib/release-readiness";
 
 // DELETE cascades and hard-deletes tracked-repo state; this matches the
 // shared repos window #1307 gave POST /api/automation/repos
@@ -70,6 +72,16 @@ export async function GET(request: Request, context: RouteContext) {
       },
     });
 
+    // Positive success evidence separates "CI green" from "no usable run
+    // evidence" for the advisory readiness context (#1483), mirroring the
+    // fleet route.
+    const succeededRuns = await prisma.githubWorkflowRun.count({
+      where: {
+        workflow: { repoId: repo.id },
+        conclusion: "success",
+      },
+    });
+
     const lastSyncRun = await prisma.automationSyncRun.findFirst({
       where: { repoId: repo.id },
       orderBy: { startedAt: "desc" },
@@ -81,10 +93,30 @@ export async function GET(request: Request, context: RouteContext) {
       orderBy: { createdAt: "desc" },
     });
 
+    // Advisory release pulse + readiness (#1484), mirroring the fleet route:
+    // cached-data-only derivation, no forge call, no model call.
+    const pulse = await collectReleasePulse({
+      fullName: repo.fullName,
+      releaseState: asReleaseDeltaState(repo.releaseState),
+      releaseBaselineTag: repo.releaseBaselineTag,
+      releaseBaselineSha: repo.releaseBaselineSha,
+      releaseBaselinePublishedAt: repo.releaseBaselinePublishedAt,
+      releaseHeadSha: repo.releaseHeadSha,
+      releaseAheadBy: repo.releaseAheadBy,
+    });
+    const readiness = deriveReleaseReadiness({
+      pulse,
+      now: new Date(),
+      ci: releaseCiStatus({ failingRuns, runningRuns, succeededRuns }),
+    });
+
     return NextResponse.json(jsonSafe({
       ...repo,
       failingRuns,
       runningRuns,
+      succeededRuns,
+      pulse,
+      readiness,
       lastSyncRun,
       recentEvents,
     }));
