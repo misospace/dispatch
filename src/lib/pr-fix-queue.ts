@@ -3521,11 +3521,20 @@ export async function markPrFixItem(
   // reopen is taken from the settle-gap retry.
   const writeReopen = async (tx: any, row: any, noteSuffix = ""): Promise<any | null> => {
         const reopenCapped = (row.fixAttempts ?? 1) >= maxPrFixAttempts();
+        // #1503 review: a fresh-attempt reopen re-derives the linked issue too —
+        // an operator reclassify (BLOCKED → FIXED) can settle a row whose lane
+        // column reads NEEDS_HUMAN, and the reopen must not re-enter the loop
+        // (or park) on the shared lane with a frontier parent. Mirrors the
+        // release/requeue rule; the DB read is in-tx like requeuePrFixItem's.
+        const reopenLane = releaseLaneFromParentClass(
+          await linkedIssueEscalationClassified(tx, row.repo, row.issue),
+          row.lane,
+        );
         const reopenData: Record<string, unknown> = reopenCapped
           ? {
               status: "PARKED",
               // #1503: capped give-up park keeps the exclusive lane.
-              lane: preserveEscalationLane(row.lane),
+              lane: reopenLane,
               outcome: "no_progress",
           decisionDetail: null,
           // #1253: disposition audit stamp (capped give-up park).
@@ -3542,7 +3551,7 @@ export async function markPrFixItem(
       : {
           status: "QUEUED",
           // #1503: the post-dispatch-evidence reopen keeps the exclusive lane.
-          lane: preserveEscalationLane(row.lane),
+          lane: reopenLane,
           ...freshAttemptGeneration(),
           fixAttempts: { increment: 1 },
           attemptHeadSha: row.headSha ?? row.attemptHeadSha ?? null,

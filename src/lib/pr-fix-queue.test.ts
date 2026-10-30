@@ -6827,6 +6827,48 @@ describe("#1503 escalation-lane exclusivity", () => {
       expect(client.items[0].status).toBe("QUEUED");
       expect(client.items[0].lane).toBe("ESCALATED");
     });
+
+    it("a refused FIXED released from an operator reclassify re-derives the frontier parent", async () => {
+      client.issueRows.push(frontierIssue);
+      // Unmoved head → the #940 guard refuses the tombstone and releases a
+      // fresh attempt (the same release path as the QUEUED mark).
+      githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValueOnce("H1");
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 927, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+        reason: "r", feedback: "f", evidenceKey: "review:927", issue: 737, headSha: "H1",
+      });
+      expect(client.items[0].lane).toBe("ESCALATED");
+      await markPrFixItem(client, { repo: "org/repo", pr: 927, status: "BLOCKED", note: "human decision" });
+      expect(client.items[0].lane).toBe("NEEDS_HUMAN");
+      const refused = await markPrFixItem(client, {
+        repo: "org/repo", pr: 927, status: "FIXED",
+        actorTier: "maintainer", allowStickyReclassify: true,
+      });
+      expect(mutatedItem(refused).status).toBe("QUEUED");
+      expect(mutatedItem(refused).lane).toBe("ESCALATED");
+      expect(client.items[0].lane).toBe("ESCALATED");
+    });
+
+    it("a fresh-evidence reopen of a reclassified hold re-derives the frontier parent", async () => {
+      client.issueRows.push(frontierIssue);
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 926, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+        reason: "r", feedback: "f", evidenceKey: "review:926", issue: 737,
+      });
+      expect(client.items[0].lane).toBe("ESCALATED");
+      await markPrFixItem(client, { repo: "org/repo", pr: 926, status: "BLOCKED", note: "human decision" });
+      expect(client.items[0].lane).toBe("NEEDS_HUMAN");
+      // New review evidence lands on the held row after the hold (the
+      // #1249 durable ledger aside, the cache path suffices here).
+      client.items[0].postDispatchEvidenceKeys = ["review:926b"];
+      const reopened = await markPrFixItem(client, {
+        repo: "org/repo", pr: 926, status: "FIXED",
+        actorTier: "maintainer", allowStickyReclassify: true,
+      });
+      expect(reopened.mutated).toBe(true);
+      expect(client.items[0].status).toBe("QUEUED");
+      expect(client.items[0].lane).toBe("ESCALATED");
+    });
   });
 
   describe("enforcePrFixHandoutLaneExclusivity (hand-out gate)", () => {
