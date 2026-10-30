@@ -408,6 +408,8 @@ describe("GET /api/automation/repos — release pulse", () => {
       completedUmbrellaCount: 0,
       unknownDeliveryCount: 0,
       highlightsTruncated: false,
+      highlightCount: 1,
+      deliveredWithoutHighlightCount: 0,
     });
     expect(body[0].pulse.highlights).toHaveLength(1);
     expect(body[0].pulse.highlights[0]).toMatchObject({
@@ -493,6 +495,8 @@ describe("GET /api/automation/repos — release pulse", () => {
       unreleasedCommits: { state: "no-baseline", count: null },
       deliveredIssueCount: 0,
       highlights: [],
+      highlightCount: 0,
+      deliveredWithoutHighlightCount: 0,
       completedUmbrellaCount: 0,
       unknownDeliveryCount: 0,
     });

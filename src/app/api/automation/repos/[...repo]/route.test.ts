@@ -12,6 +12,8 @@ const { mocks } = vi.hoisted(() => ({
     githubWorkflowRunCount: vi.fn().mockResolvedValue(0),
     automationSyncRunFindFirst: vi.fn().mockResolvedValue(null),
     automationEventFindMany: vi.fn().mockResolvedValue([]),
+    issueLifecycleEventFindMany: vi.fn().mockResolvedValue([]),
+    issueFindMany: vi.fn().mockResolvedValue([]),
   },
 }));
 
@@ -31,6 +33,8 @@ vi.mock("@/lib/prisma", () => ({
     githubWorkflowRun: { count: mocks.githubWorkflowRunCount },
     automationSyncRun: { findFirst: mocks.automationSyncRunFindFirst },
     automationEvent: { findMany: mocks.automationEventFindMany },
+    issueLifecycleEvent: { findMany: mocks.issueLifecycleEventFindMany },
+    issue: { findMany: mocks.issueFindMany },
   },
 }));
 
@@ -289,3 +293,120 @@ describe("DELETE /api/automation/repos/[...repo] — rate limit", () => {
 
 
 
+
+describe("GET /api/automation/repos/[...repo] — release pulse (#1484)", () => {
+  const BASELINE_MS = Date.parse("2024-01-01T00:00:00Z");
+
+  function readyRepo(overrides: Record<string, unknown> = {}) {
+    return {
+      id: "repo-1",
+      fullName: "myorg/myrepo",
+      name: "myrepo",
+      owner: "myorg",
+      defaultBranch: "main",
+      latestCommitSha: "headsha1",
+      releaseState: "ahead",
+      releaseBaselineTag: "v1.0.0",
+      releaseBaselineSha: "basesha1",
+      releaseBaselinePublishedAt: new Date(BASELINE_MS),
+      releaseHeadSha: "headsha1",
+      releaseAheadBy: 7,
+      releaseError: null,
+      releaseDeltaSyncedAt: new Date("2024-01-02T00:00:00Z"),
+      openPRCount: 0,
+      lastSyncedAt: new Date("2024-01-02T00:00:00Z"),
+      syncError: null,
+      source: "user",
+      workflows: [],
+      releases: [],
+      packages: [],
+      _count: { workflows: 0, releases: 1 },
+      ...overrides,
+    };
+  }
+
+  function pulseGetRequest() {
+    return GET(
+      new Request("http://localhost/api/automation/repos/myorg/myrepo", {
+        headers: { Authorization: `Bearer ${mockToken}` },
+      }),
+      { params: Promise.resolve({ repo: ["myorg", "myrepo"] }) },
+    );
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetRateLimits();
+    mocks.issueLifecycleEventFindMany.mockResolvedValue([]);
+    mocks.issueFindMany.mockResolvedValue([]);
+    mocks.githubWorkflowRunCount.mockResolvedValue(0);
+    mocks.automationSyncRunFindFirst.mockResolvedValue(null);
+    mocks.automationEventFindMany.mockResolvedValue([]);
+  });
+
+  it("returns a ready pulse and advisory readiness for a baseline repo", async () => {
+    mocks.findUniqueAutomationRepo.mockResolvedValue(readyRepo());
+    mocks.issueLifecycleEventFindMany.mockResolvedValue([
+      {
+        kind: "pr_merged",
+        source: "github-webhook",
+        actor: "myorg",
+        agentName: null,
+        fromStatus: null,
+        toStatus: null,
+        sourceEventId: "pr-101",
+        occurredAt: new Date("2024-01-05T12:00:00Z"),
+        observedAt: new Date("2024-01-05T12:00:05Z"),
+        metadata: {
+          pullRequestNumber: 101,
+          pullRequestUrl: "https://github.com/myorg/myrepo/pull/101",
+          mergeCommitSha: "mergesha1",
+          mergedAt: "2024-01-05T12:00:00Z",
+        },
+        issueNumber: 41,
+      },
+    ]);
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        number: 41,
+        title: "Bounded implementation work",
+        url: "https://github.com/myorg/myrepo/issues/41",
+        state: "closed",
+        closedAt: new Date("2024-01-05T13:00:00Z"),
+        labels: [],
+        releaseSignal: { kind: "fix", headline: "Fix it", significance: null },
+        decomposed: false,
+        followUpUrls: [],
+      },
+    ]);
+
+    const res = await pulseGetRequest();
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.pulse.pulseState).toBe("ready");
+    expect(data.pulse.baseline.tag).toBe("v1.0.0");
+    expect(data.pulse.unreleasedCommits).toEqual({ state: "ahead", count: 7 });
+    expect(data.pulse.deliveredIssueCount).toBe(1);
+    expect(data.pulse.highlights).toHaveLength(1);
+    expect(data.pulse.highlightCount).toBe(1);
+    expect(data.pulse.deliveredWithoutHighlightCount).toBe(0);
+    // Advisory readiness is present with the derived CI context (no runs → unknown).
+    expect(data.readiness.state).toBeDefined();
+    expect(data.readiness.ci).toBe("unknown");
+    // Positive success evidence is now counted for the CI context.
+    expect(data.succeededRuns).toBe(0);
+  });
+
+  it("returns an unknown pulse for a repo without usable release evidence", async () => {
+    mocks.findUniqueAutomationRepo.mockResolvedValue(readyRepo({ releaseState: "diverged" }));
+
+    const res = await pulseGetRequest();
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.pulse.pulseState).toBe("unknown");
+    expect(data.readiness.state).toBe("unknown");
+    // Non-ready repos stay cheap: no issue/event reads.
+    expect(mocks.issueLifecycleEventFindMany).not.toHaveBeenCalled();
+    expect(mocks.issueFindMany).not.toHaveBeenCalled();
+  });
+});

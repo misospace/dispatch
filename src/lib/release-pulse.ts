@@ -119,6 +119,24 @@ export interface ReleasePulseSnapshot {
   highlights: ReleasePulseHighlight[];
   highlightsTruncated: boolean;
   /**
+   * Highlight count over the FULL set, computed BEFORE the
+   * `RELEASE_PULSE_MAX_HIGHLIGHTS` cap slices the exposed list. Anything
+   * displaying or deriving from a highlight count must read this, never
+   * `highlights.length`: the cap is a presentation bound, so the capped
+   * array understates repositories with more highlights than the cap.
+   */
+  highlightCount: number;
+  /**
+   * Delivered issues with NO highlight entry (internal signals, legacy
+   * issues without a feature/fix type). Computed by the producer against
+   * the delivered set so the "N more delivered issues without a semantic
+   * highlight" copy never subtracts `highlightCount` from
+   * `deliveredIssueCount`: umbrella-only milestones add highlights without
+   * adding delivered issues, so that subtraction undercounts the remainder
+   * (or hides a genuinely positive one entirely).
+   */
+  deliveredWithoutHighlightCount: number;
+  /**
    * Semantic "feature shipped" count over the FULL highlight set, computed
    * BEFORE the `RELEASE_PULSE_MAX_HIGHLIGHTS` cap slices the exposed list:
    * feature/architecture highlights with notable/major significance.
@@ -376,6 +394,8 @@ export function buildReleasePulse(
       deliveredIssueCount: 0,
       highlights: [],
       highlightsTruncated: false,
+      highlightCount: 0,
+      deliveredWithoutHighlightCount: 0,
       notableDeliveryCount: 0,
       completedUmbrellaCount: 0,
       unknownDeliveryCount: 0,
@@ -568,6 +588,17 @@ export function buildReleasePulse(
   // does NOT imply >=volume commits — the count, not the array, is the
   // decision evidence consumers must read.
   const notableDeliveryCount = highlights.filter(isNotableDelivery).length;
+  // "Delivered but unhighlighted" must be measured against the delivered
+  // set, never subtracted from `highlightCount`: an umbrella milestone can
+  // add a highlight without the parent ever being merge-delivered, and an
+  // umbrella overriding a delivery highlight still leaves that delivered
+  // issue highlighted.
+  let deliveredWithoutHighlightCount = 0;
+  for (const delivery of deliveries.values()) {
+    if (delivery.deliveredAtMs !== null && !highlightsByIssue.has(delivery.issue.number)) {
+      deliveredWithoutHighlightCount += 1;
+    }
+  }
 
   return {
     schema: "dispatch.release-pulse/v1",
@@ -586,6 +617,10 @@ export function buildReleasePulse(
     deliveredIssueCount,
     highlights: highlightsTruncated ? highlights.slice(0, RELEASE_PULSE_MAX_HIGHLIGHTS) : highlights,
     highlightsTruncated,
+    // The true count is exposed alongside the capped list so consumers never
+    // derive a count from the truncated window.
+    highlightCount: highlights.length,
+    deliveredWithoutHighlightCount,
     notableDeliveryCount,
     completedUmbrellaCount,
     unknownDeliveryCount,
