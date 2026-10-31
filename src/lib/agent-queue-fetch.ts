@@ -13,6 +13,12 @@ import {
   type AdmissionIssueState,
   type QueueAdmissionMode,
 } from "@/lib/queue-admission";
+import {
+  getNoPrConclusionMode,
+  loadLiveNoPrConclusions,
+  toNoPrConclusionMark,
+  type NoPrConclusionRow,
+} from "@/lib/no-pr-conclusion";
 import type { RankedIssue } from "@/lib/agent-queue";
 
 /**
@@ -45,12 +51,17 @@ export interface AgentQueueFetchResult {
    */
   rankedQueue: RankedIssue[];
   /**
-   * The ranked queue before admission filtering, in the same order. Equal to
-   * rankedQueue unless admission is enforced; linked-PR follow-up routing
-   * scans this so it is unaffected by issue admission.
+   * The ranked queue before admission and no-PR-conclusion filtering, in the
+   * same order. Equal to rankedQueue unless admission or the #1506 park is
+   * enforced; linked-PR follow-up routing scans this so it is unaffected by
+   * issue admission and by conclusion parks.
    */
   fullQueue: RankedIssue[];
-  /** Issues withheld by admission (enforce mode only), each carrying `admission`. */
+  /**
+   * Issues withheld from pickup (enforce modes only): admission-withheld
+   * entries carrying `admission`, plus issues parked by a terminal no-PR
+   * conclusion carrying `noPrConclusion`.
+   */
   withheldQueue: RankedIssue[];
   /** The grooming admission mode this fetch ran under. */
   admissionMode: QueueAdmissionMode;
@@ -152,6 +163,21 @@ export async function fetchAgentQueueData(
   const leasedIssueIdSet = new Set(leasedIssueIds);
   const filteredIssues = issues.filter((issue) => !leasedIssueIdSet.has(issue.id));
 
+  // Terminal no-PR conclusion parks (#1506): one small ledger read, only when
+  // the mode is on. The park decision is pure content-fingerprint evaluation
+  // (see lib/no-pr-conclusion); no GitHub call happens here.
+  const noPrMode = getNoPrConclusionMode();
+  const liveParks: Map<string, NoPrConclusionRow> =
+    noPrMode === "off"
+      ? new Map()
+      : await loadLiveNoPrConclusions(
+          filteredIssues.map((issue) => ({ id: issue.id, title: issue.title, body: issue.body })),
+        );
+  // Parked-and-withheld only in enforce; in audit the mark is attached and
+  // the item stays where it was.
+  const isParkWithheld = (item: { issueId?: string }): boolean =>
+    noPrMode === "enforce" && item.issueId !== undefined && liveParks.has(item.issueId);
+
   // Open-issue key set for dependency gating (issues are already filtered to state: "open")
   const openIssueKeys = new Set(issues.map((i) => dependencyKey(i.repository.fullName, i.number)));
 
@@ -183,15 +209,32 @@ export async function fetchAgentQueueData(
     },
   );
 
+  // Attach park marks before admission annotation so they survive onto the
+  // withheld entries (#1506). The mark is carried in every mode except off.
+  if (noPrMode !== "off") {
+    for (const item of rankedQueue) {
+      const park = item.issueId ? liveParks.get(item.issueId) : undefined;
+      if (park) item.noPrConclusion = toNoPrConclusionMark(park);
+    }
+  }
+
   const prFixItems = prFixItemsRaw.map(toAgentQueuePrFixItem);
 
   if (admissionMode === "off") {
+    const conclusionWithheld = rankedQueue
+      .filter(isParkWithheld)
+      .map((item) => ({ ...item, claimable: false }));
     return {
       resolvedLane,
       laneValid: true,
-      rankedQueue,
+      rankedQueue: conclusionWithheld.length
+        ? rankedQueue.filter((item) => !isParkWithheld(item))
+        : rankedQueue,
+      // fullQueue feeds linked-PR follow-up routing, which is PR work and
+      // was never gated by issue-side holds — parked issues stay visible to
+      // it (#1506, mirroring the PR-fix precedent from admission).
       fullQueue: rankedQueue,
-      withheldQueue: [],
+      withheldQueue: conclusionWithheld,
       admissionMode,
       prFixItems,
       availableLanes,
@@ -232,14 +275,21 @@ export async function fetchAgentQueueData(
     };
   }
 
+  const admissionWithheld = fullQueue
+    .filter((item) => item.admission?.admitted === false)
+    .map((item) => ({ ...item, claimable: false }));
+  const admitted = fullQueue.filter((item) => item.admission?.admitted !== false);
+  // A parked issue that admission also withheld is counted once, on the
+  // admission side; the park never double-lists it.
   return {
     resolvedLane,
     laneValid: true,
-    rankedQueue: fullQueue.filter((item) => item.admission?.admitted !== false),
+    rankedQueue: admitted.filter((item) => !isParkWithheld(item)),
     fullQueue,
-    withheldQueue: fullQueue
-      .filter((item) => item.admission?.admitted === false)
-      .map((item) => ({ ...item, claimable: false })),
+    withheldQueue: [
+      ...admissionWithheld,
+      ...admitted.filter(isParkWithheld).map((item) => ({ ...item, claimable: false })),
+    ],
     admissionMode,
     prFixItems,
     availableLanes,

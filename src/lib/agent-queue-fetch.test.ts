@@ -11,11 +11,17 @@ const { mocks } = vi.hoisted(() => ({
     getLaneIds: vi.fn(() => ["local", "cloud", "frontier", "backlog"]),
     prFixLaneForRequest: vi.fn((l: string | null | undefined) => (!l ? undefined : l === "frontier" ? "ESCALATED" : l === "local" ? "NORMAL" : null)),
     parseExcludedLabels: vi.fn(() => []),
+    // #1506: the terminal no-PR conclusion park ledger read/cleanup.
+    noPrFindMany: vi.fn().mockResolvedValue([]),
+    noPrDeleteMany: vi.fn().mockResolvedValue({ count: 0 }),
   },
 }));
 
 vi.mock("@/lib/prisma", () => ({
-  prisma: { issue: { findMany: mocks.findMany } },
+  prisma: {
+    issue: { findMany: mocks.findMany },
+    noPrConclusion: { findMany: mocks.noPrFindMany, deleteMany: mocks.noPrDeleteMany },
+  },
   asPrFixQueueClient: (c: unknown) => c,
 }));
 vi.mock("@/lib/agent-queue", () => ({ buildAgentQueue: mocks.buildAgentQueue }));
@@ -28,6 +34,7 @@ vi.mock("@/lib/config", () => ({ parseExcludedLabels: mocks.parseExcludedLabels 
 vi.mock("@/lib/lane-config", () => ({ resolveRequestLane: mocks.resolveRequestLane, getLaneIds: mocks.getLaneIds, prFixLaneForRequest: mocks.prFixLaneForRequest }));
 
 import { fetchAgentQueueData } from "./agent-queue-fetch";
+import { computeConclusionContentFingerprint } from "@/lib/no-pr-conclusion";
 
 function issue(id: string, over: Record<string, unknown> = {}) {
   return { id, number: 1, title: `#${id}`, url: "u", labels: [], currentLane: "local", decomposed: false, repository: { fullName: "org/repo" }, ...over };
@@ -39,11 +46,15 @@ function params(over: { agentName?: string; lane?: string | null } = {}) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  delete process.env.DISPATCH_NO_PR_CONCLUSION_MODE;
+  delete process.env.DISPATCH_QUEUE_ADMISSION_MODE;
   mocks.findMany.mockResolvedValue([]);
   mocks.findLeasedIssueIds.mockResolvedValue([]);
   mocks.listQueuedPrFixItems.mockResolvedValue([]);
   mocks.buildAgentQueue.mockReturnValue([]);
   mocks.resolveRequestLane.mockReturnValue(null);
+  mocks.noPrFindMany.mockResolvedValue([]);
+  mocks.noPrDeleteMany.mockResolvedValue({ count: 0 });
 });
 
 describe("fetchAgentQueueData", () => {
@@ -123,5 +134,93 @@ describe("fetchAgentQueueData", () => {
     mocks.resolveRequestLane.mockReturnValue("cloud");
     expect((await fetchAgentQueueData(params({ lane: "cloud" }))).prFixItems).toEqual([]);
     expect(mocks.listQueuedPrFixItems).not.toHaveBeenCalled();
+  });
+});
+
+describe("fetchAgentQueueData — terminal no-PR conclusion park (#1506)", () => {
+  // Build a live park row for issue `id`: its fingerprint matches the issue's
+  // current title/body, so `loadLiveNoPrConclusions` treats it as live.
+  function parkFor(id: string, over: Record<string, unknown> = {}) {
+    return {
+      id: `park-${id}`,
+      issueId: id,
+      agentName: "worker",
+      outcome: "no_changes_needed",
+      contentFingerprint: computeConclusionContentFingerprint({ title: `#${id}`, body: null }),
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+      summary: "no PR needed",
+      ...over,
+    };
+  }
+
+  it("enforce: a live park withholds the issue into withheldQueue and out of rankedQueue", async () => {
+    process.env.DISPATCH_NO_PR_CONCLUSION_MODE = "enforce";
+    mocks.findMany.mockResolvedValue([issue("parked")]);
+    mocks.noPrFindMany.mockResolvedValue([parkFor("parked")]);
+    mocks.buildAgentQueue.mockReturnValue([{ issueId: "parked", title: "#parked", labels: [] }]);
+
+    const r = await fetchAgentQueueData(params());
+
+    expect(r.rankedQueue).toEqual([]);
+    expect(r.withheldQueue).toEqual([
+      expect.objectContaining({
+        issueId: "parked",
+        claimable: false,
+        noPrConclusion: expect.objectContaining({ agentName: "worker", outcome: "no_changes_needed" }),
+      }),
+    ]);
+    // fullQueue retains the parked issue for linked-PR follow-up routing.
+    expect(r.fullQueue.map((i) => i.issueId)).toEqual(["parked"]);
+  });
+
+  it("audit mode: a live park attaches the mark but withholds nothing", async () => {
+    process.env.DISPATCH_NO_PR_CONCLUSION_MODE = "audit";
+    mocks.findMany.mockResolvedValue([issue("parked")]);
+    mocks.noPrFindMany.mockResolvedValue([parkFor("parked")]);
+    mocks.buildAgentQueue.mockReturnValue([{ issueId: "parked", title: "#parked", labels: [] }]);
+
+    const r = await fetchAgentQueueData(params());
+
+    expect(r.withheldQueue).toEqual([]);
+    expect(r.rankedQueue).toEqual([
+      expect.objectContaining({
+        issueId: "parked",
+        noPrConclusion: expect.objectContaining({ agentName: "worker", outcome: "no_changes_needed" }),
+      }),
+    ]);
+    expect(r.fullQueue.map((i) => i.issueId)).toEqual(["parked"]);
+  });
+
+  it("off: no park ledger read and no mark is attached", async () => {
+    process.env.DISPATCH_NO_PR_CONCLUSION_MODE = "off";
+    mocks.findMany.mockResolvedValue([issue("parked")]);
+    mocks.noPrFindMany.mockResolvedValue([parkFor("parked")]);
+    mocks.buildAgentQueue.mockReturnValue([{ issueId: "parked", title: "#parked", labels: [] }]);
+
+    const r = await fetchAgentQueueData(params());
+
+    expect(mocks.noPrFindMany).not.toHaveBeenCalled();
+    expect(r.rankedQueue).toEqual([{ issueId: "parked", title: "#parked", labels: [] }]);
+    expect(r.withheldQueue).toEqual([]);
+    expect(r.rankedQueue[0].noPrConclusion).toBeUndefined();
+  });
+
+  it("an expired park (fingerprint mismatch) is not live: nothing withheld, stale row cleaned up", async () => {
+    process.env.DISPATCH_NO_PR_CONCLUSION_MODE = "enforce";
+    mocks.findMany.mockResolvedValue([issue("edited")]);
+    // Recorded against old content; the issue's title has since moved, so the
+    // fingerprint no longer matches — the park ended the moment the edit landed.
+    const staleRow = parkFor("edited", {
+      contentFingerprint: computeConclusionContentFingerprint({ title: "#edited-OLD", body: null }),
+    });
+    mocks.noPrFindMany.mockResolvedValue([staleRow]);
+    mocks.buildAgentQueue.mockReturnValue([{ issueId: "edited", title: "#edited", labels: [] }]);
+
+    const r = await fetchAgentQueueData(params());
+
+    expect(r.rankedQueue.map((i) => i.issueId)).toEqual(["edited"]);
+    expect(r.withheldQueue).toEqual([]);
+    expect(r.rankedQueue[0].noPrConclusion).toBeUndefined();
+    expect(mocks.noPrDeleteMany).toHaveBeenCalledWith({ where: { id: { in: ["park-edited"] } } });
   });
 });

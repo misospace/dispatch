@@ -7,6 +7,7 @@ import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/a
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { transitionIssueStatus } from "@/lib/issue-status";
 import { recordStatusTransition } from "@/lib/issue-lifecycle";
+import { clearNoPrConclusionPark, type ConclusionWriteClient } from "@/lib/no-pr-conclusion";
 
 // Generous per-actor rate limit — normal kanban drag-and-drop and agent
 // status transitions stay far below this.
@@ -101,6 +102,23 @@ export async function POST(request: Request) {
             before: effectiveCurrentLabels,
             after: newLabels as string[],
           });
+
+          // #1506: a board move is the operator's current decision on the
+          // issue, so any stored terminal no-PR conclusion is retired with
+          // the same atomicity precedent as the status mirror in this
+          // transaction. A no-op (and records nothing) when the issue
+          // carries no park row.
+          await clearNoPrConclusionPark(
+            {
+              issueId: issueId as string,
+              repoFullName: repoFullName as string,
+              issueNumber: issueNumber as number,
+              actor: moveActor,
+              source: "api:move",
+              reason: "board move",
+            },
+            tx as unknown as ConclusionWriteClient,
+          );
         });
       }
 

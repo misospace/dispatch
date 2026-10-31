@@ -7,6 +7,7 @@ import { enforceWorkerAgentScope, enforceWorkerBound } from "@/lib/worker-identi
 import { transitionIssueStatus } from "@/lib/issue-status";
 import { getLiveIssueLabels } from "@/lib/claim-gate";
 import { recordStatusTransition } from "@/lib/issue-lifecycle";
+import { clearNoPrConclusionPark, type ConclusionWriteClient } from "@/lib/no-pr-conclusion";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
 const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
@@ -182,6 +183,24 @@ export async function POST(request: Request) {
           mirroredBefore: issue.labels,
           metadata: targetLabel === "status/blocked" ? { blocked: true } : null,
         });
+
+        // #1506: the operator's status decision is authoritative over any
+        // stored terminal no-PR conclusion, so the park retires in the same
+        // commit — the same atomicity precedent as the #1453
+        // nextGroomingAction retirement in this update. A no-op when the
+        // issue carries no park row (the library's own check); it never
+        // fails the transition.
+        await clearNoPrConclusionPark(
+          {
+            issueId: issueId as string,
+            repoFullName: effectiveRepo,
+            issueNumber: effectiveNumber,
+            actor: actorName,
+            source: "api:status",
+            reason: `status ${targetLabel}`,
+          },
+          tx as unknown as ConclusionWriteClient,
+        );
       });
 
       // Write audit log

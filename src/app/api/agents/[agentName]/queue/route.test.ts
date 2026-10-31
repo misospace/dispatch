@@ -11,6 +11,9 @@ const { mocks } = vi.hoisted(() => ({
     issueFindMany: vi.fn(),
     prFixFindMany: vi.fn(),
     findLeasedIssueIds: vi.fn(),
+    // #1506: the queue fetch reads the terminal no-PR conclusion park ledger.
+    noPrConclusionFindMany: vi.fn().mockResolvedValue([]),
+    noPrConclusionDeleteMany: vi.fn().mockResolvedValue({ count: 0 }),
   },
 }));
 
@@ -18,6 +21,10 @@ vi.mock("@/lib/prisma", () => ({
   prisma: {
     issue: { findMany: mocks.issueFindMany },
     prFixQueueItem: { findMany: mocks.prFixFindMany },
+    noPrConclusion: {
+      findMany: mocks.noPrConclusionFindMany,
+      deleteMany: mocks.noPrConclusionDeleteMany,
+    },
   },
   asPrFixQueueClient: (client: any) => client,
 }));
@@ -41,6 +48,8 @@ describe("GET /api/agents/[agentName]/queue", () => {
     mocks.prFixFindMany.mockResolvedValue([]);
     mocks.issueFindMany.mockResolvedValue([]);
     mocks.findLeasedIssueIds.mockResolvedValue([]);
+    mocks.noPrConclusionFindMany.mockResolvedValue([]);
+    mocks.noPrConclusionDeleteMany.mockResolvedValue({ count: 0 });
   });
 
   afterEach(() => {

@@ -50,6 +50,10 @@ export const LIFECYCLE_EVENT_KINDS = [
   "ownership_registered",
   /** A worker recorded a terminal ownership disposition (#1251). */
   "ownership_dispositioned",
+  /** A worker's terminal no-PR report parked the issue out of the queue (#1506). */
+  "conclusion_parked",
+  /** A conclusion park ended: operator clear, content edit, or force-claim (#1506). */
+  "conclusion_cleared",
 ] as const;
 
 export type LifecycleEventKind = (typeof LIFECYCLE_EVENT_KINDS)[number];
@@ -81,6 +85,8 @@ export const LIFECYCLE_SOURCES = [
   "agent-report",
   /** POST /api/agent-work/ownership (#1251 register/disposition records). */
   "api:ownership",
+  /** DELETE /api/issues/[id]/no-pr-conclusion (#1506 operator park clear). */
+  "api:no-pr-conclusion",
   /** A bounded backfill over already-observed records (#1203). */
   "backfill",
 ] as const;

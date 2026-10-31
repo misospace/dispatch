@@ -25,6 +25,9 @@ const { mocks } = vi.hoisted(() => ({
     prFixTransactionError: null as Error | null,
     // Queue-client surfaces touched THROUGH the admission transaction.
     prFixTxSurfaces: [] as string[],
+    // #1506: the terminal no-PR conclusion park ledger read/cleanup.
+    noPrConclusionFindMany: vi.fn().mockResolvedValue([]),
+    noPrConclusionDeleteMany: vi.fn().mockResolvedValue({ count: 0 }),
   },
 }));
 
@@ -70,15 +73,19 @@ vi.mock("@/lib/prisma", () => {
       return prFixQueueItem.updateMany(args);
     },
   };
-  return {
-    prisma: {
-      issue: { findMany: mocks.issueFindMany },
-      prFixQueueItem,
-      prFixHistory: { create: mocks.prFixHistoryCreate },
-      capacityHandoff: {
-        findMany: mocks.capacityHandoffFindMany,
-        deleteMany: mocks.capacityHandoffDeleteMany,
-      },
+    return {
+      prisma: {
+        issue: { findMany: mocks.issueFindMany },
+        noPrConclusion: {
+          findMany: mocks.noPrConclusionFindMany,
+          deleteMany: mocks.noPrConclusionDeleteMany,
+        },
+        prFixQueueItem,
+        prFixHistory: { create: mocks.prFixHistoryCreate },
+        capacityHandoff: {
+          findMany: mocks.capacityHandoffFindMany,
+          deleteMany: mocks.capacityHandoffDeleteMany,
+        },
       // The #1327 REBASE admission transaction runs the concurrency gate,
       // the dispatch stamp, and the hand-out push on the TRANSACTION client;
       // it mirrors the top-level surface here. $executeRaw is a no-op

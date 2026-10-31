@@ -837,7 +837,18 @@ export async function GET(
       : null;
 
     if (withheldQueue.length > 0) {
-      const withheldNote = `${withheldQueue.length} ready issue${withheldQueue.length === 1 ? "" : "s"} withheld by grooming admission`;
+      // #1506: tell a grooming-admission hold apart from a terminal no-PR
+      // conclusion park — an operator un-parks a concluded issue differently
+      // than they re-groom a stale one.
+      const conclusionCount = withheldQueue.filter((item) => item.noPrConclusion).length;
+      const admissionCount = withheldQueue.length - conclusionCount;
+      const plural = (n: number) => (n === 1 ? "" : "s");
+      const withheldNote = [
+        admissionCount > 0 ? `${admissionCount} ready issue${plural(admissionCount)} withheld by grooming admission` : null,
+        conclusionCount > 0 ? `${conclusionCount} issue${plural(conclusionCount)} parked by a terminal no-PR conclusion` : null,
+      ]
+        .filter(Boolean)
+        .join(" and ");
       return respond(
         createIdleTask(`No work available (${[withheldNote, deferredNote, excludedNote, capacityNote].filter(Boolean).join("; ")})`),
       );
