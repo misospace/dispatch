@@ -1116,17 +1116,18 @@ async function executeGroomerRun(
     if (applied.outcome === "replayed") {
       // This exact application already landed: lane history and the applier's
       // writes are never repeated. Only the local cooldown stamp moves, so the
-      // same plan is not re-billed every scheduler tick. The release-signal
-      // projection is the one exception a replay may still write: it is
-      // persisted after the application finalizes, so a failed issue update on
-      // the fresh path would otherwise leave the signal missing or stale
-      // forever — every same-key retry replays and returns here. The heal is
-      // bounded: only an empty column, or one holding a projection this
-      // application supersedes (an older appliedAt); never a projection a
-      // newer application already owns. A clear (this application carries no
-      // signal) writes the same provenance-carrying tombstone the fresh path
-      // writes (dispatch#1487), so it is never mistaken for an unwritten
-      // column by a later replay of an older key.
+      // same plan is not re-billed every scheduler tick. Two local columns a
+      // replay may still write: the release-signal projection and the verdict
+      // summary (dispatch#1470) — both are persisted after the application
+      // finalizes, so a failed issue update on the fresh path would otherwise
+      // leave them missing or stale forever; every same-key retry replays and
+      // returns here. The projection heal is bounded: only an empty column, or
+      // one holding a projection this application supersedes (an older
+      // appliedAt); never a projection a newer application already owns. A
+      // clear (this application carries no signal) writes the same
+      // provenance-carrying tombstone the fresh path writes (dispatch#1487), so
+      // it is never mistaken for an unwritten column by a later replay of an
+      // older key.
       const replayData: Record<string, unknown> = {
         groomedAt: new Date(),
         groomedBy: "hosted-groomer",
@@ -1134,7 +1135,7 @@ async function executeGroomerRun(
       };
       const storedProjection = await deps.prisma.issue.findUnique({
         where: { id: candidate.id },
-        select: { releaseSignal: true },
+        select: { releaseSignal: true, groomingSummary: true },
       });
       const stored = readProjectionProvenance(storedProjection?.releaseSignal);
       const storedIsCurrent = stored?.applicationKey === applicationKey;
@@ -1172,6 +1173,16 @@ async function executeGroomerRun(
         replayData.releaseSignal = diff.releaseSignal
           ? { ...diff.releaseSignal, provenance: healProvenance }
           : clearedReleaseSignalProjection(healProvenance);
+      }
+      // The summary heal (#1470): the verdict summary is part of the application
+      // key, so the replaying run's text is exactly the text this application
+      // persists — a replay never carries a different verdict's summary. The
+      // column has no ownership provenance (an operator groom-route write or a
+      // newer verdict may hold its text), so the heal stays bounded to the
+      // empty column: it recovers the write the fresh path lost and never
+      // overwrites text that is already there.
+      if (output.summary && !storedProjection?.groomingSummary) {
+        replayData.groomingSummary = output.summary;
       }
       // #1472: a replay is a fresh validation of the same verdict against
       // current evidence — this run collected its evidence, built the plan,
