@@ -59,6 +59,7 @@ git-hook installation, migrations, DATABASE_URL requirements, or test execution 
 | `DISPATCH_PR_FOLLOWUP_INTERVAL_MS` | No | PR-followup sync interval (default 900000 = 15m; `0` disables) |
 | `DISPATCH_PRUNE_CLOSED_INTERVAL_MS` | No | Closed-issue prune interval (default 86400000 = 24h; `0` disables) |
 | `DISPATCH_CAPACITY_COOLDOWN_MS` | No | Bounded cooldown for explicit capacity-exhaustion handoffs (default 900000 = 15m, clamped 1m–6h). Scoped to the exhausted capacity on the handed item only; unrelated capacities keep dispatch. See [docs/capacity-handoff.md](./docs/capacity-handoff.md) |
+| `DISPATCH_AGENT_ACTIVITY_WINDOW_MS` | No | Recency window for the Agents page default view (#1494): an identity with no open assignment and no live work stays visible while its latest AgentRun report/heartbeat falls inside it (default 604800000 = 7d, clamped 1m–30d). Hiding is display-only; history is never deleted and new activity re-lists the identity. See `src/lib/agent-directory.ts`. |
 | `DISPATCH_OWNERSHIP_ACTIVE_WINDOW_MS` | No | Ownership liveness window (#1251): renewals inside it keep a claim `CLAIMED_ACTIVE` (default 900000 = 15m, clamped 1m–6h). See [docs/worker-ownership-capability.md](./docs/worker-ownership-capability.md) |
 | `DISPATCH_OWNERSHIP_LONG_RUN_GRACE_MS` | No | Long-run grace (#1251): sustained silence inside it is `CLAIMED_LONG_RUNNING`, never release (default 2700000 = 45m, clamped ≥ active window, ≤24h) |
 | `DISPATCH_OWNERSHIP_RENEW_TTL_MS` | No | Expiry a renewed lease receives (#1251) (default 1800000 = 30m, clamped 1m–24h) |
