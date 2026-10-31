@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { createLinkedPrFixItem, enqueuePrFixItem, hasInFlightRebaseHandout, withRebaseLaneAdmission, REBASE_LANE_ADVISORY_LOCK_KEY, normalizeQueueRepo, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, parseMarkPrFixInput, parseEnqueuePrFixInput, resolvePrFixFromAgentReport, ackPrFixHandout, parseAckPrFixHandoutInput, reclaimStalePrFixHandouts, prFixHandoutTimeoutMs, maxPrFixReclaims, prFixAckLivenessMs, DEFAULT_PR_FIX_ACK_LIVENESS_MS, agentAlreadyHanded, isRebaseLaneAgent, parseRebaseAgentPool, DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS, DEFAULT_PR_FIX_MAX_RECLAIMS, PrFixQueueClient, type MarkPrFixResult } from "./pr-fix-queue";
+import { createLinkedPrFixItem, enqueuePrFixItem, hasInFlightRebaseHandout, withRebaseLaneAdmission, withHandoutLaneExclusivityFence, linkedIssueEscalationClassified, REBASE_LANE_ADVISORY_LOCK_KEY, normalizeQueueRepo, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, parseMarkPrFixInput, parseEnqueuePrFixInput, resolvePrFixFromAgentReport, ackPrFixHandout, parseAckPrFixHandoutInput, reclaimStalePrFixHandouts, prFixHandoutTimeoutMs, maxPrFixReclaims, prFixAckLivenessMs, DEFAULT_PR_FIX_ACK_LIVENESS_MS, agentAlreadyHanded, isRebaseLaneAgent, parseRebaseAgentPool, enforcePrFixHandoutLaneExclusivity, DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS, DEFAULT_PR_FIX_MAX_RECLAIMS, PrFixQueueClient, type MarkPrFixResult } from "./pr-fix-queue";
 
 function mutatedItem(result: MarkPrFixResult): any {
   if (!result.mutated) throw new Error(`expected mutation, got ${result.reason}`);
@@ -69,6 +69,7 @@ function makeClient(): PrFixQueueClient & {
   history: any[];
   handoffs: any[];
   agentRuns: any[];
+  issueRows: Array<{ repo: string; number: number; currentLane: string | null }>;
   inTransaction: boolean;
   hooks: {
     beforeUpdateMany: (() => void) | null;
@@ -82,12 +83,34 @@ function makeClient(): PrFixQueueClient & {
   // #1419: agent-run liveness ledger rows for the reclaimer's dead-owner
   // probes (agentName/createdAt and item/generation/finishedAt filters).
   const agentRuns: any[] = [];
+  // #1503: issue rows for the escalation-lane lookups. Tests push
+  // `{ repo, number, currentLane }` entries; the fake matches the helper's
+  // `{ repository: { fullName: { equals, mode: "insensitive" } }, number }`
+  // where-clause.
+  const issueRows: Array<{ repo: string; number: number; currentLane: string | null }> = [];
   let seq = 0;
   const client: any = {
     items,
     history,
     handoffs,
     agentRuns,
+    issueRows,
+    issue: {
+      findFirst: async ({ where }: any) =>
+        issueRows.find(
+          (r) =>
+            (where?.number === undefined || r.number === where.number) &&
+            (where?.repository?.fullName?.equals === undefined ||
+              r.repo.toLowerCase() === String(where.repository.fullName.equals).toLowerCase()),
+        ) ?? null,
+      // #1503 review: the fence's locked parent read — mirrors `findFirst`
+      // against the same rows (the production wrapper issues it as
+      // SELECT ... FOR SHARE on the tx; the fake just shares the data).
+      findFirstLocked: async (repo: string, issue: number) =>
+        issueRows.find(
+          (r) => r.number === issue && r.repo.toLowerCase() === repo.toLowerCase(),
+        ) ?? null,
+    },
     // #1419: agent liveness ledger read model for the reclaimer's probes.
     agentRun: {
       findFirst: async ({ where }: any) => {
@@ -257,7 +280,24 @@ function makeClient(): PrFixQueueClient & {
                 JSON.stringify(where.handoutReceipts.equals ?? [])) &&
             (where.agentHandouts === undefined ||
               JSON.stringify(i.agentHandouts ?? []) ===
-                JSON.stringify(where.agentHandouts.equals ?? [])),
+                JSON.stringify(where.agentHandouts.equals ?? [])) &&
+            // #1503: plain-equality lane pin (the escalation-lane correction
+            // CAS must not fire on an already-ESCALATED row).
+            (where.lane === undefined || i.lane === where.lane) &&
+            // #1503: top-level OR over nullable-column arms, mirroring the
+            // route test's semantics: `{ col: null }` matches NULL/absent,
+            // `{ col: { not: x } }` does NOT match NULL. An unknown arm fails
+            // closed.
+            (where.OR === undefined ||
+              (where.OR as any[]).some((cond: any) => {
+                if ("dispatchedGeneration" in cond) {
+                  if (cond.dispatchedGeneration === null) return i.dispatchedGeneration == null;
+                  return (
+                    i.dispatchedGeneration != null && i.dispatchedGeneration !== cond.dispatchedGeneration.not
+                  );
+                }
+                return false;
+              })),
         );
         for (const match of matches) {
           const idx = items.findIndex((i) => i.id === match.id);
@@ -6591,6 +6631,611 @@ describe("hand-out-scoped external waits (#1430)", () => {
       expect(client.history.at(-1)).toMatchObject({ status: "WAITING_EXTERNAL", note: ALPHA_NOTE });
       expect(client.history.some((h) => h.status === "PARKED")).toBe(false);
       expect(surfacingMocks.surfacePrFixParked).not.toHaveBeenCalled();
+    });
+  });
+});
+
+// ─── #1503: escalation-lane (frontier) exclusivity ──────────────────────────
+//
+// The global test lane config (vitest.setup.ts) declares local (default),
+// cloud (roleless), frontier (escalation), backlog. The linked issue's
+// `currentLane` is the escalation provenance: PR-fix work linked to a
+// frontier-classified issue must never live in — or be handed out from — the
+// shared NORMAL queue.
+
+describe("#1503 escalation-lane exclusivity", () => {
+  let client: ReturnType<typeof makeClient>;
+  beforeEach(() => {
+    client = makeClient();
+  });
+
+  const frontierIssue = { repo: "Org/Repo", number: 737, currentLane: "frontier" };
+  const localIssue = { repo: "org/repo", number: 100, currentLane: "local" };
+  const aliasedIssue = { repo: "org/repo", number: 111, currentLane: "escalated" };
+
+  it("enqueues NORMAL-classified work linked to a frontier issue as ESCALATED", async () => {
+    client.issueRows.push(frontierIssue);
+    const item = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 901, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+      reason: "PR review: CHANGES_REQUESTED", feedback: "fix", evidenceKey: "review:901", issue: 737,
+    });
+    expect(item.lane).toBe("ESCALATED");
+    expect(client.history.at(-1)).toMatchObject({ action: "enqueue", lane: "ESCALATED" });
+  });
+
+  it("keeps work linked to a non-escalation lane issue in NORMAL", async () => {
+    client.issueRows.push(localIssue);
+    const item = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 902, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+      reason: "PR review: CHANGES_REQUESTED", feedback: "fix", evidenceKey: "review:902", issue: 100,
+    });
+    expect(item.lane).toBe("NORMAL");
+  });
+
+  it("resolves legacy lane aliases (escalated → frontier) for provenance", async () => {
+    client.issueRows.push(aliasedIssue);
+    const item = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 903, lane: "NORMAL", type: "CI_FAILURE",
+      reason: "r", feedback: "f", evidenceKey: "cr:903", issue: 111,
+    });
+    expect(item.lane).toBe("ESCALATED");
+  });
+
+  it("never overrides a NEEDS_HUMAN human hold with the escalation lane", async () => {
+    client.issueRows.push(frontierIssue);
+    const item = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 904, lane: "NEEDS_HUMAN", type: "REVIEW_FEEDBACK",
+      reason: "r", feedback: "", evidenceKey: "review:904", issue: 737,
+    });
+    expect(item.lane).toBe("NEEDS_HUMAN");
+    expect(item.status).toBe("BLOCKED");
+  });
+
+  it("keeps mechanical REBASE work NORMAL on a frontier issue (#1327 exception)", async () => {
+    client.issueRows.push(frontierIssue);
+    const item = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 905, lane: "NORMAL", type: "REBASE",
+      reason: "Mechanical rebase: PR CONFLICTING against base (#1327)", feedback: "rebase", evidenceKey: "merge_state:org/repo#905", issue: 737,
+    });
+    expect(item.lane).toBe("NORMAL");
+    expect(item.type).toBe("REBASE");
+  });
+
+  it("does not downgrade an ESCALATED row on new or repeated evidence", async () => {
+    client.issueRows.push(frontierIssue);
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 906, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+      reason: "PR review: CHANGES_REQUESTED", feedback: "first", evidenceKey: "review:906a", issue: 737,
+    });
+    expect(client.items[0].lane).toBe("ESCALATED");
+    // A plain NORMAL enqueue (external caller, generic path) must not demote.
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 906, lane: "NORMAL", type: "CI_FAILURE",
+      reason: "r", feedback: "second", evidenceKey: "cr:906", issue: 737,
+    });
+    expect(client.items[0].lane).toBe("ESCALATED");
+    // Escalation provenance is sticky even if the linked issue is gone: the
+    // stored ESCALATED lane itself is exclusive.
+    client.issueRows.length = 0;
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 906, lane: "NORMAL", type: "OTHER",
+      reason: "r", feedback: "third", evidenceKey: "other:906", issue: 737,
+    });
+    expect(client.items[0].lane).toBe("ESCALATED");
+  });
+
+  it("operator requeue returns frontier work to ESCALATED, including from a NEEDS_HUMAN hold", async () => {
+    client.issueRows.push(frontierIssue);
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 907, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+      reason: "r", feedback: "f", evidenceKey: "review:907", issue: 737,
+    });
+    await markPrFixItem(client, { repo: "org/repo", pr: 907, status: "BLOCKED", note: "human decision" });
+    expect(client.items[0].status).toBe("BLOCKED");
+    expect(client.items[0].lane).toBe("NEEDS_HUMAN");
+    const requeued = await requeuePrFixItem(client, { repo: "org/repo", pr: 907, note: "try again" });
+    expect(requeued?.status).toBe("QUEUED");
+    expect(requeued?.lane).toBe("ESCALATED");
+    expect(client.history.at(-1)).toMatchObject({ action: "requeue", lane: "ESCALATED" });
+  });
+
+  it("mark PARKED/QUEUED transitions never demote the ESCALATED lane", async () => {
+    client.issueRows.push(frontierIssue);
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 908, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+      reason: "r", feedback: "f", evidenceKey: "review:908", issue: 737,
+    });
+    await markPrFixItem(client, { repo: "org/repo", pr: 908, status: "PARKED", outcome: "no_progress", expectedGeneration: 1 });
+    expect(client.items[0].status).toBe("PARKED");
+    expect(client.items[0].lane).toBe("ESCALATED");
+    const released = await markPrFixItem(client, { repo: "org/repo", pr: 908, status: "QUEUED", expectedGeneration: 1 });
+    expect(released?.mutated).toBe(true);
+    expect(client.items[0].status).toBe("QUEUED");
+    expect(client.items[0].lane).toBe("ESCALATED");
+  });
+
+  // #1503 review blocker: a BLOCKED mark replaces the lane column with
+  // NEEDS_HUMAN, so a later mark back to QUEUED must re-derive the linked
+  // issue's classification instead of collapsing the hold lane to NORMAL.
+  describe("markPrFixItem release re-derives the linked issue (#1503 review)", () => {
+    function breakIssueLookup() {
+      client.issue.findFirst = async () => {
+        throw new Error("db down");
+      };
+    }
+
+    it("releases a NEEDS_HUMAN hold of frontier work back at ESCALATED, not NORMAL", async () => {
+      client.issueRows.push(frontierIssue);
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 909, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+        reason: "r", feedback: "f", evidenceKey: "review:909", issue: 737,
+      });
+      expect(client.items[0].lane).toBe("ESCALATED");
+      await markPrFixItem(client, { repo: "org/repo", pr: 909, status: "BLOCKED", note: "human decision" });
+      expect(client.items[0].status).toBe("BLOCKED");
+      expect(client.items[0].lane).toBe("NEEDS_HUMAN");
+      const released = await markPrFixItem(client, { repo: "org/repo", pr: 909, status: "QUEUED", expectedGeneration: 1 });
+      expect(released?.mutated).toBe(true);
+      expect(client.items[0].status).toBe("QUEUED");
+      expect(client.items[0].lane).toBe("ESCALATED");
+      expect(client.history.at(-1)).toMatchObject({ action: "mark", status: "QUEUED", lane: "ESCALATED" });
+    });
+
+    it("release from a hold keeps a normal-parent row NORMAL (no unverified raise)", async () => {
+      client.issueRows.push(localIssue);
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 910, lane: "NORMAL", type: "CI_FAILURE",
+        reason: "r", feedback: "f", evidenceKey: "cr:910", issue: 100,
+      });
+      await markPrFixItem(client, { repo: "org/repo", pr: 910, status: "BLOCKED", note: "human decision" });
+      const released = await markPrFixItem(client, { repo: "org/repo", pr: 910, status: "QUEUED", expectedGeneration: 1 });
+      expect(released?.mutated).toBe(true);
+      expect(client.items[0].status).toBe("QUEUED");
+      expect(client.items[0].lane).toBe("NORMAL");
+    });
+
+    it("release on an unreadable parent keeps the held-row fallback (no unverified raise; the gate re-reads at issuance)", async () => {
+      client.issueRows.push(frontierIssue);
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 923, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+        reason: "r", feedback: "f", evidenceKey: "review:923", issue: 737,
+      });
+      await markPrFixItem(client, { repo: "org/repo", pr: 923, status: "BLOCKED", note: "human decision" });
+      breakIssueLookup();
+      const released = await markPrFixItem(client, { repo: "org/repo", pr: 923, status: "QUEUED", expectedGeneration: 1 });
+      expect(released?.mutated).toBe(true);
+      // Nothing was verified (UNKNOWN), so the hold's lane collapses exactly
+      // like the sanctioned requeue fallback — and the hand-out gate refuses
+      // a NORMAL consumer on UNKNOWN at issuance, so nothing unverified is
+      // ever handed to the shared lane.
+      expect(client.items[0].status).toBe("QUEUED");
+      expect(client.items[0].lane).toBe("NORMAL");
+    });
+
+    it("release on an unreadable parent never demotes a stored ESCALATED lane", async () => {
+      client.issueRows.push(frontierIssue);
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 924, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+        reason: "r", feedback: "f", evidenceKey: "review:924", issue: 737,
+      });
+      expect(client.items[0].lane).toBe("ESCALATED");
+      await markPrFixItem(client, { repo: "org/repo", pr: 924, status: "PARKED", outcome: "no_progress", expectedGeneration: 1 });
+      expect(client.items[0].lane).toBe("ESCALATED");
+      breakIssueLookup();
+      const released = await markPrFixItem(client, { repo: "org/repo", pr: 924, status: "QUEUED", expectedGeneration: 1 });
+      expect(released?.mutated).toBe(true);
+      expect(client.items[0].status).toBe("QUEUED");
+      expect(client.items[0].lane).toBe("ESCALATED");
+    });
+
+    it("a refused FIXED released from an operator reclassify re-derives the frontier parent", async () => {
+      client.issueRows.push(frontierIssue);
+      // Unmoved head → the #940 guard refuses the tombstone and releases a
+      // fresh attempt (the same release path as the QUEUED mark).
+      githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValueOnce("H1");
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 927, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+        reason: "r", feedback: "f", evidenceKey: "review:927", issue: 737, headSha: "H1",
+      });
+      expect(client.items[0].lane).toBe("ESCALATED");
+      await markPrFixItem(client, { repo: "org/repo", pr: 927, status: "BLOCKED", note: "human decision" });
+      expect(client.items[0].lane).toBe("NEEDS_HUMAN");
+      const refused = await markPrFixItem(client, {
+        repo: "org/repo", pr: 927, status: "FIXED",
+        actorTier: "maintainer", allowStickyReclassify: true,
+      });
+      expect(mutatedItem(refused).status).toBe("QUEUED");
+      expect(mutatedItem(refused).lane).toBe("ESCALATED");
+      expect(client.items[0].lane).toBe("ESCALATED");
+    });
+
+    it("a fresh-evidence reopen of a reclassified hold re-derives the frontier parent", async () => {
+      client.issueRows.push(frontierIssue);
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 926, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+        reason: "r", feedback: "f", evidenceKey: "review:926", issue: 737,
+      });
+      expect(client.items[0].lane).toBe("ESCALATED");
+      await markPrFixItem(client, { repo: "org/repo", pr: 926, status: "BLOCKED", note: "human decision" });
+      expect(client.items[0].lane).toBe("NEEDS_HUMAN");
+      // New review evidence lands on the held row after the hold (the
+      // #1249 durable ledger aside, the cache path suffices here).
+      client.items[0].postDispatchEvidenceKeys = ["review:926b"];
+      const reopened = await markPrFixItem(client, {
+        repo: "org/repo", pr: 926, status: "FIXED",
+        actorTier: "maintainer", allowStickyReclassify: true,
+      });
+      expect(reopened.mutated).toBe(true);
+      expect(client.items[0].status).toBe("QUEUED");
+      expect(client.items[0].lane).toBe("ESCALATED");
+    });
+  });
+
+  describe("enforcePrFixHandoutLaneExclusivity (hand-out gate)", () => {
+    // A row misclassified BEFORE the fix: QUEUED, NORMAL lane, but the linked
+    // issue is frontier. Create it without provenance, then attach the issue.
+    async function makeMisclassifiedRow(pr: number) {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+        reason: "r", feedback: "f", evidenceKey: `review:${pr}`,
+      });
+      client.items.at(-1)!.issue = 737;
+      client.issueRows.push(frontierIssue);
+      return client.items.at(-1)!;
+    }
+
+    function candidate(row: any) {
+      return { id: row.id, repo: row.repo, pr: row.pr, issue: row.issue, generation: row.generation, lane: row.lane };
+    }
+
+    it("refuses a misclassified frontier row for the normal lane and corrects the queued row", async () => {
+      const row = await makeMisclassifiedRow(911);
+      const result = await enforcePrFixHandoutLaneExclusivity(client, candidate(row), "NORMAL");
+      expect(result).toEqual({ decision: "refuse", correctedLane: true });
+      // Safe correction: lane flips, everything else (generation, hand-out
+      // state, evidence) is untouched.
+      expect(client.items[0].lane).toBe("ESCALATED");
+      expect(client.items[0].generation).toBe(1);
+      expect(client.items[0].agentHandouts).toEqual([]);
+      expect(client.items[0].handoutReceipts).toEqual([]);
+      expect(client.history.at(-1)).toMatchObject({ action: "mark", lane: "ESCALATED", status: "QUEUED" });
+      expect(String(client.history.at(-1).note)).toContain("#1503");
+    });
+
+    it("leaves a live hand-out exactly as issued (no stolen claim, no second publication authority)", async () => {
+      const row = await makeMisclassifiedRow(912);
+      row.agentHandouts = ["tok-abc@minimax@1"];
+      const result = await enforcePrFixHandoutLaneExclusivity(client, candidate(row), "NORMAL");
+      expect(result).toEqual({ decision: "refuse", correctedLane: false });
+      expect(client.items[0].lane).toBe("NORMAL");
+      expect(client.items[0].agentHandouts).toEqual(["tok-abc@minimax@1"]);
+      expect(client.history.some((h) => String(h.note ?? "").includes("#1503"))).toBe(false);
+    });
+
+    it("does not disturb a generation already stamped for dispatch (hand-out append pending)", async () => {
+      const row = await makeMisclassifiedRow(919);
+      // A normal poller that passed the gate on the pre-reclassification read
+      // stamps before appending: the stamp pin closes the correction on the
+      // generation it is about to hand out.
+      row.dispatchedGeneration = 1;
+      const result = await enforcePrFixHandoutLaneExclusivity(client, candidate(row), "NORMAL");
+      expect(result).toEqual({ decision: "refuse", correctedLane: false });
+      expect(client.items.find((i) => i.pr === 919)?.lane).toBe("NORMAL");
+    });
+
+    it("the lane pin keeps a concurrently corrected row untouched", async () => {
+      const row = await makeMisclassifiedRow(920);
+      const staleCandidate = { ...candidate(row), lane: "NORMAL" };
+      client.items.find((i) => i.pr === 920)!.lane = "ESCALATED"; // another consumer corrected it first
+      const result = await enforcePrFixHandoutLaneExclusivity(client, staleCandidate, "NORMAL");
+      expect(result).toEqual({ decision: "refuse", correctedLane: false });
+      expect(client.history.some((h) => String(h.note ?? "").includes("Escalation-lane correction"))).toBe(false);
+    });
+
+    it("refuses an already-ESCALATED row for the normal lane without touching it", async () => {
+      client.issueRows.push(frontierIssue);
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 913, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+        reason: "r", feedback: "f", evidenceKey: "review:913", issue: 737,
+      });
+      const row = client.items[0];
+      const historyLen = client.history.length;
+      const result = await enforcePrFixHandoutLaneExclusivity(client, candidate(row), "NORMAL");
+      expect(result).toEqual({ decision: "refuse", correctedLane: false });
+      expect(client.history).toHaveLength(historyLen);
+    });
+
+    it("serves an ESCALATED row to the escalation lane", async () => {
+      client.issueRows.push(frontierIssue);
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 914, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+        reason: "r", feedback: "f", evidenceKey: "review:914", issue: 737,
+      });
+      const row = client.items[0];
+      const result = await enforcePrFixHandoutLaneExclusivity(client, candidate(row), "ESCALATED");
+      expect(result).toEqual({ decision: "eligible", correctedLane: false });
+    });
+
+    it("corrects a misclassified row opportunistically for escalation and unfiltered polls", async () => {
+      const row = await makeMisclassifiedRow(915);
+      const escalated = await enforcePrFixHandoutLaneExclusivity(client, candidate(row), "ESCALATED");
+      expect(escalated).toEqual({ decision: "eligible", correctedLane: true });
+      expect(client.items[0].lane).toBe("ESCALATED");
+
+      const row2 = await makeMisclassifiedRow(916);
+      const unfiltered = await enforcePrFixHandoutLaneExclusivity(client, candidate(row2), undefined);
+      expect(unfiltered).toEqual({ decision: "eligible", correctedLane: true });
+      // The fake client replaces the row object on update; read the live row.
+      expect(client.items.find((i) => i.pr === 916)?.lane).toBe("ESCALATED");
+    });
+
+    it("serves ordinary shared work to the normal lane", async () => {
+      client.issueRows.push(localIssue);
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 917, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+        reason: "r", feedback: "f", evidenceKey: "review:917", issue: 100,
+      });
+      const row = client.items[0];
+      const result = await enforcePrFixHandoutLaneExclusivity(client, candidate(row), "NORMAL");
+      expect(result).toEqual({ decision: "eligible", correctedLane: false });
+      expect(client.items[0].lane).toBe("NORMAL");
+    });
+
+    it("refuses the normal lane for a frontier issue discovered after the queue read (concurrent parent change)", async () => {
+      // Row enqueued as plain NORMAL (issue row absent at the time), then the
+      // issue is (re)classified frontier between the queue read and hand-out.
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 918, lane: "NORMAL", type: "CI_FAILURE",
+        reason: "r", feedback: "f", evidenceKey: "cr:918", issue: 737,
+      });
+      client.issueRows.push(frontierIssue);
+      const row = client.items[0];
+      expect(row.lane).toBe("NORMAL");
+      const result = await enforcePrFixHandoutLaneExclusivity(client, candidate(row), "NORMAL");
+      expect(result.decision).toBe("refuse");
+      expect(client.items[0].lane).toBe("ESCALATED");
+    });
+
+    it("refuses the normal lane on an UNVERIFIABLE parent classification without correcting anything", async () => {
+      // UNKNOWN (#1503 review): the lookup threw, so nothing was verified —
+      // a declared-normal consumer must not be authorized, but there is also
+      // nothing to correct (no CAS, no history row).
+      const row = await makeMisclassifiedRow(921);
+      client.issue.findFirst = async () => {
+        throw new Error("db down");
+      };
+      const result = await enforcePrFixHandoutLaneExclusivity(client, candidate(row), "NORMAL");
+      expect(result).toEqual({ decision: "refuse", correctedLane: false });
+      expect(client.items[0].lane).toBe("NORMAL");
+      expect(client.history.some((h: any) => String(h.note ?? "").includes("#1503"))).toBe(false);
+    });
+
+    it("keeps an unverifiable classification eligible for escalation and unfiltered polls", async () => {
+      const row = await makeMisclassifiedRow(922);
+      client.issue.findFirst = async () => {
+        throw new Error("db down");
+      };
+      // An escalation consumer is authorized for escalation work regardless of
+      // the parent's verifiability; the #1046 unfiltered poll is unrestricted
+      // by contract. Neither gets a correction CAS.
+      expect(await enforcePrFixHandoutLaneExclusivity(client, candidate(row), "ESCALATED"))
+        .toEqual({ decision: "eligible", correctedLane: false });
+      expect(await enforcePrFixHandoutLaneExclusivity(client, candidate(row), undefined))
+        .toEqual({ decision: "eligible", correctedLane: false });
+      expect(client.items[0].lane).toBe("NORMAL");
+      expect(client.history.some((h: any) => String(h.note ?? "").includes("#1503"))).toBe(false);
+    });
+  });
+
+  describe("linkedIssueEscalationClassified (tri-state, #1503 review)", () => {
+    it("resolves UNKNOWN when the lookup throws (fail closed, never authorizes the lower lane)", async () => {
+      client.issueRows.push(frontierIssue);
+      client.issue.findFirst = async () => {
+        throw new Error("db down");
+      };
+      expect(await linkedIssueEscalationClassified(client, "org/repo", 737)).toBe("UNKNOWN");
+    });
+
+    it("resolves NOT_ESCALATED for a missing issue row (definitive, not UNKNOWN)", async () => {
+      // A pruned/deleted issue row is a definitive read: classification
+      // recreates rows via sync, and treating absence as UNKNOWN would strand
+      // QUEUED items forever.
+      expect(await linkedIssueEscalationClassified(client, "org/repo", 999)).toBe("NOT_ESCALATED");
+    });
+
+    it("resolves ESCALATED for a frontier-classified row and NOT_ESCALATED for a normal row", async () => {
+      client.issueRows.push(frontierIssue);
+      client.issueRows.push(localIssue);
+      expect(await linkedIssueEscalationClassified(client, "org/repo", 737)).toBe("ESCALATED");
+      expect(await linkedIssueEscalationClassified(client, "org/repo", 100)).toBe("NOT_ESCALATED");
+    });
+
+    it("resolves NOT_ESCALATED without a linked issue (definitive: no parent)", async () => {
+      expect(await linkedIssueEscalationClassified(client, "org/repo", null)).toBe("NOT_ESCALATED");
+      expect(await linkedIssueEscalationClassified(client, "org/repo", undefined)).toBe("NOT_ESCALATED");
+      // Even a broken surface stays definitive when there is no parent.
+      client.issue.findFirst = async () => {
+        throw new Error("db down");
+      };
+      expect(await linkedIssueEscalationClassified(client, "org/repo", null)).toBe("NOT_ESCALATED");
+    });
+  });
+
+  describe("enqueue/requeue on an UNKNOWN parent (#1503 review)", () => {
+    function breakIssueLookup() {
+      client.issue.findFirst = async () => {
+        throw new Error("db down");
+      };
+    }
+
+    it("enqueue keeps the supplied NORMAL lane on an unavailable lookup (no unverified raise)", async () => {
+      breakIssueLookup();
+      const item = await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 930, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+        reason: "r", feedback: "f", evidenceKey: "review:930", issue: 737,
+      });
+      expect(item.lane).toBe("NORMAL");
+      expect(client.history.at(-1)).toMatchObject({ action: "enqueue", lane: "NORMAL" });
+    });
+
+    it("enqueue never demotes an already-ESCALATED row on an unavailable lookup", async () => {
+      client.issueRows.push(frontierIssue);
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 931, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+        reason: "r", feedback: "f", evidenceKey: "review:931", issue: 737,
+      });
+      expect(client.items[0].lane).toBe("ESCALATED");
+      breakIssueLookup();
+      // The stored-ESCALATED arm still protects the raised row: UNKNOWN keeps
+      // the supplied lane, but a NORMAL enqueue must not demote what the
+      // earlier verified raise pinned.
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 931, lane: "NORMAL", type: "CI_FAILURE",
+        reason: "r", feedback: "f", evidenceKey: "cr:931", issue: 737,
+      });
+      expect(client.items[0].lane).toBe("ESCALATED");
+    });
+
+    it("requeue keeps a PARKED NORMAL row at NORMAL on an unreadable parent (no silent demotion, no unverified raise)", async () => {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 932, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+        reason: "r", feedback: "f", evidenceKey: "review:932", issue: 737,
+      });
+      await markPrFixItem(client, { repo: "org/repo", pr: 932, status: "PARKED", outcome: "no_progress", expectedGeneration: 1 });
+      expect(client.items[0].status).toBe("PARKED");
+      breakIssueLookup();
+      const requeued = await requeuePrFixItem(client, { repo: "org/repo", pr: 932, note: "try again" });
+      expect(requeued?.status).toBe("QUEUED");
+      expect(requeued?.lane).toBe("NORMAL");
+    });
+
+    it("requeue keeps an ESCALATED row at ESCALATED on an unreadable parent (no silent demotion)", async () => {
+      client.issueRows.push(frontierIssue);
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 933, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+        reason: "r", feedback: "f", evidenceKey: "review:933", issue: 737,
+      });
+      // PARKED keeps the ESCALATED lane (only NEEDS_HUMAN replaces it, and a
+      // NEEDS_HUMAN requeue deliberately resets to NORMAL unless the parent
+      // verifies ESCALATED — pre-#1503 rule, untouched here).
+      await markPrFixItem(client, { repo: "org/repo", pr: 933, status: "PARKED", outcome: "no_progress", expectedGeneration: 1 });
+      expect(client.items[0].lane).toBe("ESCALATED");
+      breakIssueLookup();
+      const requeued = await requeuePrFixItem(client, { repo: "org/repo", pr: 933, note: "try again" });
+      expect(requeued?.status).toBe("QUEUED");
+      expect(requeued?.lane).toBe("ESCALATED");
+    });
+  });
+
+  describe("withHandoutLaneExclusivityFence (atomic issuance, #1503 review)", () => {
+    async function misclassifiedRow(pr: number) {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+        reason: "r", feedback: "f", evidenceKey: `review:${pr}`,
+      });
+      client.items.at(-1)!.issue = 737;
+      return client.items.at(-1)!;
+    }
+
+    function candidateOf(row: any) {
+      return { id: row.id, repo: row.repo, pr: row.pr, issue: row.issue, generation: row.generation, lane: row.lane };
+    }
+
+    it("catches the parent flip between the gate read and the issuance write: no hand-out, correction CAS fired", async () => {
+      // Inside ONE fence call there are TWO parent reads: the gate's plain
+      // findFirst (still NOT_ESCALATED) and the fence's locked authority read
+      // (SELECT ... FOR SHARE — sees the flip that landed in between). The
+      // locked verdict refuses the issuance and applies the correction CAS.
+      const row = await misclassifiedRow(940);
+      const realFindFirst = client.issue.findFirst;
+      let findFirstCalls = 0;
+      client.issue.findFirst = async (args: any) => {
+        findFirstCalls += 1;
+        if (findFirstCalls <= 2) return null; // pre-gate + fence gate: parent still local
+        return realFindFirst(args);
+      };
+      let lockedCalls = 0;
+      client.issue.findFirstLocked = async () => {
+        lockedCalls += 1;
+        return { repo: "org/repo", number: 737, currentLane: "frontier" }; // the locked read sees the flip
+      };
+      const preGate = await enforcePrFixHandoutLaneExclusivity(client, candidateOf(row), "NORMAL");
+      expect(preGate).toEqual({ decision: "eligible", correctedLane: false });
+      let issued = false;
+      const result = await withHandoutLaneExclusivityFence(client, candidateOf(row), "NORMAL", async () => {
+        issued = true;
+        return "task";
+      });
+      expect(result).toBeNull();
+      expect(issued).toBe(false);
+      // The locked authority read ran once, inside the fence transaction.
+      expect(lockedCalls).toBe(1);
+      expect(client.items[0].lane).toBe("ESCALATED");
+      expect(client.history.at(-1)).toMatchObject({ action: "mark", lane: "ESCALATED" });
+    });
+
+    it("defers on an UNKNOWN classification inside the fence for a normal request", async () => {
+      const row = await misclassifiedRow(941);
+      client.issue.findFirst = async () => {
+        throw new Error("db down");
+      };
+      let issued = false;
+      const result = await withHandoutLaneExclusivityFence(client, candidateOf(row), "NORMAL", async () => {
+        issued = true;
+        return "task";
+      });
+      expect(result).toBeNull();
+      expect(issued).toBe(false);
+      expect(client.items[0].lane).toBe("NORMAL");
+    });
+
+    it("defers when the gate refuses inside the fence (stored ESCALATED vs normal request)", async () => {
+      const row = await misclassifiedRow(942);
+      row.lane = "ESCALATED";
+      let issued = false;
+      const result = await withHandoutLaneExclusivityFence(client, candidateOf(row), "NORMAL", async () => {
+        issued = true;
+        return "task";
+      });
+      expect(result).toBeNull();
+      expect(issued).toBe(false);
+    });
+
+    it("defers when the transaction itself fails (serialization failure / aborted transaction)", async () => {
+      const row = await misclassifiedRow(943);
+      client.issueRows.push(frontierIssue);
+      const originalTransaction = client.$transaction;
+      client.$transaction = async () => {
+        throw new Error("Transaction failed: Transaction was aborted due to a serialization failure");
+      };
+      let issued = false;
+      const result = await withHandoutLaneExclusivityFence(client, candidateOf(row), "NORMAL", async () => {
+        issued = true;
+        return "task";
+      });
+      expect(result).toBeNull();
+      expect(issued).toBe(false);
+      // Nothing was corrected either — the transaction never ran.
+      expect(client.items[0].lane).toBe("NORMAL");
+      expect(client.history.some((h: any) => String(h.note ?? "").includes("#1503"))).toBe(false);
+      client.$transaction = originalTransaction;
+    });
+
+    it("issues through the fence when eligible: the hand-out runs ONCE on the transaction client", async () => {
+      const row = await misclassifiedRow(944);
+      let seenTx: unknown = null;
+      let calls = 0;
+      const result = await withHandoutLaneExclusivityFence(client, candidateOf(row), "NORMAL", async (tx) => {
+        calls += 1;
+        seenTx = tx;
+        return "task";
+      });
+      expect(result).toBe("task");
+      expect(calls).toBe(1);
+      // The callback received the SAME client the transaction handed it (the
+      // fake's tx is the client itself; a real Prisma tx is a distinct
+      // transaction-scoped surface the callback must write through).
+      expect(seenTx).toBe(client);
     });
   });
 });

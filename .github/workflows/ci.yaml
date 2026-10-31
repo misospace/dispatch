@@ -190,11 +190,17 @@ jobs:
       # current owner" is a compare-and-swap guarantee — the hand-out arrays
       # are pinned by equality and a hand-out that commits inside the
       # transaction window must lose the CAS — and only a real PostgreSQL can
-      # prove that the pin bites (#1491).
+      # prove that the pin bites (#1491). The #1503 hand-out lane-exclusivity
+      # fence joins it for the same class of reason: the parent
+      # reclassification-vs-issuance ordering is a ROW-LOCK guarantee (SELECT
+      # ... FOR SHARE held until the issuance transaction commits) — a flip
+      # must either commit before the locked read (refused) or block until
+      # after the fence commits — and only a real PostgreSQL can prove the
+      # blocking (mocks have no lock waits at all).
       - name: Concurrency and idempotency against a real PostgreSQL
         env:
           RUN_DB_INTEGRATION: "1"
-        run: npx vitest run src/lib/sync-lock.integration.test.ts "src/app/api/agents/[agentName]/tasks/report/route.integration.test.ts" src/lib/groomer/apply.integration.test.ts src/lib/groomer/blocked-reconciliation.integration.test.ts src/lib/pr-fix-external-wait.integration.test.ts src/lib/issue-mutation-guard.integration.test.ts src/lib/agent-work.integration.test.ts src/lib/pr-fix-rebase-type.integration.test.ts src/lib/lease-expiry-recovery.integration.test.ts src/lib/attempt-requeue-fence.integration.test.ts
+        run: npx vitest run src/lib/sync-lock.integration.test.ts "src/app/api/agents/[agentName]/tasks/report/route.integration.test.ts" src/lib/groomer/apply.integration.test.ts src/lib/groomer/blocked-reconciliation.integration.test.ts src/lib/pr-fix-external-wait.integration.test.ts src/lib/issue-mutation-guard.integration.test.ts src/lib/agent-work.integration.test.ts src/lib/pr-fix-rebase-type.integration.test.ts src/lib/lease-expiry-recovery.integration.test.ts src/lib/attempt-requeue-fence.integration.test.ts src/lib/pr-fix-handout-lane-fence.integration.test.ts
 
   coverage:
     name: Coverage
