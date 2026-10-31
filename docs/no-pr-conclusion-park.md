@@ -16,9 +16,10 @@ The park is one row in the `NoPrConclusion` table. It records the reporting
 agent, the outcome, the summary, the evidence, and a content fingerprint: the
 sha256 of the canonical issue title and body at park time. The report route
 writes it inside `POST /api/agents/{agent}/tasks/report` when the task type is
-`implement`, the outcome is one of the three terminal values, and the report
-carries no PR-fix attempt token (see Boundaries). The response echoes the
-decision in `conclusionPark`.
+`implement`, the outcome is one of the three terminal values, the report
+carries no PR-fix attempt token (see Boundaries), and — for a worker-tier
+caller — the issue is live-assigned to the reporting agent (see Boundaries).
+The response echoes the decision in `conclusionPark`.
 
 The park never writes GitHub labels, never closes an issue, and never touches
 `status/blocked`. The blocked label keeps its own meaning and its
@@ -107,6 +108,15 @@ holds.
 - A successful `already_done` close supersedes the park. The close is the
   harder stop, and a park that survived a human reopen would withhold work the
   human just brought back.
-- A bound worker's assertion can park an issue it never held. The blast radius
-  is bounded: the row names the agent, the lifecycle event names it, and every
-  operator path above reverses it.
+- A worker-tier report may only park an issue its agent actually owns. Before
+  the park lands, the route checks the issue's live GitHub label set for
+  `agent/<bound agent>` — the same authoritative check the `already_done`
+  close gate (#1143) and the #1129 status gate use, because the Prisma cache
+  can lag a claim made directly on GitHub (#1037). A report for an issue not
+  live-assigned to the reporting agent parks nothing and echoes
+  `conclusionPark: { applied: false, reason: "not-assigned" }`; the
+  suppression is logged. An unreadable live assignment withholds the park too
+  (`reason: "assignment-unverified"`): fail-closed on the park, fail-open on
+  the report, because a 5xx retry could not re-park anyway. Maintainer-tier
+  callers (operator, OIDC, basic, auth-disabled) bypass the gate — operators
+  may conclude any issue, and they own every path above that clears a park.

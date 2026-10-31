@@ -3214,3 +3214,121 @@ expect(mocks.noPrConclusionUpsert).toHaveBeenCalledTimes(1);
     expect(mocks.noPrConclusionUpsert).not.toHaveBeenCalled();
   });
 });
+
+describe("POST /api/agents/[agentName]/tasks/report — park worker ownership (#1510 review)", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+    resetRateLimits();
+    mocks.repoFindUnique.mockResolvedValue({ id: "repo-1" });
+    mocks.issueFindUnique.mockResolvedValue(issueRow());
+    mocks.noPrConclusionUpsert.mockResolvedValue({});
+    prismaMock.issueLifecycleEvent.create.mockResolvedValue({ id: "evt-1" });
+    prismaMock.prFixQueueItem.findUnique.mockResolvedValue(null);
+  });
+
+  const issueRow = (over: Record<string, unknown> = {}) => ({
+    id: "issue-42",
+    title: "Fix login redirect",
+    body: "Steps to reproduce: log in, then click settings",
+    state: "open",
+    ...over,
+  });
+
+  // `bound-report-agent` is bound to `test-agent` in the dispatch-env mock;
+  // `postRequest` defaults to the maintainer token, so worker-tier park tests
+  // build their request with this token explicitly.
+  function workerPostRequest(body: unknown) {
+    return POST(
+      authedRequest("http://localhost/api/agents/test-agent/tasks/report", {
+        method: "POST",
+        token: "bound-report-agent",
+        body,
+      }),
+      { params: Promise.resolve({ agentName: "test-agent" }) },
+    );
+  }
+
+  const parkBody = {
+    taskType: "implement",
+    outcome: "no_changes_needed",
+    repoFullName: "org/repo",
+    issueNumber: 42,
+    summary: "Already fixed in main",
+  };
+
+  it("a worker report for an issue NOT live-assigned to it does not record a park", async () => {
+    // #1510 review round 2: the park withholds queue pickup, so a bound
+    // worker may only park an issue it actually owns. Live GitHub labels are
+    // authoritative — the cache can lag a claim made on the forge (#1037).
+    getLiveIssueLabelsMock.mockResolvedValueOnce(["status/ready", "priority/p1"]);
+
+    const res = await workerPostRequest(parkBody);
+    expect(res.status).toBe(200);
+    expect(getLiveIssueLabelsMock).toHaveBeenCalledWith("org/repo", 42);
+    expect(mocks.noPrConclusionUpsert).not.toHaveBeenCalled();
+    expect(prismaMock.issueLifecycleEvent.create).not.toHaveBeenCalled();
+    // The report still lands — the park is a best-effort side effect and the
+    // report must never fail over it; the worker learns why nothing parked.
+    const body = await res.json();
+    expect(body.report.outcome).toBe("no_changes_needed");
+    expect(body.conclusionPark).toEqual({ applied: false, reason: "not-assigned" });
+  });
+
+  it("a worker report for its live-assigned issue records the park", async () => {
+    getLiveIssueLabelsMock.mockResolvedValueOnce(["agent/test-agent", "status/ready"]);
+
+    const res = await workerPostRequest(parkBody);
+    expect(res.status).toBe(200);
+    expect(mocks.noPrConclusionUpsert).toHaveBeenCalledTimes(1);
+    const body = await res.json();
+    expect(body.conclusionPark).toEqual({
+      applied: true,
+      outcome: "no_changes_needed",
+      reason: "parked",
+    });
+  });
+
+  it("another agent's live assignment does not let a worker park the issue", async () => {
+    getLiveIssueLabelsMock.mockResolvedValueOnce(["agent/bravo", "status/ready"]);
+
+    const res = await workerPostRequest(parkBody);
+    expect(res.status).toBe(200);
+    expect(mocks.noPrConclusionUpsert).not.toHaveBeenCalled();
+    const body = await res.json();
+    expect(body.conclusionPark).toEqual({ applied: false, reason: "not-assigned" });
+  });
+
+  it("an unreadable live assignment withholds the park but the report still lands", async () => {
+    // Fail-closed on the park (never withhold without proof of ownership),
+    // fail-open on the report (a 5xx retry would land in the duplicate
+    // branch and never re-park, so the report must not fail over the park).
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    getLiveIssueLabelsMock.mockRejectedValueOnce(new Error("github down"));
+
+    const res = await workerPostRequest(parkBody);
+    expect(res.status).toBe(200);
+    expect(mocks.noPrConclusionUpsert).not.toHaveBeenCalled();
+    const body = await res.json();
+    expect(body.conclusionPark).toEqual({ applied: false, reason: "assignment-unverified" });
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("assignment-unverified"));
+    warn.mockRestore();
+  });
+
+  it("a maintainer report parks without any live assignment", async () => {
+    // Maintainer-tier callers bypass the ownership gate — operators may
+    // conclude any issue (same split as the already_done close gate).
+    // getLiveIssueLabels must never be consulted for the maintainer tier.
+    const res = await postRequest({ ...parkBody });
+    expect(res.status).toBe(200);
+    expect(getLiveIssueLabelsMock).not.toHaveBeenCalled();
+    expect(mocks.noPrConclusionUpsert).toHaveBeenCalledTimes(1);
+    const body = await res.json();
+    expect(body.conclusionPark).toEqual({
+      applied: true,
+      outcome: "no_changes_needed",
+      reason: "parked",
+    });
+  });
+});

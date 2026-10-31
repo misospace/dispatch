@@ -258,6 +258,50 @@ async function enforceAlreadyDoneWorkerScope(
   return null;
 }
 
+/**
+ * #1510 review round 2: the park withholds queue pickup for the named issue,
+ * so a worker-tier report may only park an issue the credential's agent
+ * actually owns. This mirrors `enforceAlreadyDoneWorkerScope` (#1143) and the
+ * #1129 status gate: live GitHub labels are authoritative for the assignment
+ * decision, because the Prisma cache can lag a claim made directly on GitHub
+ * (#1037). Maintainer-tier callers (basic / OIDC / maintainer bearer /
+ * auth-disabled) bypass the gate — operators may conclude any issue.
+ *
+ * Unlike the already_done close, this gate is a SKIP, not a refusal: the park
+ * is a best-effort side effect and the report must never fail over it (a 5xx
+ * retry would land in the duplicate branch and never re-park). An unreadable
+ * live assignment therefore withholds the park and lets the report land.
+ *
+ * Returns the skip reason to echo in `conclusionPark.reason`, or null when
+ * the park may proceed.
+ */
+async function parkAssignmentSkipReason(
+  auth: Awaited<ReturnType<typeof authorizeRequest>>,
+  repoFullName: string,
+  issueNumber: number,
+): Promise<string | null> {
+  if (!auth.authorized) return null;
+  if (auth.type !== "bearer" || auth.tier !== "worker") return null;
+  const bound = getBoundWorkerAgent(auth);
+  // Unreachable in practice — the route's worker-scope gate refuses an
+  // unbound worker token before any side effect — but a worker-tier
+  // credential with no determinable identity must not park anything.
+  if (!bound) return "not-assigned";
+  let liveLabels: string[];
+  try {
+    liveLabels = await getLiveIssueLabels(repoFullName, issueNumber);
+  } catch (err) {
+    console.warn(
+      `[no-pr-conclusion] could not verify live assignment of ${repoFullName}#${issueNumber} for ${bound}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return "assignment-unverified";
+  }
+  if (getAgentFromLabels(liveLabels) !== `${AGENT_PREFIX}${bound}`) {
+    return "not-assigned";
+  }
+  return null;
+}
+
 function buildTouchedUrls(
   report: TaskReportBody,
 ): string[] {
@@ -908,17 +952,39 @@ export async function POST(
           } else if (parkedIssue.state !== "open") {
             conclusionPark = { applied: false, reason: "issue-not-open" };
           } else {
-            await recordNoPrConclusion({
-              issueId,
-              repoFullName: report.repoFullName,
-              issueNumber: report.issueNumber,
-              agentName,
-              outcome: conclusionOutcome,
-              summary: report.summary,
-              evidence: report.evidence,
-              issue: { title: parkedIssue.title, body: parkedIssue.body },
-            });
-            conclusionPark = { applied: true, outcome: conclusionOutcome, reason: "parked" };
+            // #1510 review round 2: a worker-tier credential may only park an
+            // issue its agent actually owns — live GitHub labels are
+            // authoritative, matching the already_done close gate and the
+            // #1129 status gate. The gate skips the park (never refuses the
+            // report): the park is best-effort, and a 5xx retry would land in
+            // the duplicate branch and never re-park.
+            const parkSkipReason = await parkAssignmentSkipReason(
+              auth,
+              report.repoFullName,
+              report.issueNumber,
+            );
+            if (parkSkipReason) {
+              // The suppression is otherwise invisible, so log it. A
+              // worker that keeps reporting conclusions for issues it does
+              // not own leaves a trace instead of silently withholding
+              // queue pickup it was never granted.
+              console.warn(
+                `[no-pr-conclusion] ${agentName} reported ${conclusionOutcome} for ${report.repoFullName}#${report.issueNumber} without a live assignment (${parkSkipReason}); the issue is not parked`,
+              );
+              conclusionPark = { applied: false, reason: parkSkipReason };
+            } else {
+              await recordNoPrConclusion({
+                issueId,
+                repoFullName: report.repoFullName,
+                issueNumber: report.issueNumber,
+                agentName,
+                outcome: conclusionOutcome,
+                summary: report.summary,
+                evidence: report.evidence,
+                issue: { title: parkedIssue.title, body: parkedIssue.body },
+              });
+              conclusionPark = { applied: true, outcome: conclusionOutcome, reason: "parked" };
+            }
           }
         } catch (error) {
           console.warn(
