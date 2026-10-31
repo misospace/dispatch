@@ -857,28 +857,42 @@ export async function POST(
     // (the close is the harder stop; a park surviving a reopen would withhold
     // work a human explicitly brought back). A duplicate (idempotent replay)
     // never re-parks — the original report owns the side effect. A report that
-    // settles PR-fix work never parks either: the conclusion is issue work,
+    // carries a PR-fix attempt token never parks either: it is PR-fix work,
     // and the PR-fix lane owns the PR (#1510 review).
     let conclusionPark: { applied: boolean; outcome?: string; reason: string } | undefined;
     const conclusionOutcome = report.outcome;
     if (report.taskType === "implement" && isNoPrConclusionOutcome(conclusionOutcome)) {
-      // #1510 review (Major): the terminal no-PR conclusion is ISSUE work, so
-      // a report that settles PR-fix work must not park the issue on top of
-      // that settlement — the PR-fix lane owns the PR, and the issue-work
-      // conclusion is dropped with it. "Settles PR-fix work" is the
-      // resolution's own verdict, NOT the presence of an attempt token: a
-      // report whose token settled nothing (no PR coordinates, unknown item,
-      // stale generation, already-terminal item) is the issue conclusion it
-      // claims to be, so it still parks. A malformed token must not defeat the
-      // stop that ends the re-offer loop (#1506).
-      const settledPrFixWork =
-        prFixResolution.matched === true &&
-        prFixResolution.action !== "none" &&
-        prFixResolution.action !== "skipped";
+      // #1510 review (hard blocker): the terminal no-PR conclusion is ISSUE
+      // work, and the park is a stop on issue work only. A report that carries
+      // a PR-fix attempt token is PR-fix work, so it must not park the issue:
+      // one report must not both settle PR-fix work and record an issue
+      // conclusion, because the park would then withhold the issue while the
+      // PR-fix lane still owns its PR.
+      //
+      // The exclusion keys on the token's PRESENCE, not on the settlement's
+      // verdict, because the worker contract defines the park by the report
+      // shape: an implement report WITHOUT a prFixItem is the terminal issue
+      // conclusion, and only that one parks (docs/worker-execution-contract.md).
+      // A mixed implement report is off that contract — next-task issues a
+      // token only with a followup-pr task — so Dispatch reads it as PR-fix
+      // work, whatever the token settles. The #1506 stop still holds for every
+      // contract-conforming report, because a report without a token parks.
+      //
+      // The response reports one reason for every case the token excludes. The
+      // settlement outcome is not repeated here: the response already carries
+      // it in `prFixResolution`.
+      const carriesPrFixAttempt = report.prFixItem != null;
       if (duplicate) {
         conclusionPark = { applied: false, reason: "duplicate report; the conclusion park was not re-run" };
-      } else if (settledPrFixWork) {
-        conclusionPark = { applied: false, reason: "pr-fix-settled" };
+      } else if (carriesPrFixAttempt) {
+        // The suppression is otherwise invisible, so log it. A report that
+        // carries a token is off the issue-work contract, and a worker that
+        // repeats it can keep an issue in the re-offer loop without any park
+        // to show for it.
+        console.warn(
+          `[no-pr-conclusion] ${agentName} reported ${conclusionOutcome} with a PR-fix attempt token (${report.prFixItem!.id}); the issue is not parked`,
+        );
+        conclusionPark = { applied: false, reason: "pr-fix-attempt" };
       } else if (!issueId || !report.repoFullName || report.issueNumber === undefined) {
         conclusionPark = { applied: false, reason: "issue-not-tracked" };
       } else if (closeResolution && closeResolution.action === "closed") {

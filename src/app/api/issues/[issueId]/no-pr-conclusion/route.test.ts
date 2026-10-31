@@ -261,6 +261,23 @@ describe("DELETE /api/issues/[issueId]/no-pr-conclusion — operator clear", () 
     expect(mocks.auditCreate.mock.calls[0][0].data.actor).toBe("jory@example.com");
   });
 
+  it("accepts an auth-disabled caller, because auth-disabled is an operator path", async () => {
+    // The route refuses bearer callers only. Auth-disabled mode is an operator
+    // path (the same split admission-override uses), so the clear works there
+    // too. This test pins that split: a change that treated auth-disabled as a
+    // bearer credential would lock the operator out of the documented clear.
+    useAuthMode("disabled");
+    mocks.noPrConclusionFindUnique.mockResolvedValue(livePark());
+
+    const res = await DELETE(new Request(URL_, { method: "DELETE" }), ctx);
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ success: true, cleared: true });
+    expect(mocks.noPrConclusionDelete).toHaveBeenCalledWith({ where: { issueId: "issue-1" } });
+    const notes = JSON.parse(mocks.auditCreate.mock.calls[0][0].data.notes);
+    expect(notes.authType).toBe("disabled");
+  });
+
   it("is an idempotent no-op when the issue carries no park row", async () => {
     const res = await DELETE(operatorRequest("DELETE"), ctx);
 

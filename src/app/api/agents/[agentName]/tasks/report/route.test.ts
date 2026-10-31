@@ -2820,8 +2820,9 @@ describe("POST /api/agents/[agentName]/tasks/report — terminal no-PR conclusio
     mocks.noPrConclusionUpsert.mockResolvedValue({});
     prismaMock.issueLifecycleEvent.create.mockResolvedValue({ id: "evt-1" });
     prismaMock.prFixQueueItem.findUnique.mockResolvedValue(null);
-    // The PR-fix resolver is the verdict the park gate reads: the default
-    // "no matching pr-fix queue item" means the report settles no PR-fix work.
+    // The PR-fix resolver settles the queue item; the park gate reads the
+    // report's attempt token, not this verdict. The default "no matching
+    // pr-fix queue item" is the value a report without a token gets.
     // Re-established per test so a test that stages a settlement cannot leak
     // into the next one.
     prFixResolveMock.mockReset().mockResolvedValue({
@@ -2928,11 +2929,11 @@ describe("POST /api/agents/[agentName]/tasks/report — terminal no-PR conclusio
     expect(mocks.noPrConclusionUpsert).not.toHaveBeenCalled();
   });
 
-  it("an implement report that SETTLES pr-fix work does NOT record a park (PR-fix work never parks)", async () => {
-    // #1510 review (Major): a report that settles the PR-fix queue item is
-    // PR-fix work. Parking the issue on top of that settlement would withhold
-    // the issue while the PR-fix lane owns the PR, so the issue-work conclusion
-    // is dropped with it.
+  it("an implement report that carries a PR-fix attempt token does NOT record a park", async () => {
+    // #1510 review (hard blocker): a report that carries a PR-fix attempt
+    // token is PR-fix work. Parking the issue on top of that settlement would
+    // withhold the issue while the PR-fix lane owns the PR, so the issue-work
+    // conclusion is dropped with it.
     mocks.repoFindUnique.mockResolvedValue({ id: "repo-1" });
     mocks.issueFindUnique.mockResolvedValue(issueRow());
     prFixResolveMock.mockResolvedValue({
@@ -2962,16 +2963,18 @@ describe("POST /api/agents/[agentName]/tasks/report — terminal no-PR conclusio
     expect(prismaMock.issueLifecycleEvent.create).not.toHaveBeenCalled();
     // The decision is still echoed, so the worker learns why nothing parked.
     const body = await res.json();
-    expect(body.conclusionPark).toEqual({ applied: false, reason: "pr-fix-settled" });
+    expect(body.conclusionPark).toEqual({ applied: false, reason: "pr-fix-attempt" });
   });
 
-  it("an implement report whose prFixItem settles NOTHING still records a park", async () => {
-    // The attempt token is malformed or stale (unknown item, no PR
-    // coordinates, already-terminal row): the report settles no PR-fix work,
-    // so it is the issue conclusion it claims to be. A malformed token must not
-    // defeat the stop that ends the re-offer loop (#1506).
+  it("an ACCEPTED mixed implement+prFixItem no-PR outcome records NO park", async () => {
+    // #1510 review (hard blocker): the report is accepted, but it presents a
+    // PR-fix attempt token, so Dispatch reads it as PR-fix work and never
+    // parks the issue. The exclusion keys on the token's presence, not on the
+    // settlement's verdict, so the token settling nothing changes the reason
+    // but not the decision.
     mocks.repoFindUnique.mockResolvedValue({ id: "repo-1" });
     mocks.issueFindUnique.mockResolvedValue(issueRow());
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
     const res = await postRequest({
       taskType: "implement",
@@ -2981,9 +2984,33 @@ describe("POST /api/agents/[agentName]/tasks/report — terminal no-PR conclusio
       prFixItem: { id: "item-9", generation: 1 },
     });
     expect(res.status).toBe(200);
-    expect(mocks.noPrConclusionUpsert).toHaveBeenCalledTimes(1);
+    expect(mocks.noPrConclusionUpsert).not.toHaveBeenCalled();
+    expect(prismaMock.issueLifecycleEvent.create).not.toHaveBeenCalled();
     const body = await res.json();
-    expect(body.conclusionPark).toEqual({ applied: true, outcome: "no_changes_needed", reason: "parked" });
+    expect(body.conclusionPark).toEqual({ applied: false, reason: "pr-fix-attempt" });
+    // The suppression is logged, so a worker that repeats it leaves a trace.
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("item-9"));
+    warn.mockRestore();
+  });
+
+  it("an accepted mixed implement+prFixItem already_addressed outcome records NO park", async () => {
+    // `already_addressed` is the other no-PR outcome that accepts a
+    // prFixItem, so it carries the same exclusion as `no_changes_needed`.
+    mocks.repoFindUnique.mockResolvedValue({ id: "repo-1" });
+    mocks.issueFindUnique.mockResolvedValue(issueRow());
+
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "already_addressed",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      prFixItem: { id: "item-9", generation: 1 },
+    });
+    expect(res.status).toBe(200);
+    expect(mocks.noPrConclusionUpsert).not.toHaveBeenCalled();
+    expect(prismaMock.issueLifecycleEvent.create).not.toHaveBeenCalled();
+    const body = await res.json();
+    expect(body.conclusionPark).toEqual({ applied: false, reason: "pr-fix-attempt" });
   });
 
   it("an implement report with an explicitly null prFixItem records a park", async () => {

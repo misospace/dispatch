@@ -318,7 +318,9 @@ Behavioral notes:
   unchanged).
 - The same outcome on an **implement** task (no `prFixItem`) is unrelated to
   the PR-fix queue: it is a terminal no-PR conclusion that parks the issue out
-  of queue pickup (#1506). See [no-pr-conclusion-park.md](./no-pr-conclusion-park.md).
+  of queue pickup (#1506). An **implement** report that carries a `prFixItem`
+  is PR-fix work instead, and it parks nothing. See
+  [no-pr-conclusion-park.md](./no-pr-conclusion-park.md).
 
 ## Fenced capacity-exhaustion handoff (#1256)
 

@@ -17,8 +17,8 @@ agent, the outcome, the summary, the evidence, and a content fingerprint: the
 sha256 of the canonical issue title and body at park time. The report route
 writes it inside `POST /api/agents/{agent}/tasks/report` when the task type is
 `implement`, the outcome is one of the three terminal values, and the report
-settles no PR-fix work (see Boundaries). The response echoes the decision in
-`conclusionPark`.
+carries no PR-fix attempt token (see Boundaries). The response echoes the
+decision in `conclusionPark`.
 
 The park never writes GitHub labels, never closes an issue, and never touches
 `status/blocked`. The blocked label keeps its own meaning and its
@@ -88,15 +88,18 @@ holds.
   policy, like the capacity cooldown and the admission override.
 - The withhold applies to issue pickup. Linked-PR follow-up routing and PR-fix
   queue items are never gated, the same exception grooming admission uses.
-- A report that settles PR-fix work is PR-fix work, whatever its task type
-  says: it settles the queue item and never parks the issue, so a live PR-fix
-  lane cannot withhold the issue it is working on. The response echoes
-  `conclusionPark: { applied: false, reason: "pr-fix-settled" }`. "Settles
-  PR-fix work" is the settlement's own verdict, not the presence of an attempt
-  token: a report whose token settled nothing (no PR coordinates, unknown item,
-  stale generation, already-terminal item) is the issue conclusion it claims to
-  be and still parks, so a malformed token cannot defeat the stop that ends the
-  re-offer loop.
+- A report that carries a PR-fix attempt token is PR-fix work, whatever its
+  task type says. Such a report never parks the issue, so a live PR-fix lane
+  cannot withhold the issue it is working on. The response echoes
+  `conclusionPark: { applied: false, reason: "pr-fix-attempt" }`. The rule
+  keys on the token, not on the settlement: the worker contract defines the
+  park by the report shape, and an `implement` report without a `prFixItem` is
+  the terminal issue conclusion. A report that carries a token is off that
+  contract, because `next-task` issues a token only with a `followup-pr` task.
+  Dispatch accepts such a report and does not reject it, but it reads it as
+  PR-fix work and parks nothing. The stop that ends the re-offer loop still
+  holds for every report that follows the contract, because such a report
+  carries no token and parks.
 - A park write that fails is logged, and the report still succeeds. The park
   expires on the next content edit, so a lost write cannot strand the issue,
   and a 5xx retry could not re-park anyway (the idempotency duplicate branch
