@@ -1,5 +1,55 @@
 # Changelog
 
+## [0.5.74](https://github.com/misospace/dispatch/compare/v0.5.73...v0.5.74) (2026-10-31)
+
+
+### Features
+
+* **agents:** show reported Courier executions (accepts the merged Courier [#637](https://github.com/misospace/dispatch/issues/637) observation contract) ([#1498](https://github.com/misospace/dispatch/issues/1498)) ([8c91bf2](https://github.com/misospace/dispatch/commit/8c91bf27cb34b26188e98d6b4380a61b9b039a9a))
+* **automation:** compute authoritative unreleased delta from latest stable release ([#1488](https://github.com/misospace/dispatch/issues/1488)) ([f473240](https://github.com/misospace/dispatch/commit/f473240cea6ff430ae9933fd552b210e52951955))
+* **automation:** release pulse aggregation of delivered highlights and completed umbrellas (dispatch[#1482](https://github.com/misospace/dispatch/issues/1482)) ([#1496](https://github.com/misospace/dispatch/issues/1496)) ([22678cc](https://github.com/misospace/dispatch/commit/22678ccb11d5e864ba676a070075e6331f499f96))
+* **container:** update image node (24.22.1 → 26.12.1) ([#1457](https://github.com/misospace/dispatch/issues/1457)) ([e1ba005](https://github.com/misospace/dispatch/commit/e1ba005d581294f4f0fe69b23149ffa6a5d75c3e))
+* **delivery:** compare cohorts across full claim-to-merge cycles ([#1184](https://github.com/misospace/dispatch/issues/1184)) ([#1424](https://github.com/misospace/dispatch/issues/1424)) ([cd964d3](https://github.com/misospace/dispatch/commit/cd964d364efec63626d59dd5cefcde00d801165a))
+* **deps:** update dependency eslint (10.13.0 → 10.14.0) ([#1502](https://github.com/misospace/dispatch/issues/1502)) ([f879557](https://github.com/misospace/dispatch/commit/f8795575594a3629dcc70c2510e627a9340cd049))
+* **deps:** update dependency lucide-react (1.62.0 → 1.63.0) ([#1462](https://github.com/misospace/dispatch/issues/1462)) ([1d61222](https://github.com/misospace/dispatch/commit/1d612223f18e2d065fcf6a5285b95f966901a7c7))
+* **deps:** update dependency lucide-react (1.63.0 → 1.64.0) ([#1490](https://github.com/misospace/dispatch/issues/1490)) ([78d83d4](https://github.com/misospace/dispatch/commit/78d83d456c8a1e284679be3a7d380ccfef0a91e7))
+* **deps:** update dependency lucide-react (1.64.0 → 1.65.0) ([#1501](https://github.com/misospace/dispatch/issues/1501)) ([33e6e31](https://github.com/misospace/dispatch/commit/33e6e311bcd61c289a0c7f3049bfa18dfcb3f3d1))
+* **deps:** update node.js (26.12.1 → v26.13.0) ([#1477](https://github.com/misospace/dispatch/issues/1477)) ([5a11927](https://github.com/misospace/dispatch/commit/5a11927607017573553eddfa23df6089c399db5a))
+* **groomer:** add bounded investigation continuation ([#1464](https://github.com/misospace/dispatch/issues/1464)) ([7cf89e0](https://github.com/misospace/dispatch/commit/7cf89e0b67d53ebcddf782951dd804a20614e35f))
+* **groomer:** persist semantic-only release signal (dispatch[#1481](https://github.com/misospace/dispatch/issues/1481)) ([#1486](https://github.com/misospace/dispatch/issues/1486)) ([91bcfa2](https://github.com/misospace/dispatch/commit/91bcfa225bbd7c7547393a210a44c55f30f70245))
+* **release-pulse:** derive an explainable advisory release-readiness state ([#1497](https://github.com/misospace/dispatch/issues/1497)) ([079e365](https://github.com/misospace/dispatch/commit/079e365bcce34be79d106b106c594eb29783c9a1))
+* **release-pulse:** surface Release Pulse in fleet, repo detail, and single-repo Kanban ([#1484](https://github.com/misospace/dispatch/issues/1484)) ([#1500](https://github.com/misospace/dispatch/issues/1500)) ([7e3a99c](https://github.com/misospace/dispatch/commit/7e3a99ce93a14b47c6c572c3d708340670cb386e))
+* **retry:** adopt the fenced attempt-requeue routes pinned by Courier ([#1491](https://github.com/misospace/dispatch/issues/1491)) ([#1492](https://github.com/misospace/dispatch/issues/1492)) ([25c71f6](https://github.com/misospace/dispatch/commit/25c71f65e2eb27b365db6f129ccaff54ee09fdca))
+
+
+### Bug Fixes
+
+* **agents:** hide inactive identities by default ([#1505](https://github.com/misospace/dispatch/issues/1505)) ([aaad8f8](https://github.com/misospace/dispatch/commit/aaad8f88ebd6c4ace4723edf43507e1b4784a609))
+* **api:** normalize cleared release-signal tombstones on raw issue-row surfaces ([#1487](https://github.com/misospace/dispatch/issues/1487)) ([96ca089](https://github.com/misospace/dispatch/commit/96ca0893d1148451b7378de93119204ae0069bfc))
+* **auth:** reject login callbacks that normalize to external URLs ([#1467](https://github.com/misospace/dispatch/issues/1467)) ([e456e50](https://github.com/misospace/dispatch/commit/e456e503ca28068b77b9be6f105e6e73ec2555c9))
+* **deps:** update dependency @types/node (26.6.5 → 26.6.6) ([#1485](https://github.com/misospace/dispatch/issues/1485)) ([3fb0dbf](https://github.com/misospace/dispatch/commit/3fb0dbf62974c499b0cf3ddf21451be380878d28))
+* **deps:** update dependency astro (7.4.2 → 7.4.3) ([#1474](https://github.com/misospace/dispatch/issues/1474)) ([f514dbc](https://github.com/misospace/dispatch/commit/f514dbcde8622e8bd5bd260fb59b4a3e420e34a0))
+* **deps:** update dependency astro (7.4.3 → 7.4.4) ([#1489](https://github.com/misospace/dispatch/issues/1489)) ([ecfa1b3](https://github.com/misospace/dispatch/commit/ecfa1b369ba16486bfeb66d4fa72728266ac573e))
+* **groomer:** apply a re-groom that changes only the persisted reason ([#1461](https://github.com/misospace/dispatch/issues/1461)) ([#1469](https://github.com/misospace/dispatch/issues/1469)) ([33fe6c3](https://github.com/misospace/dispatch/commit/33fe6c3a649fb107e4e75c8d3ce1217b06674b9c))
+* **groomer:** heal a lost release-signal clear as a tombstone on replay ([#1487](https://github.com/misospace/dispatch/issues/1487)) ([9260336](https://github.com/misospace/dispatch/commit/926033612a2475d05ae93c8e58c57dedb2922854))
+* **groomer:** provenance tombstone for cleared release-signal projections ([#1487](https://github.com/misospace/dispatch/issues/1487)) ([25e1772](https://github.com/misospace/dispatch/commit/25e177241ed485239a651afc2d8bb4d49402d797))
+* **groomer:** retire superseded needs-info reasons ([#1453](https://github.com/misospace/dispatch/issues/1453)) ([#1456](https://github.com/misospace/dispatch/issues/1456)) ([03ad698](https://github.com/misospace/dispatch/commit/03ad6986b22754de11a6d72faf1545b1a9197800))
+* **groomer:** revisit stranded dependency blocks ([#1459](https://github.com/misospace/dispatch/issues/1459)) ([#1471](https://github.com/misospace/dispatch/issues/1471)) ([b43f4b7](https://github.com/misospace/dispatch/commit/b43f4b7a566655d4b1000c2cda1229cf97f03900))
+* **groomer:** separate tool gaps from human questions in needs_info ([#1452](https://github.com/misospace/dispatch/issues/1452)) ([#1460](https://github.com/misospace/dispatch/issues/1460)) ([d58eb20](https://github.com/misospace/dispatch/commit/d58eb207396fbada0229dfc0b24e3e33c91a6258))
+* **groomer:** tombstone release-signal clears so replay heal cannot resurrect stale signals ([#1487](https://github.com/misospace/dispatch/issues/1487)) ([2f91890](https://github.com/misospace/dispatch/commit/2f91890c46471c237a51a72632025e101e9fc3a9))
+* **observability:** exclude terminal lease dispositions from execution and stale-ownership metrics ([#1455](https://github.com/misospace/dispatch/issues/1455)) ([#1463](https://github.com/misospace/dispatch/issues/1463)) ([7659733](https://github.com/misospace/dispatch/commit/7659733f2a7f70f6ddb10c60ce278bab994f0df5))
+* **pr-fix:** preserve frontier lane exclusivity ([#1504](https://github.com/misospace/dispatch/issues/1504)) ([fd9dc82](https://github.com/misospace/dispatch/commit/fd9dc82dd3af7e9430ff6eb4b6f773e1599cb05a))
+
+
+### Documentation
+
+* docs/hosted-groomer.md ([9260336](https://github.com/misospace/dispatch/commit/926033612a2475d05ae93c8e58c57dedb2922854))
+
+
+### Refactors
+
+* dedupe reinvented LaneOption and agentName-required error ([#1478](https://github.com/misospace/dispatch/issues/1478)) ([d2d82d0](https://github.com/misospace/dispatch/commit/d2d82d00297dd4014593b732fee7ccc1aefc8fd8))
+
 ## [0.5.73](https://github.com/misospace/dispatch/compare/v0.5.72...v0.5.73) (2026-10-27)
 
 
