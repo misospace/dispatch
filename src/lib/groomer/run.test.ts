@@ -46,6 +46,8 @@ const { mocks } = vi.hoisted(() => ({
     childClaims: new Map<string, Record<string, any>>(),
     /** Simulated Issue.releaseSignal column state, written by issue.update. */
     issueProjection: null as unknown,
+    /** Simulated Issue.groomingSummary column state, written by issue.update. */
+    issueGroomingSummary: null as string | null,
     prisma: {
       $transaction: vi.fn(),
       $queryRaw: vi.fn(),
@@ -370,12 +372,17 @@ describe("runHostedGroomer", () => {
     mocks.prisma.issue.update.mockResolvedValue({ id: "issue-42" });
     // The Issue.releaseSignal column is simulated: an issue.update whose data
     // carries the field sets or clears it; one without leaves it untouched.
+    // The Issue.groomingSummary column is simulated the same way (dispatch#1470).
     mocks.issueProjection = null;
+    mocks.issueGroomingSummary = null;
     mocks.prisma.issue.update.mockImplementation(async ({ data }: { data: Record<string, unknown> }) => {
       if ("releaseSignal" in data) mocks.issueProjection = JSON.parse(JSON.stringify(data.releaseSignal));
+      if ("groomingSummary" in data) mocks.issueGroomingSummary = (data.groomingSummary as string | null) ?? null;
       return { id: "issue-42" };
     });
-    mocks.prisma.issue.findUnique.mockImplementation(async () => ({ releaseSignal: mocks.issueProjection }));
+    mocks.prisma.issue.findUnique.mockImplementation(
+      async () => ({ releaseSignal: mocks.issueProjection, groomingSummary: mocks.issueGroomingSummary }),
+    );
     mocks.prisma.issueLane.create.mockResolvedValue({ id: "lane-1" });
     mocks.prisma.agentRun.create.mockResolvedValue({ id: "run-1" });
     mocks.prisma.auditLog.create.mockResolvedValue({ id: "audit-1" });
@@ -2244,6 +2251,87 @@ Investigate session handling in auth module.`;
       for (const call of mocks.prisma.issue.update.mock.calls) {
         const data = (call[0] as { data: Record<string, unknown> }).data;
         expect(Object.keys(data).sort()).toEqual(["groomedAt", "groomedBy", "groomingRetryAfter"]);
+      }
+    });
+  });
+
+  describe("a re-groom that changes only the verdict summary (dispatch#1470)", () => {
+    function lastIssueUpdateData(): Record<string, unknown> {
+      const calls = mocks.prisma.issue.update.mock.calls;
+      expect(calls.length).toBeGreaterThan(0);
+      return (calls[calls.length - 1][0] as { data: Record<string, unknown> }).data;
+    }
+
+    it("is applied, and the issue row carries the new summary text", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(planDraft());
+      await runHostedGroomer();
+      expect(lastIssueUpdateData().groomingSummary).toBe("Ready for work.");
+
+      // Only the verdict summary changed — same labels, lane, reason and
+      // every other intent field. The persisted summary joins the
+      // application key, so the re-groom is applied, not replayed, and the
+      // Issue.groomingSummary column carries the new text.
+      mocks.prisma.issue.update.mockClear();
+      mocks.callGroomerLLM.mockResolvedValue(
+        planDraft({ verdict: { summary: "Ready for work: the return URL survives a reset." } }),
+      );
+      const result = await runHostedGroomer();
+      expect(result!.appliedMutations?.outcome).toBe("applied");
+      expect(lastIssueUpdateData().groomingSummary).toBe("Ready for work: the return URL survives a reset.");
+    });
+
+    it("a re-groom that changes nothing is still replayed, without rewriting the summary", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(planDraft());
+      await runHostedGroomer();
+
+      // Exact retry of the same plan: the application replays. The replay
+      // moves the cooldown stamp, and the summary heal stays quiet because
+      // the column already carries this verdict's text.
+      mocks.prisma.issue.update.mockClear();
+      const result = await runHostedGroomer();
+      expect(result!.appliedMutations?.outcome).toBe("replayed");
+      for (const call of mocks.prisma.issue.update.mock.calls) {
+        const data = (call[0] as { data: Record<string, unknown> }).data;
+        expect(Object.keys(data).sort()).toEqual(["groomedAt", "groomedBy", "groomingRetryAfter"]);
+      }
+    });
+
+    it("a replay heals the summary a failed issue write lost after the application finalized", async () => {
+      // DB blip: the summary write fails on the fresh path. The applier has
+      // already finalized the application, so this run dies without the new
+      // text — and every same-key retry replays and returns here.
+      mocks.callGroomerLLM.mockResolvedValue(planDraft());
+      let sawSummaryWrite = false;
+      mocks.prisma.issue.update.mockImplementation(async ({ data }: { data: Record<string, unknown> }) => {
+        if ("groomingSummary" in data && !sawSummaryWrite) {
+          sawSummaryWrite = true;
+          throw new Error("db blip");
+        }
+        if ("groomingSummary" in data) mocks.issueGroomingSummary = data.groomingSummary as string;
+        if ("releaseSignal" in data) mocks.issueProjection = JSON.parse(JSON.stringify(data.releaseSignal));
+        return { id: "issue-42" };
+      });
+      await expect(runHostedGroomer()).rejects.toThrow(/db blip/);
+      expect(mocks.issueGroomingSummary).toBeNull();
+
+      const result = await runHostedGroomer();
+      expect(result!.appliedMutations?.outcome).toBe("replayed");
+      expect(lastIssueUpdateData().groomingSummary).toBe("Ready for work.");
+    });
+
+    it("a replay never overwrites summary text the column already carries", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(planDraft());
+      await runHostedGroomer();
+      // An operator groom (POST /api/issues/groom) rewrote the column after
+      // this application landed. The replay heal is bounded to the empty
+      // column: it recovers a lost write, it never stomps existing text.
+      mocks.issueGroomingSummary = "operator note: hold for the release cut";
+      mocks.prisma.issue.update.mockClear();
+      const result = await runHostedGroomer();
+      expect(result!.appliedMutations?.outcome).toBe("replayed");
+      for (const call of mocks.prisma.issue.update.mock.calls) {
+        const data = (call[0] as { data: Record<string, unknown> }).data;
+        expect("groomingSummary" in data).toBe(false);
       }
     });
   });
