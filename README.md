@@ -200,6 +200,8 @@ The lesson feed shares `DISPATCH_LLM_API_KEY` and `DISPATCH_LLM_BASE_URL` with t
 | `DISPATCH_GROOMER_INTERVAL_MS` | No | Interval (ms) between automated `/api/groomer/run` runs. Set to `"0"` to disable. |
 | `DISPATCH_PR_FOLLOWUP_INTERVAL_MS` | No | Interval (ms) between automated `/api/pr-followup/sync` runs. Set to `"0"` to disable. |
 | `DISPATCH_PRUNE_CLOSED_INTERVAL_MS` | No | Interval (ms) between automated `/api/issues/prune-closed` runs. Set to `"0"` to disable. |
+| `DISPATCH_AGENT_EXECUTION_RETENTION_MS` | No | Retention window (ms) for terminal `AgentExecution` observation rows (#1499): the scheduled prune deletes terminal rows whose last observation is older than this. Display-data hygiene only — never touches `AgentWork`, leases, or ownership state. Clamped to 1 h–90 d; defaults to `604800000` (7 days). |
+| `DISPATCH_AGENT_EXECUTIONS_PRUNE_INTERVAL_MS` | No | Interval (ms) between automated `/api/agent-work/observations/prune` runs. Set to `"0"` to disable. |
 
 > **Legacy aliases (do not set):** `MISSION_CONTROL_URL` and
 > `MISSION_CONTROL_AGENT_TOKEN` were renamed to `DISPATCH_URL` and

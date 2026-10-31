@@ -50,6 +50,7 @@ const DEFAULT_SYNC_INTERVAL_MS = 15 * 60 * 1000; // 15m
 const DEFAULT_GROOMER_INTERVAL_MS = 10 * 60 * 1000; // 10m
 const DEFAULT_PR_FOLLOWUP_INTERVAL_MS = 15 * 60 * 1000; // 15m
 const DEFAULT_PRUNE_CLOSED_INTERVAL_MS = 24 * 60 * 60 * 1000; // daily
+const DEFAULT_AGENT_EXECUTIONS_PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000; // daily (#1499)
 const DEFAULT_RECONCILE_INTERVAL_MS = 30 * 60 * 1000; // 30m
 const DEFAULT_STALE_WORK_INTERVAL_MS = 5 * 60 * 1000; // 5m
 // Default-disabled (#1211 review): the reclaimer reopens stamped hand-outs as
@@ -118,6 +119,15 @@ export function schedulerConfigFromEnv(env: Record<string, string | undefined>):
       path: "/api/issues/prune-closed",
       body: {},
       intervalMs: jobIntervalFromEnv(env.DISPATCH_PRUNE_CLOSED_INTERVAL_MS, DEFAULT_PRUNE_CLOSED_INTERVAL_MS),
+    },
+    {
+      name: "agent-executions-prune",
+      path: "/api/agent-work/observations/prune",
+      body: {},
+      intervalMs: jobIntervalFromEnv(
+        env.DISPATCH_AGENT_EXECUTIONS_PRUNE_INTERVAL_MS,
+        DEFAULT_AGENT_EXECUTIONS_PRUNE_INTERVAL_MS,
+      ),
     },
     {
       name: "reconcile",

@@ -100,9 +100,16 @@ describe("resolveParticipantTrust", () => {
     expect(deps.lookup).not.toHaveBeenCalled();
   });
 
-  it.each(["itsmiso-ai", "its-saffron", "its-miso", "github-actions[bot]"])(
-    "trusts internal automation %s without a permission lookup",
-    async (login) => {
+  it.each([
+    "itsmiso-ai",
+    "its-saffron",
+    "its-miso",
+    "github-actions[bot]",
+    "itsmiso-ai[bot]",
+    "its-saffron[bot]",
+    "its-miso[bot]",
+    "Its-Saffron[bot]",
+  ])("trusts internal automation %s without a permission lookup", async (login) => {
       const deps = depsReturning({ status: "not_found" });
 
       const participant = await resolve(login, "NONE", deps);

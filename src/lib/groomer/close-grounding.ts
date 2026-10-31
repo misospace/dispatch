@@ -40,7 +40,11 @@ export interface PinnedReadContent {
    * Path to the whitespace-normalised segments read at `headSha`.
    * A bounded ranged read (dispatch#1451) contributes one segment per read;
    * excerpts are checked against each segment on its own and never across
-   * an unseen gap between two ranges.
+   * an unseen gap between two ranges. Two segments whose line coordinates
+   * are exactly adjacent (dispatch#1465) are one contiguous stretch of the
+   * file, so they are stored merged and an excerpt crossing their seam
+   * grounds; segments without coordinates, or with a gap or overlap, stay
+   * separate.
    */
   files: ReadonlyMap<string, string[]>;
 }
@@ -50,6 +54,13 @@ export interface PinnedRead {
   /** The ref the file was read at; only reads at the head SHA are kept. */
   ref: string | null;
   content: string;
+  /**
+   * 1-based inclusive line coordinates of the content, as the ranged read
+   * showed them (dispatch#1465). Absent when the read had no coordinates;
+   * only exact coordinates let adjacent segments merge.
+   */
+  startLine?: number;
+  endLine?: number;
 }
 
 /** Hard cap on pinned content retained per run, after normalisation. */
@@ -68,35 +79,114 @@ export function normalizeWhitespace(text: string): string {
   return text.replace(/\s+/g, " ").trim();
 }
 
+interface PinnedSegment {
+  text: string;
+  /** 1-based inclusive line coordinates, or null when the read had none. */
+  start: number | null;
+  end: number | null;
+}
+
+/**
+ * A read's usable line coordinates, or null when they are absent or
+ * malformed. Fail closed: a partial or nonsensical range never justifies
+ * bridging a seam between two segments.
+ */
+function readCoordinates(read: PinnedRead): { start: number; end: number } | null {
+  const { startLine, endLine } = read;
+  if (
+    startLine === undefined ||
+    endLine === undefined ||
+    !Number.isInteger(startLine) ||
+    !Number.isInteger(endLine) ||
+    startLine < 1 ||
+    endLine < startLine
+  ) {
+    return null;
+  }
+  return { start: startLine, end: endLine };
+}
+
+function segmentByteLength(segments: PinnedSegment[]): number {
+  return segments.reduce((sum, segment) => sum + Buffer.byteLength(segment.text, "utf8"), 0);
+}
+
+/**
+ * Join coordinate-adjacent segments in place (#1465): a read of lines 1–10
+ * followed by a read of lines 11–20 showed the content on both sides of the
+ * seam, so an excerpt crossing it is verbatim content the run saw. Two
+ * segments join only when one starts exactly one line after the other ends;
+ * a gap, an overlap, or a missing coordinate keeps them separate, so unseen
+ * content is never bridged. A read that bridges two stored segments chains
+ * them into one; containment folding still applies before the join (as
+ * before), so a read folded away for being already-held text may cost a
+ * merge, never a bridge.
+ */
+function mergeAdjacentSegments(segments: PinnedSegment[]): void {
+  for (;;) {
+    let merged = false;
+    for (let i = 0; i < segments.length && !merged; i++) {
+      for (let j = i + 1; j < segments.length && !merged; j++) {
+        const a = segments[i];
+        const b = segments[j];
+        if (a.start === null || a.end === null || b.start === null || b.end === null) continue;
+        let first: PinnedSegment;
+        let second: PinnedSegment;
+        if (b.start === a.end + 1) {
+          first = a;
+          second = b;
+        } else if (a.start === b.end + 1) {
+          first = b;
+          second = a;
+        } else {
+          continue;
+        }
+        segments.splice(j, 1);
+        segments.splice(i, 1);
+        segments.push({ text: `${first.text} ${second.text}`, start: first.start, end: second.end });
+        merged = true;
+      }
+    }
+    if (!merged) return;
+  }
+}
+
 /**
  * Build the run's pinned content store. Reads at any other ref, or when the
  * run has no pinned head, are dropped. A path read more than once keeps its
  * distinct segments (dispatch#1451: head, tail and middle reads of one file
  * each ground their own excerpts); a segment contained in another is folded
- * away, and segments are never concatenated across an unseen gap.
+ * away, coordinate-adjacent segments are merged (dispatch#1465), and
+ * segments are never concatenated across an unseen gap.
  */
 export function collectPinnedReadContent(
   headSha: string | null,
   reads: PinnedRead[],
   maxBytes = MAX_PINNED_CONTENT_BYTES,
 ): PinnedReadContent {
-  const files = new Map<string, string[]>();
-  if (!headSha) return { headSha: null, files };
+  const stored = new Map<string, PinnedSegment[]>();
+  if (!headSha) return { headSha: null, files: new Map() };
   let total = 0;
   for (const read of reads) {
     if (read.ref !== headSha || !read.path || !read.content) continue;
     const normalized = normalizeWhitespace(read.content);
     if (!normalized) continue;
-    const segments = files.get(read.path) ?? [];
-    if (segments.some((segment) => segment.includes(normalized))) continue;
-    const kept = segments.filter((segment) => !normalized.includes(segment));
-    const before = segments.reduce((sum, segment) => sum + Buffer.byteLength(segment, "utf8"), 0);
-    const after = kept.reduce((sum, segment) => sum + Buffer.byteLength(segment, "utf8"), 0)
-      + Buffer.byteLength(normalized, "utf8");
+    const segments = stored.get(read.path) ?? [];
+    if (segments.some((segment) => segment.text.includes(normalized))) continue;
+    const coordinates = readCoordinates(read);
+    const kept = segments.filter((segment) => !normalized.includes(segment.text));
+    const candidate = [
+      ...kept,
+      { text: normalized, start: coordinates?.start ?? null, end: coordinates?.end ?? null },
+    ];
+    mergeAdjacentSegments(candidate);
+    const before = segmentByteLength(segments);
+    const after = segmentByteLength(candidate);
     if (total - before + after > maxBytes) continue;
-    files.set(read.path, [...kept, normalized]);
+    stored.set(read.path, candidate);
     total += after - before;
   }
+  const files = new Map<string, string[]>();
+  for (const [path, segments] of stored) files.set(path, segments.map((segment) => segment.text));
   return { headSha, files };
 }
 

@@ -75,14 +75,18 @@ export interface GroomerToolResult {
    * (null for the default branch), so close excerpts can be checked against
    * exactly what was read (dispatch#1099). A bounded range read carries only
    * the lines that were shown, verbatim; the header and continuation
-   * coordinates are rendering, not evidence content.
+   * coordinates are rendering, not evidence content. `startLine`/`endLine`
+   * are the 1-based inclusive line coordinates of the carried content, so
+   * coordinate-adjacent reads of one file can merge at collect time and an
+   * excerpt crossing their seam grounds (dispatch#1465).
    */
-  file?: { path: string; ref: string | null; content: string };
+  file?: { path: string; ref: string | null; content: string; startLine?: number; endLine?: number };
   /**
-   * read_file / list_directory: the result the model was shown was clipped
-   * (read_file to maxFileBytes, list_directory to maxDirEntries), so the
-   * model saw a prefix, not the whole result (dispatch#1452). Every other
-   * tool leaves it unset.
+   * The result the model was shown was clipped, so the model saw a prefix,
+   * not the whole result (dispatch#1452): read_file to maxFileBytes,
+   * list_directory to maxDirEntries, and the related-work tools when the
+   * JSON payload was reduced to fit the caller's budget (dispatch#1468).
+   * The answers that showed nothing leave it unset.
    */
   truncated?: boolean;
   /**
@@ -519,6 +523,156 @@ function buildEmptyDirectoryAnswer(path: string, cap: number): string {
 }
 
 /**
+ * The answer a related-work search with no hits gives the model. The echoed
+ * query is model-authored and unbounded, so it carries the same clamp the
+ * search_code no-match answer applies, and the wording shortens to a fixed
+ * signal the budget can still carry (dispatch#1468). Unlike the search_code
+ * empty answer this is not the freshness negative-evidence sentinel — nothing
+ * keys on a related-work zero-byte answer — so it is charged in full.
+ */
+function buildNoRelatedWorkAnswer(query: string, cap: number): string {
+  const limit = Math.max(cap, 0);
+  const echo = cutWithMarker(query, MAX_ECHOED_QUERY_BYTES);
+  const candidates = [`No related work found for "${echo}".`, "No related work found."];
+  for (const candidate of candidates) {
+    if (Buffer.byteLength(candidate, "utf8") <= limit) return candidate;
+  }
+  return truncate(candidates[candidates.length - 1], limit).text;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * The fields a reduced related-work answer always keeps (dispatch#1468): the
+ * structured identity and state the evidence snapshot records — kind, state,
+ * merged, closes — plus the coordinates that name the item. Everything else
+ * is prose: shortened first, then dropped, so a tight budget reduces the
+ * payload structurally instead of slicing the rendered JSON mid-string.
+ */
+const RELATED_WORK_AUTHORITATIVE_KEYS = new Set([
+  "kind",
+  "number",
+  "sha",
+  "state",
+  "merged",
+  "closingIssues",
+  "closingIssuesTruncated",
+  "baseRef",
+  "headRef",
+  "mergeCommitSha",
+  "mergedAt",
+  "updatedAt",
+  "committedAt",
+  "htmlUrl",
+  "evidenceKey",
+  "source",
+]);
+
+/** How much of one prose field survives the shortening rung. */
+const MAX_REDUCED_PROSE_BYTES = 200;
+
+/**
+ * The rendered JSON of a payload, or null when it does not fit the cap.
+ * `JSON.stringify(undefined)` (a deps adapter that resolved no body) renders
+ * nothing rather than throwing: the caller treats null as "does not fit".
+ */
+function jsonWithinCap(value: unknown, cap: number): string | null {
+  const text = JSON.stringify(value);
+  if (typeof text !== "string") return null;
+  return Buffer.byteLength(text, "utf8") <= cap ? text : null;
+}
+
+/**
+ * Reduce one related-work object to its authoritative fields, with prose
+ * either shortened to {@link MAX_REDUCED_PROSE_BYTES} ("shortened") or gone
+ * ("omitted"). Comments are counted, not kept: their bodies are the biggest
+ * prose in a payload, and the tool descriptions already teach that comment
+ * prose is never status. Context like `labels` and `repoFullName` gives way
+ * with the prose — the repository is already named by the call, and no
+ * snapshot field is derived from those.
+ */
+function reduceRelatedWorkObject(
+  value: Record<string, unknown>,
+  prose: "shortened" | "omitted",
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (key === "comments") {
+      if (Array.isArray(item) && item.length > 0) out.commentsOmitted = item.length;
+      continue;
+    }
+    if (RELATED_WORK_AUTHORITATIVE_KEYS.has(key)) {
+      out[key] = item;
+      continue;
+    }
+    if (prose === "shortened" && typeof item === "string" && item) {
+      out[key] = cutWithMarker(item, MAX_REDUCED_PROSE_BYTES);
+    }
+  }
+  return out;
+}
+
+/**
+ * A single related-work read answer bounded by the budget the caller has
+ * left (dispatch#1468). The payload is JSON evidence, so the reduction is
+ * structural — authoritative fields (kind, state, merged, closes) survive,
+ * comments are counted, prose is shortened and then dropped — and every
+ * rung stays valid JSON. Returns null when not even the reduced payload
+ * fits; the caller then says the budget is spent inside the budget.
+ */
+function fitRelatedWorkEvidence(
+  evidence: unknown,
+  cap: number,
+): { content: string; reduced: boolean } | null {
+  const full = jsonWithinCap(evidence, cap);
+  if (full !== null) return { content: full, reduced: false };
+  if (!isRecord(evidence)) return null;
+  for (const prose of ["shortened", "omitted"] as const) {
+    const reduced = reduceRelatedWorkObject(evidence, prose);
+    reduced.prose =
+      prose === "shortened" ? "shortened for the byte budget" : "omitted for the byte budget";
+    const text = jsonWithinCap(reduced, cap);
+    if (text !== null) return { content: text, reduced: true };
+  }
+  return null;
+}
+
+/**
+ * A related-work hit list bounded by the budget the caller has left
+ * (dispatch#1468). The full list first; then the authoritative reduction of
+ * every hit; then the hits that fit under a wrapper naming the ones that did
+ * not — a cut list must read as a spent budget, never as absence (the same
+ * rule search_code's match list follows). Returns null when not even one
+ * reduced hit fits alongside the wrapper.
+ */
+function fitRelatedWorkHits(
+  hits: readonly { evidenceKey?: string; kind?: string }[],
+  cap: number,
+): { content: string; shown: number; reduced: boolean } | null {
+  const full = jsonWithinCap(hits, cap);
+  if (full !== null) return { content: full, shown: hits.length, reduced: false };
+  const reduced = hits.map((hit) =>
+    isRecord(hit) ? reduceRelatedWorkObject(hit, "omitted") : hit,
+  );
+  const all = jsonWithinCap(reduced, cap);
+  if (all !== null) return { content: all, shown: hits.length, reduced: true };
+  const wrapper = (shown: number) => ({
+    hits: reduced.slice(0, shown),
+    resultsOmitted: hits.length - shown,
+    budget: "byte budget exhausted: more related-work results exist than are shown",
+  });
+  // The wrapper grows with every hit shown, so the first fit descending from
+  // the longest list is the longest list that fits.
+  for (let shown = hits.length - 1; shown >= 1; shown -= 1) {
+    const text = jsonWithinCap(wrapper(shown), cap);
+    if (text !== null) return { content: text, shown, reduced: true };
+  }
+  return null;
+}
+
+/**
  * A list answer (search matches, directory entries) bounded by the budget the
  * caller has left: a header, the entries that fit, and a marker naming what
  * was left out.
@@ -905,12 +1059,34 @@ const MAX_COMMIT_REF_LENGTH = 100;
 async function runRelatedWorkLookup(
   kind: RelatedWorkObservation["kind"],
   invoke: () => Promise<unknown>,
-  enrich?: (evidence: unknown) => Promise<{ evidence: unknown; warnings: string[] }>,
+  enrich:
+    | ((evidence: unknown) => Promise<{ evidence: unknown; warnings: string[] }>)
+    | undefined,
+  /** The budget the caller has left; every answer is charged inside it (dispatch#1468). */
+  totalCap: number,
 ): Promise<GroomerToolResult> {
   try {
     const read = await invoke();
     const { evidence, warnings } = enrich ? await enrich(read) : { evidence: read, warnings: [] };
-    const content = JSON.stringify(evidence);
+    const fitted = fitRelatedWorkEvidence(evidence, totalCap);
+    if (fitted === null) {
+      // Not even the authoritative reduction fits: the lookup succeeded, but
+      // showing nothing establishes nothing, so no observation is recorded —
+      // the same rule a budget-exhausted read_file follows. The answer still
+      // says so inside the budget instead of overrunning it.
+      const content = truncate(
+        "byte budget exhausted: the related-work evidence was not shown.",
+        Math.max(totalCap, 0),
+      ).text;
+      return {
+        ok: true,
+        content,
+        bytes: Buffer.byteLength(content, "utf8"),
+        sources: [],
+        ...(warnings.length > 0 ? { warnings } : {}),
+      };
+    }
+    const content = fitted.content;
     const observation = toRelatedWorkObservation(evidence, kind, "read");
     return {
       ok: true,
@@ -918,11 +1094,21 @@ async function runRelatedWorkLookup(
       bytes: Buffer.byteLength(content, "utf8"),
       sources: [],
       relatedWork: observation ? [observation] : [],
+      // A reduced payload is a clipped answer: the model saw a prefix of the
+      // evidence, not the whole of it (#1452's fact, dispatch#1468).
+      ...(fitted.reduced ? { truncated: true } : {}),
       ...(warnings.length > 0 ? { warnings } : {}),
     };
   } catch (err) {
     if (err instanceof RelatedWorkNotFoundError) {
-      const content = JSON.stringify({ found: false, kind: err.kind, ref: err.ref });
+      // A 404 is an answer, so it stays valid JSON while it can; the
+      // identity-bearing fields give way in order as the budget tightens
+      // (dispatch#1468).
+      const content =
+        jsonWithinCap({ found: false, kind: err.kind, ref: err.ref }, totalCap) ??
+        jsonWithinCap({ found: false, kind: err.kind }, totalCap) ??
+        jsonWithinCap({ found: false }, totalCap) ??
+        truncate("not found", Math.max(totalCap, 0)).text;
       return {
         ok: true,
         content,
@@ -931,7 +1117,9 @@ async function runRelatedWorkLookup(
         warnings: [`related-work: not found ${err.kind} ${err.ref}`],
       };
     }
-    const content = JSON.stringify({ error: true });
+    const content =
+      jsonWithinCap({ error: true }, totalCap) ??
+      truncate("lookup failed", Math.max(totalCap, 0)).text;
     return {
       ok: false,
       content,
@@ -1155,7 +1343,13 @@ export async function executeGroomerTool(
             content: range.content,
             bytes: Buffer.byteLength(range.content, "utf8"),
             sources: [path],
-            file: { path, ref: ref ?? null, content: range.body },
+            // A line-too-large body is a byte cut inside its first line, and
+            // the continuation footer skips the rest of that line: the read
+            // carries no coordinates, so no adjacent merge can bridge the
+            // unseen remainder (dispatch#1465).
+            file: range.lineTooLarge
+              ? { path, ref: ref ?? null, content: range.body }
+              : { path, ref: ref ?? null, content: range.body, startLine, endLine: range.lastShown },
             // A range that stops short of EOF is a truncated read too
             // (dispatch#1452): the footer names the continuation, and if the
             // model never takes it the gap fact must stand. A range that
@@ -1204,7 +1398,7 @@ export async function executeGroomerTool(
             content,
             bytes: Buffer.byteLength(content, "utf8"),
             sources: [path],
-            file: { path, ref: ref ?? null, content: body },
+            file: { path, ref: ref ?? null, content: body, startLine: 1, endLine: totalLines },
             truncated: false,
             // The whole file was shown: the run established what it holds.
             established: true,
@@ -1274,12 +1468,20 @@ export async function executeGroomerTool(
             : cut.includes("\n")
               ? cut.split("\n").length - 1
               : 1;
+        // A cut inside an oversized line 1 showed no line whole, and the
+        // past-it continuation (startLine=2) skips the rest of that line:
+        // the carried content gets no coordinates, so no adjacent merge can
+        // bridge the unseen remainder (dispatch#1465). The shownRange
+        // convention (#1451) keeps its continuity accounting unchanged.
+        const partialFirstLineOnly = cut !== firstLine && !cut.includes("\n");
         return {
           ok: true,
           content,
           bytes: Buffer.byteLength(content, "utf8"),
           sources: [path],
-          file: { path, ref: ref ?? null, content: cut },
+          file: partialFirstLineOnly
+            ? { path, ref: ref ?? null, content: cut }
+            : { path, ref: ref ?? null, content: cut, startLine: 1, endLine: shownEnd },
           // Genuinely cut by the byte cap: the head the model saw is not the
           // whole file (dispatch#1452), and a continuation read can retire
           // the fact later.
@@ -1359,25 +1561,57 @@ export async function executeGroomerTool(
           );
         }
         if (hits.length === 0) {
+          // Bounded by the budget the caller has left and charged in full
+          // (dispatch#1468): the model sees this answer, so it spends the
+          // run's budget; only search_code's empty answer is the zero-byte
+          // negative-evidence sentinel.
+          const content = buildNoRelatedWorkAnswer(query, totalCap);
           return {
             ok: true,
-            content: `No related work found for "${query}".`,
-            bytes: 0,
+            content,
+            bytes: Buffer.byteLength(content, "utf8"),
             sources: [],
           };
         }
-        const content = JSON.stringify(hits);
+        // The hit list is JSON evidence, so a tight budget reduces it
+        // structurally (authoritative fields first, prose and whole hits
+        // after, under a marker naming what was cut) instead of pushing the
+        // run past the budget the caller passed (dispatch#1468).
+        const fitted = fitRelatedWorkHits(hits, totalCap);
+        if (fitted === null) {
+          // The search found work but not one result fits the budget left.
+          // The answer says so inside the budget — like a cut search_code
+          // list, a successful search that found matches must never read as
+          // absence, and it never takes the `ok && bytes === 0` signature.
+          const content = truncate(
+            "byte budget exhausted: related work was found but no result fit the budget. More results exist — this is not an absence.",
+            totalCap,
+          ).text;
+          return {
+            ok: false,
+            content,
+            bytes: Buffer.byteLength(content, "utf8"),
+            sources: [],
+          };
+        }
+        // Only the hits the model actually saw are recorded: an answer that
+        // left a result out establishes nothing about it (the rule search_code
+        // sources already follow, dispatch#1451/#1468).
         const relatedWork = hits
+          .slice(0, fitted.shown)
           .map((hit) =>
             toRelatedWorkObservation(hit, hit.kind === "pull_request" ? "pull_request" : "issue", "search"),
           )
           .filter((observation): observation is RelatedWorkObservation => observation !== null);
         return {
           ok: true,
-          content,
-          bytes: Buffer.byteLength(content, "utf8"),
+          content: fitted.content,
+          bytes: Buffer.byteLength(fitted.content, "utf8"),
           sources: [],
           relatedWork,
+          // The list was cut or its hits reduced: the model saw a prefix
+          // (dispatch#1468).
+          ...(fitted.reduced ? { truncated: true } : {}),
         };
       }
 
@@ -1388,6 +1622,7 @@ export async function executeGroomerTool(
           "issue",
           () => deps.fetchRelatedIssue(options.repoFullName, number),
           (evidence) => withClosingIssues(evidence, options.repoFullName, deps),
+          totalCap,
         );
       }
 
@@ -1398,6 +1633,7 @@ export async function executeGroomerTool(
           "pull_request",
           () => deps.fetchRelatedPullRequest(options.repoFullName, number),
           (evidence) => withClosingIssues(evidence, options.repoFullName, deps),
+          totalCap,
         );
       }
 
@@ -1407,8 +1643,11 @@ export async function executeGroomerTool(
         if (ref.length > MAX_COMMIT_REF_LENGTH || !COMMIT_REF_PATTERN.test(ref) || ref.includes("..")) {
           return fail("read_related_commit needs a commit SHA (or tag/branch name) of letters, digits, '.', '_', '/', '-'.");
         }
-        return runRelatedWorkLookup("commit", () =>
-          deps.fetchRelatedCommit(options.repoFullName, ref),
+        return runRelatedWorkLookup(
+          "commit",
+          () => deps.fetchRelatedCommit(options.repoFullName, ref),
+          undefined,
+          totalCap,
         );
       }
 

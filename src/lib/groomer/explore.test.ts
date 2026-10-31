@@ -252,7 +252,9 @@ describe("exploreRepository", () => {
     expect(result.sources).toEqual(["src/lib/prisma.ts", "src/lib/other.ts", "src/lib/db.ts"]);
     expect(result.readSources).toEqual(["src/lib/prisma.ts"]);
     // What the read showed the model, for close-excerpt checks (dispatch#1099).
-    expect(result.readContents).toEqual([{ path: "src/lib/prisma.ts", ref: null, content: "const adapter = new PrismaPg(url);" }]);
+    expect(result.readContents).toEqual([
+      { path: "src/lib/prisma.ts", ref: null, content: "const adapter = new PrismaPg(url);", startLine: 1, endLine: 1 },
+    ]);
   });
 
   it("never spends more than the exploration total byte budget (dispatch#1451)", async () => {
@@ -392,7 +394,10 @@ describe("exploreRepository", () => {
     expect(search?.bytes).toBeLessThanOrEqual(500 - result.toolCalls[0].bytes);
   });
 
-  it("counts related-work bytes against the exploration byte budget", async () => {
+  it("keeps a related-work answer inside the exploration byte budget (dispatch#1468)", async () => {
+    // A related-work search of a big payload used to add its whole JSON to
+    // the run no matter what was left. The answer is now reduced to fit, the
+    // run keeps paying until the budget is gone, and it never overspends.
     const big = { evidenceKey: "issue:org/repo#1", body: "x".repeat(300) };
     const fetchImpl = fetchReturning({
       content: null,
@@ -402,8 +407,51 @@ describe("exploreRepository", () => {
 
     const result = await exploreRepository({ ...options, maxTotalBytes: 100, maxRounds: 4 }, deps);
 
+    expect(result.bytes).toBeLessThanOrEqual(100);
+    const searches = result.toolCalls.filter((call) => call.name === "search_related_work");
+    expect(searches.length).toBeGreaterThan(0);
+    for (const search of searches) {
+      expect(search.bytes).toBeLessThanOrEqual(100);
+    }
+    // The prose that did not fit never reaches the model.
+    expect(searches.map((call) => call.preview).join("")).not.toContain("xxxx");
+    // The charged answers really ran the budget out.
     expect(result.warnings).toContain("repository exploration hit its byte budget");
-    expect(deps.tools.searchRelatedWork).toHaveBeenCalledTimes(1);
+  });
+
+  it("never spends more than the total on a related-work read (dispatch#1468)", async () => {
+    const bigIssue = {
+      kind: "issue",
+      number: 7,
+      state: "closed",
+      title: "x".repeat(600),
+      bodyExcerpt: "b".repeat(2000),
+      comments: Array.from({ length: 5 }, () => ({
+        author: "someone",
+        authorType: "USER",
+        isBot: false,
+        bodyExcerpt: "c".repeat(900),
+        htmlUrl: "https://github.com/org/repo/issues/7",
+        createdAt: null,
+      })),
+      evidenceKey: "github:issue:org/repo#7",
+    };
+    const fetchImpl = fetchReturning({
+      content: null,
+      tool_calls: [toolCall("1", "read_related_issue", { number: 7 })],
+    });
+    const deps = makeDeps(
+      { fetchRelatedIssue: vi.fn().mockResolvedValue(bigIssue) },
+      fetchImpl,
+    );
+
+    const result = await exploreRepository({ ...options, maxTotalBytes: 120, maxRounds: 4 }, deps);
+
+    expect(result.bytes).toBeLessThanOrEqual(120);
+    const reads = result.toolCalls.filter((call) => call.name === "read_related_issue");
+    expect(reads.length).toBeGreaterThan(0);
+    expect(reads.map((call) => call.preview).join("")).not.toContain("bbbb");
+    expect(result.warnings).toContain("repository exploration hit its byte budget");
   });
 
   it("counts a related-work round against the round budget", async () => {
@@ -605,7 +653,9 @@ describe("exploreRepository pinned ref", () => {
 
     const result = await exploreRepository({ ...options, pinnedRef: "deadbeef" }, deps);
 
-    expect(result.readContents).toEqual([{ path: "src/a.ts", ref: "deadbeef", content: "export const a = 1;" }]);
+    expect(result.readContents).toEqual([
+      { path: "src/a.ts", ref: "deadbeef", content: "export const a = 1;", startLine: 1, endLine: 1 },
+    ]);
   });
 });
 

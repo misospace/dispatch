@@ -821,6 +821,8 @@ describe("executeGroomerTool read_file bounded ranges (dispatch#1451)", () => {
       path: "big.ts",
       ref: null,
       content: longFile(120).split("\n").slice(114).join("\n"),
+      startLine: 115,
+      endLine: 120,
     });
   });
 
@@ -896,6 +898,11 @@ describe("executeGroomerTool read_file bounded ranges (dispatch#1451)", () => {
     expect(result.content).not.toContain("�");
     expect(result.content).toContain("(line 1 exceeds the byte limit; continues at line 2)");
     expect(result.file?.content).toMatch(/^ü+$/);
+    // The body is a cut inside line 1 and the continuation skips its rest:
+    // no coordinates ride along, so no adjacent merge can bridge the unseen
+    // remainder (dispatch#1465).
+    expect(result.file?.startLine).toBeUndefined();
+    expect(result.file?.endLine).toBeUndefined();
     expect(result.bytes).toBeLessThanOrEqual(121);
   });
 
@@ -1192,6 +1199,7 @@ describe("executeGroomerTool read_file shownRange (dispatch#1451)", () => {
     expect(head.file?.content).toBe("L1\nL2\n");
     expect(head.content).toContain("startLine=3");
     expect(head.shownRange).toEqual({ start: 1, end: 2, totalLines: 3, eof: false });
+    expect(head.file).toMatchObject({ startLine: 1, endLine: 2 });
   });
 
   it("a head cut mid-line accounts only the lines shown whole", async () => {
@@ -1208,6 +1216,7 @@ describe("executeGroomerTool read_file shownRange (dispatch#1451)", () => {
     expect(head.file?.content).toBe("L1\nL2");
     expect(head.content).toContain("startLine=2");
     expect(head.shownRange).toEqual({ start: 1, end: 1, totalLines: 2, eof: false });
+    expect(head.file).toMatchObject({ startLine: 1, endLine: 1 });
   });
 
   it("a head cut equal to the first line accounts it whole", async () => {
@@ -1241,7 +1250,11 @@ describe("executeGroomerTool read_file shownRange (dispatch#1451)", () => {
     expect(head.truncated).toBe(true);
     expect(head.content).toContain("startLine=2");
     expect(head.shownRange).toEqual({ start: 1, end: 1, totalLines: 3, eof: false });
-
+    // The carried content is a cut inside line 1: it gets no coordinates, so
+    // the startLine=2 continuation cannot merge across the unseen remainder
+    // of line 1 (dispatch#1465).
+    expect(head.file?.startLine).toBeUndefined();
+    expect(head.file?.endLine).toBeUndefined();
     // Same on the single-line shape: nothing continues, the marker says so.
     const lone = await executeGroomerTool(
       { name: "read_file", arguments: { path: "s.ts" } },
@@ -1698,5 +1711,346 @@ describe("executeGroomerTool answers stay inside the caller's remaining budget (
     expect(result.ok).toBe(true);
     expect(result.bytes).toBe(0);
     expect(result.content).toContain("No matches");
+  });
+});
+
+describe("executeGroomerTool related-work answers stay inside the caller's budget (dispatch#1468)", () => {
+  const bigIssue = {
+    kind: "issue",
+    repoFullName: "org/repo",
+    number: 7,
+    title: "An issue title long enough to spend bytes. ".repeat(12),
+    state: "closed",
+    merged: false,
+    labels: ["type/bug", "priority/p1"],
+    bodyExcerpt: "b".repeat(2000),
+    htmlUrl: "https://github.com/org/repo/issues/7",
+    updatedAt: "2026-10-30T00:00:00Z",
+    comments: Array.from({ length: 5 }, (_, i) => ({
+      author: `commenter${i}`,
+      authorType: "USER",
+      isBot: false,
+      bodyExcerpt: "c".repeat(800),
+      htmlUrl: "https://github.com/org/repo/issues/7",
+      createdAt: "2026-10-30T00:00:00Z",
+    })),
+    source: "github-issue",
+    evidenceKey: "github:issue:org/repo#7",
+  };
+  const bigCommit = {
+    kind: "commit",
+    repoFullName: "org/repo",
+    sha: "abc1234",
+    message: `Fix the login bug\n\n${"m".repeat(1500)}`,
+    htmlUrl: "https://github.com/org/repo/commit/abc1234",
+    author: "someone",
+    committedAt: "2026-10-30T00:00:00Z",
+    source: "github-commit",
+    evidenceKey: "github:commit:org/repo@abc1234",
+  };
+  const manyHits = Array.from({ length: 8 }, (_, i) => ({
+    kind: i % 2 === 0 ? ("issue" as const) : ("pull_request" as const),
+    repoFullName: "org/repo",
+    number: 100 + i,
+    title: `Related item ${i} with a title long enough to spend bytes. `.repeat(2),
+    state: "open",
+    htmlUrl: `https://github.com/org/repo/${i % 2 === 0 ? "issues" : "pull"}/${100 + i}`,
+    evidenceKey: `github:${i % 2 === 0 ? "issue" : "pr"}:org/repo#${100 + i}`,
+  }));
+
+  it("keeps every related-work answer inside every budget it is given", async () => {
+    // The clamp is a property, not a case: whatever the caller has left, the
+    // answer fits and is charged exactly (dispatch#1468).
+    const cases = [
+      {
+        deps: makeDeps({ fetchRelatedIssue: vi.fn().mockResolvedValue(bigIssue) }),
+        call: { name: "read_related_issue", arguments: { number: 7 } },
+      },
+      {
+        deps: makeDeps({
+          fetchRelatedIssue: vi.fn().mockResolvedValue({
+            ...bigIssue,
+            // Bytes, not characters: a reduction must cut on character
+            // boundaries and stay inside the cap with multi-byte prose.
+            title: "titre ééé 🎯 long ".repeat(40),
+            bodyExcerpt: "ü".repeat(1500),
+          }),
+        }),
+        call: { name: "read_related_issue", arguments: { number: 7 } },
+      },
+      {
+        deps: makeDeps({ fetchRelatedCommit: vi.fn().mockResolvedValue(bigCommit) }),
+        call: { name: "read_related_commit", arguments: { ref: "abc1234" } },
+      },
+      {
+        deps: makeDeps({ searchRelatedWork: vi.fn().mockResolvedValue(manyHits) }),
+        call: { name: "search_related_work", arguments: { query: "loop" } },
+        foundMatches: true,
+      },
+      {
+        deps: makeDeps({
+          searchRelatedWork: vi.fn().mockResolvedValue([
+            { ...manyHits[0], title: " relación 🎯 ".repeat(40) },
+            { ...manyHits[1], title: " relación 🎯 ".repeat(40) },
+          ]),
+        }),
+        call: { name: "search_related_work", arguments: { query: "loop" } },
+        foundMatches: true,
+      },
+      {
+        deps: makeDeps({ searchRelatedWork: vi.fn().mockResolvedValue([]) }),
+        call: { name: "search_related_work", arguments: { query: "🎯".repeat(1000) } },
+        foundMatches: false,
+      },
+    ];
+    for (let cap = 0; cap <= 800; cap += 1) {
+      for (const { deps, call, foundMatches } of cases) {
+        const result = await executeGroomerTool(
+          call,
+          { ...options, maxTotalBytesRemaining: cap },
+          deps,
+        );
+        expect(
+          Buffer.byteLength(result.content, "utf8"),
+          `${call.name} cap ${cap}`,
+        ).toBeLessThanOrEqual(cap);
+        expect(result.bytes, `${call.name} cap ${cap}`).toBe(
+          Buffer.byteLength(result.content, "utf8"),
+        );
+        // A search that found matches never takes the negative-evidence
+        // signature (`ok && bytes === 0`), whatever the budget.
+        if (foundMatches) {
+          expect(result.ok && result.bytes === 0, `${call.name} cap ${cap}`).toBe(false);
+        }
+      }
+    }
+  });
+
+  it("clamps the model-authored query echo in an empty related-work answer", async () => {
+    // The query is model-authored and unbounded; the echo carries the same
+    // 200-byte clamp the search_code no-match answer applies (dispatch#1468).
+    const deps = makeDeps({ searchRelatedWork: vi.fn().mockResolvedValue([]) });
+    const result = await executeGroomerTool(
+      { name: "search_related_work", arguments: { query: "w".repeat(500) } },
+      options,
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    expect(result.content).toMatch(/^No related work found for "w+…"\.$/);
+    expect(Buffer.byteLength(result.content, "utf8")).toBeLessThan(300);
+    // The rendered answer is charged in full: unlike the search_code empty
+    // answer it is not the freshness zero-byte sentinel.
+    expect(result.bytes).toBe(Buffer.byteLength(result.content, "utf8"));
+    expect(result.bytes).toBeGreaterThan(0);
+
+    const tight = await executeGroomerTool(
+      { name: "search_related_work", arguments: { query: "w".repeat(500) } },
+      { ...options, maxTotalBytesRemaining: 30 },
+      deps,
+    );
+    expect(tight.content).toBe("No related work found.");
+  });
+
+  it("reduces a large issue read to valid JSON that keeps the authoritative fields", async () => {
+    const deps = makeDeps({ fetchRelatedIssue: vi.fn().mockResolvedValue(bigIssue) });
+    const result = await executeGroomerTool(
+      { name: "read_related_issue", arguments: { number: 7 } },
+      { ...options, maxTotalBytesRemaining: 420 },
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    expect(result.bytes).toBeLessThanOrEqual(420);
+    // A reduced payload is a clipped answer (dispatch#1468)…
+    expect(result.truncated).toBe(true);
+    // …a read that fits whole is not.
+    const roomy = await executeGroomerTool(
+      { name: "read_related_issue", arguments: { number: 7 } },
+      { ...options, maxTotalBytesRemaining: 16_000 },
+      deps,
+    );
+    expect(roomy.truncated).toBeUndefined();
+    // The payload stays valid JSON — it is never sliced mid-string.
+    const parsed = JSON.parse(result.content) as Record<string, unknown>;
+    expect(parsed.kind).toBe("issue");
+    expect(parsed.number).toBe(7);
+    expect(parsed.state).toBe("closed");
+    expect(parsed.evidenceKey).toBe("github:issue:org/repo#7");
+    expect(parsed.commentsOmitted).toBe(5);
+    // Every field the observation records is present in the shown payload.
+    expect(parsed.htmlUrl).toBe(result.relatedWork?.[0]?.url);
+    // The answer says what gave way, and no prose kept exceeds its cap.
+    expect(String(parsed.prose)).toContain("byte budget");
+    for (const field of ["title", "bodyExcerpt"]) {
+      if (typeof parsed[field] === "string") {
+        expect(Buffer.byteLength(parsed[field] as string, "utf8")).toBeLessThanOrEqual(200);
+      }
+    }
+    // The bulk of the body and comments never reaches the model.
+    expect(result.content).not.toContain("b".repeat(120));
+    expect(result.content).not.toContain("c".repeat(120));
+    // The state the evidence snapshot records survives the reduction.
+    expect(result.relatedWork?.[0]).toMatchObject({
+      key: "github:issue:org/repo#7",
+      kind: "issue",
+      state: "closed",
+    });
+  });
+
+  it("keeps merged state and closing issues when a PR read is squeezed", async () => {
+    const deps = makeDeps({
+      fetchRelatedPullRequest: vi.fn().mockResolvedValue({
+        kind: "pull_request",
+        repoFullName: "org/repo",
+        number: 42,
+        title: "A fix long enough to spend bytes. ".repeat(12),
+        state: "merged",
+        merged: true,
+        baseRef: "main",
+        headRef: "fix/42",
+        bodyExcerpt: "b".repeat(1500),
+        htmlUrl: "https://github.com/org/repo/pull/42",
+        source: "github-pull-request",
+        evidenceKey: "github:pr:org/repo#42",
+      }),
+      fetchPullRequestClosingIssues: vi
+        .fn()
+        .mockResolvedValue({ issues: ["org/repo#587"], truncated: false }),
+    });
+    const result = await executeGroomerTool(
+      { name: "read_related_pr", arguments: { number: 42 } },
+      { ...options, maxTotalBytesRemaining: 400 },
+      deps,
+    );
+    expect(result.bytes).toBeLessThanOrEqual(400);
+    expect(result.truncated).toBe(true);
+    const parsed = JSON.parse(result.content) as Record<string, unknown>;
+    expect(parsed.kind).toBe("pull_request");
+    expect(parsed.state).toBe("merged");
+    expect(parsed.merged).toBe(true);
+    expect(parsed.closingIssues).toEqual(["org/repo#587"]);
+    expect(result.relatedWork?.[0]).toMatchObject({
+      key: "github:pr:org/repo#42",
+      state: "merged",
+      closes: ["org/repo#587"],
+      baseRef: "main",
+    });
+  });
+
+  it("names the omitted hits instead of letting a cut hit list read as absence", async () => {
+    const deps = makeDeps({ searchRelatedWork: vi.fn().mockResolvedValue(manyHits) });
+    const result = await executeGroomerTool(
+      { name: "search_related_work", arguments: { query: "loop" } },
+      { ...options, maxTotalBytesRemaining: 300 },
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    expect(result.bytes).toBeLessThanOrEqual(300);
+    // A reduced list is a clipped answer (dispatch#1468).
+    expect(result.truncated).toBe(true);
+    expect(result.content).not.toContain("No related work found");
+    const parsed = JSON.parse(result.content) as {
+      hits: { evidenceKey: string }[];
+      resultsOmitted: number;
+      budget: string;
+    };
+    expect(Array.isArray(parsed.hits)).toBe(true);
+    expect(parsed.hits.length).toBeGreaterThan(0);
+    expect(parsed.resultsOmitted).toBe(manyHits.length - parsed.hits.length);
+    expect(parsed.resultsOmitted).toBeGreaterThan(0);
+    expect(parsed.budget).toContain("byte budget");
+    // Only the hits the model actually saw are recorded as evidence.
+    expect((result.relatedWork ?? []).map((o) => o.key)).toEqual(
+      parsed.hits.map((h) => h.evidenceKey),
+    );
+  });
+
+  it("keeps sha and committedAt when a commit read is squeezed", async () => {
+    const deps = makeDeps({ fetchRelatedCommit: vi.fn().mockResolvedValue(bigCommit) });
+    const result = await executeGroomerTool(
+      { name: "read_related_commit", arguments: { ref: "abc1234" } },
+      { ...options, maxTotalBytesRemaining: 260 },
+      deps,
+    );
+    expect(result.bytes).toBeLessThanOrEqual(260);
+    expect(result.truncated).toBe(true);
+    const parsed = JSON.parse(result.content) as Record<string, unknown>;
+    expect(parsed.kind).toBe("commit");
+    expect(parsed.sha).toBe("abc1234");
+    expect(parsed.committedAt).toBe("2026-10-30T00:00:00Z");
+    // Every field the observation records is present in the shown payload.
+    expect(parsed.evidenceKey).toBe(result.relatedWork?.[0]?.key);
+    expect(parsed.htmlUrl).toBe(result.relatedWork?.[0]?.url);
+  });
+
+  it("says results exist when no hit fits the remaining budget", async () => {
+    const deps = makeDeps({ searchRelatedWork: vi.fn().mockResolvedValue(manyHits) });
+    const result = await executeGroomerTool(
+      { name: "search_related_work", arguments: { query: "loop" } },
+      { ...options, maxTotalBytesRemaining: 150 },
+      deps,
+    );
+    expect(result.bytes).toBeLessThanOrEqual(150);
+    // The call did not deliver — so it is an answered failure, never an
+    // absence and never the `ok && bytes === 0` signature.
+    expect(result.ok).toBe(false);
+    expect(result.bytes).toBeGreaterThan(0);
+    expect(result.content).toContain("byte budget exhausted");
+    expect(result.content).toContain("not an absence");
+    expect(result.content).not.toContain("No related work found");
+    expect(result.relatedWork ?? []).toEqual([]);
+  });
+
+  it("bounds the not-found and lookup-failure answers too", async () => {
+    const missingRef = `${"r".repeat(60)}#99`;
+    const notFoundDeps = makeDeps({
+      fetchRelatedIssue: vi.fn().mockRejectedValue(notFound("issue", missingRef)),
+    });
+    const missing = await executeGroomerTool(
+      { name: "read_related_issue", arguments: { number: 99 } },
+      { ...options, maxTotalBytesRemaining: 24 },
+      notFoundDeps,
+    );
+    expect(missing.ok).toBe(true);
+    expect(missing.bytes).toBeLessThanOrEqual(24);
+    expect(JSON.parse(missing.content)).toEqual({ found: false });
+    expect(missing.warnings).toEqual([`related-work: not found issue ${missingRef}`]);
+
+    // Below even the smallest JSON rung the answer is bounded text, never a
+    // crash and never an overrun.
+    const squeezed = await executeGroomerTool(
+      { name: "read_related_issue", arguments: { number: 99 } },
+      { ...options, maxTotalBytesRemaining: 6 },
+      notFoundDeps,
+    );
+    expect(squeezed.bytes).toBeLessThanOrEqual(6);
+    expect(squeezed.content.startsWith("not")).toBe(true);
+
+    const errDeps = makeDeps({
+      fetchRelatedPullRequest: vi.fn().mockRejectedValue(new Error("boom")),
+    });
+    const failed = await executeGroomerTool(
+      { name: "read_related_pr", arguments: { number: 42 } },
+      { ...options, maxTotalBytesRemaining: 8 },
+      errDeps,
+    );
+    expect(failed.ok).toBe(false);
+    expect(failed.bytes).toBeLessThanOrEqual(8);
+    expect(failed.warnings).toEqual(["related-work: pull_request lookup failed"]);
+  });
+
+  it("shows a budget-exhausted notice when not even the reduced read fits", async () => {
+    const deps = makeDeps({ fetchRelatedCommit: vi.fn().mockResolvedValue(bigCommit) });
+    const result = await executeGroomerTool(
+      { name: "read_related_commit", arguments: { ref: "abc1234" } },
+      { ...options, maxTotalBytesRemaining: 40 },
+      deps,
+    );
+    expect(result.bytes).toBeLessThanOrEqual(40);
+    expect(result.content).toContain("byte budget exhausted");
+    // Showing nothing establishes nothing: no evidence is recorded, and an
+    // answer that showed nothing is not reported as a clipped one.
+    expect(result.relatedWork).toBeUndefined();
+    expect(result.truncated).toBeUndefined();
+    expect(result.sources).toEqual([]);
   });
 });

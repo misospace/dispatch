@@ -46,6 +46,8 @@ const { mocks } = vi.hoisted(() => ({
     childClaims: new Map<string, Record<string, any>>(),
     /** Simulated Issue.releaseSignal column state, written by issue.update. */
     issueProjection: null as unknown,
+    /** Simulated Issue row state, written by issue.update. */
+    issueRow: {} as Record<string, unknown>,
     prisma: {
       $transaction: vi.fn(),
       $queryRaw: vi.fn(),
@@ -371,11 +373,19 @@ describe("runHostedGroomer", () => {
     // The Issue.releaseSignal column is simulated: an issue.update whose data
     // carries the field sets or clears it; one without leaves it untouched.
     mocks.issueProjection = null;
+    // The Issue row is simulated too: every issue.update merges its data into
+    // the row, so a test can seed a row state (a stale mark, say) and read
+    // back what the run left on it, not only what it sent.
+    mocks.issueRow = {};
     mocks.prisma.issue.update.mockImplementation(async ({ data }: { data: Record<string, unknown> }) => {
       if ("releaseSignal" in data) mocks.issueProjection = JSON.parse(JSON.stringify(data.releaseSignal));
+      Object.assign(mocks.issueRow, data);
       return { id: "issue-42" };
     });
-    mocks.prisma.issue.findUnique.mockImplementation(async () => ({ releaseSignal: mocks.issueProjection }));
+    mocks.prisma.issue.findUnique.mockImplementation(async () => ({
+      releaseSignal: mocks.issueProjection,
+      groomingSummary: (mocks.issueRow.groomingSummary as string | null | undefined) ?? null,
+    }));
     mocks.prisma.issueLane.create.mockResolvedValue({ id: "lane-1" });
     mocks.prisma.agentRun.create.mockResolvedValue({ id: "run-1" });
     mocks.prisma.auditLog.create.mockResolvedValue({ id: "audit-1" });
@@ -2235,15 +2245,89 @@ Investigate session handling in auth module.`;
       expect(mocks.addIssueComment).toHaveBeenCalledTimes(1);
 
       // Exact retry of the same plan: the application replays — no comment or
-      // label write repeats, and only the cooldown stamp moves.
+      // label write repeats; the cooldown stamp moves and the freshness
+      // baseline re-anchors (#1472).
       mocks.prisma.issue.update.mockClear();
       const result = await runHostedGroomer();
       expect(result!.appliedMutations?.outcome).toBe("replayed");
       expect(mocks.addIssueComment).toHaveBeenCalledTimes(1);
       expect(mocks.updateIssueLabels).toHaveBeenCalledTimes(1);
+      // #1472: the replay now also re-anchors the freshness baseline, so the
+      // write is no longer only the cooldown stamp. It still writes no reason
+      // field and no pending action.
       for (const call of mocks.prisma.issue.update.mock.calls) {
         const data = (call[0] as { data: Record<string, unknown> }).data;
-        expect(Object.keys(data).sort()).toEqual(["groomedAt", "groomedBy", "groomingRetryAfter"]);
+        expect(data).toMatchObject({ groomedBy: "hosted-groomer", groomingRetryAfter: null });
+        for (const field of ["needsInfoReason", "blockedReason", "notReadyReason"]) expect(field in data).toBe(false);
+        expect("nextGroomingAction" in data).toBe(false);
+      }
+    });
+  });
+
+  describe("a re-groom that changes only the verdict summary (dispatch#1470)", () => {
+    function lastIssueUpdateData(): Record<string, unknown> {
+      const calls = mocks.prisma.issue.update.mock.calls;
+      expect(calls.length).toBeGreaterThan(0);
+      return (calls[calls.length - 1][0] as { data: Record<string, unknown> }).data;
+    }
+
+    it("is applied, and the issue row carries the new summary text", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(planDraft());
+      await runHostedGroomer();
+      expect(lastIssueUpdateData().groomingSummary).toBe("Ready for work.");
+
+      mocks.prisma.issue.update.mockClear();
+      mocks.callGroomerLLM.mockResolvedValue(
+        planDraft({ verdict: { summary: "Ready for work: the return URL survives a reset." } }),
+      );
+      const result = await runHostedGroomer();
+      expect(result!.appliedMutations?.outcome).toBe("applied");
+      expect(lastIssueUpdateData().groomingSummary).toBe("Ready for work: the return URL survives a reset.");
+    });
+
+    it("a re-groom that changes nothing is still replayed, without rewriting the summary", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(planDraft());
+      await runHostedGroomer();
+
+      mocks.prisma.issue.update.mockClear();
+      const result = await runHostedGroomer();
+      expect(result!.appliedMutations?.outcome).toBe("replayed");
+      for (const call of mocks.prisma.issue.update.mock.calls) {
+        const data = (call[0] as { data: Record<string, unknown> }).data;
+        expect("groomingSummary" in data).toBe(false);
+      }
+    });
+
+    it("a replay heals the summary a failed issue write lost after the application finalized", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(planDraft());
+      let sawSummaryWrite = false;
+      mocks.prisma.issue.update.mockImplementation(async ({ data }: { data: Record<string, unknown> }) => {
+        if ("groomingSummary" in data && !sawSummaryWrite) {
+          sawSummaryWrite = true;
+          throw new Error("db blip");
+        }
+        if ("releaseSignal" in data) mocks.issueProjection = JSON.parse(JSON.stringify(data.releaseSignal));
+        Object.assign(mocks.issueRow, data);
+        return { id: "issue-42" };
+      });
+      await expect(runHostedGroomer()).rejects.toThrow(/db blip/);
+      expect(mocks.issueRow.groomingSummary ?? null).toBeNull();
+
+      const result = await runHostedGroomer();
+      expect(result!.appliedMutations?.outcome).toBe("replayed");
+      expect(lastIssueUpdateData().groomingSummary).toBe("Ready for work.");
+    });
+
+    it("a replay never overwrites summary text the column already carries", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(planDraft());
+      await runHostedGroomer();
+      mocks.issueRow.groomingSummary = "operator note: hold for the release cut";
+      mocks.prisma.issue.update.mockClear();
+      const result = await runHostedGroomer();
+      expect(result!.appliedMutations?.outcome).toBe("replayed");
+      for (const call of mocks.prisma.issue.update.mock.calls) {
+        const data = (call[0] as { data: Record<string, unknown> }).data;
+        expect("groomingSummary" in data).toBe(false);
       }
     });
   });
@@ -3055,6 +3139,60 @@ Investigate session handling in auth module.`;
       );
     });
 
+    it("a replayed application re-anchors the baseline and clears the stale mark (#1472)", async () => {
+      // A row the freshness pass marked stale is re-groomed; when the re-groom
+      // replays the identical application, that replay is a fresh validation
+      // of the same verdict against current evidence. It must re-anchor the
+      // baseline and clear the stale mark: a surviving mark keeps the
+      // selector's stale branch (which bypasses the cooldown and the
+      // blocked/not-ready parking) re-offering the row every stale floor.
+      mocks.prisma.groomingRun.create.mockImplementation(
+        async () => ({ id: `gr-${mocks.prisma.groomingRun.create.mock.calls.length}`, stage: "selected" }),
+      );
+      await runHostedGroomer();
+      mocks.prisma.issue.update.mockClear();
+
+      // Seed the stale row the freshness pass would have left: the mark is
+      // what the selector's stale branch reads, so the replay has to clear it
+      // on the row, not only in the write it sends.
+      Object.assign(mocks.issueRow, {
+        groomingStaleAt: new Date("2026-09-25T00:00:00.000Z"),
+        groomingStaleReasons: ["issue_changed"],
+        groomingStaleDetail: "the issue changed since the baseline was recorded",
+      });
+      expect(mocks.issueRow.groomingStaleAt).toBeInstanceOf(Date);
+
+      const result = await runHostedGroomer();
+      expect(result!.appliedMutations?.outcome).toBe("replayed");
+
+      // The replay's write settles the row: stale mark cleared, baseline
+      // re-anchored to this run's evidence (replay run id, same digest, a
+      // head-verified pin), so the next selection sees a fresh row under the
+      // normal 24h cooldown instead of a permanently invalidated one.
+      const data = issueUpdateData();
+      expect(data).toMatchObject({
+        groomedRunId: "gr-2",
+        groomedHeadSha: "abc123",
+        groomedEvidenceDigest: "digest",
+        groomingVerifiedSha: "abc123",
+        groomingStaleAt: null,
+        groomingStaleReasons: [],
+        groomingStaleDetail: null,
+      });
+      expect(data.groomedIssueFingerprint).toBeTruthy();
+
+      // The row itself, not only the write: the stale mark is gone and the
+      // baseline points at the replaying run, so the selector no longer
+      // re-offers the row through its stale branch.
+      expect(mocks.issueRow).toMatchObject({
+        groomedRunId: "gr-2",
+        groomingStaleAt: null,
+        groomingStaleReasons: [],
+        groomingStaleDetail: null,
+      });
+      expect(mocks.issueRow.groomedIssueFingerprint).toBeTruthy();
+    });
+
     it("relies on the plan's cited read paths, not every path the run read", async () => {
       mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, toolLoopEnabled: true });
       mocks.exploreRepository.mockResolvedValue({ ...mockExploration, sources: ["src/x.ts"], readSources: ["src/x.ts"] });
@@ -3505,13 +3643,17 @@ Investigate session handling in auth module.`;
       expect(mocks.addIssueComment).toHaveBeenCalledTimes(1);
       expect(mocks.updateIssueLabels).toHaveBeenCalledTimes(1);
       expect(mocks.updateIssueTitleAndBody).toHaveBeenCalledTimes(1);
-      // The replay writes no lane history and only the local cooldown stamp.
+      // The replay writes no lane history: the cooldown stamp moves and the
+      // freshness baseline re-anchors with the stale mark cleared (#1472).
       expect(mocks.prisma.issueLane.create).toHaveBeenCalledTimes(1);
-      expect(Object.keys(mocks.prisma.issue.update.mock.calls.at(-1)![0].data).sort()).toEqual([
-        "groomedAt",
-        "groomedBy",
-        "groomingRetryAfter",
-      ]);
+      expect(mocks.prisma.issue.update.mock.calls.at(-1)![0].data).toMatchObject({
+        groomedAt: expect.any(Date),
+        groomedBy: "hosted-groomer",
+        groomingRetryAfter: null,
+        groomingStaleAt: null,
+        groomingStaleReasons: [],
+        groomingStaleDetail: null,
+      });
       expect(first!.mutationPlan!.applicationKey).toBe(second!.mutationPlan!.applicationKey);
     });
 
@@ -4215,9 +4357,11 @@ Investigate session handling in auth module.`;
       mocks.prisma.issue.update.mockClear();
       const result = await runHostedGroomer();
       expect(result!.appliedMutations?.outcome).toBe("replayed");
+      // The replay re-anchors the freshness baseline (#1472) but never
+      // touches the projection this application already owns.
       for (const call of mocks.prisma.issue.update.mock.calls) {
         const data = (call[0] as { data: Record<string, unknown> }).data;
-        expect(Object.keys(data).sort()).toEqual(["groomedAt", "groomedBy", "groomingRetryAfter"]);
+        expect("releaseSignal" in data).toBe(false);
       }
     });
 
@@ -4347,9 +4491,11 @@ Investigate session handling in auth module.`;
       mocks.prisma.issue.update.mockClear();
       const result = await runHostedGroomer();
       expect(result!.appliedMutations?.outcome).toBe("replayed");
+      // The replay re-anchors the freshness baseline (#1472) but never
+      // rewrites the tombstone this application already owns.
       for (const call of mocks.prisma.issue.update.mock.calls) {
         const data = (call[0] as { data: Record<string, unknown> }).data;
-        expect(Object.keys(data).sort()).toEqual(["groomedAt", "groomedBy", "groomingRetryAfter"]);
+        expect("releaseSignal" in data).toBe(false);
       }
     });
 

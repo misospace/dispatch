@@ -42,6 +42,16 @@ import {
 } from "./mutation-validator";
 
 /**
+ * v4 (dispatch#1470): the persisted verdict summary joined the application
+ * intent, so a re-groom whose verdict summary changed is applied — the
+ * `Issue.groomingSummary` column carries the new text — rather than replayed
+ * with the stale one. The summary text is not stored on a
+ * `GroomingApplication` row, so pre-v4 keys cannot be recomputed: rows are
+ * NOT migrated, and the decided deploy behaviour is the same one re-apply as
+ * v2 and v3 — the first post-deploy groom of an already-groomed issue applies
+ * again under its fresh v4 key (its comment re-posts, subject to the comment
+ * cooldown) before the new key is claimed and idempotency resumes.
+ *
  * v3 (dispatch#1481): the canonical intent shape gained `releaseSignal`, so
  * every stored v2 key was computed under the old shape. The field addition
  * changes hashes regardless, so stored keys are deliberately invalidated once
@@ -58,7 +68,7 @@ import {
  * comment re-posts, subject to the comment cooldown) before the new key is
  * claimed and idempotency resumes.
  */
-export const APPLICATION_KEY_VERSION = 3;
+export const APPLICATION_KEY_VERSION = 4;
 export const MAX_GITHUB_COMMENT_CHARS = 4096;
 /**
  * The largest body the applier will write to GitHub. GitHub's issue body cap
@@ -552,6 +562,15 @@ export function computeApplicationKey(input: {
       // that leaves the reason text identical is still a new application.
       reason: diff.persistedReason,
       action: diff.output.nextGroomingAction ?? null,
+      // The persisted verdict summary is part of the intent (dispatch#1470):
+      // it is written to the Issue row the same way the reason is (the run's
+      // mutation path persists `output.summary` into `Issue.groomingSummary`,
+      // and the board displays it), so a re-groom whose summary text changed
+      // must be applied — the column carries the new text — rather than
+      // replayed with the stale one. It carries the run's write-guard
+      // normalization: an empty summary persists nothing (the column keeps
+      // its previous text), so it keys as null.
+      summary: diff.output.summary || null,
       // The release signal is part of the intent (dispatch#1481): a re-groom
       // that changes only release semantics is applied so the projection never
       // replays an obsolete signal; it rides the existing application key
