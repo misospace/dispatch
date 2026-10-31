@@ -2820,6 +2820,16 @@ describe("POST /api/agents/[agentName]/tasks/report — terminal no-PR conclusio
     mocks.noPrConclusionUpsert.mockResolvedValue({});
     prismaMock.issueLifecycleEvent.create.mockResolvedValue({ id: "evt-1" });
     prismaMock.prFixQueueItem.findUnique.mockResolvedValue(null);
+    // The PR-fix resolver is the verdict the park gate reads: the default
+    // "no matching pr-fix queue item" means the report settles no PR-fix work.
+    // Re-established per test so a test that stages a settlement cannot leak
+    // into the next one.
+    prFixResolveMock.mockReset().mockResolvedValue({
+      matched: false,
+      action: "none",
+      itemId: null,
+      reason: "no matching pr-fix queue item",
+    });
   });
 
   const issueRow = (over: Record<string, unknown> = {}) => ({
@@ -2916,6 +2926,82 @@ describe("POST /api/agents/[agentName]/tasks/report — terminal no-PR conclusio
     });
     expect(res.status).toBe(200);
     expect(mocks.noPrConclusionUpsert).not.toHaveBeenCalled();
+  });
+
+  it("an implement report that SETTLES pr-fix work does NOT record a park (PR-fix work never parks)", async () => {
+    // #1510 review (Major): a report that settles the PR-fix queue item is
+    // PR-fix work. Parking the issue on top of that settlement would withhold
+    // the issue while the PR-fix lane owns the PR, so the issue-work conclusion
+    // is dropped with it.
+    mocks.repoFindUnique.mockResolvedValue({ id: "repo-1" });
+    mocks.issueFindUnique.mockResolvedValue(issueRow());
+    prFixResolveMock.mockResolvedValue({
+      matched: true,
+      action: "fixed",
+      itemId: 9,
+      reason: "pr merge state verified",
+    });
+
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "no_changes_needed",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      pullRequestNumber: 10,
+      prFixItem: { id: "item-9", generation: 1 },
+    });
+    expect(res.status).toBe(200);
+    // The PR-fix half still happens — only the issue park is withheld.
+    expect(prFixResolveMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        outcome: "no_changes_needed",
+        attempt: { itemId: "item-9", generation: 1, handoutToken: undefined },
+      }),
+    );
+    expect(mocks.noPrConclusionUpsert).not.toHaveBeenCalled();
+    expect(prismaMock.issueLifecycleEvent.create).not.toHaveBeenCalled();
+    // The decision is still echoed, so the worker learns why nothing parked.
+    const body = await res.json();
+    expect(body.conclusionPark).toEqual({ applied: false, reason: "pr-fix-settled" });
+  });
+
+  it("an implement report whose prFixItem settles NOTHING still records a park", async () => {
+    // The attempt token is malformed or stale (unknown item, no PR
+    // coordinates, already-terminal row): the report settles no PR-fix work,
+    // so it is the issue conclusion it claims to be. A malformed token must not
+    // defeat the stop that ends the re-offer loop (#1506).
+    mocks.repoFindUnique.mockResolvedValue({ id: "repo-1" });
+    mocks.issueFindUnique.mockResolvedValue(issueRow());
+
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "no_changes_needed",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      prFixItem: { id: "item-9", generation: 1 },
+    });
+    expect(res.status).toBe(200);
+    expect(mocks.noPrConclusionUpsert).toHaveBeenCalledTimes(1);
+    const body = await res.json();
+    expect(body.conclusionPark).toEqual({ applied: true, outcome: "no_changes_needed", reason: "parked" });
+  });
+
+  it("an implement report with an explicitly null prFixItem records a park", async () => {
+    // `prFixItem: null` is not a token — it must not read as PR-fix work.
+    mocks.repoFindUnique.mockResolvedValue({ id: "repo-1" });
+    mocks.issueFindUnique.mockResolvedValue(issueRow());
+
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "no_changes_needed",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      prFixItem: null,
+    });
+    expect(res.status).toBe(200);
+    expect(mocks.noPrConclusionUpsert).toHaveBeenCalledTimes(1);
+    const body = await res.json();
+    expect(body.conclusionPark).toEqual({ applied: true, outcome: "no_changes_needed", reason: "parked" });
   });
 
   it("an unresolvable issue (no cached row) records no park", async () => {

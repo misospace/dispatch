@@ -31,9 +31,15 @@ function rejectAgentCaller(auth: AuthorizedRequest) {
 /**
  * GET /api/issues/[issueId]/no-pr-conclusion — read-only diagnostics: whether
  * the issue carries a stored terminal no-PR conclusion park, whether that park
- * is still LIVE (content fingerprint unexpired), and the rollout mode. Any
- * authorized caller, including agent bearer tokens — this endpoint mutates
- * nothing.
+ * is still LIVE (content fingerprint unexpired), and the rollout mode.
+ *
+ * Maintainer tier only (DISPATCH_AGENT_TOKEN / DISPATCH_MAINTAINER_TOKEN, an
+ * OIDC session, basic auth, or auth-disabled). The route tier gate refuses
+ * worker-tier credentials — bound or legacy unbound — because this path is
+ * absent from WORKER_ALLOWLIST, and a new route defaults to maintainer by
+ * construction. The endpoint mutates nothing; the refusal is about scope (the
+ * park provenance of any issue), not effect. A worker does not need this read:
+ * the report response already echoes its own `conclusionPark`.
  */
 export async function GET(request: Request, context: { params: Promise<{ issueId: string }> }) {
   const auth = await authorizeRequest(request);

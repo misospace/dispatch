@@ -856,12 +856,29 @@ export async function POST(
     // logged, not thrown. A successful already_done close supersedes the park
     // (the close is the harder stop; a park surviving a reopen would withhold
     // work a human explicitly brought back). A duplicate (idempotent replay)
-    // never re-parks — the original report owns the side effect.
+    // never re-parks — the original report owns the side effect. A report that
+    // settles PR-fix work never parks either: the conclusion is issue work,
+    // and the PR-fix lane owns the PR (#1510 review).
     let conclusionPark: { applied: boolean; outcome?: string; reason: string } | undefined;
     const conclusionOutcome = report.outcome;
     if (report.taskType === "implement" && isNoPrConclusionOutcome(conclusionOutcome)) {
+      // #1510 review (Major): the terminal no-PR conclusion is ISSUE work, so
+      // a report that settles PR-fix work must not park the issue on top of
+      // that settlement — the PR-fix lane owns the PR, and the issue-work
+      // conclusion is dropped with it. "Settles PR-fix work" is the
+      // resolution's own verdict, NOT the presence of an attempt token: a
+      // report whose token settled nothing (no PR coordinates, unknown item,
+      // stale generation, already-terminal item) is the issue conclusion it
+      // claims to be, so it still parks. A malformed token must not defeat the
+      // stop that ends the re-offer loop (#1506).
+      const settledPrFixWork =
+        prFixResolution.matched === true &&
+        prFixResolution.action !== "none" &&
+        prFixResolution.action !== "skipped";
       if (duplicate) {
         conclusionPark = { applied: false, reason: "duplicate report; the conclusion park was not re-run" };
+      } else if (settledPrFixWork) {
+        conclusionPark = { applied: false, reason: "pr-fix-settled" };
       } else if (!issueId || !report.repoFullName || report.issueNumber === undefined) {
         conclusionPark = { applied: false, reason: "issue-not-tracked" };
       } else if (closeResolution && closeResolution.action === "closed") {

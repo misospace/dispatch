@@ -3,7 +3,7 @@ import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMockWithSafeEqual, authed
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
-vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMockWithSafeEqual());
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMockWithSafeEqual(mockToken, { "test-worker-token": "worker" }));
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
@@ -104,7 +104,7 @@ describe("GET /api/issues/[issueId]/no-pr-conclusion — read-only diagnostics",
   it("reports a live park with its provenance, liveness, and mode", async () => {
     mocks.noPrConclusionFindUnique.mockResolvedValue(livePark());
 
-    // Any authorized caller may read — including an agent bearer token.
+    // Maintainer tier may read — the agent/maintainer token is enough.
     const res = await GET(agentBearerRequest("GET"), ctx);
 
     expect(res.status).toBe(200);
@@ -156,6 +156,31 @@ describe("GET /api/issues/[issueId]/no-pr-conclusion — read-only diagnostics",
   it("returns 401 when no authorization is provided", async () => {
     const res = await GET(new Request(URL_, { method: "GET" }), ctx);
     expect(res.status).toBe(401);
+  });
+
+  it("refuses a worker-tier token with 403 (maintainer-tier route by construction)", async () => {
+    // #1510 review (Minor): this GET is absent from WORKER_ALLOWLIST, so the
+    // route tier gate refuses worker-tier credentials — bound or legacy
+    // unbound. The refusal is intentional (the park provenance of any issue is
+    // operator-scoped), not a gap in the allowlist.
+    const res = await GET(
+      authedRequest(URL_, { method: "GET", token: "test-worker-token" }),
+      ctx,
+    );
+
+    expect(res.status).toBe(403);
+    expect((await res.json()).error).toMatch(/maintainer/i);
+    // The park is never read on the denied path. The tier gate does write its
+    // own `auth_tier_denied` audit row — that is the auth module's row, not
+    // this route's.
+    expect(mocks.findUnique).not.toHaveBeenCalled();
+    expect(mocks.noPrConclusionFindUnique).not.toHaveBeenCalled();
+    expect(mocks.noPrConclusionDelete).not.toHaveBeenCalled();
+    expect(mocks.auditCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ action: "auth_tier_denied", success: false }),
+      }),
+    );
   });
 });
 

@@ -16,8 +16,9 @@ The park is one row in the `NoPrConclusion` table. It records the reporting
 agent, the outcome, the summary, the evidence, and a content fingerprint: the
 sha256 of the canonical issue title and body at park time. The report route
 writes it inside `POST /api/agents/{agent}/tasks/report` when the task type is
-`implement` and the outcome is one of the three terminal values. The response
-echoes the decision in `conclusionPark`.
+`implement`, the outcome is one of the three terminal values, and the report
+settles no PR-fix work (see Boundaries). The response echoes the decision in
+`conclusionPark`.
 
 The park never writes GitHub labels, never closes an issue, and never touches
 `status/blocked`. The blocked label keeps its own meaning and its
@@ -54,7 +55,12 @@ Any one of these actions retires the park:
    claim discharges the park after its own transaction commits.
 
 `GET /api/issues/{issueId}/no-pr-conclusion` shows the stored park, whether it
-is live, and the current mode. Any authorized caller can read it.
+is live, and the current mode. Maintainer tier only: the agent/maintainer
+token, an OIDC session, basic auth, or auth-disabled mode. Worker-tier
+credentials (bound or legacy unbound) are refused by the route tier gate,
+because this path is not on the worker allowlist and a new route defaults to
+maintainer by construction. A worker does not need the read: the report
+response already echoes its own `conclusionPark`.
 
 While a live park exists and the mode is `enforce`, `POST /api/issues/claim`
 refuses a non-force claim with 409 and names the clearing paths.
@@ -82,6 +88,15 @@ holds.
   policy, like the capacity cooldown and the admission override.
 - The withhold applies to issue pickup. Linked-PR follow-up routing and PR-fix
   queue items are never gated, the same exception grooming admission uses.
+- A report that settles PR-fix work is PR-fix work, whatever its task type
+  says: it settles the queue item and never parks the issue, so a live PR-fix
+  lane cannot withhold the issue it is working on. The response echoes
+  `conclusionPark: { applied: false, reason: "pr-fix-settled" }`. "Settles
+  PR-fix work" is the settlement's own verdict, not the presence of an attempt
+  token: a report whose token settled nothing (no PR coordinates, unknown item,
+  stale generation, already-terminal item) is the issue conclusion it claims to
+  be and still parks, so a malformed token cannot defeat the stop that ends the
+  re-offer loop.
 - A park write that fails is logged, and the report still succeeds. The park
   expires on the next content edit, so a lost write cannot strand the issue,
   and a 5xx retry could not re-park anyway (the idempotency duplicate branch
