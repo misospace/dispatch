@@ -22,6 +22,9 @@ const { mocks } = vi.hoisted(() => ({
     fetchPullRequestLabels: vi.fn(),
     fetchPullRequestHeadSha: vi.fn(),
     findLeasedIssueIds: vi.fn(),
+    // #1506: the terminal no-PR conclusion park ledger read/cleanup.
+    noPrConclusionFindMany: vi.fn().mockResolvedValue([]),
+    noPrConclusionDeleteMany: vi.fn().mockResolvedValue({ count: 0 }),
   },
 }));
 
@@ -35,6 +38,11 @@ vi.mock("@/lib/prisma", () => {
   return {
     prisma: {
       issue: { findMany: mocks.issueFindMany },
+      // #1506: the terminal no-PR conclusion park ledger read/cleanup.
+      noPrConclusion: {
+        findMany: mocks.noPrConclusionFindMany,
+        deleteMany: mocks.noPrConclusionDeleteMany,
+      },
       groomingRun: { findMany: mocks.groomingRunFindMany },
       prFixQueueItem,
       prFixHistory: { create: mocks.prFixHistoryCreate },
@@ -246,6 +254,8 @@ beforeEach(() => {
   mocks.fetchPullRequestLabels.mockResolvedValue([]);
   mocks.fetchPullRequestHeadSha.mockResolvedValue(null);
   mocks.findLeasedIssueIds.mockResolvedValue([]);
+  mocks.noPrConclusionFindMany.mockResolvedValue([]);
+  mocks.noPrConclusionDeleteMany.mockResolvedValue({ count: 0 });
 });
 
 afterEach(() => {

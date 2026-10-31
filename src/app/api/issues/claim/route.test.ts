@@ -17,7 +17,7 @@ vi.mock("@/lib/issue-mutation-guard", () => ({
     return { status: result.complete ? "completed" : "retained", value: result.value };
   },
 }));
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, authedRequest } from "@/test/route-helpers";
 
 const { WORKER_TOKEN } = vi.hoisted(() => ({ WORKER_TOKEN: "worker-token" }));
@@ -38,6 +38,8 @@ const { mocks } = vi.hoisted(() => ({
     agentWorkFindMany: vi.fn().mockResolvedValue([]),
     agentWorkUpdate: vi.fn().mockResolvedValue({}),
     agentWorkDeleteMany: vi.fn().mockResolvedValue({ count: 0 }),
+    noPrConclusionFindUnique: vi.fn().mockResolvedValue(null),
+    noPrConclusionDelete: vi.fn().mockResolvedValue({ id: "park-1" }),
     transaction: vi.fn((arg: any) => {
       if (typeof arg === "function") {
         return Promise.resolve(
@@ -89,6 +91,12 @@ vi.mock("@/lib/prisma", () => ({
       update: mocks.agentWorkUpdate,
       deleteMany: mocks.agentWorkDeleteMany,
     },
+    // #1506: the claim route reads (and a force-claim discharges) the
+    // terminal no-PR conclusion park row.
+    noPrConclusion: {
+      findUnique: mocks.noPrConclusionFindUnique,
+      delete: mocks.noPrConclusionDelete,
+    },
     $transaction: mocks.transaction,
   },
 }));
@@ -99,6 +107,7 @@ vi.mock("@/lib/issue-status", () => ({ transitionIssueStatus: vi.fn(async (_repo
 vi.mock("@/lib/claim-gate", () => ({ getLiveIssueLabels: mocks.getLiveIssueLabels }));
 
 import { resetRateLimits } from "@/lib/rate-limit";
+import { computeConclusionContentFingerprint } from "@/lib/no-pr-conclusion";
 import { POST } from "./route";
 
 // Per-actor rate-limit windows are process-global; reset them per test so the
@@ -1375,5 +1384,140 @@ describe("POST /api/issues/claim — parked claims (#1316, #1334)", () => {
     const updateData = (mocks.leaseUpdate.mock.calls[0] as any)[0].data;
     expect(updateData.retryAfter).toBeNull();
     expect(updateData.waitReason).toBeNull();
+  });
+});
+
+describe("POST /api/issues/claim — terminal no-PR conclusion park gate (#1506)", () => {
+  // The cached issue as the park row's fingerprint was computed: title and
+  // body are what the fingerprint covers, so both must be present and stable.
+  const PARKED_ISSUE = {
+    id: "issue-1",
+    state: "open",
+    number: 42,
+    title: "Fix the flaky test suite",
+    body: "Already fixed upstream; no changes needed here.",
+    repository: { fullName: "org/repo" },
+    labels: [] as string[],
+  };
+  const LIVE_PARK = {
+    id: "park-1",
+    issueId: "issue-1",
+    agentName: "alpha",
+    outcome: "no_changes_needed",
+    summary: null,
+    evidence: null,
+    contentFingerprint: computeConclusionContentFingerprint(PARKED_ISSUE),
+    createdAt: new Date("2026-10-31T00:00:00.000Z"),
+  };
+  const STALE_PARK = { ...LIVE_PARK, contentFingerprint: "sha256:stale" };
+
+  const savedMode = process.env.DISPATCH_NO_PR_CONCLUSION_MODE;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    guardState.resuming = false;
+    guardState.stillHolds = true;
+    guardState.fencedGuardLost = false;
+    mocks.findUnique.mockResolvedValue(PARKED_ISSUE);
+    mocks.updateIssue.mockResolvedValue(PARKED_ISSUE);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.getLiveIssueLabels.mockResolvedValue([] as string[]);
+    mocks.leaseFindMany.mockResolvedValue([]);
+    mocks.leaseDeleteMany.mockResolvedValue({ count: 0 });
+    mocks.leaseUpdateMany.mockResolvedValue({ count: 0 });
+    mocks.leaseFindUnique.mockResolvedValue(null);
+    mocks.leaseFindFirst.mockResolvedValue(null);
+    mocks.leaseCreate.mockResolvedValue({
+      id: "l-1", agentName: "test-agent", issueId: "issue-1", checkpoint: "issue_claimed",
+      claimToken: "claim_tk_1", renewedAt: new Date(), createdAt: new Date(),
+    });
+    mocks.leaseUpdate.mockResolvedValue({
+      id: "l-1", agentName: "test-agent", issueId: "issue-1", checkpoint: "issue_claimed",
+      claimToken: "claim_tk_1", renewedAt: new Date(), createdAt: new Date(),
+    });
+    mocks.intentFindFirst.mockResolvedValue(null);
+  });
+
+  afterEach(() => {
+    if (savedMode === undefined) delete process.env.DISPATCH_NO_PR_CONCLUSION_MODE;
+    else process.env.DISPATCH_NO_PR_CONCLUSION_MODE = savedMode;
+  });
+
+  it("holds a non-force claim with a retryable 409 while a live park is in force (enforce mode)", async () => {
+    mocks.noPrConclusionFindUnique.mockResolvedValue(LIVE_PARK);
+
+    const res = await POST(makeRequest());
+
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toContain("parked");
+    expect(body.error).toContain("alpha");
+    expect(body.error).toContain("no-pr-conclusion");
+    // The gate fires before the live label fetch and before any write: no
+    // GitHub call, no lease, no cache touch.
+    expect(mocks.getLiveIssueLabels).not.toHaveBeenCalled();
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.leaseCreate).not.toHaveBeenCalled();
+    // A held claim never discharges the park.
+    expect(mocks.noPrConclusionDelete).not.toHaveBeenCalled();
+  });
+
+  it("a stale park (content fingerprint mismatch) does not hold the claim", async () => {
+    mocks.noPrConclusionFindUnique.mockResolvedValue(STALE_PARK);
+
+    const res = await POST(makeRequest());
+
+    expect(res.status).toBe(200);
+    // The claim proceeds against live labels as usual.
+    expect(mocks.getLiveIssueLabels).toHaveBeenCalled();
+    // A non-force claim never discharges the park, even a stale one — only a
+    // content edit, status change, move, or operator clear retires it.
+    expect(mocks.noPrConclusionDelete).not.toHaveBeenCalled();
+  });
+
+  it("audit mode: the park annotates but does not hold the claim", async () => {
+    process.env.DISPATCH_NO_PR_CONCLUSION_MODE = "audit";
+    mocks.noPrConclusionFindUnique.mockResolvedValue(LIVE_PARK);
+
+    const res = await POST(makeRequest());
+
+    expect(res.status).toBe(200);
+    expect(mocks.noPrConclusionDelete).not.toHaveBeenCalled();
+  });
+
+  it("a maintainer force-claim supersedes a live park and discharges it after the claim commit", async () => {
+    mocks.noPrConclusionFindUnique.mockResolvedValue(LIVE_PARK);
+
+    const res = await POST(makeRequest({ force: true }));
+
+    expect(res.status).toBe(200);
+    // The park row is retired only after the claim transaction committed.
+    expect(mocks.noPrConclusionDelete).toHaveBeenCalledWith({ where: { issueId: "issue-1" } });
+    expect(mocks.createLifecycleEvent).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        issueId: "issue-1",
+        kind: "conclusion_cleared",
+        source: "api:claim",
+        metadata: {
+          parkedBy: "alpha",
+          parkedOutcome: "no_changes_needed",
+          reason: "force-claim supersedes the terminal no-PR conclusion",
+        },
+      }),
+    });
+  });
+
+  it("a force-claim that fails before its commit never discharges the park", async () => {
+    // The guard is stolen before the fenced remote write: the attempt
+    // 409s with no claim commit, so the park must survive.
+    guardState.fencedGuardLost = true;
+    mocks.noPrConclusionFindUnique.mockResolvedValue(LIVE_PARK);
+
+    const res = await POST(makeRequest({ force: true }));
+
+    expect(res.status).toBe(409);
+    expect(mocks.noPrConclusionDelete).not.toHaveBeenCalled();
   });
 });

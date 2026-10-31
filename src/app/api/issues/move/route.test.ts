@@ -12,6 +12,8 @@ const { mocks } = vi.hoisted(() => ({
     removeIssueLabel: vi.fn().mockResolvedValue(undefined),
     addIssueLabel: vi.fn().mockResolvedValue(undefined),
     auth: vi.fn(),
+    noPrConclusionFindUnique: vi.fn().mockResolvedValue(null),
+    noPrConclusionDelete: vi.fn().mockResolvedValue({}),
   },
 }));
 
@@ -31,6 +33,11 @@ vi.mock("@/lib/prisma", () => ({
     auditLog: {
       create: mocks.createAuditLog,
     },
+    // #1506: a board move retires the terminal no-PR park row atomically.
+    noPrConclusion: {
+      findUnique: mocks.noPrConclusionFindUnique,
+      delete: mocks.noPrConclusionDelete,
+    },
     // The move commits the cache write and its lifecycle event together (#1202).
     $transaction: (arg: any) =>
       Promise.resolve(
@@ -40,6 +47,10 @@ vi.mock("@/lib/prisma", () => ({
               issueLifecycleEvent: {
                 create: mocks.createLifecycleEvent,
                 upsert: mocks.upsertLifecycleEvent,
+              },
+              noPrConclusion: {
+                findUnique: mocks.noPrConclusionFindUnique,
+                delete: mocks.noPrConclusionDelete,
               },
             })
           : Promise.all(arg),
@@ -511,5 +522,88 @@ describe("POST /api/issues/move — closed-issue guard (#1206)", () => {
     expect(res.status).toBe(400);
     expect(mocks.updateIssue).not.toHaveBeenCalled();
     expect(mocks.createAuditLog).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/issues/move — terminal no-PR park clear (#1506)", () => {
+  const PARKED_ISSUE = {
+    id: "issue-1",
+    state: "open",
+    labels: ["status/backlog"],
+    number: 42,
+  };
+  const LIVE_PARK = {
+    id: "park-1",
+    issueId: "issue-1",
+    agentName: "alpha",
+    outcome: "no_changes_needed",
+    summary: null,
+    evidence: null,
+    contentFingerprint: "sha256:whatever",
+    createdAt: new Date("2026-10-31T00:00:00.000Z"),
+  };
+
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    delete process.env.DISPATCH_AUTH_USERNAME;
+    delete process.env.DISPATCH_AUTH_PASSWORD;
+    resetAuthCaches();
+    resetRateLimits();
+    vi.clearAllMocks();
+    mocks.auth.mockReset();
+    // clearAllMocks keeps prior implementations alive, so pin the park
+    // lookup back to "no row" every test.
+    mocks.noPrConclusionFindUnique.mockResolvedValue(null);
+    mocks.findIssue.mockResolvedValue(PARKED_ISSUE);
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+  });
+
+  it("retires the stored terminal conclusion in the same commit as the move", async () => {
+    mocks.noPrConclusionFindUnique.mockResolvedValue(LIVE_PARK);
+
+    const res = await postRequest(makePayload({ actor: "operator-1" }));
+
+    expect(res.status).toBe(200);
+    // The park row is retired atomically with the cache write (the tx
+    // client, not the outer prisma, performs the delete).
+    expect(mocks.noPrConclusionDelete).toHaveBeenCalledWith({ where: { issueId: "issue-1" } });
+    expect(mocks.createLifecycleEvent).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        issueId: "issue-1",
+        kind: "conclusion_cleared",
+        source: "api:move",
+        actor: "operator-1",
+        metadata: {
+          parkedBy: "alpha",
+          parkedOutcome: "no_changes_needed",
+          reason: "board move",
+        },
+      }),
+    });
+  });
+
+  it("is a no-op when the issue carries no park row", async () => {
+    const res = await postRequest(makePayload());
+
+    expect(res.status).toBe(200);
+    expect(mocks.noPrConclusionDelete).not.toHaveBeenCalled();
+    const clearedCalls = mocks.createLifecycleEvent.mock.calls.filter(
+      (call: any) => (call[0] as any).data?.kind === "conclusion_cleared",
+    );
+    expect(clearedCalls).toHaveLength(0);
+  });
+
+  it("a move that fails before its commit never retires the park", async () => {
+    mocks.noPrConclusionFindUnique.mockResolvedValue(LIVE_PARK);
+    mocks.removeIssueLabel.mockRejectedValueOnce(new Error("github 500"));
+
+    const res = await postRequest(makePayload());
+
+    expect(res.status).toBe(500);
+    // The GitHub mutation fails before the transaction ever runs.
+    expect(mocks.noPrConclusionDelete).not.toHaveBeenCalled();
   });
 });

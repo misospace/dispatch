@@ -22,6 +22,7 @@ import { parseExecutionMetadata } from "@/lib/execution-metadata";
 import { PLAN_LIMITS } from "@/lib/groomer/plan";
 import { getLiveIssueLabels } from "@/lib/claim-gate";
 import { recordLifecycleEventQuietly } from "@/lib/issue-lifecycle";
+import { isNoPrConclusionOutcome, recordNoPrConclusion } from "@/lib/no-pr-conclusion";
 import { AGENT_PREFIX, getAgentFromLabels } from "@/types";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
@@ -844,6 +845,59 @@ export async function POST(
       }
     }
 
+    // #1506: a terminal no-PR conclusion on an implement task parks the issue so
+    // buildAgentQueue/next-task stop re-offering it — otherwise the reconciler's
+    // restore-to-ready (no open or merged fixing PR found) loops it forever
+    // (misospace/courier#665). The park is a Dispatch-side ledger row; GitHub is
+    // untouched. It is recorded in every DISPATCH_NO_PR_CONCLUSION_MODE (the
+    // mode only decides whether the queue enforces the withhold). It is
+    // best-effort: a report must never fail over it, and a 5xx retry would hit
+    // the duplicate branch and never re-park, so a park-write failure is
+    // logged, not thrown. A successful already_done close supersedes the park
+    // (the close is the harder stop; a park surviving a reopen would withhold
+    // work a human explicitly brought back). A duplicate (idempotent replay)
+    // never re-parks — the original report owns the side effect.
+    let conclusionPark: { applied: boolean; outcome?: string; reason: string } | undefined;
+    const conclusionOutcome = report.outcome;
+    if (report.taskType === "implement" && isNoPrConclusionOutcome(conclusionOutcome)) {
+      if (duplicate) {
+        conclusionPark = { applied: false, reason: "duplicate report; the conclusion park was not re-run" };
+      } else if (!issueId || !report.repoFullName || report.issueNumber === undefined) {
+        conclusionPark = { applied: false, reason: "issue-not-tracked" };
+      } else if (closeResolution && closeResolution.action === "closed") {
+        conclusionPark = { applied: false, reason: "issue-closed" };
+      } else {
+        try {
+          const parkedIssue = await prisma.issue.findUnique({
+            where: { id: issueId },
+            select: { title: true, body: true, state: true },
+          });
+          if (!parkedIssue) {
+            conclusionPark = { applied: false, reason: "issue-not-tracked" };
+          } else if (parkedIssue.state !== "open") {
+            conclusionPark = { applied: false, reason: "issue-not-open" };
+          } else {
+            await recordNoPrConclusion({
+              issueId,
+              repoFullName: report.repoFullName,
+              issueNumber: report.issueNumber,
+              agentName,
+              outcome: conclusionOutcome,
+              summary: report.summary,
+              evidence: report.evidence,
+              issue: { title: parkedIssue.title, body: parkedIssue.body },
+            });
+            conclusionPark = { applied: true, outcome: conclusionOutcome, reason: "parked" };
+          }
+        } catch (error) {
+          console.warn(
+            `[no-pr-conclusion] failed to park ${report.repoFullName}#${report.issueNumber} (${conclusionOutcome}): ${error instanceof Error ? error.message : String(error)}`,
+          );
+          conclusionPark = { applied: false, reason: "park-write-failed" };
+        }
+      }
+    }
+
     // A failed or blocked attempt is a lifecycle event of its own (#1202): it
     // is the evidence that distinguishes "released because the work finished"
     // from "released because the worker gave up", which a status label alone
@@ -884,6 +938,7 @@ export async function POST(
       agentRunId: run.id,
       prFixResolution,
       ...(closeResolution ? { closeResolution } : {}),
+      ...(conclusionPark ? { conclusionPark } : {}),
       ...(duplicate ? { duplicate: true } : {}),
     });
   } catch (error) {

@@ -101,8 +101,11 @@ The `tasks/report` endpoint accepts these outcomes:
 | `issue_closed` | The issue was closed |
 | `blocked` | Work cannot proceed without external input |
 | `failed` | The task failed unexpectedly |
-| `no_changes_needed` | No action was required |
-| `already_addressed` | A PR-fix attempt whose feedback was already handled — settles the queue item with an optional evidence string (commit SHAs/paths) and no new push (#1121). Still gated on PR merge state; a repeated same-evidence disagreement with an unchanged head reopens via #940 and bounds to BLOCKED at `PR_FIX_MAX_ATTEMPTS`. |
+| `no_changes_needed` | No action was required. On an **implement** task this is a terminal no-PR conclusion: Dispatch parks the issue out of queue pickup (#1506, see [docs/no-pr-conclusion-park.md](../../../docs/no-pr-conclusion-park.md)); the response echoes `conclusionPark`. |
+| `already_addressed` | A PR-fix attempt whose feedback was already handled — settles the queue item with an optional evidence string (commit SHAs/paths) and no new push (#1121). Still gated on PR merge state; a repeated same-evidence disagreement with an unchanged head reopens via #940 and bounds to BLOCKED at `PR_FIX_MAX_ATTEMPTS`. On an **implement** task (no `prFixItem`) it is a terminal no-PR conclusion and parks the issue out of queue pickup (#1506). |
+| `already_done` | Implement-only assertion that the work already shipped. Runs the evidence-pinned close policy (#1143); a refused close still records the terminal no-PR park so the issue stops being re-offered (#1506). A successful close supersedes the park. |
+
+The three terminal no-PR outcomes (`no_changes_needed`, `already_addressed` on implement, `already_done`) park the issue in Dispatch only: no GitHub label and no close. The park ends when the issue title or body is edited, or when an operator clears it (`DELETE /api/issues/[issueId]/no-pr-conclusion`, a status change, a board move, or a maintainer force-claim). A parked issue is refused by `POST /api/issues/claim` with 409 for every non-force claim.
 | `handed-off` | The worker accepted the task but handed it to another process; records a neutral terminal run status and preserves supplied issue/PR identity without settling the PR-fix queue. Independent pr-followup sync owns ingestion. |
 | `capacity-exhausted` | Explicit recognition that the worker's execution capacity cannot run the handed PR-fix attempt (#1256). Requires the issued `prFixItem` token (including its per-hand-out `handoutToken` receipt) and a `capacity` identifier; releases exactly the issued hand-out without spending repair budget and records a capacity-scoped cooldown. For claimed issue work use `POST /api/issues/capacity-handoff` instead. |
 

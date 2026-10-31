@@ -49,6 +49,7 @@ model Issue {
   handoffSettlements          IssueHandoffSettlement[]
   ownershipReleaseIntents     OwnershipReleaseIntent[]
   ownershipReconcileCandidate OwnershipReconcileCandidate?
+  noPrConclusion              NoPrConclusion?
 
   // Escalated lane outcome tracking
   decomposed     Boolean   @default(false)
@@ -157,6 +158,33 @@ model IssueMutationGuard {
   updatedAt  DateTime @updatedAt
 
   @@index([agentName, claimToken])
+}
+
+// #1506: a worker's terminal no-PR conclusion on an implement task
+// (`no_changes_needed`, `already_addressed`, `already_done`) parks the issue
+// out of the agent queue so reconciliation's restore-to-ready cannot re-offer
+// concluded work forever. Dispatch-side queue policy only: no GitHub label or
+// close is written. The park is live while the issue content fingerprint
+// matches (a title/body edit ends it) and until an operator clears it
+// (DELETE /api/issues/[issueId]/no-pr-conclusion, a status set, a board move,
+// or a maintainer force-claim). One live park per issue: a later terminal
+// conclusion replaces it.
+model NoPrConclusion {
+  id                 String   @id @default(cuid())
+  issueId            String   @unique
+  issue              Issue    @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  agentName          String
+  outcome            String
+  summary            String?  @db.Text
+  evidence           String?  @db.Text
+  // sha256 over canonical { title, body } at park time (labels/state excluded
+  // on purpose: status churn — including the reconciler's in-review restore —
+  // must never end a park; a content edit always does).
+  contentFingerprint String
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@index([createdAt])
 }
 
 enum PrFixLane {

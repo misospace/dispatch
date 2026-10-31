@@ -11,6 +11,8 @@ const { mocks } = vi.hoisted(() => ({
     removeIssueLabel: vi.fn(),
     addIssueLabel: vi.fn(),
     getLiveIssueLabels: vi.fn().mockResolvedValue([] as string[]),
+    noPrConclusionFindUnique: vi.fn().mockResolvedValue(null),
+    noPrConclusionDelete: vi.fn().mockResolvedValue({}),
   },
 }));
 
@@ -26,6 +28,11 @@ vi.mock("@/lib/prisma", () => ({
       upsert: mocks.upsertLifecycleEvent,
     },
     auditLog: { create: mocks.createAuditLog },
+    // #1506: a status change retires the terminal no-PR park row atomically.
+    noPrConclusion: {
+      findUnique: mocks.noPrConclusionFindUnique,
+      delete: mocks.noPrConclusionDelete,
+    },
     // The status write and its lifecycle event commit together (#1202).
     $transaction: (arg: any) =>
       Promise.resolve(
@@ -35,6 +42,10 @@ vi.mock("@/lib/prisma", () => ({
               issueLifecycleEvent: {
                 create: mocks.createLifecycleEvent,
                 upsert: mocks.upsertLifecycleEvent,
+              },
+              noPrConclusion: {
+                findUnique: mocks.noPrConclusionFindUnique,
+                delete: mocks.noPrConclusionDelete,
               },
             })
           : Promise.all(arg),
@@ -50,6 +61,7 @@ vi.mock("@/lib/github", () => ({
 vi.mock("@/lib/claim-gate", () => ({ getLiveIssueLabels: mocks.getLiveIssueLabels }));
 
 import { resetRateLimits } from "@/lib/rate-limit";
+import { computeConclusionContentFingerprint } from "@/lib/no-pr-conclusion";
 import { POST } from "./route";
 
 // Reset process-global per-actor rate-limit windows per test (see claim suite).
@@ -636,5 +648,121 @@ describe("POST /api/issues/status — lifecycle evidence (#1202)", () => {
         metadata: { recoveredFromMirroredState: true },
       }),
     });
+  });
+});
+
+describe("POST /api/issues/status — terminal no-PR park clear (#1506)", () => {
+  const PARKED_ISSUE = {
+    id: "issue-1",
+    state: "open",
+    labels: ["status/ready"] as string[],
+    number: 42,
+    title: "Fix the flaky test suite",
+    body: "Already fixed upstream; no changes needed here.",
+    repository: { fullName: "org/repo" },
+  };
+  const LIVE_PARK = {
+    id: "park-1",
+    issueId: "issue-1",
+    agentName: "alpha",
+    outcome: "no_changes_needed",
+    summary: null,
+    evidence: null,
+    contentFingerprint: computeConclusionContentFingerprint(PARKED_ISSUE),
+    createdAt: new Date("2026-10-31T00:00:00.000Z"),
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // clearAllMocks keeps prior implementations alive, so pin the park
+    // lookup back to "no row" every test.
+    mocks.noPrConclusionFindUnique.mockResolvedValue(null);
+    mocks.findUnique.mockResolvedValue(PARKED_ISSUE);
+    mocks.getLiveIssueLabels.mockResolvedValue(["status/ready"]);
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+  });
+
+  it("retires the stored terminal conclusion in the same commit as the status change", async () => {
+    mocks.noPrConclusionFindUnique.mockResolvedValue(LIVE_PARK);
+
+    const res = await POST(makeRequest({ status: "in-progress", actor: "operator-1" }));
+
+    expect(res.status).toBe(200);
+    // The park row is retired atomically with the transition (the tx client,
+    // not the outer prisma, performs the delete).
+    expect(mocks.noPrConclusionDelete).toHaveBeenCalledWith({ where: { issueId: "issue-1" } });
+    expect(mocks.createLifecycleEvent).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        issueId: "issue-1",
+        kind: "conclusion_cleared",
+        source: "api:status",
+        actor: "operator-1",
+        metadata: {
+          parkedBy: "alpha",
+          parkedOutcome: "no_changes_needed",
+          reason: "status status/in-progress",
+        },
+      }),
+    });
+  });
+
+  it("is a no-op (never 409/400) when the issue carries no park row", async () => {
+    // noPrConclusionFindUnique resolves null by default.
+    const res = await POST(makeRequest({ status: "in-progress" }));
+
+    expect(res.status).toBe(200);
+    expect(mocks.noPrConclusionDelete).not.toHaveBeenCalled();
+    // No clear event, and the transition itself still records exactly one
+    // status_changed event.
+    const clearedCalls = mocks.createLifecycleEvent.mock.calls.filter(
+      (call: any) => (call[0] as any).data?.kind === "conclusion_cleared",
+    );
+    expect(clearedCalls).toHaveLength(0);
+    const statusCalls = mocks.createLifecycleEvent.mock.calls.filter(
+      (call: any) => (call[0] as any).data?.kind === "status_changed",
+    );
+    expect(statusCalls).toHaveLength(1);
+  });
+
+  it("a worker-tier status change never discharges the park", async () => {
+    // The same worker that concluded may set status on its assigned issue;
+    // that must not retire its own park. Ending a park is the operator's call.
+    mocks.noPrConclusionFindUnique.mockResolvedValue(LIVE_PARK);
+    mocks.getLiveIssueLabels.mockResolvedValue(["agent/alpha", "status/ready"]);
+
+    const res = await POST(
+      new Request("http://localhost/api/issues/status", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer status-worker-token" },
+        body: JSON.stringify({
+          issueId: "issue-1",
+          repoFullName: "org/repo",
+          issueNumber: 42,
+          status: "in-progress",
+          agentName: "alpha",
+        }),
+      }),
+    );
+
+    expect(res.status).toBe(200);
+    expect(mocks.noPrConclusionDelete).not.toHaveBeenCalled();
+    const clearedCalls = mocks.createLifecycleEvent.mock.calls.filter(
+      (call: any) => (call[0] as any).data?.kind === "conclusion_cleared",
+    );
+    expect(clearedCalls).toHaveLength(0);
+  });
+
+  it("a failing status write never retires the park (same transaction rolls back)", async () => {
+    mocks.noPrConclusionFindUnique.mockResolvedValue(LIVE_PARK);
+    mocks.updateIssue.mockRejectedValueOnce(new Error("db down"));
+
+    const res = await POST(makeRequest({ status: "in-progress" }));
+
+    expect(res.status).toBe(500);
+    // The mirror update throws before the clear runs, so nothing is retired.
+    expect(mocks.noPrConclusionDelete).not.toHaveBeenCalled();
   });
 });
