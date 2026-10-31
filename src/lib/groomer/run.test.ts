@@ -2235,15 +2235,21 @@ Investigate session handling in auth module.`;
       expect(mocks.addIssueComment).toHaveBeenCalledTimes(1);
 
       // Exact retry of the same plan: the application replays — no comment or
-      // label write repeats, and only the cooldown stamp moves.
+      // label write repeats; the cooldown stamp moves and the freshness
+      // baseline re-anchors (#1472).
       mocks.prisma.issue.update.mockClear();
       const result = await runHostedGroomer();
       expect(result!.appliedMutations?.outcome).toBe("replayed");
       expect(mocks.addIssueComment).toHaveBeenCalledTimes(1);
       expect(mocks.updateIssueLabels).toHaveBeenCalledTimes(1);
+      // #1472: the replay now also re-anchors the freshness baseline, so the
+      // write is no longer only the cooldown stamp. It still writes no reason
+      // field and no pending action.
       for (const call of mocks.prisma.issue.update.mock.calls) {
         const data = (call[0] as { data: Record<string, unknown> }).data;
-        expect(Object.keys(data).sort()).toEqual(["groomedAt", "groomedBy", "groomingRetryAfter"]);
+        expect(data).toMatchObject({ groomedBy: "hosted-groomer", groomingRetryAfter: null });
+        for (const field of ["needsInfoReason", "blockedReason", "notReadyReason"]) expect(field in data).toBe(false);
+        expect("nextGroomingAction" in data).toBe(false);
       }
     });
   });
@@ -3055,6 +3061,39 @@ Investigate session handling in auth module.`;
       );
     });
 
+    it("a replayed application re-anchors the baseline and clears the stale mark (#1472)", async () => {
+      // A row the freshness pass marked stale is re-groomed; when the re-groom
+      // replays the identical application, that replay is a fresh validation
+      // of the same verdict against current evidence. It must re-anchor the
+      // baseline and clear the stale mark: a surviving mark keeps the
+      // selector's stale branch (which bypasses the cooldown and the
+      // blocked/not-ready parking) re-offering the row every stale floor.
+      mocks.prisma.groomingRun.create.mockImplementation(
+        async () => ({ id: `gr-${mocks.prisma.groomingRun.create.mock.calls.length}`, stage: "selected" }),
+      );
+      await runHostedGroomer();
+      mocks.prisma.issue.update.mockClear();
+
+      const result = await runHostedGroomer();
+      expect(result!.appliedMutations?.outcome).toBe("replayed");
+
+      // The replay's write settles the row: stale mark cleared, baseline
+      // re-anchored to this run's evidence (replay run id, same digest, a
+      // head-verified pin), so the next selection sees a fresh row under the
+      // normal 24h cooldown instead of a permanently invalidated one.
+      const data = issueUpdateData();
+      expect(data).toMatchObject({
+        groomedRunId: "gr-2",
+        groomedHeadSha: "abc123",
+        groomedEvidenceDigest: "digest",
+        groomingVerifiedSha: "abc123",
+        groomingStaleAt: null,
+        groomingStaleReasons: [],
+        groomingStaleDetail: null,
+      });
+      expect(data.groomedIssueFingerprint).toBeTruthy();
+    });
+
     it("relies on the plan's cited read paths, not every path the run read", async () => {
       mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, toolLoopEnabled: true });
       mocks.exploreRepository.mockResolvedValue({ ...mockExploration, sources: ["src/x.ts"], readSources: ["src/x.ts"] });
@@ -3505,13 +3544,17 @@ Investigate session handling in auth module.`;
       expect(mocks.addIssueComment).toHaveBeenCalledTimes(1);
       expect(mocks.updateIssueLabels).toHaveBeenCalledTimes(1);
       expect(mocks.updateIssueTitleAndBody).toHaveBeenCalledTimes(1);
-      // The replay writes no lane history and only the local cooldown stamp.
+      // The replay writes no lane history: the cooldown stamp moves and the
+      // freshness baseline re-anchors with the stale mark cleared (#1472).
       expect(mocks.prisma.issueLane.create).toHaveBeenCalledTimes(1);
-      expect(Object.keys(mocks.prisma.issue.update.mock.calls.at(-1)![0].data).sort()).toEqual([
-        "groomedAt",
-        "groomedBy",
-        "groomingRetryAfter",
-      ]);
+      expect(mocks.prisma.issue.update.mock.calls.at(-1)![0].data).toMatchObject({
+        groomedAt: expect.any(Date),
+        groomedBy: "hosted-groomer",
+        groomingRetryAfter: null,
+        groomingStaleAt: null,
+        groomingStaleReasons: [],
+        groomingStaleDetail: null,
+      });
       expect(first!.mutationPlan!.applicationKey).toBe(second!.mutationPlan!.applicationKey);
     });
 
@@ -4215,9 +4258,11 @@ Investigate session handling in auth module.`;
       mocks.prisma.issue.update.mockClear();
       const result = await runHostedGroomer();
       expect(result!.appliedMutations?.outcome).toBe("replayed");
+      // The replay re-anchors the freshness baseline (#1472) but never
+      // touches the projection this application already owns.
       for (const call of mocks.prisma.issue.update.mock.calls) {
         const data = (call[0] as { data: Record<string, unknown> }).data;
-        expect(Object.keys(data).sort()).toEqual(["groomedAt", "groomedBy", "groomingRetryAfter"]);
+        expect("releaseSignal" in data).toBe(false);
       }
     });
 
@@ -4347,9 +4392,11 @@ Investigate session handling in auth module.`;
       mocks.prisma.issue.update.mockClear();
       const result = await runHostedGroomer();
       expect(result!.appliedMutations?.outcome).toBe("replayed");
+      // The replay re-anchors the freshness baseline (#1472) but never
+      // rewrites the tombstone this application already owns.
       for (const call of mocks.prisma.issue.update.mock.calls) {
         const data = (call[0] as { data: Record<string, unknown> }).data;
-        expect(Object.keys(data).sort()).toEqual(["groomedAt", "groomedBy", "groomingRetryAfter"]);
+        expect("releaseSignal" in data).toBe(false);
       }
     });
 
