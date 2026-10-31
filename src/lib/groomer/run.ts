@@ -1173,6 +1173,48 @@ async function executeGroomerRun(
           ? { ...diff.releaseSignal, provenance: healProvenance }
           : clearedReleaseSignalProjection(healProvenance);
       }
+      // #1472: a replay is a fresh validation of the same verdict against
+      // current evidence — this run collected its evidence, built the plan,
+      // and the apply-time preconditions verified that evidence against the
+      // live state — so the freshness baseline re-anchors here exactly as an
+      // applied outcome re-anchors it. This is what clears a stale mark:
+      // without the clear the selector's stale branch keeps bypassing the
+      // cooldown and the blocked/not-ready parking and re-offers the row
+      // forever; clearing without re-anchoring would not help either, since
+      // the same invalidation (fingerprint behind, dependency set moved, head
+      // ahead of the verified sha) would just re-mark the row on the next
+      // freshness pass. The builder never throws: on a recording failure the
+      // columns reset to unknown with the mark cleared, the same fallback the
+      // applied path uses.
+      Object.assign(
+        replayData,
+        await freshnessBaselineIssueData(deps.prisma, {
+          groomingRunId: groomingRun.id,
+          repoFullName: candidate.repoFullName,
+          issueNumber: candidate.number,
+          evidence,
+          candidate,
+          // A replayed application wrote nothing: the current state is the
+          // evidence state, and the applier reports the labels as the analysis
+          // found them (title/body null → the evidence snapshot is the truth).
+          labelsAfter: applied.labels,
+          closed: applied.closed,
+          evidenceWindowStart,
+          repositoryQueries: repositoryContext.queries,
+          repositoryEmptyQueries: repositoryContext.emptyQueries,
+          explorationRan: exploration !== null,
+          explorationToolCalls: exploration ? explorationCallsForFreshness(exploration.toolCalls) : [],
+          citations: plan.citations,
+          blockedDependencyKeys:
+            output.nextGroomingAction === "mark_blocked" ? typedVerdictDependencyKeys(plan, evidenceCatalog) : [],
+        }),
+      );
+      // Same live-head verification as the applied path: the preconditions
+      // just checked the pinned evidence against the live head.
+      const replayHead = preconditions.checks.find((c) => c.name === "head");
+      if (replayData.groomedIssueFingerprint && replayHead?.status === "passed" && preconditions.liveHeadSha) {
+        replayData.groomingVerifiedSha = preconditions.liveHeadSha;
+      }
       await deps.prisma.issue.update({
         where: { id: candidate.id },
         data: replayData,
