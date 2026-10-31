@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, afterEach } from "vitest";
 import {
   AGENT_EXECUTION_LIVENESS_MS,
   AGENT_EXECUTION_LIST_LIMIT,
@@ -7,10 +7,13 @@ import {
   AGENT_EXECUTION_WORK_TYPES,
   AgentExecutionDeps,
   AgentExecutionError,
+  DEFAULT_AGENT_EXECUTION_RETENTION_MS,
   TERMINAL_AGENT_EXECUTION_STATES,
   applyExecutionObservation,
   deriveExecutionStaleness,
+  getAgentExecutionRetentionMs,
   listActiveExecutions,
+  pruneTerminalExecutions,
   reportExecutionObservation,
   resolveObservedAt,
   validateExecutionObservation,
@@ -778,5 +781,79 @@ describe("listActiveExecutions", () => {
       ["recent", "live"],
       ["aged", "stale"],
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Retention prune (#1499)
+// ---------------------------------------------------------------------------
+
+describe("getAgentExecutionRetentionMs", () => {
+  const original = process.env.DISPATCH_AGENT_EXECUTION_RETENTION_MS;
+
+  afterEach(() => {
+    if (original === undefined) delete process.env.DISPATCH_AGENT_EXECUTION_RETENTION_MS;
+    else process.env.DISPATCH_AGENT_EXECUTION_RETENTION_MS = original;
+  });
+
+  it("defaults to 7d — well past the 24h recent-terminal display window", () => {
+    expect(DEFAULT_AGENT_EXECUTION_RETENTION_MS).toBe(7 * 24 * 60 * 60_000);
+    delete process.env.DISPATCH_AGENT_EXECUTION_RETENTION_MS;
+    expect(getAgentExecutionRetentionMs()).toBe(7 * 24 * 60 * 60_000);
+  });
+
+  it("honors DISPATCH_AGENT_EXECUTION_RETENTION_MS inside the clamp range", () => {
+    process.env.DISPATCH_AGENT_EXECUTION_RETENTION_MS = String(24 * 60 * 60_000);
+    expect(getAgentExecutionRetentionMs()).toBe(24 * 60 * 60_000);
+  });
+
+  it("clamps 1h–90d and falls back to the default on garbage", () => {
+    process.env.DISPATCH_AGENT_EXECUTION_RETENTION_MS = "1";
+    expect(getAgentExecutionRetentionMs()).toBe(60 * 60_000);
+    process.env.DISPATCH_AGENT_EXECUTION_RETENTION_MS = String(365 * 24 * 60 * 60_000);
+    expect(getAgentExecutionRetentionMs()).toBe(90 * 24 * 60 * 60_000);
+    process.env.DISPATCH_AGENT_EXECUTION_RETENTION_MS = "7d";
+    expect(getAgentExecutionRetentionMs()).toBe(7 * 24 * 60 * 60_000);
+  });
+});
+
+describe("pruneTerminalExecutions", () => {
+  function makePruneDeps(count = 3) {
+    const deleteMany = vi.fn(async (_args: { where: Record<string, unknown> }) => ({ count }));
+    return { deps: { agentExecution: { deleteMany } }, deleteMany };
+  }
+
+  it("fences the delete on the terminal state set and the retention cutoff", async () => {
+    const { deps, deleteMany } = makePruneDeps(0);
+    const result = await pruneTerminalExecutions(deps, { now: NOW, retentionMs: 24 * 60 * 60_000 });
+    expect(result.prunedCount).toBe(0);
+    expect(result.cutoff).toEqual(new Date(NOW.getTime() - 24 * 60 * 60_000));
+    expect(deleteMany).toHaveBeenCalledWith({
+      where: {
+        executionState: { in: ["SUCCEEDED", "FAILED", "BLOCKED", "BLOCKED_EXTERNAL", "HANDED_OFF"] },
+        lastObservedAt: { lt: new Date(NOW.getTime() - 24 * 60 * 60_000) },
+      },
+    });
+  });
+
+  it("defaults the retention to the env-derived window and now to the clock", async () => {
+    const { deps, deleteMany } = makePruneDeps(5);
+    const result = await pruneTerminalExecutions(deps);
+    expect(result.prunedCount).toBe(5);
+    const where = deleteMany.mock.calls[0][0].where as {
+      executionState: { in: string[] };
+      lastObservedAt: { lt: Date };
+    };
+    expect(where.executionState.in).toEqual([...TERMINAL_AGENT_EXECUTION_STATES]);
+    // now is the real clock; cutoff must be exactly retention behind it.
+    expect(Date.now() - where.lastObservedAt.lt.getTime()).toBeGreaterThanOrEqual(
+      DEFAULT_AGENT_EXECUTION_RETENTION_MS,
+    );
+  });
+
+  it("returns the deleted count from the injected surface", async () => {
+    const { deps } = makePruneDeps(42);
+    const result = await pruneTerminalExecutions(deps, { now: NOW, retentionMs: 60_000 });
+    expect(result.prunedCount).toBe(42);
   });
 });
