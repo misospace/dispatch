@@ -465,7 +465,31 @@ describe("computeApplicationKey", () => {
     const input = { repoFullName: "org/repo", issueNumber: 42, plan: planFor(d), diff: diffFor(d) };
     const v1Key = v1ApplicationKey(input);
     expect(computeApplicationKey(input)).not.toBe(v1Key);
-    expect(APPLICATION_KEY_VERSION).toBe(3);
+    expect(APPLICATION_KEY_VERSION).toBe(4);
+  });
+
+  it("changes when the verdict summary changes, so a summary-only re-groom applies (dispatch#1470)", () => {
+    // The summary is persisted to Issue.groomingSummary and displayed on the
+    // board, so a re-groom whose summary text changed is a different intent:
+    // it must be applied, not replayed with the stale one.
+    const keyFor = (summary: string) =>
+      computeApplicationKey({
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        plan: planFor(draft({ summary })),
+        diff: diffFor(draft({ summary })),
+      });
+    expect(keyFor("Ready.")).toBe(keyFor("Ready."));
+    expect(keyFor("Ready.")).not.toBe(keyFor("Ready, and the return URL survives a reset."));
+  });
+
+  it("no longer matches the pre-#1470 (v3) key for the same plan, so existing rows cannot block (dispatch#1470)", () => {
+    const input = { repoFullName: "org/repo", issueNumber: 42, plan: planFor(draft()), diff: diffFor(draft()) };
+    // Every pre-bump generation is invalidated at once (the version field is
+    // part of the digest), so no stored v1/v2/v3 row can match a v4 key.
+    expect(computeApplicationKey(input)).not.toBe(v3ApplicationKey(input));
+    expect(computeApplicationKey(input)).not.toBe(v2ApplicationKey(input));
+    expect(APPLICATION_KEY_VERSION).toBe(4);
   });
 
   it("is carried by the comment marker, which only counts at the end of a comment Dispatch posted", () => {
@@ -544,6 +568,42 @@ function v2ApplicationKey(input: {
       close: input.diff.close,
       reason: input.diff.persistedReason,
       action: input.diff.output.nextGroomingAction ?? null,
+      children: input.diff.children
+        ? input.diff.children.briefs.map((brief) => childBriefKey(input.repoFullName, input.issueNumber, brief)).sort()
+        : null,
+    },
+  };
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
+/**
+ * The v3 application key, exactly as main computed it before dispatch#1470:
+ * the persisted reason, verdict action and release signal had joined the
+ * intent, the verdict summary had not, and v: 3. Field order included, since
+ * the digest hashes the serialized JSON.
+ */
+function v3ApplicationKey(input: {
+  repoFullName: string;
+  issueNumber: number;
+  plan: GroomingPlan;
+  diff: GroomingMutationDiff;
+}): string {
+  const canonical = {
+    v: 3,
+    repo: input.repoFullName.toLowerCase(),
+    issue: input.issueNumber,
+    evidenceDigest: input.plan.evidence.evidenceDigest,
+    planVersion: input.plan.schemaVersion,
+    intent: {
+      labels: [...new Set(input.diff.labelsAfter)].sort(),
+      lane: input.diff.lane,
+      comment: input.diff.comment,
+      title: input.diff.title,
+      body: input.diff.body,
+      close: input.diff.close,
+      reason: input.diff.persistedReason,
+      action: input.diff.output.nextGroomingAction ?? null,
+      releaseSignal: input.diff.releaseSignal,
       children: input.diff.children
         ? input.diff.children.briefs.map((brief) => childBriefKey(input.repoFullName, input.issueNumber, brief)).sort()
         : null,
@@ -792,13 +852,13 @@ describe("applyGroomingMutations", () => {
 
   it("re-applies once under a fresh key when existing rows were recorded before the version bump (deploy decision)", async () => {
     // Rows are not migrated: an older generation's key cannot be recomputed
-    // under the new shape (v3 adds releaseSignal, dispatch#1481). The first
-    // post-deploy groom claims its fresh v3 key and applies again — the
+    // under the new shape (v4 adds the verdict summary, dispatch#1470). The
+    // first post-deploy groom claims its fresh v4 key and applies again — the
     // comment re-posts, subject to the comment cooldown — and the old row is
-    // left untouched. A second application under the same v3 key replays:
+    // left untouched. A second application under the same v4 key replays:
     // idempotency resumes after the one re-apply.
     const fullInput = applyInput(fullDiff());
-    const preBumpKey = v2ApplicationKey({
+    const preBumpKey = v3ApplicationKey({
       repoFullName: fullInput.repoFullName,
       issueNumber: fullInput.issueNumber,
       plan: fullPlan,
@@ -826,12 +886,12 @@ describe("applyGroomingMutations", () => {
   });
 
   it("a pre-bump comment still suppresses the re-applied comment inside the cooldown window (deploy decision)", async () => {
-    // The pre-bump comment's marker no longer matches the fresh v3 key, so it
+    // The pre-bump comment's marker no longer matches the fresh v4 key, so it
     // is not the application's own comment — but the cooldown counts any
     // Dispatch-posted groomer comment in the window, so the re-apply does not
     // double-post for a recently groomed issue.
     const fullInput = applyInput(fullDiff());
-    const preBumpKey = v2ApplicationKey({
+    const preBumpKey = v3ApplicationKey({
       repoFullName: fullInput.repoFullName,
       issueNumber: fullInput.issueNumber,
       plan: fullPlan,
