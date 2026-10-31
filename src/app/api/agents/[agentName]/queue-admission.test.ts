@@ -28,28 +28,47 @@ const { mocks } = vi.hoisted(() => ({
   },
 }));
 
-vi.mock("@/lib/prisma", () => ({
-  prisma: {
-    issue: { findMany: mocks.issueFindMany },
-    noPrConclusion: {
-      findMany: mocks.noPrConclusionFindMany,
-      deleteMany: mocks.noPrConclusionDeleteMany,
-    },
-    groomingRun: { findMany: mocks.groomingRunFindMany },
-    prFixQueueItem: {
-      findMany: mocks.prFixFindMany,
-      findUnique: mocks.prFixFindUnique,
-      create: mocks.prFixCreate,
-      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
-    },
-    prFixHistory: { create: mocks.prFixHistoryCreate },
-    $transaction: async (fn: any) => fn({
-      prFixQueueItem: { create: mocks.prFixCreate, findUnique: mocks.prFixFindUnique },
+vi.mock("@/lib/prisma", () => {
+  const prFixQueueItem = {
+    findMany: mocks.prFixFindMany,
+    findUnique: mocks.prFixFindUnique,
+    create: mocks.prFixCreate,
+    updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+  };
+  return {
+    prisma: {
+      issue: { findMany: mocks.issueFindMany },
+      // #1506: the terminal no-PR conclusion park ledger read/cleanup.
+      noPrConclusion: {
+        findMany: mocks.noPrConclusionFindMany,
+        deleteMany: mocks.noPrConclusionDeleteMany,
+      },
+      groomingRun: { findMany: mocks.groomingRunFindMany },
+      prFixQueueItem,
       prFixHistory: { create: mocks.prFixHistoryCreate },
-    }),
-  },
-  asPrFixQueueClient: (client: unknown) => client,
-}));
+      // #1503: the non-rebase hand-out now runs inside the issuance fence's
+      // transaction, so the tx surface must carry everything the fence path
+      // touches (the parent-classification read and the stamp/append CASes),
+      // mirroring the module client.
+      $transaction: async (fn: any) => fn({
+        issue: {
+          findFirst: async () => null,
+          // #1503 review: the fence's locked parent read — this fixture has no
+          // escalation-lane config beyond the global setup, so "no row" (a
+          // definitive NOT_ESCALATED) keeps ordinary work dispatching.
+          findFirstLocked: async () => null,
+        },
+        prFixQueueItem: {
+          create: mocks.prFixCreate,
+          findUnique: mocks.prFixFindUnique,
+          updateMany: (args: any) => prFixQueueItem.updateMany(args),
+        },
+        prFixHistory: { create: mocks.prFixHistoryCreate },
+      }),
+    },
+    asPrFixQueueClient: (client: unknown) => client,
+  };
+});
 
 vi.mock("@/lib/github", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/github")>()),

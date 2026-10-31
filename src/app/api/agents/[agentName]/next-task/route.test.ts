@@ -8,6 +8,11 @@ vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock(mockToken, { "test-worke
 const { mocks } = vi.hoisted(() => ({
   mocks: {
     issueFindMany: vi.fn(),
+    // #1503: linked-issue escalation provenance read by the hand-out gate.
+    issueFindFirst: vi.fn(),
+    // #1503 review: the fence's locked parent read (SELECT ... FOR SHARE) —
+    // the in-transaction serialization boundary.
+    issueFindFirstLocked: vi.fn(),
     prFixFindMany: vi.fn(),
     prFixCreate: vi.fn(),
     prFixHistoryCreate: vi.fn(),
@@ -73,19 +78,20 @@ vi.mock("@/lib/prisma", () => {
       return prFixQueueItem.updateMany(args);
     },
   };
-    return {
-      prisma: {
-        issue: { findMany: mocks.issueFindMany },
-        noPrConclusion: {
-          findMany: mocks.noPrConclusionFindMany,
-          deleteMany: mocks.noPrConclusionDeleteMany,
-        },
-        prFixQueueItem,
-        prFixHistory: { create: mocks.prFixHistoryCreate },
-        capacityHandoff: {
-          findMany: mocks.capacityHandoffFindMany,
-          deleteMany: mocks.capacityHandoffDeleteMany,
-        },
+  return {
+    prisma: {
+      issue: { findMany: mocks.issueFindMany, findFirst: mocks.issueFindFirst },
+      // #1506: the terminal no-PR conclusion park ledger read/cleanup.
+      noPrConclusion: {
+        findMany: mocks.noPrConclusionFindMany,
+        deleteMany: mocks.noPrConclusionDeleteMany,
+      },
+      prFixQueueItem,
+      prFixHistory: { create: mocks.prFixHistoryCreate },
+      capacityHandoff: {
+        findMany: mocks.capacityHandoffFindMany,
+        deleteMany: mocks.capacityHandoffDeleteMany,
+      },
       // The #1327 REBASE admission transaction runs the concurrency gate,
       // the dispatch stamp, and the hand-out push on the TRANSACTION client;
       // it mirrors the top-level surface here. $executeRaw is a no-op
@@ -93,12 +99,32 @@ vi.mock("@/lib/prisma", () => {
       // against PostgreSQL in pr-fix-rebase-type.integration.test.ts).
       $transaction: async (fn: any) => {
         // A failed admission (lock timeout, aborted transaction) must make
-        // the route fail CLOSED, so the failure is injectable here.
-        if (mocks.prFixTransactionError) throw mocks.prFixTransactionError;
+        // the route fail CLOSED, so the failure is injectable here. The
+        // error is ONE-SHOT (consumed on throw): a poll's later transaction
+        // — e.g. the #1503 non-rebase issuance fence after a failed REBASE
+        // admission — runs normally, mirroring production where the
+        // advisory-lock wait and a separate issuance transaction fail
+        // independently.
+        if (mocks.prFixTransactionError) {
+          const error = mocks.prFixTransactionError;
+          mocks.prFixTransactionError = null;
+          throw error;
+        }
         return fn({
           prFixQueueItem: txPrFixQueueItem,
           prFixHistory: { create: mocks.prFixHistoryCreate },
-          $executeRaw: async () => 1,
+          // #1503 review: the hand-out fence re-runs the escalation gate
+          // INSIDE the transaction, which reads the linked issue's
+          // `currentLane` through the tx surface (plain + LOCKED read) —
+          // mirror the top-level surface here.
+          issue: {
+            findFirst: mocks.issueFindFirst,
+            findFirstLocked: mocks.issueFindFirstLocked,
+          },
+          $executeRaw: async () => {
+            mocks.prFixTxSurfaces.push("executeRaw");
+            return 1;
+          },
         });
       },
     },
@@ -573,15 +599,17 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       row.type = "REBASE";
 
       // Poll 2a — an agent outside the pool is deferred BEFORE the admission
-      // transaction: no gate read, no writes.
+      // transaction: no gate read, no writes. (Poll 1's #1503 issuance-fence
+      // surfaces remain in the log; slice past them.)
       process.env.DISPATCH_REBASE_AGENTS = "local-coder";
       mocks.prFixUpdateMany.mockClear();
+      const surfacesBeforeDeferred = mocks.prFixTxSurfaces.length;
       const deferred = await (await GET(request(exclusionUrl()), {
         params: Promise.resolve({ agentName: "example-agent" }),
       })).json();
       expect(deferred.prFixItem).toBeUndefined();
       expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
-      expect(mocks.prFixTxSurfaces).toEqual([]);
+      expect(mocks.prFixTxSurfaces.slice(surfacesBeforeDeferred)).toEqual([]);
 
       // Poll 2b — a pool-eligible poll re-derives the lane from the flipped
       // row and enforces the serialized admission: the gate read and the
@@ -793,11 +821,15 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(mocks.prFixTxSurfaces).toContain("findUnique");
   });
 
-  it("keeps ordinary fix hand-outs off the admission transaction (#1327 review)", async () => {
-    // Mirror of the case above: ordinary fix work never takes the lane lock,
-    // so it must not run inside the rebase admission transaction.
+  it("keeps ordinary fix hand-outs off the REBASE admission transaction (#1327 review)", async () => {
+    // Ordinary fix work never takes the rebase lane lock. Since #1503 it
+    // DOES run inside its own issuance fence (serializable transaction around
+    // the escalation classification + hand-out), but that fence never reads
+    // the rebase concurrency gate (`findMany`, the in-flight hand-out probe)
+    // — the lane-lock signature read — and never touches $executeRaw. The
+    // hand-out itself still dispatches.
     const fix = { ...prFixRow(28) };
-    mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+    mocks.prFixFindMany.mockImplementation(async ({ where }: any) =>
       where?.OR ? [] : [fix]);
     mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
       (where.id === fix.id ? { ...fix } : null));
@@ -806,7 +838,14 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       params: Promise.resolve({ agentName: "example-agent" }),
     })).json();
     expect(body.type).toBe("followup-pr");
-    expect(mocks.prFixTxSurfaces).toEqual([]);
+    // Its OWN #1503 fence ran (stamp + append on the tx surface)...
+    expect(mocks.prFixTxSurfaces).toContain("findUnique");
+    expect(mocks.prFixTxSurfaces).toContain("updateMany");
+    // ...but the REBASE admission's lane lock ($executeRaw advisory lock) and
+    // its concurrency gate read never did: the #1503 fence is a plain
+    // locking-read transaction, not the advisory-lock boundary.
+    expect(mocks.prFixTxSurfaces).not.toContain("findMany");
+    expect(mocks.prFixTxSurfaces).not.toContain("executeRaw");
   });
 
   it("retries a deferred REBASE hand-out on the next poll (#1327 review)", async () => {
@@ -1105,6 +1144,12 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     });
     mocks.prFixUpdateMany.mockResolvedValue({ count: 1 });
     mocks.issueFindMany.mockResolvedValue([]);
+    // #1503: no linked issue resolves as escalation-classified unless a test
+    // opts in (keeps the hand-out gate inert for pre-existing fixtures).
+    mocks.issueFindFirst.mockResolvedValue(null);
+    // #1503 review: the fence's locked parent read defaults to "no linked
+    // issue row" (definitive NOT_ESCALATED) unless a test scripts it.
+    mocks.issueFindFirstLocked.mockResolvedValue(null);
     mocks.findLeasedIssueIds.mockResolvedValue([]);
   });
 
@@ -3905,5 +3950,188 @@ describe("GET /api/agents/[agentName]/next-task — CI park deferral suppression
     expect(body.type).toBe("idle");
     expect(row.agentHandouts).toEqual([]);
     expect(row.dispatchedGeneration ?? null).toBeNull();
+  });
+});
+
+// ─── #1503: escalation-lane (frontier) exclusivity at hand-out ──────────────
+//
+// A row linked to a frontier-classified issue is escalation-authoritative no
+// matter how it was classified at enqueue. The declared-normal poll must be
+// refused and the queued row corrected; the escalation poll keeps serving; the
+// mechanical REBASE lane (#1327) is the declared exception.
+
+describe("GET next-task escalation-lane exclusivity (#1503)", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    // REBASE admission runs for `example-agent` (the declared exception's
+    // pool), mirroring the main describe's harness defaults.
+    process.env.DISPATCH_REBASE_AGENTS = "example-agent";
+    resetAuthCaches();
+    vi.clearAllMocks();
+    mocks.prFixFindMany.mockResolvedValue([]);
+    mocks.linkedRows = [];
+    mocks.prFixTransactionError = null;
+    mocks.prFixTxSurfaces = [];
+    mocks.prFixUpdateMany.mockResolvedValue({ count: 1 });
+    mocks.prFixHistoryCreate.mockResolvedValue({});
+    mocks.issueFindMany.mockResolvedValue([]);
+    mocks.issueFindFirst.mockResolvedValue(null);
+    // #1503 review: the fence's locked parent read defaults to "no linked
+    // issue row" (definitive NOT_ESCALATED) unless a test scripts it.
+    mocks.issueFindFirstLocked.mockResolvedValue(null);
+    mocks.findLeasedIssueIds.mockResolvedValue([]);
+    mocks.fetchPullRequestLabels.mockResolvedValue([]);
+    mocks.fetchPullRequestHeadSha.mockResolvedValue(null);
+    mocks.prFixFindUniqueByRepo.mockResolvedValue(null);
+  });
+  afterEach(() => {
+    delete process.env.DISPATCH_REBASE_AGENTS;
+  });
+
+  function frontierLinkedRow(pr = 40) {
+    return {
+      id: `prfix-${pr}`, repo: "org/repo", pr, issue: 737,
+      url: `https://github.com/org/repo/pull/${pr}`, lane: "NORMAL", status: "QUEUED",
+      reason: "PR review: CHANGES_REQUESTED", feedback: [], evidenceKeys: [], author: "bot",
+      generation: 1, agentHandouts: [],
+    };
+  }
+
+  it("refuses a misclassified frontier row for the normal lane and issues the safe correction", async () => {
+    const row = frontierLinkedRow();
+    mocks.prFixFindMany.mockResolvedValue([row]);
+    mocks.issueFindFirst.mockResolvedValue({ currentLane: "frontier" });
+    const body = await (
+      await GET(request("/api/agents/example-agent/next-task?lane=local"), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })
+    ).json();
+    // Nothing handed out to the shared lane...
+    expect(body.type).toBe("idle");
+    // ...and the queued-row correction CAS fired with the live-attempt pins.
+    const cas = mocks.prFixUpdateMany.mock.calls.map(([args]: any) => args)
+      .find((args: any) => args.data?.lane === "ESCALATED");
+    expect(cas).toBeTruthy();
+    expect(cas.where).toMatchObject({
+      id: row.id,
+      lane: "NORMAL",
+      status: "QUEUED",
+      generation: 1,
+      agentHandouts: { equals: [] },
+    });
+    expect(cas.where.OR).toEqual([
+      { dispatchedGeneration: null },
+      { dispatchedGeneration: { not: 1 } },
+    ]);
+    expect(mocks.prFixHistoryCreate).toHaveBeenCalled();
+  });
+
+  it("refuses an already-ESCALATED row for the normal lane without touching it", async () => {
+    const row = { ...frontierLinkedRow(41), lane: "ESCALATED" };
+    mocks.prFixFindMany.mockResolvedValue([row]);
+    const body = await (
+      await GET(request("/api/agents/example-agent/next-task?lane=local"), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })
+    ).json();
+    expect(body.type).toBe("idle");
+    expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it("serves an ESCALATED row to the frontier lane", async () => {
+    const row = { ...frontierLinkedRow(42), lane: "ESCALATED" };
+    mocks.prFixFindMany.mockResolvedValue([row]);
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) => (where.id === row.id ? row : null));
+    const body = await (
+      await GET(request("/api/agents/example-agent/next-task?lane=frontier"), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })
+    ).json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem.id).toBe(row.id);
+  });
+
+  it("hands a REBASE row out on the normal lane despite a frontier link (#1327 exception)", async () => {
+    const row = {
+      ...frontierLinkedRow(43),
+      type: "REBASE",
+      reason: "Mechanical rebase: PR CONFLICTING against base (#1327)",
+    };
+    mocks.prFixFindMany.mockResolvedValue([row]);
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) => (where.id === row.id ? row : null));
+    mocks.issueFindFirst.mockResolvedValue({ currentLane: "frontier" });
+    const body = await (
+      await GET(request("/api/agents/example-agent/next-task?lane=local"), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })
+    ).json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem.fixType).toBe("REBASE");
+    // The mechanical lane skipped the escalation lookup entirely.
+    expect(mocks.issueFindFirst).not.toHaveBeenCalled();
+  });
+
+  it("refuses a NORMAL→frontier parent flip that lands between the gate read and the issuance write (TOCTOU race regression, #1503)", async () => {
+    // The pre-transaction gate reads the parent as still `local` (eligible),
+    // then the parent is reclassified `frontier` before the hand-out write.
+    // The issuance fence re-runs the gate INSIDE the transaction and takes the
+    // LOCKED parent read (`SELECT ... FOR SHARE`) as the authority, so the
+    // flip is seen atomically with issuance: refused + corrected, and the
+    // ordinary read-then-append window can never issue NORMAL work for a
+    // frontier parent.
+    const row = frontierLinkedRow(44);
+    mocks.prFixFindMany.mockResolvedValue([row]);
+    // Unlocked reads (pre-transaction gate + the fence's in-tx gate): the
+    // parent still looks `local`.
+    mocks.issueFindFirst.mockResolvedValue({ currentLane: "local" });
+    // The locked authority read inside the fence transaction sees the flip.
+    mocks.issueFindFirstLocked.mockResolvedValue({ currentLane: "frontier" });
+    const body = await (
+      await GET(request("/api/agents/example-agent/next-task?lane=local"), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })
+    ).json();
+    expect(body.type).toBe("idle");
+    // The unlocked parent was read by both gates, and the locked authority
+    // read ran exactly once — inside the issuance fence transaction.
+    expect(mocks.issueFindFirst).toHaveBeenCalledTimes(2);
+    expect(mocks.issueFindFirstLocked).toHaveBeenCalledTimes(1);
+    // The escalation correction CAS fired on the TRANSACTION surface (the
+    // fence's tx), with the same live-attempt pin shape as the plain-gate CAS.
+    const cas = mocks.prFixUpdateMany.mock.calls.map(([args]: any) => args)
+      .find((args: any) => args.data?.lane === "ESCALATED");
+    expect(cas).toBeTruthy();
+    expect(cas.where).toMatchObject({
+      id: row.id,
+      lane: "NORMAL",
+      status: "QUEUED",
+      generation: 1,
+      agentHandouts: { equals: [] },
+    });
+    expect(cas.where.OR).toEqual([
+      { dispatchedGeneration: null },
+      { dispatchedGeneration: { not: 1 } },
+    ]);
+    expect(mocks.prFixTxSurfaces).toContain("updateMany");
+    expect(mocks.prFixHistoryCreate).toHaveBeenCalled();
+    // No hand-out was stamped or appended for the normal consumer.
+    expect(mocks.prFixUpdateMany.mock.calls.filter((([args]: any) => Array.isArray(args.data?.agentHandouts?.push))).length).toBe(0);
+  });
+
+  it("defers a hand-out when the parent classification is unverifiable (lookup fails) for the normal lane (fail closed, #1503)", async () => {
+    const row = frontierLinkedRow(45);
+    mocks.prFixFindMany.mockResolvedValue([row]);
+    mocks.issueFindFirst.mockRejectedValue(new Error("db down"));
+    const body = await (
+      await GET(request("/api/agents/example-agent/next-task?lane=local"), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })
+    ).json();
+    expect(body.type).toBe("idle");
+    // UNKNOWN never manufactures a correction: nothing was verified, so no
+    // CAS, no history row — and of course no hand-out.
+    expect(mocks.prFixUpdateMany.mock.calls.filter((([args]: any) => args.data?.lane === "ESCALATED")).length).toBe(0);
+    expect(mocks.prFixHistoryCreate).not.toHaveBeenCalled();
+    expect(mocks.prFixUpdateMany.mock.calls.filter((([args]: any) => Array.isArray(args.data?.agentHandouts?.push))).length).toBe(0);
   });
 });

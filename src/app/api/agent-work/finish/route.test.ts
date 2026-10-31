@@ -410,6 +410,10 @@ describe("POST /api/agent-work/finish — rate limit", () => {
 });
 
 describe("POST /api/agent-work/finish — bound worker scope (#1129)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   it("denies a bound worker finishing another agent's work", async () => {
     const res = await handleFinish(
       new Request("http://localhost/api/agent-work/finish", {

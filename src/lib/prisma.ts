@@ -131,31 +131,88 @@ export function __resetPrismaClientForTests(): void {
 // it as Prisma.TransactionClient. The two are structurally compatible for the
 // model delegates these callbacks actually use; cast the callback once (rather
 // than `as any`) so the transaction's return type T is still checked.
+
+/**
+ * Build the narrow queue-client surface a `$transaction` callback runs on
+ * (#1503 review): the same delegate list as `asPrFixQueueClient`, taken from
+ * the raw transaction client, PLUS the fence's serialization boundary —
+ * `issue.findFirstLocked`, a `SELECT ... FOR SHARE` read on the linked Issue
+ * row that must be issued through the tx so the share lock is held until the
+ * transaction commits.
+ *
+ * `issue.findFirst` stays the plain modeled read (the pre-gate and the
+ * classification helper use it unlocked); every other surface is a straight
+ * delegate passthrough, and `$executeRaw` forwards so the #1327 REBASE
+ * advisory lock keeps working through a wrapped tx. There is deliberately no
+ * `findFirstLocked` on the TOP-LEVEL client: a lock outside a transaction is
+ * meaningless, and only the fence holds one.
+ */
+function asPrFixQueueTx(tx: Prisma.TransactionClient): PrFixQueueClient {
+  return {
+    issue: {
+      findFirst: (args: any) => tx.issue.findFirst(args),
+      // #1503 review: the issuance fence's locking read — SELECT ... FOR SHARE
+      // OF "Issue", bound parameters via Prisma.sql. LOWER()=LOWER() mirrors
+      // the classification lookup's case-insensitive repo match (the queue
+      // folds repo casing, Issue.repository.fullName keeps GitHub casing);
+      // ILIKE would treat `_` as a wildcard, so it is deliberately avoided.
+      // A found row carries its `currentLane`; a missing row is a definitive
+      // NOT_ESCALATED read (null); a thrown read aborts the transaction and
+      // the fence defers.
+      findFirstLocked: async (repo: string, issue: number) => {
+        const rows = await tx.$queryRaw<{ currentLane: string | null }[]>(
+          Prisma.sql`
+            SELECT i."currentLane" AS "currentLane"
+            FROM "Issue" i
+            JOIN "Repository" r ON r."id" = i."repositoryId"
+            WHERE LOWER(r."fullName") = LOWER(${repo}) AND i."number" = ${issue}
+            FOR SHARE OF i
+          `,
+        );
+        return rows[0] ?? null;
+      },
+    },
+    prFixQueueItem: tx.prFixQueueItem,
+    prFixHistory: tx.prFixHistory,
+    // #1419: the dead-owner recovery probes read agent-run liveness off this
+    // delegate; without it they fail closed (treat every acked attempt as
+    // live) instead of reclaiming blind.
+    agentRun: tx.agentRun,
+    capacityHandoff: tx.capacityHandoff,
+    // #1249: without this delegate every route handler's queue client was
+    // ledger-inert — `readEvidenceLedgerView`/`recordEvidenceTransition` no-op
+    // and settlement falls back to the bounded #1119 cache.
+    prFixEvidence: tx.prFixEvidence,
+    // #495: the CI park lifecycle's exactly-once ledger runs off this
+    // delegate; without it the lifecycle routes degrade to the state-only
+    // writes (same-value idempotent re-applies instead of the ledger).
+    prFixCIParkLedger: tx.prFixCIParkLedger,
+    // #1491: the fenced attempt-requeue settlement ledger and the durable
+    // issuance history; both fail closed when absent (never unfenced, never
+    // double-applied).
+    prFixRequeueSettlement: tx.prFixRequeueSettlement,
+    attemptIssuance: tx.attemptIssuance,
+    // #1327: the REBASE advisory lock is issued through the raw surface of
+    // whichever client the admission runs on; forward it from the tx.
+    $executeRaw: (query: Prisma.Sql, ...values: unknown[]) => tx.$executeRaw(query, ...values),
+    $transaction: <T>(fn: (tx: PrFixQueueClient) => Promise<T>): Promise<T> =>
+      tx.$transaction(fn as (tx: Prisma.TransactionClient) => Promise<T>),
+  };
+}
+
 export function asPrFixQueueClient(client: PrismaClient): PrFixQueueClient {
   return {
     issue: client.issue,
     prFixQueueItem: client.prFixQueueItem,
     prFixHistory: client.prFixHistory,
-    // #1419: the dead-owner recovery probes read agent-run liveness off this
-    // delegate; without it they fail closed (treat every acked attempt as
-    // live) instead of reclaiming blind.
     agentRun: client.agentRun,
     capacityHandoff: client.capacityHandoff,
-    // #1249: without this delegate every route handler's queue client was
-    // ledger-inert — `readEvidenceLedgerView`/`recordEvidenceTransition` no-op
-    // and settlement falls back to the bounded #1119 cache.
     prFixEvidence: client.prFixEvidence,
-    // #495: the CI park lifecycle's exactly-once ledger runs off this
-    // delegate; without it the lifecycle routes degrade to the state-only
-    // writes (same-value idempotent re-applies instead of the ledger).
     prFixCIParkLedger: client.prFixCIParkLedger,
-    // #1491: the fenced attempt-requeue settlement ledger and the durable
-    // issuance history; both fail closed when absent (never unfenced, never
-    // double-applied).
     prFixRequeueSettlement: client.prFixRequeueSettlement,
     attemptIssuance: client.attemptIssuance,
     $transaction: <T>(fn: (tx: PrFixQueueClient) => Promise<T>): Promise<T> =>
-      client.$transaction(fn as (tx: Prisma.TransactionClient) => Promise<T>),
+      client.$transaction((tx) => fn(asPrFixQueueTx(tx))),
   };
 }
 

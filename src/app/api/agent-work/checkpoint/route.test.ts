@@ -414,6 +414,10 @@ describe("POST /api/agent-work/checkpoint — rate limit", () => {
 });
 
 describe("POST /api/agent-work/checkpoint — bound worker scope (#1129)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   it("denies a bound worker checkpointing another agent's work", async () => {
     const res = await handleCheckpoint(
       new Request("http://localhost/api/agent-work/checkpoint", {

@@ -179,6 +179,10 @@ describe("POST /api/agent-work/start", () => {
 });
 
 describe("POST /api/agent-work/start — bound worker scope (#1129)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   it("denies a bound worker starting work for another agent", async () => {
     const res = await handleStart(
       new Request("http://localhost/api/agent-work/start", {
