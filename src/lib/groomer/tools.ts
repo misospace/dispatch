@@ -75,9 +75,12 @@ export interface GroomerToolResult {
    * (null for the default branch), so close excerpts can be checked against
    * exactly what was read (dispatch#1099). A bounded range read carries only
    * the lines that were shown, verbatim; the header and continuation
-   * coordinates are rendering, not evidence content.
+   * coordinates are rendering, not evidence content. `startLine`/`endLine`
+   * are the 1-based inclusive line coordinates of the carried content, so
+   * coordinate-adjacent reads of one file can merge at collect time and an
+   * excerpt crossing their seam grounds (dispatch#1465).
    */
-  file?: { path: string; ref: string | null; content: string };
+  file?: { path: string; ref: string | null; content: string; startLine?: number; endLine?: number };
   /**
    * The result the model was shown was clipped, so the model saw a prefix,
    * not the whole result (dispatch#1452): read_file to maxFileBytes,
@@ -1340,7 +1343,13 @@ export async function executeGroomerTool(
             content: range.content,
             bytes: Buffer.byteLength(range.content, "utf8"),
             sources: [path],
-            file: { path, ref: ref ?? null, content: range.body },
+            // A line-too-large body is a byte cut inside its first line, and
+            // the continuation footer skips the rest of that line: the read
+            // carries no coordinates, so no adjacent merge can bridge the
+            // unseen remainder (dispatch#1465).
+            file: range.lineTooLarge
+              ? { path, ref: ref ?? null, content: range.body }
+              : { path, ref: ref ?? null, content: range.body, startLine, endLine: range.lastShown },
             // A range that stops short of EOF is a truncated read too
             // (dispatch#1452): the footer names the continuation, and if the
             // model never takes it the gap fact must stand. A range that
@@ -1389,7 +1398,7 @@ export async function executeGroomerTool(
             content,
             bytes: Buffer.byteLength(content, "utf8"),
             sources: [path],
-            file: { path, ref: ref ?? null, content: body },
+            file: { path, ref: ref ?? null, content: body, startLine: 1, endLine: totalLines },
             truncated: false,
             // The whole file was shown: the run established what it holds.
             established: true,
@@ -1459,12 +1468,20 @@ export async function executeGroomerTool(
             : cut.includes("\n")
               ? cut.split("\n").length - 1
               : 1;
+        // A cut inside an oversized line 1 showed no line whole, and the
+        // past-it continuation (startLine=2) skips the rest of that line:
+        // the carried content gets no coordinates, so no adjacent merge can
+        // bridge the unseen remainder (dispatch#1465). The shownRange
+        // convention (#1451) keeps its continuity accounting unchanged.
+        const partialFirstLineOnly = cut !== firstLine && !cut.includes("\n");
         return {
           ok: true,
           content,
           bytes: Buffer.byteLength(content, "utf8"),
           sources: [path],
-          file: { path, ref: ref ?? null, content: cut },
+          file: partialFirstLineOnly
+            ? { path, ref: ref ?? null, content: cut }
+            : { path, ref: ref ?? null, content: cut, startLine: 1, endLine: shownEnd },
           // Genuinely cut by the byte cap: the head the model saw is not the
           // whole file (dispatch#1452), and a continuation read can retire
           // the fact later.
