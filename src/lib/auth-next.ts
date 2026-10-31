@@ -7,6 +7,7 @@
 
 import NextAuth from "next-auth";
 import type { OIDCConfig } from "@auth/core/providers/oauth";
+import { CONTROL_OR_BACKSLASH, DEFAULT_CALLBACK_URL } from "./callback-url";
 
 function getOidcProvider(): OIDCConfig<Record<string, unknown>> {
   const issuerOrDiscovery = process.env.DISPATCH_OIDC_ISSUER;
@@ -52,6 +53,38 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
   },
   providers: [getOidcProvider()],
   callbacks: {
+    // Re-validate every post-login redirect target as same-origin (#1466).
+    //
+    // Without this callback, @auth/core's default heuristic is the only gate:
+    // it allows anything starting with "/" verbatim, which accepts the
+    // protocol-relative `//evil.example` shape and the slash-backslash /
+    // control-character variants that re-form one after URL parsing. The
+    // `GET /api/login` route sanitizes `callbackUrl` through `safeCallbackUrl`
+    // before calling `signIn`, but that keeps the flow safe only as long as
+    // that one call survives; the framework-level entry points
+    // (`/api/auth/*` with a `callbackUrl` query param or cookie) never pass
+    // through it. This callback is the fail-closed backstop for both: resolve
+    // the candidate against the configured base origin and keep it only if it
+    // stays on that origin, otherwise fall back to the default callback URL.
+    async redirect({ url, baseUrl }) {
+      // The slash-backslash and C0/DEL control-character variants re-form a
+      // protocol-relative URL only after browser-side stripping, so they
+      // resolve to a same-origin (percent-encoded) path here and would pass
+      // a bare origin check. Reject them with the same guard `safeCallbackUrl`
+      // applies: the shared regex keeps both gates on one rule, so neither
+      // can drift ahead of the other.
+      if (CONTROL_OR_BACKSLASH.test(url)) return DEFAULT_CALLBACK_URL;
+      try {
+        const base = new URL(baseUrl);
+        const resolved = new URL(url, base);
+        if (resolved.origin === base.origin) {
+          return resolved.toString();
+        }
+      } catch {
+        // Unparseable candidate: fall back below.
+      }
+      return DEFAULT_CALLBACK_URL;
+    },
     async session({ token, session }) {
       if (token) {
         // Ensure sub (subject) is available from OIDC id_token

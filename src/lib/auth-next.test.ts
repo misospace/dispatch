@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { DEFAULT_CALLBACK_URL } from "./callback-url";
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
@@ -17,6 +18,7 @@ vi.mock("next-auth", () => ({
 
 type AuthNextConfigForTest = {
   callbacks: {
+    redirect(args: { url: string; baseUrl: string }): Promise<string>;
     session(args: {
       token: Record<string, unknown>;
       session: { user: Record<string, unknown> };
@@ -91,5 +93,85 @@ describe("auth-next OIDC configuration", () => {
 
     expect(provider.checks).toContain("state");
     expect(provider.checks).toContain("pkce");
+  });
+});
+
+const BASE_ORIGIN = "https://dispatch.example";
+
+function staysOnBaseOrigin(result: string): boolean {
+  try {
+    return new URL(result, BASE_ORIGIN).origin === BASE_ORIGIN;
+  } catch {
+    return false;
+  }
+}
+
+describe("auth-next redirect callback", () => {
+  it.each([
+    "/board",
+    "/",
+    "/board/issues",
+    "/board?tab=issues",
+    "/board?tab=issues&lane=normal#card-7",
+    "/custom/return",
+    "/board%2Fissues",
+    "/board?redirect=%2Finside",
+  ])("keeps local redirect target %s on the base origin", async (url) => {
+    const config = await loadConfig();
+    const result = await config.callbacks.redirect({ url, baseUrl: BASE_ORIGIN });
+
+    expect(result).toBe(new URL(url, BASE_ORIGIN).toString());
+    expect(staysOnBaseOrigin(result)).toBe(true);
+  });
+
+  it("keeps an absolute same-origin redirect target", async () => {
+    const config = await loadConfig();
+    const result = await config.callbacks.redirect({
+      url: `${BASE_ORIGIN}/board?tab=issues`,
+      baseUrl: BASE_ORIGIN,
+    });
+
+    expect(result).toBe(`${BASE_ORIGIN}/board?tab=issues`);
+  });
+
+  it.each([
+    ["protocol-relative URL", "//evil.example"],
+    ["protocol-relative URL with path", "//evil.example/path"],
+    ["absolute external URL", "https://evil.example/path"],
+    ["absolute external URL (uppercase scheme)", "HTTP://evil.example/path"],
+    ["slash-backslash variant", "/\\evil.example/path"],
+    ["slash-backslash-slash variant", "/\\/evil.example"],
+    ["tab control character", "/\t/evil.example"],
+    ["newline control character", "/\n/evil.example"],
+    ["carriage-return control character", "/\r/evil.example"],
+    ["vertical tab", "/\v/evil.example"],
+    ["form feed", "/\f/evil.example"],
+    ["DEL control character", "/\x7f/evil.example"],
+    ["javascript: scheme", "javascript:alert(1)"],
+    ["data: scheme", "data:text/html,<script>alert(1)</script>"],
+  ])("falls back to the default callback for %s", async (_name, url) => {
+    const config = await loadConfig();
+    const result = await config.callbacks.redirect({ url, baseUrl: BASE_ORIGIN });
+
+    expect(result).toBe(DEFAULT_CALLBACK_URL);
+    expect(staysOnBaseOrigin(result)).toBe(true);
+  });
+
+  it("never returns a target off the base origin", async () => {
+    const config = await loadConfig();
+    const candidates = [
+      "/board",
+      "//evil.example",
+      "https://evil.example/path",
+      "/\\evil.example/path",
+      "/\t/evil.example",
+      "javascript:alert(1)",
+      "not a url %",
+      "",
+    ];
+    for (const url of candidates) {
+      const result = await config.callbacks.redirect({ url, baseUrl: BASE_ORIGIN });
+      expect(staysOnBaseOrigin(result)).toBe(true);
+    }
   });
 });

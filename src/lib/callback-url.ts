@@ -16,7 +16,7 @@ export const DEFAULT_CALLBACK_URL = "/board";
  *    slashes for special schemes) and embedded C0/DEL control characters
  *    (e.g. /<TAB>/evil.com — the parser strips tab, LF and CR).
  */
-const CONTROL_OR_BACKSLASH = /[\\\u0000-\u001f\u007f]/;
+export const CONTROL_OR_BACKSLASH = /[\\\u0000-\u001f\u007f]/;
 const CALLBACK_ORIGIN_BASE = "http://callback.invalid";
 const CALLBACK_ORIGIN = new URL(CALLBACK_ORIGIN_BASE).origin;
 
