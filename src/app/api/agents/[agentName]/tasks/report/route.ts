@@ -957,12 +957,23 @@ export async function POST(
             // authoritative, matching the already_done close gate and the
             // #1129 status gate. The gate skips the park (never refuses the
             // report): the park is best-effort, and a 5xx retry would land in
-            // the duplicate branch and never re-park.
-            const parkSkipReason = await parkAssignmentSkipReason(
-              auth,
-              report.repoFullName,
-              report.issueNumber,
-            );
+            // the duplicate branch and never re-park. The gate swallows its
+            // own GitHub errors as "assignment-unverified"; an unexpected
+            // throw from it is the same verdict — unreadable ownership — not
+            // a park-write failure, so it is caught separately.
+            let parkSkipReason: string | null;
+            try {
+              parkSkipReason = await parkAssignmentSkipReason(
+                auth,
+                report.repoFullName,
+                report.issueNumber,
+              );
+            } catch (error) {
+              console.warn(
+                `[no-pr-conclusion] could not verify live assignment of ${report.repoFullName}#${report.issueNumber} for ${agentName}: ${error instanceof Error ? error.message : String(error)}`,
+              );
+              parkSkipReason = "assignment-unverified";
+            }
             if (parkSkipReason) {
               // The suppression is otherwise invisible, so log it. A
               // worker that keeps reporting conclusions for issues it does

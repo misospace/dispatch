@@ -3226,6 +3226,11 @@ describe("POST /api/agents/[agentName]/tasks/report — park worker ownership (#
     mocks.noPrConclusionUpsert.mockResolvedValue({});
     prismaMock.issueLifecycleEvent.create.mockResolvedValue({ id: "evt-1" });
     prismaMock.prFixQueueItem.findUnique.mockResolvedValue(null);
+    // Full reset, not clearAllMocks: an earlier gate block in this file
+    // installs a persistent `mockResolvedValue` on the live-label mock, and a
+    // stale `agent/alpha` implementation would silently let a future test
+    // that forgets its own stub park.
+    getLiveIssueLabelsMock.mockReset();
   });
 
   const issueRow = (over: Record<string, unknown> = {}) => ({
@@ -3314,6 +3319,19 @@ describe("POST /api/agents/[agentName]/tasks/report — park worker ownership (#
     expect(body.conclusionPark).toEqual({ applied: false, reason: "assignment-unverified" });
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("assignment-unverified"));
     warn.mockRestore();
+  });
+
+  it("a closed issue skips the open check before the ownership gate is consulted", async () => {
+    // Ordering pin: the tracked/open short-circuits come first, so a report
+    // for a closed issue answers "issue-not-open" without a live-label
+    // round-trip — the ownership gate is only reached for an open issue.
+    mocks.issueFindUnique.mockResolvedValue(issueRow({ state: "closed" }));
+
+    const res = await workerPostRequest(parkBody);
+    expect(res.status).toBe(200);
+    expect(getLiveIssueLabelsMock).not.toHaveBeenCalled();
+    const body = await res.json();
+    expect(body.conclusionPark).toEqual({ applied: false, reason: "issue-not-open" });
   });
 
   it("a maintainer report parks without any live assignment", async () => {

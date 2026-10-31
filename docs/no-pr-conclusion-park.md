@@ -117,6 +117,7 @@ holds.
   `conclusionPark: { applied: false, reason: "not-assigned" }`; the
   suppression is logged. An unreadable live assignment withholds the park too
   (`reason: "assignment-unverified"`): fail-closed on the park, fail-open on
-  the report, because a 5xx retry could not re-park anyway. Maintainer-tier
-  callers (operator, OIDC, basic, auth-disabled) bypass the gate — operators
-  may conclude any issue, and they own every path above that clears a park.
+  the   report, because a 5xx retry could not re-park anyway. Maintainer-tier
+  callers (the agent/maintainer token, an OIDC session, basic auth, or
+  auth-disabled mode) bypass the gate — operators may conclude any issue, and
+  they own every path above that clears a park.
