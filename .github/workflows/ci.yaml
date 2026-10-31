@@ -196,11 +196,16 @@ jobs:
       # ... FOR SHARE held until the issuance transaction commits) — a flip
       # must either commit before the locked read (refused) or block until
       # after the fence commits — and only a real PostgreSQL can prove the
-      # blocking (mocks have no lock waits at all).
+      # blocking (mocks have no lock waits at all). The #1472 stale-replay
+      # test joins it for the same class of reason: "no repeated selection"
+      # is a where-clause guarantee on the row the selector reads (the stale
+      # branch reads `groomingStaleAt`), so only a real PostgreSQL can prove
+      # that a replayed application cleared the mark and the selector stopped
+      # re-offering the row.
       - name: Concurrency and idempotency against a real PostgreSQL
         env:
           RUN_DB_INTEGRATION: "1"
-        run: npx vitest run src/lib/sync-lock.integration.test.ts "src/app/api/agents/[agentName]/tasks/report/route.integration.test.ts" src/lib/groomer/apply.integration.test.ts src/lib/groomer/blocked-reconciliation.integration.test.ts src/lib/pr-fix-external-wait.integration.test.ts src/lib/issue-mutation-guard.integration.test.ts src/lib/agent-work.integration.test.ts src/lib/pr-fix-rebase-type.integration.test.ts src/lib/lease-expiry-recovery.integration.test.ts src/lib/attempt-requeue-fence.integration.test.ts src/lib/pr-fix-handout-lane-fence.integration.test.ts
+        run: npx vitest run src/lib/sync-lock.integration.test.ts "src/app/api/agents/[agentName]/tasks/report/route.integration.test.ts" src/lib/groomer/apply.integration.test.ts src/lib/groomer/blocked-reconciliation.integration.test.ts src/lib/groomer/stale-replay.integration.test.ts src/lib/pr-fix-external-wait.integration.test.ts src/lib/issue-mutation-guard.integration.test.ts src/lib/agent-work.integration.test.ts src/lib/pr-fix-rebase-type.integration.test.ts src/lib/lease-expiry-recovery.integration.test.ts src/lib/attempt-requeue-fence.integration.test.ts src/lib/pr-fix-handout-lane-fence.integration.test.ts
 
   coverage:
     name: Coverage

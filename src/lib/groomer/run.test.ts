@@ -46,6 +46,8 @@ const { mocks } = vi.hoisted(() => ({
     childClaims: new Map<string, Record<string, any>>(),
     /** Simulated Issue.releaseSignal column state, written by issue.update. */
     issueProjection: null as unknown,
+    /** Simulated Issue row state, written by issue.update. */
+    issueRow: {} as Record<string, unknown>,
     prisma: {
       $transaction: vi.fn(),
       $queryRaw: vi.fn(),
@@ -371,8 +373,13 @@ describe("runHostedGroomer", () => {
     // The Issue.releaseSignal column is simulated: an issue.update whose data
     // carries the field sets or clears it; one without leaves it untouched.
     mocks.issueProjection = null;
+    // The Issue row is simulated too: every issue.update merges its data into
+    // the row, so a test can seed a row state (a stale mark, say) and read
+    // back what the run left on it, not only what it sent.
+    mocks.issueRow = {};
     mocks.prisma.issue.update.mockImplementation(async ({ data }: { data: Record<string, unknown> }) => {
       if ("releaseSignal" in data) mocks.issueProjection = JSON.parse(JSON.stringify(data.releaseSignal));
+      Object.assign(mocks.issueRow, data);
       return { id: "issue-42" };
     });
     mocks.prisma.issue.findUnique.mockImplementation(async () => ({ releaseSignal: mocks.issueProjection }));
@@ -3074,6 +3081,16 @@ Investigate session handling in auth module.`;
       await runHostedGroomer();
       mocks.prisma.issue.update.mockClear();
 
+      // Seed the stale row the freshness pass would have left: the mark is
+      // what the selector's stale branch reads, so the replay has to clear it
+      // on the row, not only in the write it sends.
+      Object.assign(mocks.issueRow, {
+        groomingStaleAt: new Date("2026-09-25T00:00:00.000Z"),
+        groomingStaleReasons: ["issue_changed"],
+        groomingStaleDetail: "the issue changed since the baseline was recorded",
+      });
+      expect(mocks.issueRow.groomingStaleAt).toBeInstanceOf(Date);
+
       const result = await runHostedGroomer();
       expect(result!.appliedMutations?.outcome).toBe("replayed");
 
@@ -3092,6 +3109,17 @@ Investigate session handling in auth module.`;
         groomingStaleDetail: null,
       });
       expect(data.groomedIssueFingerprint).toBeTruthy();
+
+      // The row itself, not only the write: the stale mark is gone and the
+      // baseline points at the replaying run, so the selector no longer
+      // re-offers the row through its stale branch.
+      expect(mocks.issueRow).toMatchObject({
+        groomedRunId: "gr-2",
+        groomingStaleAt: null,
+        groomingStaleReasons: [],
+        groomingStaleDetail: null,
+      });
+      expect(mocks.issueRow.groomedIssueFingerprint).toBeTruthy();
     });
 
     it("relies on the plan's cited read paths, not every path the run read", async () => {
