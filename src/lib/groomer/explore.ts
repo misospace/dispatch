@@ -38,8 +38,9 @@ export interface ExploreToolRecord {
   preview: string;
   /**
    * True when this call's result was clipped (a read by bytes, a directory
-   * listing by entries) and the model saw a prefix, not the whole result
-   * (dispatch#1452). False for submit_findings and for every tool that does
+   * listing by entries, a related-work payload reduced to the byte budget)
+   * and the model saw a prefix, not the whole result (dispatch#1452,
+   * dispatch#1468). False for submit_findings and for every tool that does
    * not truncate.
    */
   truncated: boolean;
