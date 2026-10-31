@@ -12,9 +12,15 @@ vi.mock("@/lib/github", () => ({
 }));
 
 describe("internal automation identities", () => {
-  it("matches only exact identities case-insensitively", () => {
+  it("matches exact identities case-insensitively, including their [bot] App forms", () => {
     expect(isInternalAutomationAuthor("ITS-MISO")).toBe(true);
+    expect(isInternalAutomationAuthor("its-saffron[bot]")).toBe(true);
+    expect(isInternalAutomationAuthor("ITSMISO-AI[bot]")).toBe(true);
+    expect(isInternalAutomationAuthor("its-miso[bot]")).toBe(true);
     expect(isInternalAutomationAuthor("unrelated-app[bot]")).toBe(false);
+    expect(isInternalAutomationAuthor("saffron")).toBe(false);
+    expect(isInternalAutomationAuthor("its-saffron-bot")).toBe(false);
+    expect(isInternalAutomationAuthor("github-actions")).toBe(false);
   });
 });
 
