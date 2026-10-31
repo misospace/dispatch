@@ -31,15 +31,21 @@ export interface IssueContextInput {
 const AUTOMATION_AUTHORS = new Set(["itsmiso-ai", "its-saffron", "its-miso", "github-actions[bot]"]);
 
 /**
- * Exact identities for automation operated by this system. Other bots,
- * including renovate[bot] and dependabot[bot], are untrusted by default;
- * operators can allow them via DISPATCH_GROOMER_TRUSTED_LOGINS.
+ * Exact identities for automation operated by this system. The miso accounts
+ * post both as user accounts (bare) and as GitHub Apps (`name[bot]`, which is
+ * how GitHub renders App comments, e.g. `its-saffron[bot]`); GitHub Actions
+ * only ever posts as `github-actions[bot]`, so its bare name is not trusted.
+ * Other bots, including renovate[bot] and dependabot[bot], are untrusted by
+ * default; operators can allow them via DISPATCH_GROOMER_TRUSTED_LOGINS.
  */
+const INTERNAL_AUTOMATION_BASE_NAMES = ["itsmiso-ai", "its-saffron", "its-miso"] as const;
+const INTERNAL_AUTOMATION_BOT_ONLY_NAMES = ["github-actions"] as const;
+
 export const INTERNAL_AUTOMATION_AUTHORS: ReadonlySet<string> = new Set([
-  "itsmiso-ai",
-  "its-saffron",
-  "its-miso",
-  "github-actions[bot]",
+  ...INTERNAL_AUTOMATION_BASE_NAMES,
+  ...[...INTERNAL_AUTOMATION_BASE_NAMES, ...INTERNAL_AUTOMATION_BOT_ONLY_NAMES].map(
+    (name) => `${name}[bot]`,
+  ),
 ]);
 
 export function isInternalAutomationAuthor(author: string): boolean {
