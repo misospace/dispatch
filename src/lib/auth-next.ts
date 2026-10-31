@@ -67,17 +67,23 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
     // the candidate against the configured base origin and keep it only if it
     // stays on that origin, otherwise fall back to the default callback URL.
     async redirect({ url, baseUrl }) {
-      // The slash-backslash and C0/DEL control-character variants re-form a
-      // protocol-relative URL only after browser-side stripping, so they
-      // resolve to a same-origin (percent-encoded) path here and would pass
-      // a bare origin check. Reject them with the same guard `safeCallbackUrl`
-      // applies: the shared regex keeps both gates on one rule, so neither
-      // can drift ahead of the other.
+      // Two fail-closed layers. First, the same guard `safeCallbackUrl`
+      // applies: backslashes and C0/DEL characters never appear in a
+      // legitimate local path. The URL parser strips tab/LF/CR before it
+      // parses, so `/\t/evil.example` already resolves off-origin; the
+      // parser instead percent-encodes \v, \f and \x7f into a same-origin
+      // path, and rejecting the whole class up front is the conservative
+      // superset. Sharing the regex keeps both gates on one rule, so
+      // neither can drift ahead of the other.
       if (CONTROL_OR_BACKSLASH.test(url)) return DEFAULT_CALLBACK_URL;
       try {
         const base = new URL(baseUrl);
         const resolved = new URL(url, base);
         if (resolved.origin === base.origin) {
+          // Never echo credentials embedded in the candidate back out in
+          // the Location header (browsers surface them as an auth prompt).
+          resolved.username = "";
+          resolved.password = "";
           return resolved.toString();
         }
       } catch {

@@ -134,6 +134,26 @@ describe("auth-next redirect callback", () => {
     expect(result).toBe(`${BASE_ORIGIN}/board?tab=issues`);
   });
 
+  it("never echoes embedded credentials in the returned target", async () => {
+    const config = await loadConfig();
+    const result = await config.callbacks.redirect({
+      url: `https://user:pass@dispatch.example/board`,
+      baseUrl: BASE_ORIGIN,
+    });
+
+    expect(result).toBe(`${BASE_ORIGIN}/board`);
+  });
+
+  it("is origin-strict, not host-strict", async () => {
+    const config = await loadConfig();
+    const result = await config.callbacks.redirect({
+      url: "http://dispatch.example/board",
+      baseUrl: BASE_ORIGIN,
+    });
+
+    expect(result).toBe(DEFAULT_CALLBACK_URL);
+  });
+
   it.each([
     ["protocol-relative URL", "//evil.example"],
     ["protocol-relative URL with path", "//evil.example/path"],
