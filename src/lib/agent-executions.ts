@@ -628,6 +628,77 @@ async function writeExecutionAudit(
 }
 
 // ---------------------------------------------------------------------------
+// Retention prune (#1499)
+// ---------------------------------------------------------------------------
+
+/**
+ * Default retention for terminal rows: 7 days — comfortably past the 24h
+ * recent-terminal display window (#1498), so the prune never deletes a row
+ * the Agents page would still show.
+ */
+export const DEFAULT_AGENT_EXECUTION_RETENTION_MS = 7 * 24 * 60 * 60_000;
+
+const MIN_AGENT_EXECUTION_RETENTION_MS = 60 * 60_000; // 1h
+const MAX_AGENT_EXECUTION_RETENTION_MS = 90 * 24 * 60 * 60_000; // 90d
+
+/**
+ * Terminal-row retention window, overridable with
+ * `DISPATCH_AGENT_EXECUTION_RETENTION_MS` (clamped 1h–90d). Garbage values
+ * fall back to the default.
+ */
+export function getAgentExecutionRetentionMs(): number {
+  const raw = process.env.DISPATCH_AGENT_EXECUTION_RETENTION_MS ?? "";
+  if (!/^\d+$/.test(raw)) return DEFAULT_AGENT_EXECUTION_RETENTION_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_AGENT_EXECUTION_RETENTION_MS;
+  return Math.min(Math.max(parsed, MIN_AGENT_EXECUTION_RETENTION_MS), MAX_AGENT_EXECUTION_RETENTION_MS);
+}
+
+/** Injectable prune surface. */
+export interface AgentExecutionPruneDeps {
+  agentExecution: {
+    deleteMany(args: { where: Record<string, unknown> }): Promise<{ count: number }>;
+  };
+}
+
+export interface PruneTerminalExecutionsResult {
+  prunedCount: number;
+  cutoff: Date;
+}
+
+/**
+ * Delete terminal rows whose last observation is older than the retention
+ * window. Display-data hygiene ONLY (#1499): the delete is fenced on the
+ * terminal state set, so it can never touch a non-terminal (live) execution,
+ * and it reads/writes no other table — AgentWork, leases, and ownership
+ * state are untouched, and nothing downstream of claim/admission/settlement
+ * consumes this table.
+ *
+ * Known trade-off: once a terminal row is pruned, the per-run-UID terminal
+ * fence (`execution_terminal`) is gone with it — a late NON-terminal
+ * delivery for the same `(agentName, executionId)` with a fresh idempotency
+ * key would create a new row instead of being rejected. That is acceptable:
+ * the wire contract mints a NEW run UID for a recreated run, the resurrected
+ * row is display-only (staleness marks it stale, and it re-prunes once it
+ * terminates again), and no behavioral state keys off this table.
+ */
+export async function pruneTerminalExecutions(
+  deps: AgentExecutionPruneDeps,
+  options: { now?: Date; retentionMs?: number } = {},
+): Promise<PruneTerminalExecutionsResult> {
+  const now = options.now ?? new Date();
+  const retentionMs = options.retentionMs ?? getAgentExecutionRetentionMs();
+  const cutoff = new Date(now.getTime() - retentionMs);
+  const result = await deps.agentExecution.deleteMany({
+    where: {
+      executionState: { in: [...TERMINAL_AGENT_EXECUTION_STATES] },
+      lastObservedAt: { lt: cutoff },
+    },
+  });
+  return { prunedCount: result.count, cutoff };
+}
+
+// ---------------------------------------------------------------------------
 // Read path (display-only)
 // ---------------------------------------------------------------------------
 

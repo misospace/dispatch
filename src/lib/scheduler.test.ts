@@ -69,6 +69,8 @@ describe("schedulerConfigFromEnv", () => {
     expect(byName("ci-failures").intervalMs).toBe(30 * 60 * 1000);
     expect(byName("prune-closed").path).toBe("/api/issues/prune-closed");
     expect(byName("prune-closed").intervalMs).toBe(24 * 60 * 60 * 1000);
+    expect(byName("agent-executions-prune").path).toBe("/api/agent-work/observations/prune");
+    expect(byName("agent-executions-prune").intervalMs).toBe(24 * 60 * 60 * 1000);
     expect(byName("reconcile").path).toBe("/api/issues/reconcile");
     expect(byName("reconcile").intervalMs).toBe(30 * 60 * 1000);
     expect(byName("stale-work").path).toBe("/api/agent-work/sweep");
@@ -105,6 +107,17 @@ describe("schedulerConfigFromEnv", () => {
   it("disables pr-fix-sweep when DISPATCH_PR_FIX_SWEEP_INTERVAL_MS is 0", () => {
     const jobs = schedulerConfigFromEnv({ DISPATCH_PR_FIX_SWEEP_INTERVAL_MS: "0" }).jobs;
     expect(jobs.map((j) => j.name)).not.toContain("pr-fix-sweep");
+  });
+
+  it("disables agent-executions-prune when DISPATCH_AGENT_EXECUTIONS_PRUNE_INTERVAL_MS is 0", () => {
+    const jobs = schedulerConfigFromEnv({ DISPATCH_AGENT_EXECUTIONS_PRUNE_INTERVAL_MS: "0" }).jobs;
+    expect(jobs.map((j) => j.name)).not.toContain("agent-executions-prune");
+  });
+
+  it("honors DISPATCH_AGENT_EXECUTIONS_PRUNE_INTERVAL_MS", () => {
+    const byName = schedulerConfigFromEnv({ DISPATCH_AGENT_EXECUTIONS_PRUNE_INTERVAL_MS: "3600000" }).jobs
+      .find((j) => j.name === "agent-executions-prune")!;
+    expect(byName.intervalMs).toBe(3600000);
   });
 
   it("disables an individual job when its interval env is 0", () => {
