@@ -821,6 +821,8 @@ describe("executeGroomerTool read_file bounded ranges (dispatch#1451)", () => {
       path: "big.ts",
       ref: null,
       content: longFile(120).split("\n").slice(114).join("\n"),
+      startLine: 115,
+      endLine: 120,
     });
   });
 
@@ -896,6 +898,11 @@ describe("executeGroomerTool read_file bounded ranges (dispatch#1451)", () => {
     expect(result.content).not.toContain("�");
     expect(result.content).toContain("(line 1 exceeds the byte limit; continues at line 2)");
     expect(result.file?.content).toMatch(/^ü+$/);
+    // The body is a cut inside line 1 and the continuation skips its rest:
+    // no coordinates ride along, so no adjacent merge can bridge the unseen
+    // remainder (dispatch#1465).
+    expect(result.file?.startLine).toBeUndefined();
+    expect(result.file?.endLine).toBeUndefined();
     expect(result.bytes).toBeLessThanOrEqual(121);
   });
 
@@ -1192,6 +1199,7 @@ describe("executeGroomerTool read_file shownRange (dispatch#1451)", () => {
     expect(head.file?.content).toBe("L1\nL2\n");
     expect(head.content).toContain("startLine=3");
     expect(head.shownRange).toEqual({ start: 1, end: 2, totalLines: 3, eof: false });
+    expect(head.file).toMatchObject({ startLine: 1, endLine: 2 });
   });
 
   it("a head cut mid-line accounts only the lines shown whole", async () => {
@@ -1208,6 +1216,7 @@ describe("executeGroomerTool read_file shownRange (dispatch#1451)", () => {
     expect(head.file?.content).toBe("L1\nL2");
     expect(head.content).toContain("startLine=2");
     expect(head.shownRange).toEqual({ start: 1, end: 1, totalLines: 2, eof: false });
+    expect(head.file).toMatchObject({ startLine: 1, endLine: 1 });
   });
 
   it("a head cut equal to the first line accounts it whole", async () => {
@@ -1241,7 +1250,11 @@ describe("executeGroomerTool read_file shownRange (dispatch#1451)", () => {
     expect(head.truncated).toBe(true);
     expect(head.content).toContain("startLine=2");
     expect(head.shownRange).toEqual({ start: 1, end: 1, totalLines: 3, eof: false });
-
+    // The carried content is a cut inside line 1: it gets no coordinates, so
+    // the startLine=2 continuation cannot merge across the unseen remainder
+    // of line 1 (dispatch#1465).
+    expect(head.file?.startLine).toBeUndefined();
+    expect(head.file?.endLine).toBeUndefined();
     // Same on the single-line shape: nothing continues, the marker says so.
     const lone = await executeGroomerTool(
       { name: "read_file", arguments: { path: "s.ts" } },
