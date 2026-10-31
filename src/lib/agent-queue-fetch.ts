@@ -167,12 +167,22 @@ export async function fetchAgentQueueData(
   // the mode is on. The park decision is pure content-fingerprint evaluation
   // (see lib/no-pr-conclusion); no GitHub call happens here.
   const noPrMode = getNoPrConclusionMode();
-  const liveParks: Map<string, NoPrConclusionRow> =
-    noPrMode === "off"
-      ? new Map()
-      : await loadLiveNoPrConclusions(
-          filteredIssues.map((issue) => ({ id: issue.id, title: issue.title, body: issue.body })),
-        );
+  let liveParks: Map<string, NoPrConclusionRow> = new Map();
+  if (noPrMode !== "off") {
+    try {
+      liveParks = await loadLiveNoPrConclusions(
+        filteredIssues.map((issue) => ({ id: issue.id, title: issue.title, body: issue.body })),
+      );
+    } catch (error) {
+      // A ledger read failure (a canary or rollback window against a database
+      // without the table) must not halt pickup fleet-wide: this poll degrades
+      // to pre-feature behavior and the claim gate stays fail-closed. A
+      // concluded issue re-offered once is churn; a dead queue is an outage.
+      console.warn(
+        `[no-pr-conclusion] park ledger read failed; this poll withholds nothing: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
   // Parked-and-withheld only in enforce; in audit the mark is attached and
   // the item stays where it was.
   const isParkWithheld = (item: { issueId?: string }): boolean =>
@@ -263,12 +273,19 @@ export async function fetchAgentQueueData(
   });
 
   if (admissionMode === "audit") {
+    // The two holds are independent knobs: admission-audit annotates without
+    // filtering, but a conclusion-enforce park still withholds here (#1506).
+    const admissionAuditWithheld = fullQueue
+      .filter(isParkWithheld)
+      .map((item) => ({ ...item, claimable: false }));
     return {
       resolvedLane,
       laneValid: true,
-      rankedQueue: fullQueue,
+      rankedQueue: admissionAuditWithheld.length
+        ? fullQueue.filter((item) => !isParkWithheld(item))
+        : fullQueue,
       fullQueue,
-      withheldQueue: [],
+      withheldQueue: admissionAuditWithheld,
       admissionMode,
       prFixItems,
       availableLanes,

@@ -189,18 +189,23 @@ export async function POST(request: Request) {
         // commit — the same atomicity precedent as the #1453
         // nextGroomingAction retirement in this update. A no-op when the
         // issue carries no park row (the library's own check); it never
-        // fails the transition.
-        await clearNoPrConclusionPark(
-          {
-            issueId: issueId as string,
-            repoFullName: effectiveRepo,
-            issueNumber: effectiveNumber,
-            actor: actorName,
-            source: "api:status",
-            reason: `status ${targetLabel}`,
-          },
-          tx as unknown as ConclusionWriteClient,
-        );
+        // fails the transition. Worker-tier bearers never discharge: a bound
+        // worker can set status on its assigned issue, and the same worker
+        // that just concluded must not retire its own park — ending a park is
+        // the operator's call, like the DELETE route's bearer rejection.
+        if (!(auth.type === "bearer" && auth.tier === "worker")) {
+          await clearNoPrConclusionPark(
+            {
+              issueId: issueId as string,
+              repoFullName: effectiveRepo,
+              issueNumber: effectiveNumber,
+              actor: actorName,
+              source: "api:status",
+              reason: `status ${targetLabel}`,
+            },
+            tx as unknown as ConclusionWriteClient,
+          );
+        }
       });
 
       // Write audit log

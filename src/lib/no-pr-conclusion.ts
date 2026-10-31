@@ -75,9 +75,11 @@ export interface FingerprintableIssueContent {
 
 /**
  * sha256 over the canonical issue CONTENT (title + body). Labels and state
- * are deliberately absent — see the module header. Normalization matches the
- * grooming fingerprint (trimmed title, CRLF→LF, trailing-whitespace-stripped
- * body) so equivalent representations hash equal.
+ * are deliberately absent — see the module header. The text normalization
+ * (trimmed title, CRLF→LF, trailing-whitespace-stripped body) follows the
+ * grooming fingerprint, but the hashed content set is narrower on purpose:
+ * the grooming fingerprint covers labels and state too, and reusing it here
+ * would let status churn end a park — reviving the exact loop this stops.
  */
 export function computeConclusionContentFingerprint(issue: FingerprintableIssueContent): string {
   const canonical = {

@@ -107,18 +107,22 @@ export async function POST(request: Request) {
           // issue, so any stored terminal no-PR conclusion is retired with
           // the same atomicity precedent as the status mirror in this
           // transaction. A no-op (and records nothing) when the issue
-          // carries no park row.
-          await clearNoPrConclusionPark(
-            {
-              issueId: issueId as string,
-              repoFullName: repoFullName as string,
-              issueNumber: issueNumber as number,
-              actor: moveActor,
-              source: "api:move",
-              reason: "board move",
-            },
-            tx as unknown as ConclusionWriteClient,
-          );
+          // carries no park row. Worker-tier bearers never discharge: the
+          // move route carries no per-agent scope, so honoring one here
+          // would let any agent token retire any issue's park.
+          if (!(auth.type === "bearer" && auth.tier === "worker")) {
+            await clearNoPrConclusionPark(
+              {
+                issueId: issueId as string,
+                repoFullName: repoFullName as string,
+                issueNumber: issueNumber as number,
+                actor: moveActor,
+                source: "api:move",
+                reason: "board move",
+              },
+              tx as unknown as ConclusionWriteClient,
+            );
+          }
         });
       }
 

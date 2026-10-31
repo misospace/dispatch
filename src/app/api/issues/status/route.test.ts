@@ -727,6 +727,34 @@ describe("POST /api/issues/status — terminal no-PR park clear (#1506)", () => 
     expect(statusCalls).toHaveLength(1);
   });
 
+  it("a worker-tier status change never discharges the park", async () => {
+    // The same worker that concluded may set status on its assigned issue;
+    // that must not retire its own park. Ending a park is the operator's call.
+    mocks.noPrConclusionFindUnique.mockResolvedValue(LIVE_PARK);
+    mocks.getLiveIssueLabels.mockResolvedValue(["agent/alpha", "status/ready"]);
+
+    const res = await POST(
+      new Request("http://localhost/api/issues/status", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer status-worker-token" },
+        body: JSON.stringify({
+          issueId: "issue-1",
+          repoFullName: "org/repo",
+          issueNumber: 42,
+          status: "in-progress",
+          agentName: "alpha",
+        }),
+      }),
+    );
+
+    expect(res.status).toBe(200);
+    expect(mocks.noPrConclusionDelete).not.toHaveBeenCalled();
+    const clearedCalls = mocks.createLifecycleEvent.mock.calls.filter(
+      (call: any) => (call[0] as any).data?.kind === "conclusion_cleared",
+    );
+    expect(clearedCalls).toHaveLength(0);
+  });
+
   it("a failing status write never retires the park (same transaction rolls back)", async () => {
     mocks.noPrConclusionFindUnique.mockResolvedValue(LIVE_PARK);
     mocks.updateIssue.mockRejectedValueOnce(new Error("db down"));

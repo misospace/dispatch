@@ -191,6 +191,46 @@ describe("fetchAgentQueueData — terminal no-PR conclusion park (#1506)", () =>
     expect(r.fullQueue.map((i) => i.issueId)).toEqual(["parked"]);
   });
 
+  it("admission-audit + conclusion-enforce: the park still withholds (#1506 knob independence)", async () => {
+    process.env.DISPATCH_NO_PR_CONCLUSION_MODE = "enforce";
+    process.env.DISPATCH_QUEUE_ADMISSION_MODE = "audit";
+    // labels [] keeps grooming admission "not_gated": the withheld entry can
+    // only come from the park, proving the two knobs are independent.
+    mocks.findMany.mockResolvedValue([issue("parked")]);
+    mocks.noPrFindMany.mockResolvedValue([parkFor("parked")]);
+    mocks.buildAgentQueue.mockReturnValue([{ issueId: "parked", title: "#parked", labels: [] }]);
+
+    const r = await fetchAgentQueueData(params());
+
+    expect(r.admissionMode).toBe("audit");
+    // Admission audit annotates without filtering, but the enforce park split
+    // must still run: the parked issue is not implementation pickup.
+    expect(r.rankedQueue).toEqual([]);
+    expect(r.withheldQueue).toEqual([
+      expect.objectContaining({
+        issueId: "parked",
+        claimable: false,
+        noPrConclusion: expect.objectContaining({ agentName: "worker" }),
+      }),
+    ]);
+    expect(r.fullQueue.map((i) => i.issueId)).toEqual(["parked"]);
+  });
+
+  it("a ledger read failure degrades the poll open instead of halting pickup", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    process.env.DISPATCH_NO_PR_CONCLUSION_MODE = "enforce";
+    mocks.findMany.mockResolvedValue([issue("parked")]);
+    mocks.noPrFindMany.mockRejectedValue(new Error("table missing"));
+    mocks.buildAgentQueue.mockReturnValue([{ issueId: "parked", title: "#parked", labels: [] }]);
+
+    const r = await fetchAgentQueueData(params());
+
+    expect(r.rankedQueue.map((i) => i.issueId)).toEqual(["parked"]);
+    expect(r.withheldQueue).toEqual([]);
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
   it("off: no park ledger read and no mark is attached", async () => {
     process.env.DISPATCH_NO_PR_CONCLUSION_MODE = "off";
     mocks.findMany.mockResolvedValue([issue("parked")]);
