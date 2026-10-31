@@ -252,7 +252,9 @@ describe("exploreRepository", () => {
     expect(result.sources).toEqual(["src/lib/prisma.ts", "src/lib/other.ts", "src/lib/db.ts"]);
     expect(result.readSources).toEqual(["src/lib/prisma.ts"]);
     // What the read showed the model, for close-excerpt checks (dispatch#1099).
-    expect(result.readContents).toEqual([{ path: "src/lib/prisma.ts", ref: null, content: "const adapter = new PrismaPg(url);" }]);
+    expect(result.readContents).toEqual([
+      { path: "src/lib/prisma.ts", ref: null, content: "const adapter = new PrismaPg(url);", startLine: 1, endLine: 1 },
+    ]);
   });
 
   it("never spends more than the exploration total byte budget (dispatch#1451)", async () => {
@@ -605,7 +607,9 @@ describe("exploreRepository pinned ref", () => {
 
     const result = await exploreRepository({ ...options, pinnedRef: "deadbeef" }, deps);
 
-    expect(result.readContents).toEqual([{ path: "src/a.ts", ref: "deadbeef", content: "export const a = 1;" }]);
+    expect(result.readContents).toEqual([
+      { path: "src/a.ts", ref: "deadbeef", content: "export const a = 1;", startLine: 1, endLine: 1 },
+    ]);
   });
 });
 

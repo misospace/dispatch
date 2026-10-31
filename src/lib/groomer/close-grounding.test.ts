@@ -139,6 +139,51 @@ describe("collectPinnedReadContent", () => {
     expect(store.files.get("a.ts")).toEqual(["head segment", "tail segment"]);
   });
 
+  it("merges coordinate-adjacent segments so a seam-spanning excerpt grounds (dispatch#1465)", () => {
+    const store = collectPinnedReadContent(HEAD, [
+      { path: "a.ts", ref: HEAD, content: "lines 1 through 10", startLine: 1, endLine: 10 },
+      { path: "a.ts", ref: HEAD, content: "lines 11 through 20", startLine: 11, endLine: 20 },
+    ]);
+    expect(store.files.get("a.ts")).toEqual(["lines 1 through 10 lines 11 through 20"]);
+  });
+
+  it("merges adjacent segments regardless of arrival order", () => {
+    const store = collectPinnedReadContent(HEAD, [
+      { path: "a.ts", ref: HEAD, content: "second", startLine: 11, endLine: 20 },
+      { path: "a.ts", ref: HEAD, content: "first", startLine: 1, endLine: 10 },
+    ]);
+    expect(store.files.get("a.ts")).toEqual(["first second"]);
+  });
+
+  it("a bridging read joins the segments on both sides of the seam", () => {
+    const store = collectPinnedReadContent(HEAD, [
+      { path: "a.ts", ref: HEAD, content: "head", startLine: 1, endLine: 10 },
+      { path: "a.ts", ref: HEAD, content: "tail", startLine: 21, endLine: 30 },
+      { path: "a.ts", ref: HEAD, content: "middle", startLine: 11, endLine: 20 },
+    ]);
+    expect(store.files.get("a.ts")).toEqual(["head middle tail"]);
+  });
+
+  it("keeps segments with a coordinate gap separate", () => {
+    const store = collectPinnedReadContent(HEAD, [
+      { path: "a.ts", ref: HEAD, content: "first", startLine: 1, endLine: 10 },
+      { path: "a.ts", ref: HEAD, content: "third", startLine: 12, endLine: 20 },
+    ]);
+    expect(store.files.get("a.ts")).toEqual(["first", "third"]);
+  });
+
+  it("keeps overlapping, partial-coordinate and uncoordinated segments separate", () => {
+    const store = collectPinnedReadContent(HEAD, [
+      { path: "a.ts", ref: HEAD, content: "first", startLine: 1, endLine: 10 },
+      { path: "a.ts", ref: HEAD, content: "overlap", startLine: 8, endLine: 15 },
+      { path: "a.ts", ref: HEAD, content: "plain" },
+      { path: "b.ts", ref: HEAD, content: "half-coordinated", startLine: 1 },
+      { path: "b.ts", ref: HEAD, content: "next", startLine: 2, endLine: 3 },
+    ]);
+    expect(store.files.get("a.ts")).toEqual(["first", "overlap", "plain"]);
+    expect(store.files.get("b.ts")).toEqual(["half-coordinated", "next"]);
+  });
+
   it("is bounded", () => {
     const reads = Array.from({ length: 5 }, (_, i) => ({ path: `f${i}.ts`, ref: HEAD, content: "x".repeat(40) }));
     expect(collectPinnedReadContent(HEAD, reads, 100).files.size).toBe(2);
@@ -251,6 +296,35 @@ describe("evaluateCloseGrounding", () => {
     // An excerpt crossing the unseen gap between two segments matches nothing.
     expect(
       evaluateCloseGrounding({ evidenceRefs: [], criteria: [criterion("verbose; function omega()")] }, segmented).errors[0],
+    ).toContain("not found verbatim in src/sync.ts");
+  });
+
+  it("grounds an excerpt spanning the seam of two coordinate-adjacent reads (dispatch#1465)", () => {
+    const headRead = {
+      path: "src/sync.ts",
+      ref: HEAD,
+      content: "function alpha() {\n  return alphaConfig.enabled && verbose;",
+      startLine: 1,
+      endLine: 2,
+    };
+    const tailRead = {
+      path: "src/sync.ts",
+      ref: HEAD,
+      content: "function omega() {\n  return omegaFallback.active || legacyMode;\n}",
+      startLine: 3,
+      endLine: 5,
+    };
+    const merged = buildEvidenceCatalog(snapshot(), collectPinnedReadContent(HEAD, [headRead, tailRead]));
+    expect(
+      evaluateCloseGrounding({ evidenceRefs: [], criteria: [criterion("verbose; function omega()")] }, merged).errors,
+    ).toEqual([]);
+    // The same reads with a line gap never merge, and the seam stays unfound.
+    const gapped = buildEvidenceCatalog(
+      snapshot(),
+      collectPinnedReadContent(HEAD, [headRead, { ...tailRead, startLine: 4, endLine: 6 }]),
+    );
+    expect(
+      evaluateCloseGrounding({ evidenceRefs: [], criteria: [criterion("verbose; function omega()")] }, gapped).errors[0],
     ).toContain("not found verbatim in src/sync.ts");
   });
 
