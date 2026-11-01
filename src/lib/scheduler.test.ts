@@ -6,12 +6,17 @@ function fakeDeps(overrides: Partial<SchedulerDeps> = {}): SchedulerDeps & { log
   return {
     fetch: vi.fn(async () => new Response(null, { status: 200 })) as unknown as typeof fetch,
     setInterval: vi.fn(() => "interval-handle"),
+    clearInterval: vi.fn(),
     setTimeout: vi.fn(() => "timeout-handle"),
     log: (m, e) => logs.push([m, e]),
     logs,
     ...overrides,
   };
 }
+
+// Unique interval handles across captures, so clears from one start never
+// alias another start's handles.
+let handleSeq = 0;
 
 const CONFIG: SchedulerConfig = {
   enabled: true,
@@ -283,5 +288,111 @@ describe("supervisor", () => {
     intervals[0]!();
     expect((deps.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls.length).toBe(before);
     expect(deps.logs.some(([m]) => m.includes("re-arming"))).toBe(false);
+  });
+
+  // Regression for audit finding F6 (#1421): the supervisor re-armed overdue
+  // jobs with a fresh setInterval without clearing the previous handle. A
+  // timer that was merely delayed (a stalled event loop) rather than dead
+  // stayed live alongside each replacement, so every supervisor pass stacked
+  // another duplicate periodic invocation.
+  describe("re-arm handle hygiene (#1421)", () => {
+    function captureHandles() {
+      const intervals: Array<{ fn: () => void; handle: string }> = [];
+      const timeouts: Array<() => void> = [];
+      const cleared: string[] = [];
+      // live = armed and not cleared, from this instance's view; a stale
+      // clear of another start's handle deletes nothing here.
+      const live = new Map<string, () => void>();
+      const deps = fakeDeps({
+        setInterval: vi.fn((fn: () => void) => {
+          const handle = `i${handleSeq++}`;
+          intervals.push({ fn, handle });
+          live.set(handle, fn);
+          return handle;
+        }) as unknown as SchedulerDeps["setInterval"],
+        clearInterval: vi.fn((handle: unknown) => {
+          cleared.push(handle as string);
+          live.delete(handle as string);
+        }) as unknown as SchedulerDeps["clearInterval"],
+        setTimeout: vi.fn((fn: () => void) => {
+          timeouts.push(fn);
+          return "t";
+        }) as unknown as SchedulerDeps["setTimeout"],
+      });
+      return { deps, intervals, timeouts, cleared, live };
+    }
+
+    it("clears the overdue job's original interval before arming the replacement", async () => {
+      const cfg: SchedulerConfig = {
+        ...CONFIG,
+        startupDelayMs: 0,
+        jobs: [{ ...CONFIG.jobs[0], name: "rearm-clear", intervalMs: 1 }],
+      };
+      const cap = captureHandles();
+      startScheduler(cfg, cap.deps);
+      for (const t of cap.timeouts) t();
+      await vi.waitFor(() => expect(cap.deps.fetch).toHaveBeenCalled());
+
+      // intervals[0] is the supervisor; the job's own interval is the next.
+      const supervisor = cap.intervals[0]!;
+      const originalJobHandle = cap.intervals[1]!.handle;
+      expect(supervisor.handle).not.toBe(originalJobHandle);
+
+      await new Promise((r) => globalThis.setTimeout(r, 20));
+      supervisor.fn();
+      await vi.waitFor(() =>
+        expect(cap.deps.logs.some(([m]) => m.includes("re-arming"))).toBe(true),
+      );
+
+      // The replacement replaced the original: the stale handle is cleared and
+      // exactly one job interval (the replacement) plus the supervisor remain.
+      expect(cap.cleared).toContain(originalJobHandle);
+      expect(cap.live.size).toBe(2);
+    });
+
+    it("keeps exactly one live interval per job across repeated supervisor ticks", async () => {
+      const cfg: SchedulerConfig = {
+        ...CONFIG,
+        startupDelayMs: 0,
+        jobs: [{ ...CONFIG.jobs[0], name: "rearm-stack", intervalMs: 1 }],
+      };
+      const cap = captureHandles();
+      startScheduler(cfg, cap.deps);
+      for (const t of cap.timeouts) t();
+      await vi.waitFor(() => expect(cap.deps.fetch).toHaveBeenCalled());
+
+      const supervisor = cap.intervals[0]!;
+      for (let tick = 0; tick < 3; tick++) {
+        await new Promise((r) => globalThis.setTimeout(r, 20));
+        supervisor.fn();
+      }
+      await vi.waitFor(() =>
+        expect(cap.deps.logs.filter(([m]) => m.includes("re-arming")).length).toBe(3),
+      );
+
+      // Three overdue passes re-armed three times, but each pass cleared the
+      // previous handle: supervisor + exactly one live job interval.
+      expect(cap.live.size).toBe(2);
+      const jobHandleAfter = cap.intervals[cap.intervals.length - 1]!.handle;
+      expect(cap.live.has(jobHandleAfter)).toBe(true);
+    });
+
+    it("a second startScheduler call replaces the previous supervisor timer (restart)", () => {
+      const cfg: SchedulerConfig = {
+        ...CONFIG,
+        jobs: [{ ...CONFIG.jobs[0], name: "restart-hygiene" }],
+      };
+      const first = captureHandles();
+      startScheduler(cfg, first.deps);
+      const firstSupervisor = first.intervals[0]!.handle;
+
+      const second = captureHandles();
+      startScheduler(cfg, second.deps);
+
+      // The restart cleared the previous supervisor instead of stacking a
+      // second one beside it.
+      expect(second.deps.clearInterval).toHaveBeenCalledWith(firstSupervisor);
+      expect(second.live.size).toBe(1); // only the new supervisor; job timers arm via startup timeout
+    });
   });
 });

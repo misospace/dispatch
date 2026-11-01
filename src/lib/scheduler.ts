@@ -42,6 +42,7 @@ export interface SchedulerConfig {
 export interface SchedulerDeps {
   fetch: typeof fetch;
   setInterval: (fn: () => void, ms: number) => unknown;
+  clearInterval: (handle: unknown) => void;
   setTimeout: (fn: () => void, ms: number) => unknown;
   log: (message: string, error?: unknown) => void;
 }
@@ -194,6 +195,11 @@ export async function schedulerHealthCheck(config: SchedulerConfig, deps: Schedu
 /** How often the supervisor checks for stopped timers. */
 const SUPERVISOR_INTERVAL_MS = 60_000;
 
+// Reserved intervalHandles key for the supervisor's own timer. No job is named
+// this, and it keeps a second startScheduler call in the same process (a dev
+// reload) from stacking supervisors on top of the first one's (#1421).
+const SUPERVISOR_HANDLE_KEY = "__supervisor__";
+
 // Held on globalThis, not in module scope. startScheduler runs from
 // instrumentation.ts, which Turbopack standalone isolates into its own chunk
 // graph — the same isolation the header of instrumentation.ts describes for
@@ -204,10 +210,20 @@ const SUPERVISOR_INTERVAL_MS = 60_000;
 const globalForScheduler = globalThis as unknown as {
   __schedulerLastRunAt?: Map<string, number>;
   __schedulerArmedIntervalMs?: Map<string, number>;
+  __schedulerIntervalHandles?: Map<string, unknown>;
 };
 
 const lastRunAt = (globalForScheduler.__schedulerLastRunAt ??= new Map<string, number>());
 const armedIntervalMs = (globalForScheduler.__schedulerArmedIntervalMs ??= new Map<string, number>());
+
+// The live interval handle per job, keyed by name. Global for the same
+// chunk-graph reason as the maps above. The supervisor re-arms overdue jobs,
+// and a timer that is merely delayed (a stalled event loop) is still live:
+// arming a second interval without clearing the first left both firing
+// forever, so every later tick multiplied the duplicate invocations (#1421).
+// One map entry per job is what makes "at most one live interval per job"
+// checkable at arm time.
+const intervalHandles = (globalForScheduler.__schedulerIntervalHandles ??= new Map<string, unknown>());
 
 /** Scheduler liveness for /api/health: per job, when it last completed. */
 export function schedulerState(): {
@@ -257,6 +273,40 @@ export async function runJob(job: ScheduledJob, config: SchedulerConfig, deps: S
 }
 
 /**
+ * Arm a periodic timer and track it under `key`, clearing whatever timer was
+ * previously live for that key.
+ *
+ * Both job intervals and the supervisor's own timer arm through this. The old
+ * code never cleared the previous handle: re-arming a job whose timer was only
+ * delayed (a stalled event loop, not a dead one) left two live intervals
+ * firing forever, and every later supervisor pass added another (#1421).
+ * One tracked handle per key is what keeps "at most one live interval per
+ * timer" true at arm time.
+ */
+function armTracked(
+  key: string,
+  fn: () => void,
+  ms: number,
+  deps: SchedulerDeps,
+  handles: unknown[],
+): void {
+  const previous = intervalHandles.get(key);
+  if (previous !== undefined) deps.clearInterval(previous);
+  const handle = deps.setInterval(fn, ms);
+  intervalHandles.set(key, handle);
+  handles.push(handle);
+}
+
+function armJobInterval(
+  job: ScheduledJob,
+  config: SchedulerConfig,
+  deps: SchedulerDeps,
+  handles: unknown[],
+): void {
+  armTracked(job.name, () => void runJob(job, config, deps), job.intervalMs, deps, handles);
+}
+
+/**
  * Start the scheduler. No-op (returns []) when disabled or when no token is
  * configured. Each job runs once after startupDelayMs, then every intervalMs.
  * Returns the interval handles (for teardown in tests).
@@ -286,8 +336,7 @@ export function startScheduler(config: SchedulerConfig, deps: SchedulerDeps): un
     armedIntervalMs.set(job.name, job.intervalMs);
     deps.setTimeout(() => {
       void runJob(job, config, deps);
-      const handle = deps.setInterval(() => void runJob(job, config, deps), job.intervalMs);
-      handles.push(handle);
+      armJobInterval(job, config, deps, handles);
     }, config.startupDelayMs);
   }
 
@@ -299,24 +348,32 @@ export function startScheduler(config: SchedulerConfig, deps: SchedulerDeps): un
   // enqueued 35 items. Root cause in the standalone runtime is not established,
   // so this does not pretend to fix it — it detects the state and recovers,
   // and says so loudly rather than starving every queue in silence.
-  const supervisorHandle = deps.setInterval(() => {
-    const now = Date.now();
-    for (const job of config.jobs) {
-      const last = lastRunAt.get(job.name);
-      // Never-run jobs are covered by their own startup timeout; only re-arm
-      // something that ran and then stopped, so a slow start is not mistaken
-      // for a dead timer.
-      if (last === undefined || now - last <= job.intervalMs * 2) continue;
-      deps.log(
-        `job "${job.name}" has not run for ${Math.round((now - last) / 1000)}s ` +
-          `(interval ${Math.round(job.intervalMs / 1000)}s) — re-arming`,
-      );
-      lastRunAt.set(job.name, now);
-      void runJob(job, config, deps);
-      handles.push(deps.setInterval(() => void runJob(job, config, deps), job.intervalMs));
-    }
-  }, SUPERVISOR_INTERVAL_MS);
-  handles.push(supervisorHandle);
+  armTracked(
+    SUPERVISOR_HANDLE_KEY,
+    () => {
+      const now = Date.now();
+      for (const job of config.jobs) {
+        const last = lastRunAt.get(job.name);
+        // Never-run jobs are covered by their own startup timeout; only re-arm
+        // something that ran and then stopped, so a slow start is not mistaken
+        // for a dead timer.
+        if (last === undefined || now - last <= job.intervalMs * 2) continue;
+        deps.log(
+          `job "${job.name}" has not run for ${Math.round((now - last) / 1000)}s ` +
+            `(interval ${Math.round(job.intervalMs / 1000)}s) — re-arming`,
+        );
+        lastRunAt.set(job.name, now);
+        void runJob(job, config, deps);
+        // Replace, never stack: the old timer may be merely delayed rather
+        // than dead, so the previous handle is cleared before the new one is
+        // armed (#1421).
+        armJobInterval(job, config, deps, handles);
+      }
+    },
+    SUPERVISOR_INTERVAL_MS,
+    deps,
+    handles,
+  );
 
   return handles;
 }
