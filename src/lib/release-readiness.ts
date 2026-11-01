@@ -27,6 +27,7 @@
  */
 
 import type { ReleasePulseSnapshot } from "./release-pulse";
+import { toMillis } from "./time-parse";
 
 export type ReleaseReadinessState = "quiet" | "building" | "candidate" | "unknown";
 
@@ -62,13 +63,6 @@ export interface ReleaseReadiness {
     ageCommits: number;
     ageDays: number;
   };
-}
-
-function parseMillis(value: Date | string | number | null): number | null {
-  if (value === null) return null;
-  const ms =
-    value instanceof Date ? value.getTime() : typeof value === "number" ? value : Date.parse(value);
-  return Number.isNaN(ms) ? null : ms;
 }
 
 function plural(count: number, singular: string, suffix = "s"): string {
@@ -142,11 +136,11 @@ export function deriveReleaseReadiness(input: ReleaseReadinessInput): ReleaseRea
     return build("unknown", [baselineEvidenceUnknownReason(pulse)]);
   }
 
-  const nowMs = parseMillis(input.now);
+  const nowMs = toMillis(input.now);
   if (nowMs === null) {
     return build("unknown", ["Current time evidence is unavailable."]);
   }
-  const baselineMs = parseMillis(pulse.baseline ? pulse.baseline.publishedAt : null);
+  const baselineMs = toMillis(pulse.baseline ? pulse.baseline.publishedAt : null);
   if (baselineMs === null) {
     // Defensive: a ready pulse always carries a parseable publication time
     // (the pulse gate guarantees it); never trust a snapshot that doesn't.

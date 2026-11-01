@@ -22,6 +22,7 @@ import {
   type LifecycleProvenance,
   type TimelineIssueInput,
 } from "./issue-lifecycle-read";
+import { toMillis } from "./time-parse";
 import {
   buildWorkItemDeliveryChain,
   type WorkAttemptPrFixItemRecord,
@@ -231,12 +232,6 @@ export const COHORT_DEFINITIONS: Readonly<Record<string, string>> = Object.freez
 });
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-function toMillis(value: Date | string | null | undefined): number | null {
-  if (value === null || value === undefined) return null;
-  const ms = value instanceof Date ? value.getTime() : Date.parse(value);
-  return Number.isNaN(ms) ? null : ms;
-}
 
 /** Nearest-rank percentile: the value at rank ceil(p/100 * n) in the ascending
  * sorted sample. Null when the sample is empty. */

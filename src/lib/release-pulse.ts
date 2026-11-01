@@ -32,6 +32,7 @@ import {
 } from "./issue-lifecycle-read";
 import { normalizeStoredReleaseSignal, type ReleaseSignal } from "./groomer/plan";
 import type { ReleaseDeltaState } from "./automation-sync";
+import { toIso, toMillis } from "./time-parse";
 
 export type ReleasePulseHighlightKind =
   | "feature"
@@ -166,17 +167,6 @@ export function isReleasePulseReady(repo: ReleasePulseRepoInput): boolean {
 
 const FOLLOW_UP_URL_PATTERN =
   /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/(issues|pull)\/(\d+)$/;
-
-/** Parse a defensive timestamp: unparseable (or absent) values yield null. */
-function toMillis(value: Date | string | null | undefined): number | null {
-  if (value === null || value === undefined) return null;
-  const ms = value instanceof Date ? value.getTime() : Date.parse(value);
-  return Number.isNaN(ms) ? null : ms;
-}
-
-function toIso(ms: number): string {
-  return new Date(ms).toISOString();
-}
 
 /**
  * Which PR a `pr_merged` row is about: the metadata's number when it carries

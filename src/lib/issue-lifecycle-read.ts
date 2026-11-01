@@ -28,6 +28,8 @@
  * invariant to the order the rows arrive in.
  */
 
+import { toIso, toMillis } from "./time-parse";
+
 export type LifecycleProvenance = "observed" | "backfilled" | "unknown";
 
 export interface LifecycleEventRecord {
@@ -92,17 +94,6 @@ export interface TimelineIssueInput {
   issueNumber: number;
   state: string;
   closedAt?: Date | string | null;
-}
-
-/** Parse a defensive timestamp: unparseable (or absent) values yield null. */
-function toMillis(value: Date | string | null | undefined): number | null {
-  if (value === null || value === undefined) return null;
-  const ms = value instanceof Date ? value.getTime() : Date.parse(value);
-  return Number.isNaN(ms) ? null : ms;
-}
-
-function toIso(ms: number): string {
-  return new Date(ms).toISOString();
 }
 
 function isBackfilled(metadata: Record<string, unknown> | null): boolean {
