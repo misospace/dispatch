@@ -43,6 +43,10 @@ export async function register() {
   startScheduler(schedulerConfigFromEnv(process.env), {
     fetch,
     setInterval,
+    // The scheduler tracks handles opaquely (setInterval returns unknown);
+    // re-narrow them for Node's clearInterval signature.
+    clearInterval: (handle: unknown) =>
+      clearInterval(handle as Parameters<typeof clearInterval>[0]),
     setTimeout,
     log: (message, error) =>
       error !== undefined
