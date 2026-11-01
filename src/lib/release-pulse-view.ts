@@ -17,6 +17,7 @@
  */
 
 import type { ReleasePulseSnapshot } from "./release-pulse";
+import { toMillis } from "./time-parse";
 
 export type ReleasePulseViewKind = "ready" | "unknown" | "no-release";
 
@@ -49,19 +50,13 @@ export interface ReleasePulseViewInput {
 
 const READINESS_STATES = new Set(["quiet", "building", "candidate", "unknown"]);
 
-function parseMillis(value: Date | string | number | null | undefined): number | null {
-  if (value === null || value === undefined) return null;
-  const ms = value instanceof Date ? value.getTime() : typeof value === "number" ? value : Date.parse(value);
-  return Number.isNaN(ms) ? null : ms;
-}
-
 /** Whole floored days between a past publication time and `now`; null when unusable. */
 export function formatReleaseAge(
   publishedAt: string | null | undefined,
   now: Date | string | number,
 ): string | null {
-  const publishedMs = parseMillis(publishedAt);
-  const nowMs = parseMillis(now);
+  const publishedMs = toMillis(publishedAt);
+  const nowMs = toMillis(now);
   if (publishedMs === null || nowMs === null) return null;
   const days = Math.max(0, Math.floor((nowMs - publishedMs) / 86_400_000));
   return `${days}d`;
@@ -98,8 +93,8 @@ export function buildReleasePulseView(input: ReleasePulseViewInput): ReleasePuls
     ? (readiness.state as ReleasePulseView["readinessState"])
     : "unknown";
 
-  const nowMs = parseMillis(input.now);
-  const syncedMs = parseMillis(input.releaseDeltaSyncedAt);
+  const nowMs = toMillis(input.now);
+  const syncedMs = toMillis(input.releaseDeltaSyncedAt);
   // No sync evidence at all is stale: the snapshot cannot be presented as live.
   const stale = syncedMs === null || nowMs === null || nowMs - syncedMs > RELEASE_PULSE_STALE_MS;
   const syncAge =
