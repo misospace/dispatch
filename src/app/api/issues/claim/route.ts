@@ -14,6 +14,7 @@ import { recordClaimEvent } from "@/lib/issue-lifecycle";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { withIssueMutationGuard } from "@/lib/issue-mutation-guard";
 import { supersedeOwnershipReleaseIntent } from "@/lib/ownership-reconciliation";
+import { clearNoPrConclusionPark, getLiveNoPrConclusion, getNoPrConclusionMode } from "@/lib/no-pr-conclusion";
 
 const IN_PROGRESS_STATUS = "status/in-progress";
 const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
@@ -131,6 +132,23 @@ export async function POST(request: Request) {
     // Refuse closed issues (cached state is fine for this check)
     if (issue.state === "closed") {
       return errorResponse("Cannot claim a closed issue", 400);
+    }
+
+    // #1506: a live terminal no-PR conclusion is the durable stop against
+    // re-offering concluded work. In enforce mode it holds every non-force
+    // claim (a stale or absent park has no effect — the queue filter is the
+    // first line, this is the enforcement), and the maintainer force-claim
+    // is the sole deliberate override: like the §8.7 intent barrier below it
+    // is superseded (audited), not raced. The override discharges the park
+    // only after its own claim commit.
+    if (getNoPrConclusionMode() === "enforce" && force !== true) {
+      const park = await getLiveNoPrConclusion({ id: issue.id, title: issue.title, body: issue.body });
+      if (park) {
+        return errorResponse(
+          `Issue is parked by ${park.agentName}'s terminal no-PR conclusion (${park.outcome}); an operator can clear it with DELETE /api/issues/${issue.id}/no-pr-conclusion or by setting the issue's status`,
+          409,
+        );
+      }
     }
 
     // §8.7 Claim side: a pending reconciler release intent holds ANY claim on
@@ -455,6 +473,27 @@ export async function POST(request: Request) {
           metadata: force === true ? { force: true } : null,
         });
       });
+
+      // #1506: a force-claim is the operator's deliberate override of a
+      // terminal no-PR park, so it discharges the park — but only after the
+      // claim transaction committed above, so a failed claim can never
+      // discharge a live park. Best-effort: a failing clear must not mask a
+      // landed claim, and a surviving row expires on content edit or an
+      // operator clear anyway.
+      if (force === true) {
+        try {
+          await clearNoPrConclusionPark({
+            issueId: issueId as string,
+            repoFullName,
+            issueNumber,
+            actor,
+            source: "api:claim",
+            reason: "force-claim supersedes the terminal no-PR conclusion",
+          });
+        } catch (error) {
+          console.warn(`no-PR conclusion park clear failed after force claim on issue #${issueNumber}:`, error);
+        }
+      }
 
       // Create or renew a lease for this agent (issue #166) — done above, as
       // the §8.7 claim intent committed before the remote add.

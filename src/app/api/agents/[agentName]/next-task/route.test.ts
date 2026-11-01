@@ -30,6 +30,9 @@ const { mocks } = vi.hoisted(() => ({
     prFixTransactionError: null as Error | null,
     // Queue-client surfaces touched THROUGH the admission transaction.
     prFixTxSurfaces: [] as string[],
+    // #1506: the terminal no-PR conclusion park ledger read/cleanup.
+    noPrConclusionFindMany: vi.fn().mockResolvedValue([]),
+    noPrConclusionDeleteMany: vi.fn().mockResolvedValue({ count: 0 }),
   },
 }));
 
@@ -78,6 +81,11 @@ vi.mock("@/lib/prisma", () => {
   return {
     prisma: {
       issue: { findMany: mocks.issueFindMany, findFirst: mocks.issueFindFirst },
+      // #1506: the terminal no-PR conclusion park ledger read/cleanup.
+      noPrConclusion: {
+        findMany: mocks.noPrConclusionFindMany,
+        deleteMany: mocks.noPrConclusionDeleteMany,
+      },
       prFixQueueItem,
       prFixHistory: { create: mocks.prFixHistoryCreate },
       capacityHandoff: {

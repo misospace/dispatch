@@ -16,6 +16,7 @@ import {
   formatDependencyBlockReason,
 } from "@/lib/issue-dependencies";
 import type { QueueAdmission } from "@/lib/queue-admission";
+import type { NoPrConclusionMark } from "@/lib/no-pr-conclusion";
 
 export { isRenovateIssue } from "@/lib/issue-filters";
 
@@ -63,6 +64,13 @@ export interface RankedIssue {
    * DISPATCH_QUEUE_ADMISSION_MODE is audit or enforce; absent when off.
    */
   admission?: QueueAdmission;
+  /**
+   * Live terminal no-PR conclusion park (#1506). Present only when
+   * DISPATCH_NO_PR_CONCLUSION_MODE is audit or enforce; in enforce the item
+   * is withheld from the ranked queue and carried in the withheld queue
+   * instead.
+   */
+  noPrConclusion?: NoPrConclusionMark | null;
 }
 
 // ─── Anti-starvation aging ──────────────────────────────────────────────────

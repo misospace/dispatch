@@ -39,6 +39,14 @@ const { mocks, mockAgentRun, mockDedupe, prFixResolveMock, closeResolveMock, pri
     issue: {
       findUnique: vi.fn().mockResolvedValue(null),
     },
+    // #1506: the terminal no-PR conclusion park ledger. The report route records
+    // a park (upsert) for a terminal no-PR outcome on an implement task; the
+    // default read finds none so an unrelated report stays a no-op.
+    noPrConclusion: {
+      findUnique: vi.fn().mockResolvedValue(null),
+      upsert: vi.fn().mockResolvedValue({}),
+      delete: vi.fn().mockResolvedValue({}),
+    },
     issueLifecycleEvent: {
       create: vi.fn().mockResolvedValue({ id: "evt-1" }),
       upsert: vi.fn().mockResolvedValue({ id: "evt-1" }),
@@ -76,6 +84,8 @@ const { mocks, mockAgentRun, mockDedupe, prFixResolveMock, closeResolveMock, pri
     mocks: {
       repoFindUnique: prismaMock.repository.findUnique,
       issueFindUnique: prismaMock.issue.findUnique,
+      noPrConclusionUpsert: prismaMock.noPrConclusion.upsert,
+      noPrConclusionFindUnique: prismaMock.noPrConclusion.findUnique,
     },
     prismaMock,
     getLiveIssueLabelsMock: vi.fn(),
@@ -2794,5 +2804,549 @@ describe("POST /api/agents/[agentName]/tasks/report — durable run→fix-round 
     await postRequest(fixReport);
     expect(mockAgentRun.create.mock.calls[0][0].data).not.toHaveProperty("prFixQueueItemId");
     expect(prismaMock.prFixQueueItem.findUnique).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/agents/[agentName]/tasks/report — terminal no-PR conclusion park (#1506)", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+    resetRateLimits();
+    // Re-establish the hoisted defaults a preceding describe's mockReset() may
+    // have stripped, so the park path starts from a well-known state.
+    mocks.repoFindUnique.mockResolvedValue(null);
+    mocks.issueFindUnique.mockResolvedValue(null);
+    mocks.noPrConclusionUpsert.mockResolvedValue({});
+    prismaMock.issueLifecycleEvent.create.mockResolvedValue({ id: "evt-1" });
+    prismaMock.prFixQueueItem.findUnique.mockResolvedValue(null);
+    // The PR-fix resolver settles the queue item; the park gate reads the
+    // report's attempt token, not this verdict. The default "no matching
+    // pr-fix queue item" is the value a report without a token gets.
+    // Re-established per test so a test that stages a settlement cannot leak
+    // into the next one.
+    prFixResolveMock.mockReset().mockResolvedValue({
+      matched: false,
+      action: "none",
+      itemId: null,
+      reason: "no matching pr-fix queue item",
+    });
+  });
+
+  const issueRow = (over: Record<string, unknown> = {}) => ({
+    id: "issue-42",
+    title: "Fix login redirect",
+    body: "Steps to reproduce: log in, then click settings",
+    state: "open",
+    ...over,
+  });
+
+  function p2002() {
+    return new Prisma.PrismaClientKnownRequestError("P2002", {
+      code: "P2002",
+      meta: { target: ["agentName_idempotencyKey"] },
+      clientVersion: "5.0.0",
+    });
+  }
+
+  it("no_changes_needed on an implement report records the park with a title+body fingerprint", async () => {
+    mocks.repoFindUnique.mockResolvedValue({ id: "repo-1" });
+    mocks.issueFindUnique.mockResolvedValue(issueRow());
+
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "no_changes_needed",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      summary: "Already fixed in main",
+    });
+    expect(res.status).toBe(200);
+    expect(mocks.noPrConclusionUpsert).toHaveBeenCalledTimes(1);
+    const arg = mocks.noPrConclusionUpsert.mock.calls[0][0];
+    expect(arg.where).toEqual({ issueId: "issue-42" });
+    expect(arg.create).toEqual(
+      expect.objectContaining({
+        issueId: "issue-42",
+        agentName: "test-agent",
+        outcome: "no_changes_needed",
+        summary: "Already fixed in main",
+        contentFingerprint: expect.any(String),
+      }),
+    );
+    // The park is also a first-class lifecycle event.
+    expect(prismaMock.issueLifecycleEvent.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          issueId: "issue-42",
+          kind: "conclusion_parked",
+          agentName: "test-agent",
+        }),
+      }),
+    );
+    // The park decision is echoed to the reporting worker (#1506 contract).
+    const body = await res.json();
+    expect(body.conclusionPark).toEqual({
+      applied: true,
+      outcome: "no_changes_needed",
+      reason: "parked",
+    });
+  });
+
+  it("already_addressed on an implement report records the park, carrying the evidence", async () => {
+    mocks.repoFindUnique.mockResolvedValue({ id: "repo-1" });
+    mocks.issueFindUnique.mockResolvedValue(issueRow());
+
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "already_addressed",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      evidence: "shipped in abc12345",
+    });
+    expect(res.status).toBe(200);
+    expect(mocks.noPrConclusionUpsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { issueId: "issue-42" },
+        create: expect.objectContaining({
+          outcome: "already_addressed",
+          evidence: "shipped in abc12345",
+        }),
+      }),
+    );
+  });
+
+  it("followup-pr already_addressed does NOT record a park (issue-work terminal only)", async () => {
+    mocks.repoFindUnique.mockResolvedValue({ id: "repo-1" });
+    mocks.issueFindUnique.mockResolvedValue(issueRow());
+
+    const res = await postRequest({
+      taskType: "followup-pr",
+      outcome: "already_addressed",
+      repoFullName: "org/repo",
+      pullRequestNumber: 5,
+    });
+    expect(res.status).toBe(200);
+    expect(mocks.noPrConclusionUpsert).not.toHaveBeenCalled();
+  });
+
+  it("an implement report that carries a PR-fix attempt token does NOT record a park", async () => {
+    // #1510 review (hard blocker): a report that carries a PR-fix attempt
+    // token is PR-fix work. Parking the issue on top of that settlement would
+    // withhold the issue while the PR-fix lane owns the PR, so the issue-work
+    // conclusion is dropped with it.
+    mocks.repoFindUnique.mockResolvedValue({ id: "repo-1" });
+    mocks.issueFindUnique.mockResolvedValue(issueRow());
+    prFixResolveMock.mockResolvedValue({
+      matched: true,
+      action: "fixed",
+      itemId: 9,
+      reason: "pr merge state verified",
+    });
+
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "no_changes_needed",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      pullRequestNumber: 10,
+      prFixItem: { id: "item-9", generation: 1 },
+    });
+    expect(res.status).toBe(200);
+    // The PR-fix half still happens — only the issue park is withheld.
+    expect(prFixResolveMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        outcome: "no_changes_needed",
+        attempt: { itemId: "item-9", generation: 1, handoutToken: undefined },
+      }),
+    );
+    expect(mocks.noPrConclusionUpsert).not.toHaveBeenCalled();
+    expect(prismaMock.issueLifecycleEvent.create).not.toHaveBeenCalled();
+    // The decision is still echoed, so the worker learns why nothing parked.
+    const body = await res.json();
+    expect(body.conclusionPark).toEqual({ applied: false, reason: "pr-fix-attempt" });
+  });
+
+  it("an ACCEPTED mixed implement+prFixItem no-PR outcome records NO park", async () => {
+    // #1510 review (hard blocker): the report is accepted, but it presents a
+    // PR-fix attempt token, so Dispatch reads it as PR-fix work and never
+    // parks the issue. The exclusion keys on the token's presence, not on the
+    // settlement's verdict, so the token settling nothing changes the reason
+    // but not the decision.
+    mocks.repoFindUnique.mockResolvedValue({ id: "repo-1" });
+    mocks.issueFindUnique.mockResolvedValue(issueRow());
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "no_changes_needed",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      prFixItem: { id: "item-9", generation: 1 },
+    });
+    expect(res.status).toBe(200);
+    expect(mocks.noPrConclusionUpsert).not.toHaveBeenCalled();
+    expect(prismaMock.issueLifecycleEvent.create).not.toHaveBeenCalled();
+    const body = await res.json();
+    expect(body.conclusionPark).toEqual({ applied: false, reason: "pr-fix-attempt" });
+    // The suppression is logged, so a worker that repeats it leaves a trace.
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("item-9"));
+    warn.mockRestore();
+  });
+
+  it("an accepted mixed implement+prFixItem already_addressed outcome records NO park", async () => {
+    // `already_addressed` is the other no-PR outcome that accepts a
+    // prFixItem, so it carries the same exclusion as `no_changes_needed`.
+    mocks.repoFindUnique.mockResolvedValue({ id: "repo-1" });
+    mocks.issueFindUnique.mockResolvedValue(issueRow());
+
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "already_addressed",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      prFixItem: { id: "item-9", generation: 1 },
+    });
+    expect(res.status).toBe(200);
+    expect(mocks.noPrConclusionUpsert).not.toHaveBeenCalled();
+    expect(prismaMock.issueLifecycleEvent.create).not.toHaveBeenCalled();
+    const body = await res.json();
+    expect(body.conclusionPark).toEqual({ applied: false, reason: "pr-fix-attempt" });
+  });
+
+  it("an implement report with an explicitly null prFixItem records a park", async () => {
+    // `prFixItem: null` is not a token — it must not read as PR-fix work.
+    mocks.repoFindUnique.mockResolvedValue({ id: "repo-1" });
+    mocks.issueFindUnique.mockResolvedValue(issueRow());
+
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "no_changes_needed",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      prFixItem: null,
+    });
+    expect(res.status).toBe(200);
+    expect(mocks.noPrConclusionUpsert).toHaveBeenCalledTimes(1);
+    const body = await res.json();
+    expect(body.conclusionPark).toEqual({ applied: true, outcome: "no_changes_needed", reason: "parked" });
+  });
+
+  it("an unresolvable issue (no cached row) records no park", async () => {
+    mocks.repoFindUnique.mockResolvedValue({ id: "repo-1" });
+    mocks.issueFindUnique.mockResolvedValue(null);
+
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "no_changes_needed",
+      repoFullName: "org/repo",
+      issueNumber: 999,
+    });
+    expect(res.status).toBe(200);
+    expect(mocks.noPrConclusionUpsert).not.toHaveBeenCalled();
+    const body = await res.json();
+    expect(body.conclusionPark).toEqual({ applied: false, reason: "issue-not-tracked" });
+  });
+
+  it("a closed issue is not parked (skipped, not an error)", async () => {
+    mocks.repoFindUnique.mockResolvedValue({ id: "repo-1" });
+    mocks.issueFindUnique.mockResolvedValue(issueRow({ state: "closed" }));
+
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "no_changes_needed",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+    });
+    expect(res.status).toBe(200);
+    expect(mocks.noPrConclusionUpsert).not.toHaveBeenCalled();
+    const body = await res.json();
+    expect(body.conclusionPark).toEqual({ applied: false, reason: "issue-not-open" });
+  });
+
+  it("a park-write failure does not fail the report", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mocks.repoFindUnique.mockResolvedValue({ id: "repo-1" });
+    mocks.issueFindUnique.mockResolvedValue(issueRow());
+    mocks.noPrConclusionUpsert.mockRejectedValueOnce(new Error("db down"));
+
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "no_changes_needed",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.conclusionPark).toEqual({ applied: false, reason: "park-write-failed" });
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it("already_done with a REFUSED close still parks — the defect case (close refused must stop re-offers)", async () => {
+    closeResolveMock.mockResolvedValue({
+      matched: true,
+      action: "refused",
+      reason: "close policy not satisfied",
+      reasons: ["no merged PR"],
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      headSha: null,
+      evidenceDigest: null,
+      criteria: [],
+    });
+    mocks.repoFindUnique.mockResolvedValue({ id: "repo-1" });
+    mocks.issueFindUnique.mockResolvedValue(issueRow());
+
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "already_done",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      idempotencyKey: "worker-run-1:already_done",
+      close: {
+        criteria: [
+          {
+            criterion: "Login redirects after password reset",
+            path: "src/auth/login.ts",
+            excerpt: 'return session.returnTo ?? "/";',
+          },
+        ],
+      },
+    });
+    expect(res.status).toBe(200);
+    expect(closeResolveMock).toHaveBeenCalled();
+    expect(mocks.noPrConclusionUpsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { issueId: "issue-42" },
+        create: expect.objectContaining({ outcome: "already_done" }),
+      }),
+    );
+    const body = await res.json();
+    expect(body.conclusionPark).toEqual({ applied: true, outcome: "already_done", reason: "parked" });
+  });
+
+  it("already_done with a SUCCESSFUL close does not park (the close is the harder stop)", async () => {
+    closeResolveMock.mockResolvedValue({
+      matched: true,
+      action: "closed",
+      reason: "issue closed after close policy was satisfied",
+      reasons: [],
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      headSha: "abc123",
+      evidenceDigest: "digest",
+      criteria: [{ criterion: "Login redirects", path: "src/auth/login.ts" }],
+    });
+    mocks.repoFindUnique.mockResolvedValue({ id: "repo-1" });
+    mocks.issueFindUnique.mockResolvedValue(issueRow());
+
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "already_done",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      idempotencyKey: "worker-run-1:closed",
+      close: {
+        criteria: [
+          {
+            criterion: "Login redirects after password reset",
+            path: "src/auth/login.ts",
+            excerpt: 'return session.returnTo ?? "/";',
+          },
+        ],
+      },
+    });
+    expect(res.status).toBe(200);
+    expect(mocks.noPrConclusionUpsert).not.toHaveBeenCalled();
+    const body = await res.json();
+    expect(body.conclusionPark).toEqual({ applied: false, reason: "issue-closed" });
+  });
+
+  it("a retried report with the same idempotency key does not re-park", async () => {
+    const body = {
+      taskType: "implement",
+      outcome: "no_changes_needed",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      idempotencyKey: "k:park",
+    };
+    mocks.repoFindUnique.mockResolvedValue({ id: "repo-1" });
+    mocks.issueFindUnique.mockResolvedValue(issueRow());
+
+    const first = await postRequest(body);
+    expect(first.status).toBe(200);
+    expect(mocks.noPrConclusionUpsert).toHaveBeenCalledTimes(1);
+
+    // Same idempotency key, same payload → the claim P2002s and resolves to the
+    // existing run; the original report owns the park, so the retry must not
+    // record a second one.
+    const payloadHash = mockDedupe.create.mock.calls[0][0].data.payloadHash;
+    mockDedupe.create.mockRejectedValueOnce(p2002());
+    mockDedupe.findUnique.mockResolvedValueOnce({
+      id: "claim-1",
+      agentName: "test-agent",
+      idempotencyKey: body.idempotencyKey,
+      payloadHash,
+      agentRunId: "run-1",
+      prFixResolution: null,
+      closeResolution: null,
+    });
+
+const retry = await postRequest(body);
+expect(retry.status).toBe(200);
+const retryBody = await retry.json();
+expect(retryBody.duplicate).toBe(true);
+expect(retryBody.conclusionPark).toEqual({
+applied: false,
+reason: "duplicate report; the conclusion park was not re-run",
+});
+expect(mocks.noPrConclusionUpsert).toHaveBeenCalledTimes(1);
+});
+
+  it("a no-PR report without an issue reference does not park", async () => {
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "no_changes_needed",
+      issueNumber: 42,
+    });
+    expect(res.status).toBe(200);
+    expect(mocks.noPrConclusionUpsert).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/agents/[agentName]/tasks/report — park worker ownership (#1510 review)", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+    resetRateLimits();
+    mocks.repoFindUnique.mockResolvedValue({ id: "repo-1" });
+    mocks.issueFindUnique.mockResolvedValue(issueRow());
+    mocks.noPrConclusionUpsert.mockResolvedValue({});
+    prismaMock.issueLifecycleEvent.create.mockResolvedValue({ id: "evt-1" });
+    prismaMock.prFixQueueItem.findUnique.mockResolvedValue(null);
+    // Full reset, not clearAllMocks: an earlier gate block in this file
+    // installs a persistent `mockResolvedValue` on the live-label mock, and a
+    // stale `agent/alpha` implementation would silently let a future test
+    // that forgets its own stub park.
+    getLiveIssueLabelsMock.mockReset();
+  });
+
+  const issueRow = (over: Record<string, unknown> = {}) => ({
+    id: "issue-42",
+    title: "Fix login redirect",
+    body: "Steps to reproduce: log in, then click settings",
+    state: "open",
+    ...over,
+  });
+
+  // `bound-report-agent` is bound to `test-agent` in the dispatch-env mock;
+  // `postRequest` defaults to the maintainer token, so worker-tier park tests
+  // build their request with this token explicitly.
+  function workerPostRequest(body: unknown) {
+    return POST(
+      authedRequest("http://localhost/api/agents/test-agent/tasks/report", {
+        method: "POST",
+        token: "bound-report-agent",
+        body,
+      }),
+      { params: Promise.resolve({ agentName: "test-agent" }) },
+    );
+  }
+
+  const parkBody = {
+    taskType: "implement",
+    outcome: "no_changes_needed",
+    repoFullName: "org/repo",
+    issueNumber: 42,
+    summary: "Already fixed in main",
+  };
+
+  it("a worker report for an issue NOT live-assigned to it does not record a park", async () => {
+    // #1510 review round 2: the park withholds queue pickup, so a bound
+    // worker may only park an issue it actually owns. Live GitHub labels are
+    // authoritative — the cache can lag a claim made on the forge (#1037).
+    getLiveIssueLabelsMock.mockResolvedValueOnce(["status/ready", "priority/p1"]);
+
+    const res = await workerPostRequest(parkBody);
+    expect(res.status).toBe(200);
+    expect(getLiveIssueLabelsMock).toHaveBeenCalledWith("org/repo", 42);
+    expect(mocks.noPrConclusionUpsert).not.toHaveBeenCalled();
+    expect(prismaMock.issueLifecycleEvent.create).not.toHaveBeenCalled();
+    // The report still lands — the park is a best-effort side effect and the
+    // report must never fail over it; the worker learns why nothing parked.
+    const body = await res.json();
+    expect(body.report.outcome).toBe("no_changes_needed");
+    expect(body.conclusionPark).toEqual({ applied: false, reason: "not-assigned" });
+  });
+
+  it("a worker report for its live-assigned issue records the park", async () => {
+    getLiveIssueLabelsMock.mockResolvedValueOnce(["agent/test-agent", "status/ready"]);
+
+    const res = await workerPostRequest(parkBody);
+    expect(res.status).toBe(200);
+    expect(mocks.noPrConclusionUpsert).toHaveBeenCalledTimes(1);
+    const body = await res.json();
+    expect(body.conclusionPark).toEqual({
+      applied: true,
+      outcome: "no_changes_needed",
+      reason: "parked",
+    });
+  });
+
+  it("another agent's live assignment does not let a worker park the issue", async () => {
+    getLiveIssueLabelsMock.mockResolvedValueOnce(["agent/bravo", "status/ready"]);
+
+    const res = await workerPostRequest(parkBody);
+    expect(res.status).toBe(200);
+    expect(mocks.noPrConclusionUpsert).not.toHaveBeenCalled();
+    const body = await res.json();
+    expect(body.conclusionPark).toEqual({ applied: false, reason: "not-assigned" });
+  });
+
+  it("an unreadable live assignment withholds the park but the report still lands", async () => {
+    // Fail-closed on the park (never withhold without proof of ownership),
+    // fail-open on the report (a 5xx retry would land in the duplicate
+    // branch and never re-park, so the report must not fail over the park).
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    getLiveIssueLabelsMock.mockRejectedValueOnce(new Error("github down"));
+
+    const res = await workerPostRequest(parkBody);
+    expect(res.status).toBe(200);
+    expect(mocks.noPrConclusionUpsert).not.toHaveBeenCalled();
+    const body = await res.json();
+    expect(body.conclusionPark).toEqual({ applied: false, reason: "assignment-unverified" });
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("assignment-unverified"));
+    warn.mockRestore();
+  });
+
+  it("a closed issue skips the open check before the ownership gate is consulted", async () => {
+    // Ordering pin: the tracked/open short-circuits come first, so a report
+    // for a closed issue answers "issue-not-open" without a live-label
+    // round-trip — the ownership gate is only reached for an open issue.
+    mocks.issueFindUnique.mockResolvedValue(issueRow({ state: "closed" }));
+
+    const res = await workerPostRequest(parkBody);
+    expect(res.status).toBe(200);
+    expect(getLiveIssueLabelsMock).not.toHaveBeenCalled();
+    const body = await res.json();
+    expect(body.conclusionPark).toEqual({ applied: false, reason: "issue-not-open" });
+  });
+
+  it("a maintainer report parks without any live assignment", async () => {
+    // Maintainer-tier callers bypass the ownership gate — operators may
+    // conclude any issue (same split as the already_done close gate).
+    // getLiveIssueLabels must never be consulted for the maintainer tier.
+    const res = await postRequest({ ...parkBody });
+    expect(res.status).toBe(200);
+    expect(getLiveIssueLabelsMock).not.toHaveBeenCalled();
+    expect(mocks.noPrConclusionUpsert).toHaveBeenCalledTimes(1);
+    const body = await res.json();
+    expect(body.conclusionPark).toEqual({
+      applied: true,
+      outcome: "no_changes_needed",
+      reason: "parked",
+    });
   });
 });

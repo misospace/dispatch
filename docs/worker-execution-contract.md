@@ -316,6 +316,14 @@ Behavioral notes:
   `status: "FIXED"` + `alreadyAddressed: true` + optional `evidence` (bearer
   marks still require a generation; the QUEUED/IGNORED maintainer-only gate is
   unchanged).
+- The same outcome on an **implement** task (no `prFixItem`) is unrelated to
+  the PR-fix queue: it is a terminal no-PR conclusion that parks the issue out
+  of queue pickup (#1506). An **implement** report that carries a `prFixItem`
+  is PR-fix work instead, and it parks nothing. A worker-tier report may only
+  park an issue its agent actually owns (live `agent/<bound agent>` label
+  check); a report for an issue not live-assigned to the reporting agent is
+  still accepted but parks nothing. See
+  [no-pr-conclusion-park.md](./no-pr-conclusion-park.md).
 
 ## Fenced capacity-exhaustion handoff (#1256)
 

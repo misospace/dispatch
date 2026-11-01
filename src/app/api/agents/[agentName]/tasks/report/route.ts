@@ -22,6 +22,7 @@ import { parseExecutionMetadata } from "@/lib/execution-metadata";
 import { PLAN_LIMITS } from "@/lib/groomer/plan";
 import { getLiveIssueLabels } from "@/lib/claim-gate";
 import { recordLifecycleEventQuietly } from "@/lib/issue-lifecycle";
+import { isNoPrConclusionOutcome, recordNoPrConclusion } from "@/lib/no-pr-conclusion";
 import { AGENT_PREFIX, getAgentFromLabels } from "@/types";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
@@ -254,6 +255,50 @@ async function enforceAlreadyDoneWorkerScope(
     );
   }
 
+  return null;
+}
+
+/**
+ * #1510 review round 2: the park withholds queue pickup for the named issue,
+ * so a worker-tier report may only park an issue the credential's agent
+ * actually owns. This mirrors `enforceAlreadyDoneWorkerScope` (#1143) and the
+ * #1129 status gate: live GitHub labels are authoritative for the assignment
+ * decision, because the Prisma cache can lag a claim made directly on GitHub
+ * (#1037). Maintainer-tier callers (basic / OIDC / maintainer bearer /
+ * auth-disabled) bypass the gate — operators may conclude any issue.
+ *
+ * Unlike the already_done close, this gate is a SKIP, not a refusal: the park
+ * is a best-effort side effect and the report must never fail over it (a 5xx
+ * retry would land in the duplicate branch and never re-park). An unreadable
+ * live assignment therefore withholds the park and lets the report land.
+ *
+ * Returns the skip reason to echo in `conclusionPark.reason`, or null when
+ * the park may proceed.
+ */
+async function parkAssignmentSkipReason(
+  auth: Awaited<ReturnType<typeof authorizeRequest>>,
+  repoFullName: string,
+  issueNumber: number,
+): Promise<string | null> {
+  if (!auth.authorized) return null;
+  if (auth.type !== "bearer" || auth.tier !== "worker") return null;
+  const bound = getBoundWorkerAgent(auth);
+  // Unreachable in practice — the route's worker-scope gate refuses an
+  // unbound worker token before any side effect — but a worker-tier
+  // credential with no determinable identity must not park anything.
+  if (!bound) return "not-assigned";
+  let liveLabels: string[];
+  try {
+    liveLabels = await getLiveIssueLabels(repoFullName, issueNumber);
+  } catch (err) {
+    console.warn(
+      `[no-pr-conclusion] could not verify live assignment of ${repoFullName}#${issueNumber} for ${bound}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return "assignment-unverified";
+  }
+  if (getAgentFromLabels(liveLabels) !== `${AGENT_PREFIX}${bound}`) {
+    return "not-assigned";
+  }
   return null;
 }
 
@@ -844,6 +889,123 @@ export async function POST(
       }
     }
 
+    // #1506: a terminal no-PR conclusion on an implement task parks the issue so
+    // buildAgentQueue/next-task stop re-offering it — otherwise the reconciler's
+    // restore-to-ready (no open or merged fixing PR found) loops it forever
+    // (misospace/courier#665). The park is a Dispatch-side ledger row; GitHub is
+    // untouched. It is recorded in every DISPATCH_NO_PR_CONCLUSION_MODE (the
+    // mode only decides whether the queue enforces the withhold). It is
+    // best-effort: a report must never fail over it, and a 5xx retry would hit
+    // the duplicate branch and never re-park, so a park-write failure is
+    // logged, not thrown. A successful already_done close supersedes the park
+    // (the close is the harder stop; a park surviving a reopen would withhold
+    // work a human explicitly brought back). A duplicate (idempotent replay)
+    // never re-parks — the original report owns the side effect. A report that
+    // carries a PR-fix attempt token never parks either: it is PR-fix work,
+    // and the PR-fix lane owns the PR (#1510 review).
+    let conclusionPark: { applied: boolean; outcome?: string; reason: string } | undefined;
+    const conclusionOutcome = report.outcome;
+    if (report.taskType === "implement" && isNoPrConclusionOutcome(conclusionOutcome)) {
+      // #1510 review (hard blocker): the terminal no-PR conclusion is ISSUE
+      // work, and the park is a stop on issue work only. A report that carries
+      // a PR-fix attempt token is PR-fix work, so it must not park the issue:
+      // one report must not both settle PR-fix work and record an issue
+      // conclusion, because the park would then withhold the issue while the
+      // PR-fix lane still owns its PR.
+      //
+      // The exclusion keys on the token's PRESENCE, not on the settlement's
+      // verdict, because the worker contract defines the park by the report
+      // shape: an implement report WITHOUT a prFixItem is the terminal issue
+      // conclusion, and only that one parks (docs/worker-execution-contract.md).
+      // A mixed implement report is off that contract — next-task issues a
+      // token only with a followup-pr task — so Dispatch reads it as PR-fix
+      // work, whatever the token settles. The #1506 stop still holds for every
+      // contract-conforming report, because a report without a token parks.
+      //
+      // The response reports one reason for every case the token excludes. The
+      // settlement outcome is not repeated here: the response already carries
+      // it in `prFixResolution`.
+      const carriesPrFixAttempt = report.prFixItem != null;
+      if (duplicate) {
+        conclusionPark = { applied: false, reason: "duplicate report; the conclusion park was not re-run" };
+      } else if (carriesPrFixAttempt) {
+        // The suppression is otherwise invisible, so log it. A report that
+        // carries a token is off the issue-work contract, and a worker that
+        // repeats it can keep an issue in the re-offer loop without any park
+        // to show for it.
+        console.warn(
+          `[no-pr-conclusion] ${agentName} reported ${conclusionOutcome} with a PR-fix attempt token (${report.prFixItem!.id}); the issue is not parked`,
+        );
+        conclusionPark = { applied: false, reason: "pr-fix-attempt" };
+      } else if (!issueId || !report.repoFullName || report.issueNumber === undefined) {
+        conclusionPark = { applied: false, reason: "issue-not-tracked" };
+      } else if (closeResolution && closeResolution.action === "closed") {
+        conclusionPark = { applied: false, reason: "issue-closed" };
+      } else {
+        try {
+          const parkedIssue = await prisma.issue.findUnique({
+            where: { id: issueId },
+            select: { title: true, body: true, state: true },
+          });
+          if (!parkedIssue) {
+            conclusionPark = { applied: false, reason: "issue-not-tracked" };
+          } else if (parkedIssue.state !== "open") {
+            conclusionPark = { applied: false, reason: "issue-not-open" };
+          } else {
+            // #1510 review round 2: a worker-tier credential may only park an
+            // issue its agent actually owns — live GitHub labels are
+            // authoritative, matching the already_done close gate and the
+            // #1129 status gate. The gate skips the park (never refuses the
+            // report): the park is best-effort, and a 5xx retry would land in
+            // the duplicate branch and never re-park. The gate swallows its
+            // own GitHub errors as "assignment-unverified"; an unexpected
+            // throw from it is the same verdict — unreadable ownership — not
+            // a park-write failure, so it is caught separately.
+            let parkSkipReason: string | null;
+            try {
+              parkSkipReason = await parkAssignmentSkipReason(
+                auth,
+                report.repoFullName,
+                report.issueNumber,
+              );
+            } catch (error) {
+              console.warn(
+                `[no-pr-conclusion] could not verify live assignment of ${report.repoFullName}#${report.issueNumber} for ${agentName}: ${error instanceof Error ? error.message : String(error)}`,
+              );
+              parkSkipReason = "assignment-unverified";
+            }
+            if (parkSkipReason) {
+              // The suppression is otherwise invisible, so log it. A
+              // worker that keeps reporting conclusions for issues it does
+              // not own leaves a trace instead of silently withholding
+              // queue pickup it was never granted.
+              console.warn(
+                `[no-pr-conclusion] ${agentName} reported ${conclusionOutcome} for ${report.repoFullName}#${report.issueNumber} without a live assignment (${parkSkipReason}); the issue is not parked`,
+              );
+              conclusionPark = { applied: false, reason: parkSkipReason };
+            } else {
+              await recordNoPrConclusion({
+                issueId,
+                repoFullName: report.repoFullName,
+                issueNumber: report.issueNumber,
+                agentName,
+                outcome: conclusionOutcome,
+                summary: report.summary,
+                evidence: report.evidence,
+                issue: { title: parkedIssue.title, body: parkedIssue.body },
+              });
+              conclusionPark = { applied: true, outcome: conclusionOutcome, reason: "parked" };
+            }
+          }
+        } catch (error) {
+          console.warn(
+            `[no-pr-conclusion] failed to park ${report.repoFullName}#${report.issueNumber} (${conclusionOutcome}): ${error instanceof Error ? error.message : String(error)}`,
+          );
+          conclusionPark = { applied: false, reason: "park-write-failed" };
+        }
+      }
+    }
+
     // A failed or blocked attempt is a lifecycle event of its own (#1202): it
     // is the evidence that distinguishes "released because the work finished"
     // from "released because the worker gave up", which a status label alone
@@ -884,6 +1046,7 @@ export async function POST(
       agentRunId: run.id,
       prFixResolution,
       ...(closeResolution ? { closeResolution } : {}),
+      ...(conclusionPark ? { conclusionPark } : {}),
       ...(duplicate ? { duplicate: true } : {}),
     });
   } catch (error) {
