@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { errorResponse } from "@/lib/api-errors";
+import { errorResponse, readJsonObjectBody } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
 import { addIssueComment } from "@/lib/github-issues";
@@ -28,19 +28,10 @@ export async function POST(request: Request) {
   if (limited) return limited;
 
   try {
-    let payload: unknown;
-    try {
-      payload = await request.json();
-    } catch {
-      return errorResponse("Invalid JSON body", 400);
-    }
-
-    if (typeof payload !== "object" || payload === null) {
-      return errorResponse("Invalid JSON body", 400);
-    }
-
+    const parsed = await readJsonObjectBody(request);
+    if ("error" in parsed) return parsed.error;
     const { issueId, repoFullName, issueNumber, body, agentName, actor } =
-      payload as Record<string, unknown>;
+      parsed.body;
 
     if (
       !issueId ||

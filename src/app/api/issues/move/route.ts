@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { errorResponse } from "@/lib/api-errors";
+import { errorResponse, readJsonObjectBody } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { removeIssueLabel } from "@/lib/github";
 import { STATUS_LABELS, isStatusLabel } from "@/types";
@@ -23,18 +23,9 @@ export async function POST(request: Request) {
   if (limited) return limited;
 
   try {
-    let body: unknown;
-    try {
-      body = await request.json();
-    } catch {
-      return errorResponse("Invalid JSON body", 400);
-    }
-
-    if (typeof body !== "object" || body === null) {
-      return errorResponse("Invalid JSON body", 400);
-    }
-
-    const { issueId, repoFullName, issueNumber, oldLabels, newLabels, actor: bodyActor } = body as Record<string, unknown>;
+    const parsed = await readJsonObjectBody(request);
+    if ("error" in parsed) return parsed.error;
+    const { issueId, repoFullName, issueNumber, oldLabels, newLabels, actor: bodyActor } = parsed.body;
     const moveActor = getAuthorizedActor(auth, request, bodyActor);
 
     // Validate required fields with explicit type checks

@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { errorResponse } from "@/lib/api-errors";
+import { errorResponse, readJsonObjectBody } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { updateIssueLabels } from "@/lib/github";
 import { getLiveIssueLabels } from "@/lib/claim-gate";
@@ -54,18 +54,9 @@ export async function POST(request: Request) {
   let issueIdForErrors: string | null = null;
 
   try {
-    let body: unknown;
-    try {
-      body = await request.json();
-    } catch {
-      return errorResponse("Invalid JSON body", 400);
-    }
-
-    if (typeof body !== "object" || body === null) {
-      return errorResponse("Invalid JSON body", 400);
-    }
-
-    const payload = body as UnassignPayload;
+    const parsed = await readJsonObjectBody(request);
+    if ("error" in parsed) return parsed.error;
+    const payload = parsed.body as UnassignPayload;
 
     if (
       !payload.action ||

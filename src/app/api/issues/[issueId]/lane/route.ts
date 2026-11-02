@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { errorResponse } from "@/lib/api-errors";
+import { errorResponse, readJsonObjectBody } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { parseLaneClassification, classifyLaneByHeuristics, validateLaneRecord } from "@/lib/issue-lane";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
@@ -29,19 +29,9 @@ export async function POST(request: NextRequest, context: { params: Promise<{ is
     const params = await context.params;
     const { issueId } = params;
 
-    let body: unknown;
-    try {
-      body = await request.json();
-    } catch {
-      return errorResponse("Invalid JSON body", 400);
-    }
-
-    // Reject non-object types (including arrays and null)
-    if (typeof body !== "object" || body === null || Array.isArray(body)) {
-      return errorResponse("Invalid JSON body", 400);
-    }
-
-    const parsedBody = body as LaneRequestBody;
+    const parsed = await readJsonObjectBody(request, { rejectArrays: true });
+    if ("error" in parsed) return parsed.error;
+    const parsedBody = parsed.body as LaneRequestBody;
     const { force, model } = parsedBody;
 
     // Fetch the issue from the local database

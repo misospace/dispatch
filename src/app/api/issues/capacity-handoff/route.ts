@@ -17,7 +17,7 @@
 // worker credential may only hand off its own agent's claim; the unbound
 // legacy worker token is refused (#1129).
 import { NextResponse } from "next/server";
-import { errorResponse, handleApiError } from "@/lib/api-errors";
+import { errorResponse, handleApiError, readJsonObjectBody } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest, authErrorResponse, getAuthorizedActor } from "@/lib/auth";
 import { enforceWorkerAgentScope } from "@/lib/worker-identity";
@@ -40,16 +40,8 @@ export async function POST(request: Request) {
   if (limited) return limited;
 
   try {
-    let body: unknown;
-    try {
-      body = await request.json();
-    } catch {
-      return errorResponse("Invalid JSON body", 400);
-    }
-    if (typeof body !== "object" || body === null) {
-      return errorResponse("Invalid JSON body", 400);
-    }
-
+    const parsed = await readJsonObjectBody(request);
+    if ("error" in parsed) return parsed.error;
     const {
       issueId,
       repoFullName,
@@ -59,7 +51,7 @@ export async function POST(request: Request) {
       capacity,
       settlementKey,
       note,
-    } = body as Record<string, unknown>;
+    } = parsed.body;
 
     if (
       typeof issueId !== "string" || issueId.trim() === "" ||

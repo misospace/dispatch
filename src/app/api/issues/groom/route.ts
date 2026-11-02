@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { errorResponse } from "@/lib/api-errors";
+import { errorResponse, readJsonObjectBody } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { getEscalationLane, getDefaultClaimableLane, isClaimableLane } from "@/lib/lane-config";
@@ -23,17 +23,9 @@ export async function POST(request: Request) {
   if (limited) return limited;
 
   try {
-    let body: unknown;
-    try {
-      body = await request.json();
-    } catch {
-      return errorResponse("Invalid JSON body", 400);
-    }
-
-    if (typeof body !== "object" || body === null) {
-      return errorResponse("Invalid JSON body", 400);
-    }
-
+    const parsed = await readJsonObjectBody(request);
+    if ("error" in parsed) return parsed.error;
+    const body = parsed.body;
     const {
       issueId,
       repoFullName,
@@ -45,7 +37,7 @@ export async function POST(request: Request) {
       needsInfoReason,
       actor: bodyActor,
       agentName,
-    } = body as Record<string, unknown>;
+    } = body;
 
     if (!repoFullName || typeof issueNumber !== "number" || typeof action !== "string") {
       return errorResponse("Missing required fields: repoFullName, issueNumber, action", 400);
