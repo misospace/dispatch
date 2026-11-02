@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { createHash } from "node:crypto";
 import { Prisma } from "@prisma/client";
-import { errorResponse, handleApiError } from "@/lib/api-errors";
+import { errorResponse, handleApiError, readJsonObjectBody } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest, authErrorResponse, getBoundWorkerAgent } from "@/lib/auth";
 import { enforceWorkerAgentScope } from "@/lib/worker-identity";
@@ -364,18 +364,9 @@ export async function POST(
   const scopeError = await enforceWorkerAgentScope(auth, agentName);
   if (scopeError) return scopeError;
 
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
-    return errorResponse("Invalid JSON body", 400);
-  }
-
-  if (typeof body !== "object" || body === null || Array.isArray(body)) {
-    return errorResponse("Invalid JSON body", 400);
-  }
-
-  const raw = body as Record<string, unknown>;
+  const parsed = await readJsonObjectBody(request, { rejectArrays: true });
+  if ("error" in parsed) return parsed.error;
+  const raw = parsed.body;
 
   const taskType = raw.taskType;
   if (typeof taskType !== "string" || !VALID_TASK_TYPES.includes(taskType as ValidTaskType)) {

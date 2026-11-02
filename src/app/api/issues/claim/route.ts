@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { errorResponse } from "@/lib/api-errors";
+import { errorResponse, readJsonObjectBody } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { addIssueLabel, removeIssueLabel } from "@/lib/github";
 import { analyzeAssignmentConflict, buildNewLabels } from "@/lib/assignment-conflicts";
@@ -29,18 +29,10 @@ export async function POST(request: Request) {
   if (limited) return limited;
 
   try {
-    let body: unknown;
-    try {
-      body = await request.json();
-    } catch {
-      return errorResponse("Invalid JSON body", 400);
-    }
+    const parsed = await readJsonObjectBody(request);
+    if ("error" in parsed) return parsed.error;
 
-    if (typeof body !== "object" || body === null) {
-      return errorResponse("Invalid JSON body", 400);
-    }
-
-    const { issueId, repoFullName: bodyRepoFullName, issueNumber: bodyIssueNumber, agentName: rawAgentName, force } = body as Record<string, unknown>;
+    const { issueId, repoFullName: bodyRepoFullName, issueNumber: bodyIssueNumber, agentName: rawAgentName, force } = parsed.body;
 
     // #1412: normalize the operator-supplied agent name before it is written
     // anywhere. `Lease.agentName`, `AgentWork.agentName`, the claim lifecycle

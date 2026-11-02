@@ -38,3 +38,36 @@ export function handleApiError(
   console.error(`Failed to ${context}:`, error);
   return errorResponse(`Failed to ${context}`, status);
 }
+
+/**
+ * Parse a request body that must be a JSON object, returning either the
+ * parsed object or a ready-to-send 400 response. This is the canonical
+ * replacement for the hand-rolled preamble repeated across route handlers:
+ *
+ *   const parsed = await readJsonObjectBody(request);
+ *   if ("error" in parsed) return parsed.error;
+ *   const { issueId, ... } = parsed.body;
+ *
+ * By default a JSON array is accepted (treated like any other object body,
+ * matching the routes that only guard `typeof body !== "object"`); routes
+ * whose validation deliberately rejects arrays pass `rejectArrays: true`.
+ */
+export async function readJsonObjectBody(
+  request: Request,
+  opts: { rejectArrays?: boolean } = {},
+): Promise<{ body: Record<string, unknown> } | { error: NextResponse<{ error: string }> }> {
+  let parsed: unknown;
+  try {
+    parsed = await request.json();
+  } catch {
+    return { error: errorResponse("Invalid JSON body", 400) };
+  }
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    (opts.rejectArrays === true && Array.isArray(parsed))
+  ) {
+    return { error: errorResponse("Invalid JSON body", 400) };
+  }
+  return { body: parsed as Record<string, unknown> };
+}

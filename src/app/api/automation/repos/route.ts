@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { errorResponse, handleApiError } from "@/lib/api-errors";
+import { errorResponse, handleApiError, readJsonObjectBody } from "@/lib/api-errors";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { jsonSafe } from "@/lib/json";
@@ -123,18 +123,9 @@ export async function POST(request: Request) {
   const limited = enforceRateLimit(`repos:${auth.throttleKey}`, RATE_LIMIT);
   if (limited) return limited;
 
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
-    return errorResponse("Invalid JSON body", 400);
-  }
-
-  if (typeof body !== "object" || body === null) {
-    return errorResponse("Invalid JSON body", 400);
-  }
-
-  const { fullName } = body as Record<string, unknown>;
+  const parsed = await readJsonObjectBody(request);
+  if ("error" in parsed) return parsed.error;
+  const { fullName } = parsed.body;
 
   if (typeof fullName !== "string" || !fullName) {
     return errorResponse("fullName is required", 400);

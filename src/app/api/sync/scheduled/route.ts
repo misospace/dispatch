@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { errorResponse } from "@/lib/api-errors";
+import { errorResponse, readJsonObjectBody } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { fetchIssue, syncStatusLabels } from "@/lib/github";
 import { getSyncRepos, getTrackedRepos, parseExcludedLabels } from "@/lib/config";
@@ -41,18 +41,9 @@ export async function POST(request: Request) {
   const limited = enforceRateLimit(`sync-scheduled:${auth.throttleKey}`, RATE_LIMIT);
   if (limited) return limited;
 
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
-    return errorResponse("Invalid JSON body", 400);
-  }
-
-  if (typeof body !== "object" || body === null) {
-    return errorResponse("Invalid JSON body", 400);
-  }
-
-  const options = body as Record<string, unknown>;
+  const parsed = await readJsonObjectBody(request);
+  if ("error" in parsed) return parsed.error;
+  const options = parsed.body;
   const syncIssues = options.issues !== false; // default true
   const syncAutomation = options.automation === true; // default false
 

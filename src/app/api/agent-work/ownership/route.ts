@@ -30,7 +30,7 @@
 // full path and answers `replayed: false`.
 
 import { NextResponse } from "next/server";
-import { errorResponse } from "@/lib/api-errors";
+import { errorResponse, readJsonObjectBody } from "@/lib/api-errors";
 import { authorizeRequest, authErrorResponse, getAuthorizedActor } from "@/lib/auth";
 import { enforceWorkerAgentScope } from "@/lib/worker-identity";
 import { enforceRateLimit } from "@/lib/rate-limit";
@@ -86,16 +86,9 @@ export async function POST(request: Request) {
   if (limited) return limited;
 
   try {
-    let body: unknown;
-    try {
-      body = await request.json();
-    } catch {
-      return errorResponse("Invalid JSON body", 400);
-    }
-    if (typeof body !== "object" || body === null || Array.isArray(body)) {
-      return errorResponse("Invalid JSON body", 400);
-    }
-    const input = body as Record<string, unknown>;
+    const parsed = await readJsonObjectBody(request, { rejectArrays: true });
+    if ("error" in parsed) return parsed.error;
+    const input = parsed.body;
 
     const operation = input.operation;
     if (operation !== "register" && operation !== "renew" && operation !== "disposition") {

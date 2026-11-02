@@ -22,7 +22,7 @@
 // here synthesizes AgentWork rows, leases, or ownership state.
 
 import { NextResponse } from "next/server";
-import { errorResponse, handleApiError } from "@/lib/api-errors";
+import { errorResponse, handleApiError, readJsonObjectBody } from "@/lib/api-errors";
 import { authorizeRequest, authErrorResponse, getAuthorizedActor } from "@/lib/auth";
 import { enforceWorkerAgentScope } from "@/lib/worker-identity";
 import { enforceRateLimit } from "@/lib/rate-limit";
@@ -64,16 +64,9 @@ export async function POST(request: Request) {
   );
   if (limited) return limited;
 
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
-    return errorResponse("Invalid JSON body", 400);
-  }
-  if (typeof body !== "object" || body === null || Array.isArray(body)) {
-    return errorResponse("Invalid JSON body", 400);
-  }
-
+  const parsed = await readJsonObjectBody(request, { rejectArrays: true });
+  if ("error" in parsed) return parsed.error;
+  const body = parsed.body;
   // Validate before the identity gate so the scope check compares the same
   // normalized agent name the report is keyed on.
   let input;

@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { errorResponse } from "@/lib/api-errors";
+import { errorResponse, readJsonObjectBody } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { getAgentFromLabels, AGENT_PREFIX } from "@/types";
 import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
@@ -70,18 +70,9 @@ export async function POST(request: Request) {
   if (limited) return limited;
 
   try {
-    let body: unknown;
-    try {
-      body = await request.json();
-    } catch {
-      return errorResponse("Invalid JSON body", 400);
-    }
-
-    if (typeof body !== "object" || body === null) {
-      return errorResponse("Invalid JSON body", 400);
-    }
-
-    const { issueId, repoFullName: bodyRepoFullName, issueNumber: bodyIssueNumber, agentName } = body as Record<string, unknown>;
+    const parsed = await readJsonObjectBody(request);
+    if ("error" in parsed) return parsed.error;
+    const { issueId, repoFullName: bodyRepoFullName, issueNumber: bodyIssueNumber, agentName } = parsed.body;
 
     // Validate required fields
     if (!issueId || !bodyRepoFullName || typeof bodyIssueNumber !== "number" || !agentName || typeof agentName !== "string") {
