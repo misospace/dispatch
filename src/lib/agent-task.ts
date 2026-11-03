@@ -1,4 +1,5 @@
 import type { PrFixType } from "@/types";
+import type { IntakeAck } from "@/lib/rebase-intake";
 
 export interface IssueRef {
   id?: string;
@@ -53,6 +54,12 @@ export interface IdleTask {
   type: "idle";
   shouldRun: false;
   reason: string;
+  /**
+   * #1532: the versioned intake acknowledgment. Present only when the
+   * polling client declared an intake contract (a scope or a capability) —
+   * an ordinary consumer's task stays byte-identical to the pre-#1532 shape.
+   */
+  intake?: IntakeAck;
 }
 
 export interface ImplementTask {
@@ -64,6 +71,8 @@ export interface ImplementTask {
   instructions: string;
   stopAfter: string;
   forbiddenActions: string[];
+  /** #1532: the versioned intake acknowledgment (see `IdleTask.intake`). */
+  intake?: IntakeAck;
 }
 
 export interface FollowupPrTask {
@@ -78,6 +87,8 @@ export interface FollowupPrTask {
   instructions: string;
   stopAfter: string;
   forbiddenActions: string[];
+  /** #1532: the versioned intake acknowledgment (see `IdleTask.intake`). */
+  intake?: IntakeAck;
 }
 
 export type AgentTask = IdleTask | ImplementTask | FollowupPrTask;
@@ -106,11 +117,12 @@ const FOLLOWUP_PR_FORBIDDEN = [
   "Claiming another issue while this PR is queued",
 ];
 
-export function createIdleTask(reason: string): IdleTask {
+export function createIdleTask(reason: string, options: { intake?: IntakeAck } = {}): IdleTask {
   return {
     type: "idle",
     shouldRun: false,
     reason,
+    ...(options.intake ? { intake: options.intake } : {}),
   };
 }
 
@@ -121,6 +133,8 @@ export interface ImplementTaskInput {
   instructions?: string;
   stopAfter?: string;
   forbiddenActions?: string[];
+  /** #1532: the versioned intake acknowledgment (see `IdleTask.intake`). */
+  intake?: IntakeAck;
 }
 
 export function createImplementTask(input: ImplementTaskInput): ImplementTask {
@@ -133,6 +147,7 @@ export function createImplementTask(input: ImplementTaskInput): ImplementTask {
     instructions: input.instructions ?? IMPLEMENT_INSTRUCTIONS,
     stopAfter: input.stopAfter ?? IMPLEMENT_STOP_AFTER,
     forbiddenActions: input.forbiddenActions ? [...input.forbiddenActions] : [...IMPLEMENT_FORBIDDEN],
+    ...(input.intake ? { intake: input.intake } : {}),
   };
 }
 
@@ -146,6 +161,8 @@ export interface FollowupPrTaskInput {
   instructions?: string;
   stopAfter?: string;
   forbiddenActions?: string[];
+  /** #1532: the versioned intake acknowledgment (see `IdleTask.intake`). */
+  intake?: IntakeAck;
 }
 
 export function createFollowupPrTask(input: FollowupPrTaskInput): FollowupPrTask {
@@ -161,6 +178,7 @@ export function createFollowupPrTask(input: FollowupPrTaskInput): FollowupPrTask
     instructions: input.instructions ?? FOLLOWUP_PR_INSTRUCTIONS,
     stopAfter: input.stopAfter ?? FOLLOWUP_PR_STOP_AFTER,
     forbiddenActions: input.forbiddenActions ? [...input.forbiddenActions] : [...FOLLOWUP_PR_FORBIDDEN],
+    ...(input.intake ? { intake: input.intake } : {}),
   };
 }
 

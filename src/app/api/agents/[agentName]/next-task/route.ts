@@ -15,6 +15,13 @@ import { fetchPullRequestLabels, fetchPullRequestHeadSha } from "@/lib/github";
 import { NEEDS_HUMAN_LABEL } from "@/lib/pr-fix-surfacing";
 import { CONFLICTING_STATUSES } from "@/lib/linked-pr-health";
 import { rebaseWorkItem } from "@/lib/pr-fix-rebase";
+import {
+  buildIntakeAck,
+  parseIntakeRequest,
+  REBASE_EXECUTOR_CAPABILITY,
+  REBASE_EXECUTOR_CAPABILITY_VERSION,
+  REBASE_ONLY_SCOPE,
+} from "@/lib/rebase-intake";
 import { buildCapacitySkip, loadActiveCapacityHandoffs, normalizeCapacity } from "@/lib/capacity-handoff";
 import { recordAttemptIssuanceBestEffort } from "@/lib/issue-requeue";
 import type { PrFixType } from "@/types";
@@ -346,6 +353,18 @@ export async function GET(
     }
     excludedPrFixGenerations.add(`${normalizeQueueRepo(match[1])}#${Number(match[2])}@${Number(match[3])}`);
   }
+  // #1532: the rebase-only intake contract. Parsed with the other query
+  // parameters and BEFORE any queue read: a malformed or unsupported
+  // declaration is refused (400), never read as "no contract declared" —
+  // that reading would silently widen the queue for a client that asked for
+  // a narrower one.
+  const intake = parseIntakeRequest(searchParams);
+  if (!intake.ok) return errorResponse(intake.error, 400);
+  const negotiation = intake.negotiation;
+  const rebaseOnly = negotiation.scope === REBASE_ONLY_SCOPE;
+  // The acknowledgment rides only on responses of a client that declared an
+  // intake contract; an ordinary consumer's response stays byte-identical.
+  const intakeAck = negotiation.optedIn ? buildIntakeAck(negotiation) : undefined;
   const skipped = new Map<string, {
     repoFullName: string; pullRequestNumber: number; generation: number;
     phase: string; reason: "client-excluded";
@@ -400,6 +419,7 @@ export async function GET(
         excludeDecomposed: excludeDecomposed === "true",
         includeClaimed,
         includeRenovate,
+        rebaseOnly,
       });
 
     if (!laneValid) {
@@ -416,6 +436,15 @@ export async function GET(
     // is holding back — bypassing a BLOCKED / needs-human verdict and
     // re-creating the loop this fix removes.
     const deferredIssues = new Set<string>();
+
+    // #1532: how many REBASE candidates this poll could not hand out, and how
+    // many of them were withheld because this client never declared the
+    // `rebase-executor:1` capability. The counts reach the operator through
+    // the idle reason: a rebase-only poll that finds the lane busy must not
+    // report "no work", and a deployment whose client never learned the
+    // contract must not see the lane stop dispatching without a trace.
+    let rebaseDeferredCount = 0;
+    let rebaseCapabilityDeferredCount = 0;
 
     // The caller's lane decides whether it may consume PR-fix work at all
     // (#1046): `null` means a configured lane with no PR-fix equivalent (e.g.
@@ -455,6 +484,22 @@ export async function GET(
         // Also the gate key below — one derivation, so the gate, the pin, and
         // the stamped lane can never disagree.
         const dispatchedLane = candidate.attemptType ?? candidate.fixType;
+
+        // #1532: defense in depth for rebase-only intake — the ONLY work a
+        // rebase-only consumer may take is the mechanical rebase lane. A
+        // candidate whose DISPATCHED lane is anything else is refused without
+        // a mutation, so a lane flip between the queue read and this write
+        // can never widen the rebase-only queue.
+        if (rebaseOnly && dispatchedLane !== "REBASE") {
+          console.info("[next-task-pr-fix]", {
+            repoFullName: candidate.repo,
+            pullRequestNumber: candidate.pr,
+            generation: candidate.generation,
+            phase: "QUEUED",
+            reason: "rebase-only-lane-mismatch",
+          });
+          return null;
+        }
 
         // #1503: escalation-lane exclusivity at hand-out — defense in depth
         // behind the read filter. Work whose linked issue is authoritatively
@@ -599,7 +644,8 @@ export async function GET(
            // lane identity the worker and the server agree on.
            prFixItem: { id: candidate.id, generation: confirmed.generation, handoutToken, fixType: confirmed.attemptType ?? candidate.fixType },
            reasons,
-         });
+            intake: intakeAck,
+          });
        };
 
        // #1327: the mechanical rebase lane is concurrency 1, no fan-out. The
@@ -626,6 +672,18 @@ export async function GET(
        // failed append leaves it null: the next poll falls back to the row's
        // live type instead of trusting a stamp no hand-out ever backed.
         if (dispatchedLane === "REBASE") {
+          // #1532: a REBASE hand-out additionally requires the polling client
+          // to DECLARE the `rebase-executor:1` capability. The worker pool
+          // names agents; it does not prove the client can execute a
+          // mechanical rebase — a new Dispatch paired with an old Courier
+          // would otherwise hand a rebase to a client that never learned the
+          // contract. DEFERRED, not refused: the candidate stays QUEUED for a
+          // capable poll, and ordinary fix work is untouched.
+          if (!negotiation.rebaseExecutorGranted) {
+            rebaseCapabilityDeferredCount += 1;
+            console.info(`[next-task-pr-fix] deferring REBASE ${candidate.repo}#${candidate.pr}: client did not declare the ${REBASE_EXECUTOR_CAPABILITY}:${REBASE_EXECUTOR_CAPABILITY_VERSION} capability (#1532)`);
+            return null;
+          }
           // #1327 review: the rebase worker pool is local-only by contract —
           // git is its tool surface and it must not consume paid cloud
           // capacity. Dispatch has no model/runner knowledge of agents, so
@@ -702,10 +760,39 @@ export async function GET(
     for (const candidate of prFixItems) {
       const task = await dispatchPrFixCandidate(candidate);
       if (task) return respond(task);
+      // #1532: a candidate this poll could not hand out. In the rebase-only
+      // scope every candidate is a rebase item, so the count says how many
+      // eligible items the lane held without giving one out.
+      if (rebaseOnly) rebaseDeferredCount += 1;
       // The item stays queue-owned: this agent already holds its work
       // identity, or the row was contested. Its issue must not be re-served
       // as implement work on the same PR (#1145).
       if (candidate.issue != null) deferredIssues.add(issueKey(candidate.repo, candidate.issue));
+    }
+
+    // #1532: rebase-only intake serves ONLY the mechanical rebase lane. It
+    // never materializes linked-PR work (a rebase-only consumer consumes
+    // already-queued REBASE items; it never creates work) and it never serves
+    // implementation work — so the poll ends here, before the linked-PR
+    // follow-up loop and before the ordinary issue pickup.
+    if (rebaseOnly) {
+      if (!isRebaseLaneAgent(agentName)) {
+        return respond(createIdleTask(
+          `Rebase-only intake refused: agent ${agentName} is not in the rebase worker pool (DISPATCH_REBASE_AGENTS)`,
+          { intake: intakeAck },
+        ));
+      }
+      // A deferred candidate is not "no work": the lane held an eligible item
+      // and did not hand it out (the concurrency-1 gate, a CI park, a capacity
+      // cooldown, or a hand-out this agent already holds). The count keeps
+      // that distinction visible to the client and to the operator.
+      const deferredNote = rebaseDeferredCount > 0
+        ? `${rebaseDeferredCount} rebase candidate${rebaseDeferredCount === 1 ? "" : "s"} deferred`
+        : null;
+      return respond(createIdleTask(
+        `No rebase work available (rebase-only intake${deferredNote ? `; ${deferredNote}` : ""})`,
+        { intake: intakeAck },
+      ));
     }
 
     // Linked-PR follow-up is PR work, not implementation pickup, so it scans
@@ -867,6 +954,7 @@ export async function GET(
           title: first.title,
           url: first.url,
         },
+        intake: intakeAck,
       });
       return respond(task);
     }
@@ -892,12 +980,22 @@ export async function GET(
       ? `${capacityDeferredCount} item${capacityDeferredCount === 1 ? "" : "s"} cooled for ${requestedCapacity ?? "any capacity (undeclared request)"} by a capacity handoff`
       : null;
 
+    // #1532: a REBASE candidate this client could not take because it never
+    // declared the `rebase-executor:1` capability. The note keeps the "the
+    // rebase lane stopped dispatching" case visible to the operator: the pool
+    // names the agent, but the client must also prove that it can execute the
+    // work, and a client that never learned the contract leaves the lane idle
+    // without any other trace.
+    const rebaseNote = rebaseCapabilityDeferredCount > 0
+      ? `${rebaseCapabilityDeferredCount} rebase candidate${rebaseCapabilityDeferredCount === 1 ? "" : "s"} deferred: this client did not declare the ${REBASE_EXECUTOR_CAPABILITY}:${REBASE_EXECUTOR_CAPABILITY_VERSION} capability`
+      : null;
+
     if (withheldQueue.length > 0) {
       // #1506: tell a grooming-admission hold apart from a terminal no-PR
       // conclusion park — an operator un-parks a concluded issue differently
       // than they re-groom a stale one. Attribution order matters: an item
-      // withheld by admission carries a park mark too, and it is listed on
-      // the admission side (a parked item is never double-listed).
+      // withheld by admission carries a park mark too, and it is listed on the
+      // admission side (a parked item is never double-listed).
       const admissionCount = withheldQueue.filter((item) => item.admission?.admitted === false).length;
       const conclusionCount = withheldQueue.length - admissionCount;
       const plural = (n: number) => (n === 1 ? "" : "s");
@@ -908,15 +1006,19 @@ export async function GET(
         .filter(Boolean)
         .join(" and ");
       return respond(
-        createIdleTask(`No work available (${[withheldNote, deferredNote, excludedNote, capacityNote].filter(Boolean).join("; ")})`),
+        createIdleTask(`No work available (${[withheldNote, deferredNote, excludedNote, capacityNote, rebaseNote].filter(Boolean).join("; ")})`, { intake: intakeAck }),
       );
     }
 
-    if (deferredNote || excludedNote || capacityNote) {
-      return respond(createIdleTask(`No work available (${[deferredNote, excludedNote, capacityNote].filter(Boolean).join("; ")})`));
+    if (deferredNote || excludedNote || capacityNote || rebaseNote) {
+      return respond(createIdleTask(`No work available (${[deferredNote, excludedNote, capacityNote, rebaseNote].filter(Boolean).join("; ")})`, { intake: intakeAck }));
     }
 
-    return respond(createIdleTask("No work available"));
+    if (deferredNote || excludedNote || capacityNote) {
+      return respond(createIdleTask(`No work available (${[deferredNote, excludedNote, capacityNote].filter(Boolean).join("; ")})`, { intake: intakeAck }));
+    }
+
+    return respond(createIdleTask("No work available", { intake: intakeAck }));
   } catch (error) {
     return handleApiError("fetch next task", error);
   }
