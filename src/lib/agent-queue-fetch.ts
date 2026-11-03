@@ -5,6 +5,7 @@ import { findLeasedIssueIds } from "@/lib/lease";
 import { parseExcludedLabels } from "@/lib/config";
 import { resolveRequestLane, getLaneIds, prFixLaneForRequest } from "@/lib/lane-config";
 import { dependencyKey } from "@/lib/issue-dependencies";
+import { normalizePrFixType } from "@/types";
 import {
   ADMISSION_ISSUE_SELECT,
   evaluateQueueAdmission,
@@ -35,6 +36,12 @@ export interface AgentQueueFetchParams {
   includeClaimed: boolean;
   /** Whether to include Renovate issues */
   includeRenovate: boolean;
+  /**
+   * #1532: rebase-only intake. When set, the fetch serves ONLY the queued
+   * mechanical-rebase items: no issue queue is read at all, so implementation
+   * work can never be served in this mode.
+   */
+  rebaseOnly?: boolean;
 }
 
 /**
@@ -87,7 +94,7 @@ export interface AgentQueueFetchResult {
 export async function fetchAgentQueueData(
   params: AgentQueueFetchParams,
 ): Promise<AgentQueueFetchResult> {
-  const { agentName, lane, excludeDecomposed, includeClaimed, includeRenovate } = params;
+  const { agentName, lane, excludeDecomposed, includeClaimed, includeRenovate, rebaseOnly = false } = params;
   const admissionMode = getQueueAdmissionMode();
   // Renovate exclusion is intentionally NOT applied at the DB level here.
   // `buildAgentQueue` owns that decision (via the `includeRenovate` option and
@@ -120,6 +127,34 @@ export async function fetchAgentQueueData(
     };
   }
   const prFixLane = prFixLaneForRequest(resolvedLane);
+
+  // #1532: rebase-only intake reads the PR-fix queue WITHOUT a lane filter
+  // and keeps only the mechanical rebase lane. The mechanical rebase lane is
+  // not issue-classified work (it is the declared #1503 mechanical
+  // exception), so a rebase-only consumer sees REBASE items whatever lane
+  // its own configuration has — the lane filter would otherwise hide the
+  // only work it is allowed to take.
+  //
+  // It also reads NO issue queue at all: the open-issue query, the lease
+  // query, the grooming admission, and the no-PR-conclusion park read are
+  // skipped, so `rankedQueue` / `fullQueue` / `withheldQueue` are empty and
+  // implementation work can never be served in this mode.
+  if (rebaseOnly) {
+    const rebaseItemsRaw = await listQueuedPrFixItems(asPrFixQueueClient(prisma), { lane: undefined });
+    const rebaseItems = rebaseItemsRaw.filter(
+      (item) => normalizePrFixType(item.attemptType ?? item.type) === "REBASE",
+    );
+    return {
+      resolvedLane,
+      laneValid: true,
+      rankedQueue: [],
+      fullQueue: [],
+      withheldQueue: [],
+      admissionMode,
+      prFixItems: rebaseItems.map(toAgentQueuePrFixItem),
+      availableLanes,
+    };
+  }
 
   // The open-issue list, active leases, and queued PR fix items are
   // independent — fetch them in parallel.

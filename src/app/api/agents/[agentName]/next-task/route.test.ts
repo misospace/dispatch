@@ -400,6 +400,18 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     return `/api/agents/example-agent/next-task?${params}`;
   }
 
+  /**
+   * A poll URL that declares the `rebase-executor` capability (#1532). A
+   * REBASE hand-out requires the client to declare the mechanical execution
+   * contract — an allowlisted agent NAME alone no longer proves the client
+   * can execute a rebase — so the REBASE hand-out cases poll as a capable
+   * client. The capability gate is covered by its own suite
+   * (next-task/rebase-intake.test.ts).
+   */
+  function capableExclusionUrl(entries = ["org/repo#12@2"]): string {
+    return `${exclusionUrl(entries)}&capabilities=rebase-executor:1`;
+  }
+
   function prFixRow(pr = 12, generation = 2) {
     return {
       id: `prfix-${pr}`, repo: "org/repo", pr, issue: null,
@@ -424,7 +436,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
 
   it("marks the dispatched PR-fix identity with the item's fixType (#1327)", async () => {
     mocks.prFixFindMany.mockResolvedValue([{ ...prFixRow(13), type: "REBASE", reason: "Mechanical rebase: PR dirty against base (#1327)" }]);
-    const body = await (await GET(request(exclusionUrl()), {
+    const body = await (await GET(request(capableExclusionUrl()), {
       params: Promise.resolve({ agentName: "example-agent" }),
     })).json();
     expect(body.type).toBe("followup-pr");
@@ -472,7 +484,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       const row = rebaseRow();
       rowMocks(row);
 
-      const body = await (await GET(request(exclusionUrl()), {
+      const body = await (await GET(request(capableExclusionUrl()), {
         params: Promise.resolve({ agentName: "example-agent" }),
       })).json();
       expect(body.type).toBe("followup-pr");
@@ -549,7 +561,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       const row = rebaseRow();
       rowMocks(row);
 
-      const body = await (await GET(request(exclusionUrl()), {
+      const body = await (await GET(request(capableExclusionUrl()), {
         params: Promise.resolve({ agentName: "some-cloud-agent" }),
       })).json();
       expect(body.type).toBe("followup-pr");
@@ -604,7 +616,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       process.env.DISPATCH_REBASE_AGENTS = "local-coder";
       mocks.prFixUpdateMany.mockClear();
       const surfacesBeforeDeferred = mocks.prFixTxSurfaces.length;
-      const deferred = await (await GET(request(exclusionUrl()), {
+      const deferred = await (await GET(request(capableExclusionUrl()), {
         params: Promise.resolve({ agentName: "example-agent" }),
       })).json();
       expect(deferred.prFixItem).toBeUndefined();
@@ -617,7 +629,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       // transaction, shipping REBASE.
       process.env.DISPATCH_REBASE_AGENTS = "example-agent";
       const surfacesBefore = mocks.prFixTxSurfaces.length;
-      const second = await (await GET(request(exclusionUrl()), {
+      const second = await (await GET(request(capableExclusionUrl()), {
         params: Promise.resolve({ agentName: "example-agent" }),
       })).json();
       expect(second.type).toBe("followup-pr");
@@ -705,7 +717,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
       (where.id === stale.id ? { ...stale } : null));
 
-    const blocked = await (await GET(request(exclusionUrl()), {
+    const blocked = await (await GET(request(capableExclusionUrl()), {
       params: Promise.resolve({ agentName: "example-agent" }),
     })).json();
     expect(blocked.prFixItem).toBeUndefined();
@@ -722,7 +734,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     stale.attemptType = null;
 
     const surfacesBefore = mocks.prFixTxSurfaces.length;
-    const body = await (await GET(request(exclusionUrl()), {
+    const body = await (await GET(request(capableExclusionUrl()), {
       params: Promise.resolve({ agentName: "example-agent" }),
     })).json();
     expect(body.type).toBe("followup-pr");
@@ -792,7 +804,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       where.id === fix.id ? { ...fix } : where.id === rebase.id ? { ...rebase } : null);
     mocks.prFixTransactionError = new Error("canceling statement due to lock timeout");
 
-    const body = await (await GET(request(exclusionUrl()), {
+    const body = await (await GET(request(capableExclusionUrl()), {
       params: Promise.resolve({ agentName: "example-agent" }),
     })).json();
     expect(body.type).toBe("followup-pr");
@@ -810,7 +822,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
       (where.id === row.id ? { ...row } : null));
 
-    const body = await (await GET(request(exclusionUrl()), {
+    const body = await (await GET(request(capableExclusionUrl()), {
       params: Promise.resolve({ agentName: "example-agent" }),
     })).json();
     expect(body.type).toBe("followup-pr");
@@ -858,14 +870,14 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       (where.id === row.id ? { ...row } : null));
     mocks.prFixTransactionError = new Error("canceling statement due to lock timeout");
 
-    const deferred = await (await GET(request(exclusionUrl()), {
+    const deferred = await (await GET(request(capableExclusionUrl()), {
       params: Promise.resolve({ agentName: "example-agent" }),
     })).json();
     expect(deferred.shouldRun).toBe(false);
 
     // The lane recovers on the next poll: the lock is free again.
     mocks.prFixTransactionError = null;
-    const retried = await (await GET(request(exclusionUrl()), {
+    const retried = await (await GET(request(capableExclusionUrl()), {
       params: Promise.resolve({ agentName: "example-agent" }),
     })).json();
     expect(retried.type).toBe("followup-pr");
@@ -942,7 +954,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
         : [row].filter((r: any) => r.status === "QUEUED"));
     mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
       (where.id === row.id ? { ...row } : null));
-    const body = await (await GET(request(exclusionUrl()), {
+    const body = await (await GET(request(capableExclusionUrl()), {
       params: Promise.resolve({ agentName: "example-agent" }),
     })).json();
     expect(body.type).toBe("followup-pr");
@@ -3215,7 +3227,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      request("/api/agents/example-agent/next-task?lane=local"),
+      request("/api/agents/example-agent/next-task?lane=local&capabilities=rebase-executor:1"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -4061,7 +4073,7 @@ describe("GET next-task escalation-lane exclusivity (#1503)", () => {
     mocks.prFixFindUnique.mockImplementation(async ({ where }: any) => (where.id === row.id ? row : null));
     mocks.issueFindFirst.mockResolvedValue({ currentLane: "frontier" });
     const body = await (
-      await GET(request("/api/agents/example-agent/next-task?lane=local"), {
+      await GET(request("/api/agents/example-agent/next-task?lane=local&capabilities=rebase-executor:1"), {
         params: Promise.resolve({ agentName: "example-agent" }),
       })
     ).json();

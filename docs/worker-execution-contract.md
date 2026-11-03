@@ -15,8 +15,23 @@ Exclusions never clear/requeue parked work, change attempt limits, alter lane el
 
 This document defines the generic execution contract for any agent worker consuming work from Dispatch queues. It supersedes ad-hoc behavior and ensures consistency across all workers regardless of identity or repository.
 
+## Rebase-only intake (#1532)
+
+`GET /api/agents/{agentName}/next-task` accepts three intake parameters: `work_scope` (only `rebase-only` exists in contract version 1), `work_scope_version` (only `1` exists in contract version 1), and `capabilities` (comma-separated `<name>:<version>` tokens. The only known capability is `rebase-executor` version 1). A capability declaration is proof that the client implements that client-side execution contract. An unknown scope, a scope without a version, a version without a scope, an unsupported scope version, a repeated scope parameter, a scope value over the size limit (64 characters), a malformed capability token, a capability name declared twice, a declaration over the size limit (512 characters, 16 tokens), and a `rebase-only` request without a granted `rebase-executor:1` capability all fail with HTTP 400 before any queue read. An unknown capability name or version grants nothing, is not an error, and never broadens the queue.
+
+A client that declared a scope or a capability receives an `intake` acknowledgment on the task: `{ version: 1, scope: "rebase-only" | null, scopeEnforced: true, capabilities: [{ name, requested, granted, reason? }] }`. A client that declared nothing receives no `intake` field, so an ordinary consumer sees the same response as before.
+
+A REBASE hand-out needs three things: the agent is in the `DISPATCH_REBASE_AGENTS` pool (#1327), the client declared `rebase-executor:1` in that same request (#1532), and the serialized concurrency-1 admission succeeds (#1327). A poll that did not declare the capability defers the candidate. The item stays QUEUED for a capable poll, and ordinary fix work is untouched. In the `rebase-only` scope the poll serves only queued items whose dispatched lane is `REBASE`. It never serves ordinary PR-fix work, never materializes linked-PR work, and never serves issue implementation work.
+
+A client that requested the `rebase-only` scope and receives NO `intake` acknowledgment talks to a server that does not support the contract. That client must not execute the task the server returned, and it must not poll again in a loop. A client that declared nothing expects no acknowledgment, and its task is unchanged. Enable this contract only when deployment configuration confirms server support.
+
+A client that receives a REBASE hand-out it cannot execute declines it with `outcome: "capacity-exhausted"`, the issued `prFixItem: { id, generation, handoutToken }` token, and a `capacity` identifier that names the incapable executor. Dispatch fences the release to that exact receipt and generation. It removes only the reporting agent's receipt, hand-out, and ack, keeps the item QUEUED at the same generation, spends no retry budget, and records a capacity-scoped cooldown bounded by `DISPATCH_CAPACITY_COOLDOWN_MS` (default 15m). Never fabricate completion, never reset a generation, never clear another writer's hand-out, and never create a new attempt to work around an incompatibility.
+
+See [docs/rebase-only-intake.md](rebase-only-intake.md) for the full client-facing contract.
+
 ## Table of Contents
 
+- [Rebase-only intake](#rebase-only-intake)
 - [Token Tiers](#token-tiers)
 - [One Item Per Run](#one-item-per-run)
 - [PR Fix Queue Precedence](#pr-fix-queue-precedence)
