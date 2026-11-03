@@ -1,4 +1,4 @@
-import { defineConfig } from "vitest/config";
+import { defineConfig, configDefaults } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import path from "path";
 
@@ -14,6 +14,32 @@ export default defineConfig({
     environment: "jsdom",
     globals: true,
     setupFiles: ["./vitest.setup.ts"],
+    // jsdom was recreated once per test file — ~62-70% of tracked time across
+    // the suite (#1528). vmThreads creates the environment once per worker and
+    // keeps per-file isolation (fresh VM context and module registry per file,
+    // so vi.mock hoisting and module-global state still reset), unlike
+    // isolate: false, which shares the module graph across files.
+    // login/page.test.tsx is the one carve-out: it swaps window.location with
+    // Object.defineProperty, which needs a per-file jsdom window — on the
+    // shared vmThreads window, `location` is non-configurable.
+    projects: [
+      {
+        extends: true,
+        test: {
+          name: "location-swap",
+          pool: "threads",
+          include: ["src/app/login/page.test.tsx"],
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: "jsdom-shared",
+          pool: "vmThreads",
+          exclude: [...configDefaults.exclude, "src/app/login/page.test.tsx"],
+        },
+      },
+    ],
     coverage: {
       provider: "v8",
       reporter: ["text", "html", "json-summary"],

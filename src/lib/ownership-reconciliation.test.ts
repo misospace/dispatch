@@ -63,8 +63,36 @@ const forgeShared = {
 // ─── In-memory Prisma fake with snapshot-swap transactions ───────────────────
 
 type Row = Record<string, any>;
-const CLONE = (value: unknown) =>
-  value === undefined ? undefined : (structuredClone(value) as any);
+
+// A realm-preserving deep clone. Under pool "vmThreads" the worker's
+// structuredClone hands back main-realm objects, and a cloned Date then
+// fails the `instanceof Date` guards in code under test (the commit-time
+// external-wait check at ownership-reconciliation.ts:901) — the fake must
+// hand rows back in the same realm as the code reading them (#1528).
+// Fixture rows are JSON-shaped plus Date, so this clone is equivalent here.
+function CLONE<T>(value: T): T {
+  if (value === undefined) return value;
+  const tag = Object.prototype.toString.call(value);
+  if (tag === "[object Date]") {
+    return new Date((value as unknown as Date).getTime()) as unknown as T;
+  }
+  if (Array.isArray(value)) return value.map((entry) => CLONE(entry)) as unknown as T;
+  if (typeof value === "function") {
+    throw new Error(`fake clone does not pass ${tag} values through rows`);
+  }
+  if (value !== null && typeof value === "object") {
+    const proto = Object.getPrototypeOf(value);
+    if (tag !== "[object Object]" || (proto !== Object.prototype && proto !== null)) {
+      // Map/Set/TypedArray/RegExp would silently clone to {}; fail loudly
+      // instead, the way structuredClone's different semantics used to.
+      throw new Error(`fake clone does not preserve ${tag} values — keep fixture rows JSON-shaped plus Date`);
+    }
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value)) out[key] = CLONE(entry);
+    return out as T;
+  }
+  return value;
+}
 
 function matchesScalar(value: any, cond: any): boolean {
   if (cond === null) return value === null || value === undefined;
