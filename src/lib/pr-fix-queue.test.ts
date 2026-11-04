@@ -200,6 +200,7 @@ function makeClient(): PrFixQueueClient & {
           id: `item-${++seq}`,
           generation: 1, // mirrors the column's @default(1)
           fixAttempts: 1, // mirrors the column's @default(1)
+          stagnationCount: 0, // mirrors the column's @default(0) (#1543)
           // #1119 dispatch-tracking columns: default to their schema values so a
           // freshly created row reads back as "never dispatched, no post-dispatch
           // evidence".
@@ -531,30 +532,32 @@ describe("PR review-fix queue", () => {
     expect(await listQueuedPrFixItems(client, { includeBlocked: true })).toEqual([]);
   });
 
-  it("parks a REVIEW_FEEDBACK item after PR_FIX_MAX_ATTEMPTS fix attempts (#1001, #1218)", async () => {
-    const prev = process.env.PR_FIX_MAX_ATTEMPTS;
-    process.env.PR_FIX_MAX_ATTEMPTS = "3";
+  it("parks a REVIEW_FEEDBACK item after PR_FIX_MAX_STAGNATION stagnant attempts (#1001, #1218, #1543)", async () => {
+    const prev = process.env.PR_FIX_MAX_STAGNATION;
+    process.env.PR_FIX_MAX_STAGNATION = "3";
     try {
-      // Each loop is one attempt: the fix is marked FIXED, then a fresh
-      // review reopens it.
+      // Every round re-dispatches the same head (no headSha is ever
+      // observed), so no attempt proves progress and stagnation accrues.
       for (let i = 1; i <= 3; i++) {
         const item = await enqueuePrFixItem(client, { repo: "org/repo", pr: 9, lane: "NORMAL", reason: "review", feedback: `f${i}`, evidenceKey: `review:${i}` });
         expect(item.status).toBe("QUEUED");
         expect(item.fixAttempts).toBe(i);
+        expect(item.stagnationCount).toBe(i - 1);
         const fixed = await markPrFixItem(client, { repo: "org/repo", pr: 9, status: "fixed" });
         expect(mutatedItem(fixed)?.status).toBe("FIXED");
       }
-      // The 4th attempt exceeds the cap → bounded exhaustion PARKS the item
-      // (#1218) instead of re-queuing or labeling it needs-human.
+      // The 4th stagnant round exceeds the budget → bounded exhaustion PARKS
+      // the item (#1218) instead of re-queuing or labeling it needs-human.
       const parked = await enqueuePrFixItem(client, { repo: "org/repo", pr: 9, lane: "NORMAL", reason: "review", feedback: "f4", evidenceKey: "review:4" });
       expect(parked.status).toBe("PARKED");
       expect(parked.lane).toBe("NORMAL");
       expect(parked.outcome).toBe("no_progress");
+      expect(parked.stagnationCount).toBe(3);
       expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledTimes(1);
       expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
     } finally {
-      if (prev === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
-      else process.env.PR_FIX_MAX_ATTEMPTS = prev;
+      if (prev === undefined) delete process.env.PR_FIX_MAX_STAGNATION;
+      else process.env.PR_FIX_MAX_STAGNATION = prev;
     }
   });
 });
@@ -1405,11 +1408,11 @@ describe("buildPrFixBlockedContext", () => {
   });
 
   it("uses the history enqueue count for enqueueRows, never totalAttempts", async () => {
-    // Raise the attempt cap out of the way — this test exercises history-based
-    // enqueue counting, not the #1001 bound (which would otherwise park the
+    // Raise the stagnation cap out of the way — this test exercises history-based
+    // enqueue counting, not the #1001-derived stagnation bound (which would otherwise park the
     // later attempts).
-    const prev = process.env.PR_FIX_MAX_ATTEMPTS;
-    process.env.PR_FIX_MAX_ATTEMPTS = "100";
+    const prev = process.env.PR_FIX_MAX_STAGNATION;
+    process.env.PR_FIX_MAX_STAGNATION = "100";
     try {
       const client = makeClient();
       for (let i = 0; i < 13; i += 1) {
@@ -1428,8 +1431,8 @@ describe("buildPrFixBlockedContext", () => {
       expect(context.attemptsByLane).toEqual({ NORMAL: 13 });
       expect(context.totalAttempts).toBeUndefined();
     } finally {
-      if (prev === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
-      else process.env.PR_FIX_MAX_ATTEMPTS = prev;
+      if (prev === undefined) delete process.env.PR_FIX_MAX_STAGNATION;
+      else process.env.PR_FIX_MAX_STAGNATION = prev;
     }
   });
 
@@ -1739,8 +1742,8 @@ describe("#1121 already_addressed settlement", () => {
   });
 
   it("a repeated already_addressed disagreement with an unchanged head is bounded to PARKED at the cap (#1218)", async () => {
-    const prevCap = process.env.PR_FIX_MAX_ATTEMPTS;
-    process.env.PR_FIX_MAX_ATTEMPTS = "3";
+    const prevCap = process.env.PR_FIX_MAX_STAGNATION;
+    process.env.PR_FIX_MAX_STAGNATION = "3";
     try {
       const fresh = makeClient();
       await enqueuePrFixItem(fresh, {
@@ -1767,8 +1770,8 @@ describe("#1121 already_addressed settlement", () => {
       expect(row.lane).toBe("NORMAL");
       expect(row.outcome).toBe("no_progress");
     } finally {
-      if (prevCap === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
-      else process.env.PR_FIX_MAX_ATTEMPTS = prevCap;
+      if (prevCap === undefined) delete process.env.PR_FIX_MAX_STAGNATION;
+      else process.env.PR_FIX_MAX_STAGNATION = prevCap;
     }
   });
 });
@@ -2162,14 +2165,14 @@ describe("parseMarkPrFixInput #1121", () => {
   });
 });
 
-describe("attempt cap counts fix attempts, not evidence (#1103)", () => {
+describe("stagnation guard counts head-advancing progress, not evidence or rounds (#1543)", () => {
   let client: ReturnType<typeof makeClient>;
   let prev: string | undefined;
 
   beforeEach(() => {
     client = makeClient();
-    prev = process.env.PR_FIX_MAX_ATTEMPTS;
-    process.env.PR_FIX_MAX_ATTEMPTS = "2";
+    prev = process.env.PR_FIX_MAX_STAGNATION;
+    process.env.PR_FIX_MAX_STAGNATION = "2";
     surfacingMocks.surfacePrFixBlocked.mockReset();
     surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
     surfacingMocks.surfacePrFixParked.mockReset();
@@ -2179,8 +2182,8 @@ describe("attempt cap counts fix attempts, not evidence (#1103)", () => {
   });
 
   afterEach(() => {
-    if (prev === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
-    else process.env.PR_FIX_MAX_ATTEMPTS = prev;
+    if (prev === undefined) delete process.env.PR_FIX_MAX_STAGNATION;
+    else process.env.PR_FIX_MAX_STAGNATION = prev;
   });
 
   it("keeps a first-sighting review with many inline comments QUEUED", async () => {
@@ -2201,72 +2204,123 @@ describe("attempt cap counts fix attempts, not evidence (#1103)", () => {
     expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
   });
 
-  it("requeue resets the attempt count so the item gets a full budget again", async () => {
-    await enqueuePrFixItem(client, { repo: "org/repo", pr: 2, lane: "NORMAL", reason: "r", feedback: "f1", evidenceKey: "review:1", headSha: "H1" });
-    await markPrFixItem(client, { repo: "org/repo", pr: 2, status: "fixed" });
-    await enqueuePrFixItem(client, { repo: "org/repo", pr: 2, lane: "NORMAL", reason: "r", feedback: "f2", evidenceKey: "review:2", headSha: "H2" });
-    await markPrFixItem(client, { repo: "org/repo", pr: 2, status: "fixed" });
-    const parked = await enqueuePrFixItem(client, { repo: "org/repo", pr: 2, lane: "NORMAL", reason: "r", feedback: "f3", evidenceKey: "review:3", headSha: "H3" });
-    expect(parked.status).toBe("PARKED");
-
-    const requeued = await requeuePrFixItem(client, { repo: "org/repo", pr: 2 });
-    expect(requeued.fixAttempts).toBe(1);
-    await markPrFixItem(client, { repo: "org/repo", pr: 2, status: "fixed" });
-    const reopened = await enqueuePrFixItem(client, { repo: "org/repo", pr: 2, lane: "NORMAL", reason: "r", feedback: "f4", evidenceKey: "review:4", headSha: "H4" });
-    expect(reopened.status).toBe("QUEUED");
-    expect(reopened.fixAttempts).toBe(2);
+  it("keeps a head-advancing loop dispatchable for arbitrarily many rounds (#1543)", async () => {
+    // Each round advances authoritative state: the fix lands at a new head
+    // and the next review lands on that head. No round count parks this —
+    // the retired lifetime cap would have parked it at 2.
+    for (let i = 1; i <= 7; i++) {
+      const item = await enqueuePrFixItem(client, { repo: "org/repo", pr: 2, lane: "NORMAL", reason: "r", feedback: `f${i}`, evidenceKey: `review:${i}`, headSha: `H${i}` });
+      expect(item.status).toBe("QUEUED");
+      expect(item.fixAttempts).toBe(i);
+      expect(item.stagnationCount).toBe(0);
+      await markPrFixItem(client, { repo: "org/repo", pr: 2, status: "fixed" });
+    }
+    expect(surfacingMocks.surfacePrFixParked).not.toHaveBeenCalled();
   });
 
-  it("counts refused no-push runs and parks the PR past the cap (#1218)", async () => {
+  it("operator requeue resets both the attempt count and the stagnation budget (#1543)", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 2, lane: "NORMAL", reason: "r", feedback: "f1", evidenceKey: "review:1", headSha: "H1" });
+    await markPrFixItem(client, { repo: "org/repo", pr: 2, status: "fixed" });
+    // Same evidence at the same head: the #940 reopen consumes stagnation.
+    const reopened = await enqueuePrFixItem(client, { repo: "org/repo", pr: 2, lane: "NORMAL", reason: "r", feedback: "f1", evidenceKey: "review:1", headSha: "H1" });
+    expect(reopened.status).toBe("QUEUED");
+    expect(reopened.stagnationCount).toBe(1);
+
+    await markPrFixItem(client, { repo: "org/repo", pr: 2, status: "blocked" });
+    const requeued = await requeuePrFixItem(client, { repo: "org/repo", pr: 2 });
+    expect(requeued.fixAttempts).toBe(1);
+    expect(requeued.stagnationCount).toBe(0);
+  });
+
+  it("a proven progress event resets the stagnation budget mid-loop (#1543)", async () => {
+    const prev = process.env.PR_FIX_MAX_STAGNATION;
+    process.env.PR_FIX_MAX_STAGNATION = "3";
+    try {
+      await enqueuePrFixItem(client, { repo: "org/repo", pr: 6, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "review:1", headSha: "H1" });
+      await markPrFixItem(client, { repo: "org/repo", pr: 6, status: "fixed" });
+      // Two stagnant rounds (same evidence, same head) accrue stagnation…
+      for (let expected = 1; expected <= 2; expected++) {
+        const reopened = await enqueuePrFixItem(client, { repo: "org/repo", pr: 6, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "review:1", headSha: "H1" });
+        expect(reopened.status).toBe("QUEUED");
+        expect(reopened.stagnationCount).toBe(expected);
+        await markPrFixItem(client, { repo: "org/repo", pr: 6, status: "fixed" });
+      }
+      // …then the worker pushes a real fix and the next review lands on the
+      // newer head: proven progress resets the budget to 0.
+      const progressed = await enqueuePrFixItem(client, { repo: "org/repo", pr: 6, lane: "NORMAL", reason: "r", feedback: "f2", evidenceKey: "review:2", headSha: "H2" });
+      expect(progressed.status).toBe("QUEUED");
+      expect(progressed.stagnationCount).toBe(0);
+      // …and stagnation starts counting again from zero.
+      await markPrFixItem(client, { repo: "org/repo", pr: 6, status: "fixed" });
+      const stagnantAgain = await enqueuePrFixItem(client, { repo: "org/repo", pr: 6, lane: "NORMAL", reason: "r", feedback: "f2", evidenceKey: "review:2", headSha: "H2" });
+      expect(stagnantAgain.status).toBe("QUEUED");
+      expect(stagnantAgain.stagnationCount).toBe(1);
+      expect(surfacingMocks.surfacePrFixParked).not.toHaveBeenCalled();
+    } finally {
+      if (prev === undefined) delete process.env.PR_FIX_MAX_STAGNATION;
+      else process.env.PR_FIX_MAX_STAGNATION = prev;
+    }
+  });
+
+  it("counts refused no-push runs and parks the PR past the stagnation cap (#1218, #1543)", async () => {
     await enqueuePrFixItem(client, { repo: "org/repo", pr: 3, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "review:1", headSha: "H1" });
     githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("H1");
 
     const retried = await markPrFixItem(client, { repo: "org/repo", pr: 3, status: "FIXED", expectedGeneration: 1 });
     expect(mutatedItem(retried).status).toBe("QUEUED");
     expect(mutatedItem(retried).fixAttempts).toBe(2);
+    expect(mutatedItem(retried).stagnationCount).toBe(1);
 
     const capped = await markPrFixItem(client, { repo: "org/repo", pr: 3, status: "FIXED", expectedGeneration: 2 });
     expect(mutatedItem(capped).status).toBe("PARKED");
     expect(mutatedItem(capped).lane).toBe("NORMAL");
     expect(mutatedItem(capped).outcome).toBe("no_progress");
     expect(mutatedItem(capped).generation).toBe(2);
+    expect(mutatedItem(capped).stagnationCount).toBe(2);
     expect(client.history.at(-1)).toMatchObject({ status: "PARKED", lane: "NORMAL", outcome: "no_progress" });
     expect(client.history.at(-1).note).toContain("Refused FIXED");
-    expect(client.history.at(-1).note).toContain("Bounded at 2 fix attempts");
+    expect(client.history.at(-1).note).toContain("Stagnation budget exhausted at 2 consecutive attempts");
+    expect(client.history.at(-1).note).toContain("PR_FIX_MAX_STAGNATION=2");
     expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledTimes(1);
     expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
   });
 
-  it("counts a mark back to QUEUED as an attempt without resetting the budget", async () => {
+  it("counts a mark back to QUEUED as an attempt and resets the stagnation budget (#1543)", async () => {
     await enqueuePrFixItem(client, { repo: "org/repo", pr: 4, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "review:1", headSha: "H1" });
     await markPrFixItem(client, { repo: "org/repo", pr: 4, status: "blocked" });
 
     const queued = mutatedItem(await markPrFixItem(client, { repo: "org/repo", pr: 4, status: "queued" }));
     expect(queued.status).toBe("QUEUED");
     expect(queued.fixAttempts).toBe(2);
+    expect(queued.stagnationCount).toBe(0);
 
-    // The budget is spent, so the next return is parked.
+    // The head keeps advancing, so the loop keeps iterating — the round
+    // count alone never parks it (#1543).
     expect(mutatedItem(await markPrFixItem(client, { repo: "org/repo", pr: 4, status: "fixed" })).status).toBe("FIXED");
-    const parked = await enqueuePrFixItem(client, { repo: "org/repo", pr: 4, lane: "NORMAL", reason: "r", feedback: "f2", evidenceKey: "review:2", headSha: "H2" });
-    expect(parked.status).toBe("PARKED");
-    expect(parked.lane).toBe("NORMAL");
+    const reopened = await enqueuePrFixItem(client, { repo: "org/repo", pr: 4, lane: "NORMAL", reason: "r", feedback: "f2", evidenceKey: "review:2", headSha: "H2" });
+    expect(reopened.status).toBe("QUEUED");
+    expect(reopened.fixAttempts).toBe(3);
+    expect(reopened.stagnationCount).toBe(0);
   });
 
-  it("parks the #940 no-progress tombstone reopen past the cap (#1218)", async () => {
+  it("parks the #940 no-progress tombstone reopen past the stagnation cap (#1218, #1543)", async () => {
     const input = { repo: "org/repo", pr: 5, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "review:1", headSha: "H1" };
     await enqueuePrFixItem(client, input);
     expect(mutatedItem(await markPrFixItem(client, { repo: "org/repo", pr: 5, status: "fixed" })).status).toBe("FIXED");
 
-    // Same evidence, head unchanged: the FIXED tombstone reopens (attempt 2).
+    // Same evidence, head unchanged: the FIXED tombstone reopens (attempt 2),
+    // but the head did not advance — stagnation accrues.
     const reopened = await enqueuePrFixItem(client, input);
     expect(reopened.status).toBe("QUEUED");
     expect(reopened.fixAttempts).toBe(2);
+    expect(reopened.stagnationCount).toBe(1);
 
-    // Past the cap the reopen is parked instead.
+    // Past the stagnation cap the reopen is parked instead.
     expect(mutatedItem(await markPrFixItem(client, { repo: "org/repo", pr: 5, status: "fixed" })).status).toBe("FIXED");
     const capped = await enqueuePrFixItem(client, input);
     expect(capped.status).toBe("PARKED");
     expect(capped.lane).toBe("NORMAL");
+    expect(capped.stagnationCount).toBe(2);
   });
 });
 
@@ -2578,7 +2632,7 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     expect(marked.postDispatchEvidenceKeys).toEqual([]);
   });
 
-  it("a BLOCKED settlement past the attempt cap stays sticky and never reopens (#1218)", async () => {
+  it("a BLOCKED settlement past the stagnation cap stays sticky and never reopens (#1218)", async () => {
     await enqueuePrFixItem(client, {
       repo: "org/repo", pr: 26, lane: "NORMAL", reason: "r", feedback: "f1",
       evidenceKey: "review:1", headSha: "H1",
@@ -2592,7 +2646,7 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     expect(after.postDispatchEvidenceKeys).toEqual(["review:2@H1"]);
 
     // Push the item to the attempt cap (maxPrFixAttempts defaults to 5).
-    client.items[0].fixAttempts = 5;
+    client.items[0].stagnationCount = 5;
 
     const result = await markPrFixItem(client, {
       repo: "org/repo", pr: 26, status: "BLOCKED",
@@ -2610,7 +2664,7 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     expect(settled.outcome).toBe("human_decision");
     expect(settled.postDispatchEvidenceKeys).toEqual([]);
     expect(settled.generation).toBe(1);
-    expect(settled.fixAttempts).toBe(5);
+    expect(settled.stagnationCount).toBe(5);
   });
 
   it("a stale settlement token cannot reopen on post-dispatch evidence", async () => {
@@ -3001,8 +3055,8 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
       evidenceKey: "review:1", headSha: "H1",
     });
     client.items[0].dispatchedGeneration = client.items[0].generation;
-    // At the attempt cap (maxPrFixAttempts defaults to 5).
-    client.items[0].fixAttempts = 5;
+    // At the stagnation cap (maxPrFixStagnation defaults to 5).
+    client.items[0].stagnationCount = 5;
 
     let landCount = 0;
     client.hooks.beforeUpdateManyEvery = () => {
@@ -3026,7 +3080,7 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     expect(item.lane).toBe("NORMAL");
     expect(item.outcome).toBe("no_progress");
     expect(item.generation).toBe(1);
-    expect(item.fixAttempts).toBe(5);
+    expect(item.stagnationCount).toBe(6);
     expect(item.postDispatchEvidenceKeys).toEqual([]);
     expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalled();
     expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
@@ -3036,7 +3090,7 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     // The capped forced-fallback history row names the parked hand-off. The
     // note was retagged from #1119 to #1218 when the same fallback also
     // covers the sticky BLOCKED/PARKED settlements.
-    expect(client.history.at(-1).note).toContain("parked (#1218)");
+    expect(client.history.at(-1).note).toContain("parked (#1218, #1543)");
   });
 
   it("a post-dispatch check encoded from an `@`-bearing headSha degrades to an unknown head and still reopens", async () => {
@@ -3206,8 +3260,8 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
       repo: "org/repo", pr: 46, lane: "NORMAL", reason: "r", feedback: "f2",
       evidenceKey: "review:2", headSha: "H1",
     });
-    // At the attempt cap (maxPrFixAttempts defaults to 5).
-    client.items[0].fixAttempts = 5;
+    // At the stagnation cap (maxPrFixStagnation defaults to 5).
+    client.items[0].stagnationCount = 5;
     surfacingMocks.surfacePrFixParked.mockClear();
 
     const result = await markPrFixItem(client, {
@@ -4979,9 +5033,9 @@ describe("PR-fix outcome separation (#1218)", () => {
     expect(client.items[0].status).toBe("QUEUED");
   });
 
-  it("parks a failed report past the fix-attempt cap and never labels it human", async () => {
-    const prev = process.env.PR_FIX_MAX_ATTEMPTS;
-    process.env.PR_FIX_MAX_ATTEMPTS = "1";
+  it("parks a failed report past the stagnation cap and never labels it human", async () => {
+    const prev = process.env.PR_FIX_MAX_STAGNATION;
+    process.env.PR_FIX_MAX_STAGNATION = "1";
     try {
       await enqueuePrFixItem(client, {
         repo: "org/repo", pr: 301, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k301", headSha: "H1",
@@ -5003,16 +5057,16 @@ describe("PR-fix outcome separation (#1218)", () => {
       expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledTimes(1);
       expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
     } finally {
-      if (prev === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
-      else process.env.PR_FIX_MAX_ATTEMPTS = prev;
+      if (prev === undefined) delete process.env.PR_FIX_MAX_STAGNATION;
+      else process.env.PR_FIX_MAX_STAGNATION = prev;
     }
   });
 
   it("parks a failed REBASE report instead of reopening a retry (#1327)", async () => {
     // The generic cap must NOT be what parks it: with a generous cap, the
     // rebase lane still settles terminally — one attempt per DIRTY episode.
-    const prev = process.env.PR_FIX_MAX_ATTEMPTS;
-    process.env.PR_FIX_MAX_ATTEMPTS = "5";
+    const prev = process.env.PR_FIX_MAX_STAGNATION;
+    process.env.PR_FIX_MAX_STAGNATION = "5";
     try {
       await enqueuePrFixItem(client, {
         repo: "org/repo", pr: 305, lane: "NORMAL", type: "REBASE", reason: "r", feedback: "f", evidenceKey: "k305", headSha: "H1",
@@ -5038,18 +5092,18 @@ describe("PR-fix outcome separation (#1218)", () => {
       expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
       const note = client.history.at(-1)?.note ?? "";
       expect(note).toContain("#1327");
-      expect(note).not.toContain("PR_FIX_MAX_ATTEMPTS");
+      expect(note).not.toContain("PR_FIX_MAX_STAGNATION");
     } finally {
-      if (prev === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
-      else process.env.PR_FIX_MAX_ATTEMPTS = prev;
+      if (prev === undefined) delete process.env.PR_FIX_MAX_STAGNATION;
+      else process.env.PR_FIX_MAX_STAGNATION = prev;
     }
   });
 
   it("still reopens a failed legacy conflict report below the cap (#1327)", async () => {
     // Only REBASE is terminal per episode; the legacy MERGE_CONFLICT code-fix
-    // lane keeps the generic PR_FIX_MAX_ATTEMPTS ladder.
-    const prev = process.env.PR_FIX_MAX_ATTEMPTS;
-    process.env.PR_FIX_MAX_ATTEMPTS = "5";
+    // lane keeps the generic PR_FIX_MAX_STAGNATION ladder.
+    const prev = process.env.PR_FIX_MAX_STAGNATION;
+    process.env.PR_FIX_MAX_STAGNATION = "5";
     try {
       await enqueuePrFixItem(client, {
         repo: "org/repo", pr: 306, lane: "NORMAL", type: "MERGE_CONFLICT", reason: "r", feedback: "f", evidenceKey: "k306", headSha: "H1",
@@ -5067,8 +5121,8 @@ describe("PR-fix outcome separation (#1218)", () => {
       expect(client.items[0].generation).toBe(2);
       expect(surfacingMocks.surfacePrFixParked).not.toHaveBeenCalled();
     } finally {
-      if (prev === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
-      else process.env.PR_FIX_MAX_ATTEMPTS = prev;
+      if (prev === undefined) delete process.env.PR_FIX_MAX_STAGNATION;
+      else process.env.PR_FIX_MAX_STAGNATION = prev;
     }
   });
 
@@ -5076,8 +5130,8 @@ describe("PR-fix outcome separation (#1218)", () => {
     // The bound keys on the DISPATCHED lane (attemptType), not the row's
     // mutable type: mid-attempt evidence must not smuggle a failed rebase
     // back onto the reopen ladder for a second rebase on the same head.
-    const prev = process.env.PR_FIX_MAX_ATTEMPTS;
-    process.env.PR_FIX_MAX_ATTEMPTS = "5";
+    const prev = process.env.PR_FIX_MAX_STAGNATION;
+    process.env.PR_FIX_MAX_STAGNATION = "5";
     try {
       await enqueuePrFixItem(client, {
         repo: "org/repo", pr: 307, lane: "NORMAL", type: "REBASE", reason: "r", feedback: "f", evidenceKey: "k307", headSha: "H1",
@@ -5096,8 +5150,8 @@ describe("PR-fix outcome separation (#1218)", () => {
       expect(client.items[0].status).toBe("PARKED");
       expect(client.items[0].generation).toBe(1);
     } finally {
-      if (prev === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
-      else process.env.PR_FIX_MAX_ATTEMPTS = prev;
+      if (prev === undefined) delete process.env.PR_FIX_MAX_STAGNATION;
+      else process.env.PR_FIX_MAX_STAGNATION = prev;
     }
   });
 
@@ -5105,8 +5159,8 @@ describe("PR-fix outcome separation (#1218)", () => {
     // A code-fix attempt (attemptType CI_FAILURE) that observed the PR go
     // dirty mid-run keeps the generic ladder; the rebase bound attaches to
     // rebase DISPATCHES only.
-    const prev = process.env.PR_FIX_MAX_ATTEMPTS;
-    process.env.PR_FIX_MAX_ATTEMPTS = "5";
+    const prev = process.env.PR_FIX_MAX_STAGNATION;
+    process.env.PR_FIX_MAX_STAGNATION = "5";
     try {
       await enqueuePrFixItem(client, {
         repo: "org/repo", pr: 308, lane: "NORMAL", type: "CI_FAILURE", reason: "r", feedback: "f", evidenceKey: "k308", headSha: "H1",
@@ -5127,8 +5181,8 @@ describe("PR-fix outcome separation (#1218)", () => {
       // The consumed attempt's lane stamp does not leak into the fresh one.
       expect(client.items[0].attemptType).toBeNull();
     } finally {
-      if (prev === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
-      else process.env.PR_FIX_MAX_ATTEMPTS = prev;
+      if (prev === undefined) delete process.env.PR_FIX_MAX_STAGNATION;
+      else process.env.PR_FIX_MAX_STAGNATION = prev;
     }
   });
 
@@ -5221,6 +5275,8 @@ describe("PR-fix outcome separation (#1218)", () => {
     expect(reopened.status).toBe("QUEUED");
     expect(reopened.generation).toBe(2);
     expect(reopened.fixAttempts).toBe(budgetBefore + 1);
+    // The productive push advanced the head, so the stagnation budget reset (#1543).
+    expect(reopened.stagnationCount).toBe(0);
   });
 
   it("consumes no budget and does not flip status on re-observed known feedback", async () => {
@@ -5274,17 +5330,17 @@ describe("PR-fix outcome separation (#1218)", () => {
     expect(client.items[0].outcome).toBe("no_progress");
   });
 
-  it("keeps the attempt cap and the reclaim cap independent: a reclaim does not consume the attempt budget", async () => {
-    const prevCap = process.env.PR_FIX_MAX_ATTEMPTS;
-    process.env.PR_FIX_MAX_ATTEMPTS = "2";
+  it("keeps the stagnation cap and the reclaim cap independent: a reclaim does not consume the stagnation budget", async () => {
+    const prevCap = process.env.PR_FIX_MAX_STAGNATION;
+    process.env.PR_FIX_MAX_STAGNATION = "2";
     try {
       await enqueuePrFixItem(client, {
         repo: "org/repo", pr: 309, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k309", headSha: "H1",
       });
       const row = client.items[0];
-      // At the attempt cap, but with zero reclaims — the reclaim brake is a
+      // A spent stagnation budget, but zero reclaims — the reclaim brake is a
       // separate budget and must still fire.
-      row.fixAttempts = 2;
+      row.stagnationCount = 2;
       row.dispatchedGeneration = row.generation;
       row.dispatchedAt = new Date("2026-01-01T00:00:00Z");
       row.agentHandouts = [`courier@${row.generation}`];
@@ -5299,13 +5355,13 @@ describe("PR-fix outcome separation (#1218)", () => {
 
       expect(report.reclaimed).toBe(1);
       expect(client.items[0].status).toBe("QUEUED");
-      // The reclaim bumped the reclaim budget, never the worker-execution budget.
+      // The reclaim bumped the reclaim budget, never the stagnation budget.
       expect(client.items[0].handoutReclaims).toBe(1);
-      expect(client.items[0].fixAttempts).toBe(2);
+      expect(client.items[0].stagnationCount).toBe(2);
       expect(client.items[0].generation).toBe(2);
     } finally {
-      if (prevCap === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
-      else process.env.PR_FIX_MAX_ATTEMPTS = prevCap;
+      if (prevCap === undefined) delete process.env.PR_FIX_MAX_STAGNATION;
+      else process.env.PR_FIX_MAX_STAGNATION = prevCap;
     }
   });
 

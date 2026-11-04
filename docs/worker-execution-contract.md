@@ -324,9 +324,10 @@ Behavioral notes:
   settlement for the bridge reconcile pass rather than tombstoning a red PR.
 - New review evidence reopens the item as a fresh attempt, as usual.
 - The SAME evidence re-observed with the head unchanged reopens through the
-  #940 no-progress path and counts toward `fixAttempts`; a worker and reviewer
-  that keep disagreeing end BLOCKED / NEEDS_HUMAN at `PR_FIX_MAX_ATTEMPTS`
-  (#1107), which is a real human decision.
+#940 no-progress path and consumes the consecutive-stagnation budget; a
+worker and reviewer that keep disagreeing without head movement end
+`BLOCKED` / `NEEDS_HUMAN` when the budget runs out (`PR_FIX_MAX_STAGNATION`,
+#1543), which is a real human decision.
 - `pr-fix-queue/mark` accepts the same settlement via
   `status: "FIXED"` + `alreadyAddressed: true` + optional `evidence` (bearer
   marks still require a generation; the QUEUED/IGNORED maintainer-only gate is

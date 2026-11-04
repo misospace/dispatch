@@ -89,6 +89,8 @@ export interface WorkAttemptPrFixItemRecord {
   issue: number | null;
   generation: number;
   fixAttempts: number;
+  /** Consecutive no-progress attempts (#1543) — 0 while the loop advances. */
+  stagnationCount: number;
   status: string;
   outcome: string | null;
   /** `PrFixQueueItem.type` (MERGE_CONFLICT / CI_FAILURE / REVIEW_FEEDBACK / OTHER). */

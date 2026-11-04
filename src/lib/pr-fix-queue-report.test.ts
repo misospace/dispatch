@@ -324,10 +324,10 @@ describe("resolvePrFixFromAgentReport", () => {
     expect(fetchPullRequestMergeStateMock).not.toHaveBeenCalled();
   });
 
-  it("parks a `failed` outcome past the fix-attempt cap (#1133, #1218)", async () => {
+  it("parks a `failed` outcome past the stagnation cap (#1133, #1218)", async () => {
     (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
       ...FIXTURE_ITEM,
-      fixAttempts: 5,
+      stagnationCount: 5,
     });
     (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
 

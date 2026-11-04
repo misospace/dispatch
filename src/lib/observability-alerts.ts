@@ -126,7 +126,7 @@ export const OBSERVABILITY_ALERTS: readonly ObservabilityAlertDefinition[] = [
     severity: "warning",
     forMs: 30 * 60 * 1000,
     why: "Work is queued but not draining.",
-    operatorAction: "Check worker concurrency, lane routing, and fixAttempts saturation.",
+    operatorAction: "Check worker concurrency, lane routing, and stagnation-budget exhaustion.",
   },
   {
     id: "A9",

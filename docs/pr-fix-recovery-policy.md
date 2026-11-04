@@ -62,9 +62,9 @@ queue API, the `(id, generation)` attempt token, and `tasks/report`.
   telemetry. Execution-provider exhaustion is
   [misospace/courier#320](https://github.com/misospace/courier/issues/320), not
   Dispatch recovery ownership.
-- No change to the `PR_FIX_MAX_ATTEMPTS`, `PR_FIX_MAX_RECLAIMS`, or
+- No change to the `PR_FIX_MAX_STAGNATION`, `PR_FIX_MAX_RECLAIMS`, or
   `PR_FIX_EXTERNAL_WAIT_COOLDOWN_MS` defaults. Reactivation uses the existing
-  attempt cap; this design adds no counter.
+  stagnation budget (#1543); this design adds no counter.
 
 ## Vocabulary
 
@@ -241,7 +241,7 @@ by fresh evidence depends on **hold class** and **remaining budget**, not on
 | `status` | `disposition` | Hold class | Reactivatable by fresh evidence? |
 |----------|---------------|------------|----------------------------------|
 | `QUEUED` | — | active | n/a |
-| `FIXED` | — (resolved tombstone) | resolved | **Yes**, bounded by `PR_FIX_MAX_ATTEMPTS` |
+| `FIXED` | — (resolved tombstone) | resolved | **Yes**, bounded by the stagnation budget |
 | `PARKED` | `no_progress`, budget available | operational | **Yes**, after cooldown, bounded |
 | `PARKED` | `no_progress`, budget exhausted | operational (budget-exhausted) | **No**; sets stale-disposition flag (**Proposed**); operator requeue resets budget |
 | `PARKED` | `infra_failure` | operational (fail-closed) | **No**; needs a recovery trigger or operator |
@@ -253,15 +253,15 @@ by fresh evidence depends on **hold class** and **remaining budget**, not on
 | `STALE` | — | terminal | **No**; maintainer mark to `QUEUED` |
 | `IGNORED` | — | terminal | **No**; maintainer mark to `QUEUED` |
 
-**Budget-exhausted** means `fixAttempts >= PR_FIX_MAX_ATTEMPTS` **or**
-`handoutReclaims >= PR_FIX_MAX_RECLAIMS`. This matters because
+**Budget-exhausted** means `stagnationCount >= PR_FIX_MAX_STAGNATION` **or**
+`handoutReclaims >= PR_FIX_MAX_RECLAIMS` (#1543). This matters because
 `PARKED`/`no_progress` is *created by* those caps: six of the seven `PARKED`
 write sites are cap-exhaustion (`src/lib/pr-fix-queue.ts:965`, `:1169`, `:1697`,
 `:1863`, `:2148`, `:3039`). The seventh is the generic `markPrFixItem` `PARKED`
 path (`:1620`, `:1799`), reachable from the worker-tier
 `POST /api/pr-fix-queue/mark` and from the bare-`blocked` report in
-`resolvePrFixFromAgentReport` (`:2976`); it parks without incrementing
-`fixAttempts`, so it is **budget-available** and reactivatable.
+`resolvePrFixFromAgentReport` (`:2976`); it parks without consuming the
+stagnation budget, so it is **budget-available** and reactivatable.
 
 **Proposed:** the item records why it parked (cap-exhausted vs. budget-available
 vs. fail-closed), so reactivation never mistakes an exhausted park for a
@@ -448,10 +448,13 @@ reaping closed PRs.
 - **Cooldown** (`PR_FIX_RECOVERY_COOLDOWN_MS`, **Proposed**; default 6 h,
   matching the external-wait cooldown) paces evidence-driven reactivation of
   operational holds.
-- **Budgets are unchanged.** `PR_FIX_MAX_ATTEMPTS` (fresh attempts) and
-  `PR_FIX_MAX_RECLAIMS` (unacked hand-outs) continue to bound loops.
-  Reactivation increments `fixAttempts`, so a park→reopen→park cycle terminates
-  at the cap; a cap-exhausted park is not reactivated at all (row 9).
+- **Budgets are unchanged.** `PR_FIX_MAX_STAGNATION` (consecutive attempts
+  without head advancement, #1543) and `PR_FIX_MAX_RECLAIMS` (unacked
+  hand-outs) continue to bound loops. Reactivation increments `fixAttempts`
+  and consumes stagnation budget when the reactivating evidence does not
+  advance the head, so a park→reopen→park cycle with no head movement
+  terminates at the stagnation cap; a budget-exhausted park is not
+  reactivated at all (row 9).
 - **Generation bump** gives each reactivation a new `(id, generation)`, so
   already-consumed worker identities cannot suppress or double-run it.
 

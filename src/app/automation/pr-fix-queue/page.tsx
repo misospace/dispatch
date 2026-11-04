@@ -22,6 +22,9 @@ interface PrFixItem {
   latestNote?: string | null;
   outcome?: string | null;
   fixAttempts?: number | null;
+  // #1543: consecutive attempts that ended without authoritative progress
+  // (head never advanced); 0 while the loop keeps advancing the PR head.
+  stagnationCount?: number | null;
   // #1250: structured external-wait contract, surfaced read-only on
   // WAITING_EXTERNAL rows; `legacyWait` flags a pre-contract free-text wait.
   externalWait?: { kind: string; ref: string; evidence: string; trigger: { kind: string; note?: string } } | null;
@@ -51,7 +54,14 @@ function prTitle(item: PrFixItem): string {
 function parkedReason(item: PrFixItem): string {
   const outcome = PARKED_OUTCOME_LABELS[item.outcome ?? ""] ?? item.outcome ?? "no progress";
   const attempts = typeof item.fixAttempts === "number" ? item.fixAttempts : null;
-  return attempts != null ? `${outcome} (after ${attempts} attempt${attempts === 1 ? "" : "s"})` : outcome;
+  const stagnation = typeof item.stagnationCount === "number" ? item.stagnationCount : null;
+  const detail =
+    attempts != null && stagnation != null
+      ? ` (after ${attempts} attempt${attempts === 1 ? "" : "s"}, ${stagnation} stagnant)`
+      : attempts != null
+        ? ` (after ${attempts} attempt${attempts === 1 ? "" : "s"})`
+        : "";
+  return `${outcome}${detail}`;
 }
 
 export default function PrFixQueuePage() {

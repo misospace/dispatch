@@ -119,6 +119,7 @@ function makeClient(): PrFixQueueClient & { items: any[]; ledger: any[]; history
           id: `item-${nextId++}`,
           generation: 1,
           fixAttempts: 1,
+          stagnationCount: 0,
           handoutReclaims: 0,
           evidenceSequence: 0,
           attemptEvidenceWatermark: null,
@@ -276,14 +277,14 @@ async function seedParked(client: any, overrides: Record<string, unknown> = {}):
   return client.items[0];
 }
 
-const freshEnqueue = (evidenceKey: string) => ({
+const freshEnqueue = (evidenceKey: string, head = "bbb2") => ({
   repo: "acme/widgets",
   pr: 7,
   lane: "NORMAL",
   reason: "PR review: CHANGES_REQUESTED",
   feedback: "reviewer insists",
-  headSha: "bbb2",
-  ...ledgerFields(evidenceKey),
+  headSha: head,
+  ...ledgerFields(evidenceKey, head),
 });
 
 // The rotation stamp's fairness depends on NULL ordering, and a fake that
@@ -388,12 +389,12 @@ describe("enqueue reactivation of a budget-available PARKED item (row 8, #1253)"
   it("flags a cap-exhausted PARKED item instead of reopening (row 9, control 7)", async () => {
     await seedParked(client, {
       disposedAt: new Date(Date.now() - 7 * HOUR),
-      fixAttempts: 5,
+      stagnationCount: 5,
     });
     const row = await enqueuePrFixItem(client, freshEnqueue("review:acme/widgets#7:r2"));
     expect(row.status).toBe("PARKED");
     expect(row.generation).toBe(1);
-    expect(row.fixAttempts).toBe(5);
+    expect(row.stagnationCount).toBe(5);
     expect(row.staleDisposition).toBe(true);
     expect(client.history.at(-1)).toMatchObject({
       note: expect.stringContaining("budget exhausted"),
@@ -560,7 +561,7 @@ describe("enqueue surfacing of fresh evidence on holds evidence must not overrid
   it("a cap-flipped wait reactivation lands PARKED with the wait shed but the outcome intact (S3)", async () => {
     await seedItem(client);
     const item = client.items[0];
-    item.fixAttempts = 5; // at the attempt cap
+    item.stagnationCount = 5; // at the stagnation cap
     await markPrFixItem(client, {
       repo: "acme/widgets",
       pr: 7,
@@ -569,7 +570,7 @@ describe("enqueue surfacing of fresh evidence on holds evidence must not overrid
       note: "waiting on upstream",
       externalWait: { kind: "upstream_pr", ref: "acme/deps#3", evidence: "upstream open", trigger: { kind: "merged" } },
     });
-    const row = await enqueuePrFixItem(client, freshEnqueue("review:acme/widgets#7:r2"));
+    const row = await enqueuePrFixItem(client, freshEnqueue("review:acme/widgets#7:r2", "aaa1"));
     // The cap check flipped the reactivation to a row-9 park.
     expect(row.status).toBe("PARKED");
     expect(row.generation).toBe(1); // no fresh attempt minted
@@ -582,7 +583,7 @@ describe("enqueue surfacing of fresh evidence on holds evidence must not overrid
     // Composed history note (N1): recovery rationale + cap park.
     const note = String(client.history.at(-1)?.note ?? "");
     expect(note).toContain("Reactivated on fresh actionable feedback during the external wait");
-    expect(note).toContain("Bounded at 5 fix attempts");
+    expect(note).toContain("Stagnation budget exhausted: 6 consecutive attempts");
   });
 });
 
@@ -595,7 +596,7 @@ describe("fresh attempts clear the recovery bookkeeping (S2)", () => {
   it("a maintainer mark to FIXED clears staleDisposition and the disposition stamps", async () => {
     await seedParked(client, { disposedAt: new Date(Date.now() - 7 * HOUR), recoveryAppliedAt: new Date(Date.now() - 8 * HOUR) });
     // Flag the row first (fresh evidence on a budget-exhausted park).
-    client.items[0].fixAttempts = 5;
+    client.items[0].stagnationCount = 5;
     const flagged = await enqueuePrFixItem(client, freshEnqueue("review:acme/widgets#7:r2"));
     expect(flagged.staleDisposition).toBe(true);
 
@@ -649,14 +650,14 @@ describe("fresh attempts clear the recovery bookkeeping (S2)", () => {
 });
 
 describe("park→reopen→park cycle terminates at the cap (S4, control 6)", () => {
-  const ORIGINAL = process.env.PR_FIX_MAX_ATTEMPTS;
+  const ORIGINAL = process.env.PR_FIX_MAX_STAGNATION;
   afterEach(() => {
-    if (ORIGINAL === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
-    else process.env.PR_FIX_MAX_ATTEMPTS = ORIGINAL;
+    if (ORIGINAL === undefined) delete process.env.PR_FIX_MAX_STAGNATION;
+    else process.env.PR_FIX_MAX_STAGNATION = ORIGINAL;
   });
 
   it("repeated reactivation cycles end in a flagged cap park, not an infinite reopen", async () => {
-    process.env.PR_FIX_MAX_ATTEMPTS = "3";
+    process.env.PR_FIX_MAX_STAGNATION = "3";
     const client = makeClient();
     await seedParked(client, { disposedAt: new Date(Date.now() - 7 * HOUR) });
 
@@ -666,7 +667,7 @@ describe("park→reopen→park cycle terminates at the cap (S4, control 6)", () 
     // this loop only feeds evidence and re-parks, and FAILS if it never
     // reaches the cap park within the bound.
     for (let cycle = 0; cycle < 8; cycle++) {
-      const row = await enqueuePrFixItem(client, freshEnqueue(`review:acme/widgets#7:r${keyIndex++}`));
+      const row = await enqueuePrFixItem(client, freshEnqueue(`review:acme/widgets#7:r${keyIndex++}`, "aaa1"));
       if (row.status === "PARKED") {
         finalRow = row;
         break;
@@ -701,7 +702,7 @@ describe("FIXED reopened at the attempt cap lands a flagged park (S4, control 9)
   it("the capParked write sets staleDisposition true on the FIXED reopen path", async () => {
     const client = makeClient();
     await seedItem(client);
-    client.items[0].fixAttempts = 5;
+    client.items[0].stagnationCount = 5;
     await markPrFixItem(client, {
       repo: "acme/widgets",
       pr: 7,
@@ -712,7 +713,7 @@ describe("FIXED reopened at the attempt cap lands a flagged park (S4, control 9)
     expect(client.items[0].status).toBe("FIXED");
 
     // Fresh evidence (new identity) reopens → the cap check parks it.
-    const row = await enqueuePrFixItem(client, freshEnqueue("review:acme/widgets#7:r2"));
+    const row = await enqueuePrFixItem(client, freshEnqueue("review:acme/widgets#7:r2", "aaa1"));
     expect(row.status).toBe("PARKED");
     expect(row.outcome).toBe("no_progress");
     expect(row.staleDisposition).toBe(true);
