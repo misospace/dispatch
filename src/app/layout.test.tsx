@@ -70,7 +70,7 @@ describe("RootLayout app shell", () => {
     );
     const desktopNav = container.querySelector('nav[class*="sm:flex"]');
     expect(desktopNav).toBeTruthy();
-    expect(desktopNav?.querySelectorAll("a").length).toBe(7);
+    expect(desktopNav?.querySelectorAll("a").length).toBe(8);
   });
 
   it("renders children in the main content area", () => {
@@ -138,6 +138,7 @@ describe("RootLayout app shell", () => {
     expect(screen.getByText("Board")).toBeInTheDocument();
     expect(screen.getByText("Projects")).toBeInTheDocument();
     expect(screen.getByText("Agents")).toBeInTheDocument();
+    expect(screen.getByText("Attention")).toBeInTheDocument();
     expect(screen.getByText("Automation")).toBeInTheDocument();
   });
 

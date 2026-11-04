@@ -84,10 +84,13 @@ export default function RootLayout({
                 <Link href="/projects" className="text-muted-foreground hover:text-foreground">
                   Projects
                 </Link>
-                <Link href="/agents" className="text-muted-foreground hover:text-foreground">
-                  Agents
-                </Link>
-                <Link href="/automation" className="text-muted-foreground hover:text-foreground">
+<Link href="/agents" className="text-muted-foreground hover:text-foreground">
+Agents
+</Link>
+<Link href="/attention" className="text-muted-foreground hover:text-foreground">
+Attention
+</Link>
+<Link href="/automation" className="text-muted-foreground hover:text-foreground">
                   Automation
                 </Link>
                 <Link href="/groomer" className="text-muted-foreground hover:text-foreground">
