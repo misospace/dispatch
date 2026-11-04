@@ -4864,6 +4864,78 @@ Investigate session handling in auth module.`;
       expect(completedRun()).toMatchObject({ status: "dry_run_completed", observeDisposition: "would_refuse" });
     });
 
+    it("records would_act for a comment-only plan when no groomer comment is recent", async () => {
+      mocks.selectGroomingCandidate.mockResolvedValue({ ...mockCandidate, labels: ["status/backlog", "priority/p0"] });
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("backlog", { mutations: { githubComment: "Adding a grooming note." } }),
+      );
+
+      const result = await runHostedGroomer();
+
+      expectNoMutations();
+      expect(result).toMatchObject({ mode: "observe", observeDisposition: "would_act" });
+    });
+
+    it("records would_noop for a comment-only plan inside the comment cooldown", async () => {
+      // The applier's cooldown rule consults the application store's
+      // hasRecentComment (a GroomingRun with a commentUrl since the window
+      // start); observe must consult the same rule, so auto would skip the
+      // comment and write nothing — a no-op, not an act.
+      mocks.selectGroomingCandidate.mockResolvedValue({ ...mockCandidate, labels: ["status/backlog", "priority/p0"] });
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("backlog", { mutations: { githubComment: "Adding a grooming note." } }),
+      );
+      mocks.prisma.groomingRun.findFirst.mockResolvedValue({
+        id: "gr-recent",
+        commentUrl: "https://github.com/org/repo/issues/42#issuecomment-1",
+        updatedAt: new Date(),
+      });
+
+      const result = await runHostedGroomer();
+
+      expectNoMutations();
+      expect(result).toMatchObject({ mode: "observe", observeDisposition: "would_noop" });
+      expect(completedRun()).toMatchObject({ status: "dry_run_completed", observeDisposition: "would_noop" });
+      // The cooldown read is the same store call the apply path makes.
+      expect(mocks.prisma.groomingRun.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({ where: expect.objectContaining({ issueId: "issue-42", commentUrl: { not: null } }) }),
+      );
+    });
+
+    it("records would_act for a comment-only plan when force bypasses the cooldown", async () => {
+      mocks.selectGroomingCandidate.mockResolvedValue({ ...mockCandidate, labels: ["status/backlog", "priority/p0"] });
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("backlog", { mutations: { githubComment: "Adding a grooming note." } }),
+      );
+      mocks.prisma.groomingRun.findFirst.mockResolvedValue({
+        id: "gr-recent",
+        commentUrl: "https://github.com/org/repo/issues/42#issuecomment-1",
+        updatedAt: new Date(),
+      });
+
+      const result = await runHostedGroomer({ force: true });
+
+      expectNoMutations();
+      expect(result).toMatchObject({ mode: "observe", observeDisposition: "would_act" });
+    });
+
+    it("records would_act when the cooldown skips the comment but labels still change", async () => {
+      mocks.selectGroomingCandidate.mockResolvedValue({ ...mockCandidate, labels: ["status/backlog", "priority/p0"] });
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("backlog", { mutations: { githubComment: "Adding a grooming note.", labelsToAdd: ["type/chore"] } }),
+      );
+      mocks.prisma.groomingRun.findFirst.mockResolvedValue({
+        id: "gr-recent",
+        commentUrl: "https://github.com/org/repo/issues/42#issuecomment-1",
+        updatedAt: new Date(),
+      });
+
+      const result = await runHostedGroomer();
+
+      expectNoMutations();
+      expect(result).toMatchObject({ mode: "observe", observeDisposition: "would_act" });
+    });
+
     it("records assessment_unavailable when the model stage fails in observe mode", async () => {
       mocks.callGroomerLLM.mockRejectedValue(new Error("LLM down"));
       await expect(runHostedGroomer()).rejects.toThrow("LLM down");

@@ -48,6 +48,8 @@ import {
   computeApplicationKey,
   computeMutationDiff,
   makePrismaApplicationStore,
+  readSteps,
+  resolveCommentGate,
   type ApplicationStore,
   type ApplierGitHub,
   type ApplyResult,
@@ -934,6 +936,18 @@ async function executeGroomerRun(
       preconditionFailures: preconditions.failures,
       mutationPlan,
     };
+    // The reply gate is one comment policy for both the write path and the
+    // observe disposition, so observe always sees the eligibility auto would.
+    const commentPolicy = (held || suppressed)
+      ? {
+          mode: "hold" as const,
+          reason: engagementReason,
+          detail: engagement.participants
+            .filter((participant) => !participant.trusted)
+            .map((participant) => `untrusted: ${participant.login || "unknown"} (${participant.reason})`)
+            .join("; ") || "trust assessment failed; no participants available",
+        }
+      : undefined;
 
     if (dryRun) {
       const existing = preconditions.ok ? await store.find(applicationKey) : null;
@@ -948,17 +962,31 @@ async function executeGroomerRun(
       mutationPlan.applyOutcome = applyOutcome;
       // The durable would-disposition (#1542): auto mode would have written
       // only when the preconditions held and this exact plan had not already
-      // been applied (a replay writes nothing new). A held or suppressed
-      // reply is a refusal to speak, not a mutation, so it never counts as
-      // acting on its own.
+      // been applied (a replay writes nothing new). Comment eligibility is
+      // the shared gate decision (resolveCommentGate), so a cooldown skip or
+      // an already-posted comment is a no-op, and a held reply — including a
+      // prior pending reply — is a refusal to speak, not a mutation.
       if (observe) {
+        const commentGate = diff.comment
+          ? await resolveCommentGate({
+              applicationKey,
+              priorComment: readSteps(existing?.steps).comment,
+              recentComments: preconditions.recentComments,
+              commentPolicy,
+              force: options.force === true,
+              commentCooldownHours: config.commentCooldownHours,
+              issueId: candidate.id,
+              hasRecentComment: (issueId, since) => store.hasRecentComment(issueId, since),
+            })
+          : null;
+        const commentWouldPost = diff.comment !== null && commentGate === null;
         observeDisposition = deriveObserveDisposition({
           applyOutcome,
           wouldMutate: wouldMutate({
             labelsStep: diff.labelsStep,
             labelsBefore: diff.labelsBefore,
             comment: diff.comment,
-            commentWouldPost: !held && !suppressed,
+            commentWouldPost,
             close: diff.close,
             children: diff.children !== null,
             title: diff.title,
@@ -966,7 +994,7 @@ async function executeGroomerRun(
           }),
           inFlight: false,
           snapshotUnreadable: false,
-          commentHeldOnly: (held || suppressed) && diff.comment !== null,
+          commentHeldOnly: commentGate?.status === "held",
         });
       }
       await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
@@ -1060,16 +1088,7 @@ async function executeGroomerRun(
         recentComments: preconditions.recentComments,
         force: options.force === true,
         commentCooldownHours: config.commentCooldownHours,
-        commentPolicy: (held || suppressed)
-          ? {
-              mode: "hold",
-              reason: engagementReason,
-              detail: engagement.participants
-                .filter((participant) => !participant.trusted)
-                .map((participant) => `untrusted: ${participant.login || "unknown"} (${participant.reason})`)
-                .join("; ") || "trust assessment failed; no participants available",
-            }
-          : undefined,
+        commentPolicy,
       },
       github,
       store,
