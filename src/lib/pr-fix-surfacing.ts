@@ -20,6 +20,12 @@ export interface PrFixSurfaceContext {
    */
   workerExecutions?: number | null;
   /**
+   * Consecutive attempts that ended without authoritative progress (#1543).
+   * 0 (or absent) while the loop keeps advancing the PR head — lets
+   * operators tell a long-but-healthy loop from a stuck one.
+   */
+  stagnationCount?: number | null;
+  /**
    * Number of `enqueue` history rows (evidence observations), reported
    * separately from worker executions so the two are never conflated (#1218).
    */

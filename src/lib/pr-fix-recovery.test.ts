@@ -19,7 +19,7 @@ function base(overrides: Partial<RecoveryEvaluationInput> = {}): RecoveryEvaluat
   return {
     status: "PARKED",
     outcome: "no_progress",
-    fixAttempts: 1,
+    stagnationCount: 0,
     handoutReclaims: 0,
     hasValidExternalWait: true,
     freshEvidence: true,
@@ -27,7 +27,7 @@ function base(overrides: Partial<RecoveryEvaluationInput> = {}): RecoveryEvaluat
     now: NOW,
     disposedAt: new Date(NOW.getTime() - 2 * 24 * HOUR),
     recoveryAppliedAt: null,
-    maxAttempts: 5,
+    maxStagnation: 5,
     maxReclaims: 3,
     cooldownMs: 6 * HOUR,
     ...overrides,
@@ -69,24 +69,24 @@ describe("recoveryCooldownMs", () => {
 
 describe("classifyParkedBudget", () => {
   it("classifies infra/security/invalid_wait parks fail-closed regardless of budget (B1)", () => {
-    expect(classifyParkedBudget({ status: "PARKED", outcome: "infra_failure", fixAttempts: 0 }, 5, 3)).toBe("fail-closed");
-    expect(classifyParkedBudget({ status: "PARKED", outcome: "security_failure", fixAttempts: 0 }, 5, 3)).toBe("fail-closed");
+    expect(classifyParkedBudget({ status: "PARKED", outcome: "infra_failure", stagnationCount: 0 }, 5, 3)).toBe("fail-closed");
+    expect(classifyParkedBudget({ status: "PARKED", outcome: "security_failure", stagnationCount: 0 }, 5, 3)).toBe("fail-closed");
     // The #1250 fail-closed downgrade park (negative control 16).
-    expect(classifyParkedBudget({ status: "PARKED", outcome: "invalid_wait", fixAttempts: 0 }, 5, 3)).toBe("fail-closed");
+    expect(classifyParkedBudget({ status: "PARKED", outcome: "invalid_wait", stagnationCount: 0 }, 5, 3)).toBe("fail-closed");
   });
 
   it("classifies cap-exhausted parks by attempts or reclaims", () => {
-    expect(classifyParkedBudget({ status: "PARKED", outcome: "no_progress", fixAttempts: 5 }, 5, 3)).toBe("exhausted");
-    expect(classifyParkedBudget({ status: "PARKED", outcome: "no_progress", fixAttempts: 2, handoutReclaims: 3 }, 5, 3)).toBe("exhausted");
+    expect(classifyParkedBudget({ status: "PARKED", outcome: "no_progress", stagnationCount: 5 }, 5, 3)).toBe("exhausted");
+    expect(classifyParkedBudget({ status: "PARKED", outcome: "no_progress", stagnationCount: 5, handoutReclaims: 3 }, 5, 3)).toBe("exhausted");
   });
 
   it("classifies budget-available parks and stays PARKED-shaped elsewhere", () => {
-    expect(classifyParkedBudget({ status: "PARKED", outcome: "no_progress", fixAttempts: 4 }, 5, 3)).toBe("available");
-    expect(classifyParkedBudget({ status: "PARKED", outcome: null, fixAttempts: null }, 5, 3)).toBe("available");
+    expect(classifyParkedBudget({ status: "PARKED", outcome: "no_progress", stagnationCount: 4 }, 5, 3)).toBe("available");
+    expect(classifyParkedBudget({ status: "PARKED", outcome: null, stagnationCount: null }, 5, 3)).toBe("available");
     // Non-PARKED statuses read "available": the class is only meaningful
     // for PARKED (documented contract).
     expect(classifyParkedBudget({ status: "QUEUED" }, 5, 3)).toBe("available");
-    expect(classifyParkedBudget({ status: "BLOCKED", outcome: "human_decision", fixAttempts: 99 }, 5, 3)).toBe("available");
+    expect(classifyParkedBudget({ status: "BLOCKED", outcome: "human_decision", stagnationCount: 99 }, 5, 3)).toBe("available");
   });
 });
 
@@ -126,8 +126,8 @@ describe("evaluateRecovery — PARKED fail-closed (rows 10/11)", () => {
 });
 
 describe("evaluateRecovery — PARKED exhausted (row 9, control 7)", () => {
-  it("holds and flags when fixAttempts reach the cap; no reactivation", () => {
-    const decision = evaluateRecovery(base({ fixAttempts: 5, maxAttempts: 5 }));
+  it("holds and flags when stagnationCount reaches the cap; no reactivation", () => {
+    const decision = evaluateRecovery(base({ stagnationCount: 5, maxStagnation: 5 }));
     expect(decision).toMatchObject({ action: "hold", charged: false, setStaleDisposition: true });
   });
 
@@ -138,7 +138,7 @@ describe("evaluateRecovery — PARKED exhausted (row 9, control 7)", () => {
 
   it("holds without flagging on duplicate evidence", () => {
     expect(
-      evaluateRecovery(base({ fixAttempts: 5, maxAttempts: 5, freshEvidence: false })).setStaleDisposition,
+      evaluateRecovery(base({ stagnationCount: 5, maxStagnation: 5, freshEvidence: false })).setStaleDisposition,
     ).toBe(false);
   });
 });

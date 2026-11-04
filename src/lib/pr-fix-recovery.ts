@@ -113,27 +113,29 @@ const FAIL_CLOSED_PARK_OUTCOMES = new Set(["infra_failure", "security_failure", 
  * Classify a PARKED row's remaining reactivation budget (#1253). The
  * outcome decides fail-closed BEFORE the caps: an infra/security park and
  * the #1250 `invalid_wait` downgrade park are never evidence-reactivatable
- * regardless of budget. Budget-exhausted means `fixAttempts >= maxAttempts`
- * OR `handoutReclaims >= maxReclaims` — the same caps that CREATE
- * no_progress parks.
+ * regardless of budget. Budget-exhausted means `stagnationCount >=
+ * maxStagnation` OR `handoutReclaims >= maxReclaims` — the same caps that
+ * CREATE no_progress parks (#1543: the retired lifetime attempt cap no
+ * longer creates them; the consecutive-stagnation budget does).
  */
 export function classifyParkedBudget(
-  item: { status: string; outcome?: string | null; fixAttempts?: number | null; handoutReclaims?: number | null },
-  maxAttempts: number,
+  item: { status: string; outcome?: string | null; stagnationCount?: number | null; handoutReclaims?: number | null },
+  maxStagnation: number,
   maxReclaims: number,
 ): ParkBudgetClass {
   if (item.status !== "PARKED") return "available";
   if (FAIL_CLOSED_PARK_OUTCOMES.has(item.outcome ?? "")) return "fail-closed";
-  const attempts = item.fixAttempts ?? 0;
+  const stagnation = item.stagnationCount ?? 0;
   const reclaims = item.handoutReclaims ?? 0;
-  if (attempts >= maxAttempts || reclaims >= maxReclaims) return "exhausted";
+  if (stagnation >= maxStagnation || reclaims >= maxReclaims) return "exhausted";
   return "available";
 }
 
 export interface RecoveryEvaluationInput {
   status: RecoveryStatus;
   outcome?: string | null;
-  fixAttempts?: number | null;
+  /** Consecutive attempts that ended without authoritative progress (#1543). */
+  stagnationCount?: number | null;
   handoutReclaims?: number | null;
   /** A parsed, valid structured external-wait contract exists (only meaningful for WAITING_EXTERNAL). */
   hasValidExternalWait: boolean;
@@ -159,7 +161,7 @@ export interface RecoveryEvaluationInput {
   disposedAt?: Date | string | null;
   /** Cooldown timestamp of the LAST reactivation, when one happened. */
   recoveryAppliedAt?: Date | string | null;
-  maxAttempts: number;
+  maxStagnation: number;
   maxReclaims: number;
   cooldownMs: number;
 }
@@ -256,7 +258,7 @@ function decideRecovery(input: RecoveryEvaluationInput): RecoveryDecision {
   }
 
   // status === "PARKED": rows 8-11, keyed on budget class.
-  const budget = classifyParkedBudget(input, input.maxAttempts, input.maxReclaims);
+  const budget = classifyParkedBudget(input, input.maxStagnation, input.maxReclaims);
   if (budget === "fail-closed") {
     const kind = input.outcome ?? "infra_failure";
     if (!freshEvidence) return HOLD(`duplicate evidence on a fail-closed ${kind} park is inert (#1253, rows 10/11)`);

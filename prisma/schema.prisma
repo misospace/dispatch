@@ -254,9 +254,17 @@ model PrFixQueueItem {
   // actually dispatched as, not the current type.
   attemptType              String?
   // Dispatchable fix attempts since creation or the last operator requeue
-  // (#1103): 1 on creation, +1 per fresh attempt. PR_FIX_MAX_ATTEMPTS bounds
-  // this, not evidence keys — one review can carry many comment keys.
+  // (#1103): 1 on creation, +1 per fresh attempt. Telemetry / attempt-chain
+  // reporting only — no longer a stop condition (#1543).
   fixAttempts              Int                      @default(1)
+  // Consecutive attempts that ended WITHOUT authoritative progress (#1543):
+  // an attempt made progress when the observed PR head advanced past the
+  // attempt's baseline (`attemptHeadSha`); otherwise it consumed one unit of
+  // stagnation budget. A proven progress event (head advance) resets it to 0,
+  // as does an operator requeue. `PR_FIX_MAX_STAGNATION` bounds it; past the
+  // cap the item parks as `PARKED/no_progress` like the retired
+  // `PR_FIX_MAX_ATTEMPTS` lifetime cap did.
+  stagnationCount          Int                      @default(0)
   // Last next-task hand-out of this item (#1119): the generation handed to
   // the worker (NULL = never dispatched in its current life) and the
   // wall-clock of that hand-out.

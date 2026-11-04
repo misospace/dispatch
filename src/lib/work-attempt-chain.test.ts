@@ -55,6 +55,7 @@ function prFixItem(
     issue: overrides.issue ?? 42,
     generation: overrides.generation ?? 1,
     fixAttempts: overrides.fixAttempts ?? 1,
+    stagnationCount: overrides.stagnationCount ?? 0,
     status: overrides.status ?? "QUEUED",
     outcome: overrides.outcome ?? null,
     type: overrides.type ?? "REVIEW_FEEDBACK",

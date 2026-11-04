@@ -355,6 +355,7 @@ export async function GET(request: NextRequest) {
         issue: row.issue,
         generation: row.generation,
         fixAttempts: row.fixAttempts,
+        stagnationCount: row.stagnationCount,
         status: row.status,
         outcome: row.outcome,
         type: row.type,

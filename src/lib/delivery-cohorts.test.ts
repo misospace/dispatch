@@ -74,6 +74,7 @@ function prFixItem(
     issue: overrides.issue ?? null,
     generation: overrides.generation ?? 1,
     fixAttempts: overrides.fixAttempts ?? 1,
+    stagnationCount: overrides.stagnationCount ?? 0,
     status: overrides.status ?? "FIXED",
     outcome: overrides.outcome ?? null,
     type: overrides.type ?? "CI_FAILURE",

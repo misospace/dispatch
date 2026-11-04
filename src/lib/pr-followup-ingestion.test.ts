@@ -452,7 +452,7 @@ describe("ingestReviewEvent", () => {
     expect(client.items[0].lane).toBe("NORMAL");
     expect(client.items[0].type).toBe("REBASE");
   });
-  // review and reports back; if it genuinely cannot act, PR_FIX_MAX_ATTEMPTS
+  // review and reports back; if it genuinely cannot act, the stagnation budget
   // escalates to NEEDS_HUMAN on evidence. Predicting unactionability with a
   // keyword list cost more than it saved — it dead-ended a detailed review with
   // file:line references (pr-reviewer-action#467) for 13 hours, while vague

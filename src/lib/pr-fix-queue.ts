@@ -425,7 +425,8 @@ export interface MarkPrFixInput {
   // FIXED), the #940 no-progress head-moved guard is bypassed and `evidence` is
   // recorded in the settlement history: the worker asserts the feedback was
   // already handled, so no new push is expected. New evidence still reopens the
-  // item; a repeated disagreement reopens via #940 and counts toward fixAttempts.
+  // item; a repeated disagreement reopens via #940 and consumes the
+  // consecutive-stagnation budget (#1543).
   alreadyAddressed?: boolean;
   evidence?: string | null;
   /**
@@ -1252,7 +1253,7 @@ function laneLabel(lane: string | null | undefined): string {
  */
 export async function buildPrFixBlockedContext(
   client: PrFixQueueClient,
-  item: { repo: string; pr: number; feedback?: string[] | null; fixAttempts?: number | null; staleDisposition?: boolean | null },
+  item: { repo: string; pr: number; feedback?: string[] | null; fixAttempts?: number | null; stagnationCount?: number | null; staleDisposition?: boolean | null },
 ): Promise<import("./pr-fix-surfacing").PrFixSurfaceContext> {
   const context: import("./pr-fix-surfacing").PrFixSurfaceContext = {};
 
@@ -1274,10 +1275,12 @@ export async function buildPrFixBlockedContext(
   if (links.length > 0) context.failingRunLinks = links;
   if (lastAttemptSummary) context.lastAttemptSummary = lastAttemptSummary;
 
-  // Worker executions are the real bound; report them explicitly, never as the
-  // enqueue row count (#1218).
+  // Worker executions are the real attempt count; report them explicitly, never as the
+  // enqueue row count (#1218). The consecutive-stagnation count (#1543) rides
+  // alongside so operators can tell a long-but-healthy loop from a stuck one.
   if (typeof item.fixAttempts === "number") context.workerExecutions = item.fixAttempts;
   else context.workerExecutions = null;
+  if (typeof item.stagnationCount === "number") context.stagnationCount = item.stagnationCount;
 
   // Enqueue rows grouped by lane, plus the final failure signature from the
   // latest BLOCKED or PARKED tombstone note. Historical rows without a lane are
@@ -1354,15 +1357,32 @@ function metadataPatch(input: EnqueuePrFixInput): Record<string, string | number
 }
 
 /**
- * Bound on automatic fix attempts before a REVIEW_FEEDBACK/CI item is handed to
- * a human instead of re-queued. Counts dispatchable attempts (`fixAttempts`),
- * not evidence keys: one review carries a key per inline comment, so counting
- * keys blocked a PR on first sight of a 6-comment review (#1103). Overridable
- * via PR_FIX_MAX_ATTEMPTS; defaults to 5.
+ * Consecutive-stagnation budget (#1543): bounds how many attempts in a row
+ * may end WITHOUT authoritative progress before the item parks instead of
+ * re-queueing. Progress is proven only from durable source state — the
+ * observed PR head advancing past the attempt's baseline — never from worker
+ * or model assertion. Replaces the retired lifetime `PR_FIX_MAX_ATTEMPTS`
+ * cap (#1001), which parked healthy head-advancing loops at an arbitrary
+ * round count. Overridable via PR_FIX_MAX_STAGNATION; defaults to 5.
  */
-export function maxPrFixAttempts(): number {
-  const n = Number(process.env.PR_FIX_MAX_ATTEMPTS);
+export function maxPrFixStagnation(): number {
+  const n = Number(process.env.PR_FIX_MAX_STAGNATION);
   return Number.isInteger(n) && n > 0 ? n : 5;
+}
+
+/**
+ * Authoritative progress predicate (#1543): the attempt made progress when
+ * the observed PR head advanced past the attempt's baseline. Both heads must
+ * be known (non-empty after trim/lowercase normalization, and never the
+ * literal "unknown" placeholder) and must differ; an unknown head can never
+ * prove progress (fail-closed: it consumes stagnation budget instead).
+ */
+export function attemptHeadAdvanced(observedHead?: string | null, baselineHead?: string | null): boolean {
+  const observed = String(observedHead ?? "").trim().toLowerCase();
+  const baseline = String(baselineHead ?? "").trim().toLowerCase();
+  if (!observed || !baseline) return false;
+  if (observed === "unknown" || baseline === "unknown") return false;
+  return observed !== baseline;
 }
 
 export function externalWaitCooldownMs(): number {
@@ -2415,7 +2435,7 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           ? evaluateRecovery({
               status: snapshot.status,
               outcome: snapshot.outcome ?? null,
-              fixAttempts: snapshot.fixAttempts,
+              stagnationCount: snapshot.stagnationCount,
               handoutReclaims: snapshot.handoutReclaims,
               hasValidExternalWait:
                 snapshot.status === "WAITING_EXTERNAL" ? !!parseStoredExternalWait(snapshot.externalWait) : false,
@@ -2428,7 +2448,7 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
               now,
               disposedAt: snapshot.disposedAt ?? null,
               recoveryAppliedAt: snapshot.recoveryAppliedAt ?? null,
-              maxAttempts: maxPrFixAttempts(),
+              maxStagnation: maxPrFixStagnation(),
               maxReclaims: maxPrFixReclaims(),
               cooldownMs: recoveryCooldownMs(),
             })
@@ -2471,29 +2491,38 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           resolvedStatus = nextStatus;
         }
 
-        // Bound the fix loop (#1001). Only a transition back to QUEUED opens a
-        // new attempt — more evidence on already-QUEUED work (the rest of one
-        // review's inline comments) is the same attempt and never counts
-        // (#1103). Past the cap, stop re-queuing and PARK the PR (#1218): this
-        // is bounded exhaustion, not a human decision, so it must not carry the
-        // needs-human label. Otherwise a human CHANGES_REQUESTED that N
-        // automated fixes never satisfy loops forever. This check runs AFTER
-        // the recovery decision (#1253): a budget-available reactivation that
-        // lands at the cap parks here with the stale-disposition flag (row 9
+        // Guard the fix loop (#1543, replacing the retired lifetime
+        // PR_FIX_MAX_ATTEMPTS cap of #1001). Only a transition back to QUEUED
+        // opens a new attempt — more evidence on already-QUEUED work (the rest
+        // of one review's inline comments) is the same attempt and never
+        // counts (#1103). Progress is proven ONLY from durable source state:
+        // the observed head advancing past the consumed attempt's baseline
+        // (`attemptHeadSha`, legacy `headSha` fallback). A progressing loop
+        // resets the stagnation budget and iterates for as many rounds as it
+        // needs; a loop that keeps burning attempts without advancing the head
+        // exhausts the consecutive-stagnation budget and PARKS (#1218) —
+        // bounded exhaustion, not a human decision, so it never carries the
+        // needs-human label. This check runs AFTER the recovery decision
+        // (#1253): a budget-available reactivation that lands at the
+        // stagnation cap parks here with the stale-disposition flag (row 9
         // semantics — the fresh evidence that justified the reopen is still
         // unaddressed and must surface to the operator).
-        const priorAttempts = snapshot.fixAttempts ?? 1;
         let capParked = false;
-        if (
-          resolvedStatus === "QUEUED" &&
-          snapshot.status !== "QUEUED" &&
-          priorAttempts >= maxPrFixAttempts()
-        ) {
-          resolvedStatus = "PARKED";
-          resolvedLane = "NORMAL";
-          resolvedOutcome = normalizePrFixOutcome(input.outcome) ?? "no_progress";
-          statusNote = `Bounded at ${priorAttempts} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); parked instead of re-queuing (#1001).`;
-          capParked = true;
+        let stagnationCountWrite: number | undefined;
+        if (resolvedStatus === "QUEUED" && snapshot.status !== "QUEUED") {
+          if (attemptHeadAdvanced(input.headSha, snapshot.attemptHeadSha ?? snapshot.headSha)) {
+            stagnationCountWrite = 0; // proven progress resets the budget (#1543)
+          } else {
+            const nextStagnation = (snapshot.stagnationCount ?? 0) + 1;
+            if (nextStagnation >= maxPrFixStagnation()) {
+              resolvedStatus = "PARKED";
+              resolvedLane = "NORMAL";
+              resolvedOutcome = normalizePrFixOutcome(input.outcome) ?? "no_progress";
+              statusNote = `Stagnation budget exhausted: ${nextStagnation} consecutive attempts with no head advancement (PR_FIX_MAX_STAGNATION=${maxPrFixStagnation()}); parked instead of re-queuing (#1543, replaces the retired #1001 attempt cap).`;
+              capParked = true;
+            }
+            stagnationCountWrite = nextStagnation;
+          }
         }
 
         // #1503: escalation-lane exclusivity is authoritative over this
@@ -2587,6 +2616,10 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
             ? {
                 ...freshAttemptGeneration(),
                 fixAttempts: { increment: 1 },
+                // #1543: the consumed attempt's progress classification —
+                // 0 after proven head advancement, the incremented
+                // consecutive-stagnation count otherwise.
+                ...(stagnationCountWrite !== undefined ? { stagnationCount: stagnationCountWrite } : {}),
                 attemptHeadSha: input.headSha ?? snapshot.headSha ?? null,
               }
             : {}),
@@ -2654,6 +2687,9 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           // unaddressed) flags too.
           ...(recovery?.action === "hold" && recovery.setStaleDisposition ? { staleDisposition: true } : {}),
           ...(capParked ? { staleDisposition: true } : {}),
+          // #1543: the stagnation-exhaustion park records the exhausted
+          // count so queue/observability show how the budget was spent.
+          ...(capParked && stagnationCountWrite !== undefined ? { stagnationCount: stagnationCountWrite } : {}),
           // #1253: disposition stamps — written only when THIS decision
           // transitions the row INTO a disposition from a different status.
           // Idempotent sticky re-marks (the sync's duplicate enqueues onto a
@@ -3519,8 +3555,17 @@ export async function markPrFixItem(
   // when the pin misses; the caller then feeds the miss into the bounded
   // re-decision loop below. `noteSuffix` is appended to the note when the
   // reopen is taken from the settle-gap retry.
+  // #1543: the stagnation classification shared by the reopen write and its
+  // surfacing decision, so both always agree on the same row snapshot. The
+  // consumed attempt made progress only when the observed head advanced past
+  // its baseline (`attemptHeadSha`, legacy `headSha` fallback).
+  const reopenStagnation = (row: any): number =>
+    attemptHeadAdvanced(row.headSha, row.attemptHeadSha ?? row.headSha)
+      ? 0
+      : (row.stagnationCount ?? 0) + 1;
   const writeReopen = async (tx: any, row: any, noteSuffix = ""): Promise<any | null> => {
-        const reopenCapped = (row.fixAttempts ?? 1) >= maxPrFixAttempts();
+        const nextStagnation = reopenStagnation(row);
+        const reopenCapped = nextStagnation >= maxPrFixStagnation();
         // #1503 review: a fresh-attempt reopen re-derives the linked issue too —
         // an operator reclassify (BLOCKED → FIXED) can settle a row whose lane
         // column reads NEEDS_HUMAN, and the reopen must not re-enter the loop
@@ -3536,6 +3581,8 @@ export async function markPrFixItem(
               // #1503: capped give-up park keeps the exclusive lane.
               lane: reopenLane,
               outcome: "no_progress",
+              // #1543: record the exhausted stagnation count.
+              stagnationCount: nextStagnation,
           decisionDetail: null,
           // #1253: disposition audit stamp (capped give-up park).
           disposedAt: new Date(),
@@ -3554,6 +3601,8 @@ export async function markPrFixItem(
           lane: reopenLane,
           ...freshAttemptGeneration(),
           fixAttempts: { increment: 1 },
+          // #1543: reset after proven head advancement, accumulate otherwise.
+          stagnationCount: nextStagnation,
           attemptHeadSha: row.headSha ?? row.attemptHeadSha ?? null,
           outcome: null,
           decisionDetail: null,
@@ -3586,7 +3635,7 @@ export async function markPrFixItem(
         outcome: reopenCapped ? "no_progress" : null,
         note:
           (reopenCapped
-            ? `New evidence arrived after this attempt was handed out, but bounded at ${row.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); parked (#1119).`
+            ? `New evidence arrived after this attempt was handed out, but the stagnation budget is exhausted at ${nextStagnation} consecutive attempts with no head advancement (PR_FIX_MAX_STAGNATION=${maxPrFixStagnation()}); parked (#1119, #1543).`
             : `New evidence arrived after this attempt was handed out; reopened as a fresh attempt at the current head (#1119).`) + noteSuffix,
       },
     });
@@ -3594,7 +3643,7 @@ export async function markPrFixItem(
   };
 
   const surfaceReopen = async (before: any, reopened: any) => {
-    const reopenCapped = (before.fixAttempts ?? 1) >= maxPrFixAttempts();
+    const reopenCapped = reopenStagnation(before) >= maxPrFixStagnation();
     if (reopenCapped && before.status !== "BLOCKED" && before.status !== "PARKED") {
       const context = await buildPrFixBlockedContext(client, reopened);
       await surfacePrFixParked({
@@ -3713,7 +3762,9 @@ export async function markPrFixItem(
     // attempt (same semantics as requeuePrFixItem) — bump the generation
     // alongside the status flip so the work identity changes (#1044).
     if (existing.status !== "QUEUED") {
-      Object.assign(data, freshAttemptGeneration(), { fixAttempts: { increment: 1 } });
+      // An operator release is an explicit override: the consecutive-stagnation
+      // budget resets with the fresh attempt (#1543), like requeuePrFixItem.
+      Object.assign(data, freshAttemptGeneration(), { fixAttempts: { increment: 1 }, stagnationCount: 0 });
       // Baseline the fresh attempt NOW, from the caller's head or the last
       // observed one. Leaving it null let the guard fall back to the mutable
       // headSha, which the next sync overwrites with the worker's own push —
@@ -3785,7 +3836,14 @@ export async function markPrFixItem(
       // past it, PARK the PR instead of re-running a worker that keeps pushing
       // nothing (#1103, #1218). The retry keeps the refused baseline: the head
       // is unchanged, so it is still the newest observed (#1104).
-      const refusalCapped = (existing.fixAttempts ?? 1) >= maxPrFixAttempts();
+      // #1543: the head is unchanged by definition on this path, so the
+      // refused attempt never proves progress — it always consumes one unit
+      // of stagnation budget; past the consecutive-stagnation cap, PARK the
+      // PR instead of re-running a worker that keeps pushing nothing (#1103,
+      // #1218). The retry keeps the refused baseline: the head is unchanged,
+      // so it is still the newest observed (#1104).
+      const refusalStagnation = (existing.stagnationCount ?? 0) + 1;
+      const refusalCapped = refusalStagnation >= maxPrFixStagnation();
       // #1503 review: the refused-FIXED release re-derives the parent too —
       // an operator reclassify (BLOCKED → FIXED) can reach this tail with the
       // row held at NEEDS_HUMAN, and the release must not silently demote a
@@ -3800,6 +3858,8 @@ export async function markPrFixItem(
               // #1503: the refused-attempt cap park keeps the exclusive lane.
               lane: refusalLane,
             outcome: "no_progress",
+            // #1543: record the exhausted stagnation count.
+            stagnationCount: refusalStagnation,
             decisionDetail: null,
             // #1253: disposition audit stamp (refused-FIXED cap park).
             disposedAt: new Date(),
@@ -3818,6 +3878,8 @@ export async function markPrFixItem(
             lane: refusalLane,
             ...freshAttemptGeneration(),
             fixAttempts: { increment: 1 },
+            // #1543: the head never advanced, so this consumes stagnation.
+            stagnationCount: refusalStagnation,
             attemptHeadSha: input.attemptHeadSha ?? baseline ?? null,
             outcome: null,
             decisionDetail: null,
@@ -3851,7 +3913,7 @@ export async function markPrFixItem(
             lane: refusalData.lane,
             outcome: refusalCapped ? "no_progress" : null,
             note: refusalCapped
-              ? `${refusedNote} Bounded at ${existing.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); parked instead of re-queuing (#1103).`
+              ? `${refusedNote} Stagnation budget exhausted at ${refusalStagnation} consecutive attempts with no head advancement (PR_FIX_MAX_STAGNATION=${maxPrFixStagnation()}); parked instead of re-queuing (#1103, #1543).`
               : refusedNote,
           },
         });
@@ -4094,13 +4156,21 @@ export async function markPrFixItem(
     }
     return finishMarked(stickyRow);
   }
-  const forceCapped = (lastFresh.fixAttempts ?? 1) >= maxPrFixAttempts();
+  // #1543: the consumed attempt made progress only when the observed head
+  // advanced past its baseline; otherwise this forced fallback consumes one
+  // unit of stagnation budget, and an exhausted budget parks instead.
+  const forceStagnation = attemptHeadAdvanced(lastFresh.headSha, lastFresh.attemptHeadSha ?? lastFresh.headSha)
+    ? 0
+    : (lastFresh.stagnationCount ?? 0) + 1;
+  const forceCapped = forceStagnation >= maxPrFixStagnation();
   const forceData: Record<string, unknown> = forceCapped
     ? {
         status: "PARKED",
         // #1503: a cap park never demotes the exclusive lane.
         lane: preserveEscalationLane(lastFresh.lane),
         outcome: "no_progress",
+        // #1543: record the exhausted stagnation count.
+        stagnationCount: forceStagnation,
         decisionDetail: null,
         // #1253: disposition audit stamp (racing-evidence cap park).
         disposedAt: new Date(),
@@ -4119,6 +4189,8 @@ export async function markPrFixItem(
             lane: preserveEscalationLane(lastFresh.lane),
             ...freshAttemptGeneration(),
         fixAttempts: { increment: 1 },
+        // #1543: reset after proven head advancement, accumulate otherwise.
+        stagnationCount: forceStagnation,
         attemptHeadSha: lastFresh.headSha ?? lastFresh.attemptHeadSha ?? null,
         outcome: null,
         decisionDetail: null,
@@ -4154,7 +4226,7 @@ export async function markPrFixItem(
         note: [
           input.note,
           forceCapped
-            ? `Post-dispatch evidence kept landing while this settlement was in flight, but bounded at ${lastFresh.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); parked (#1218).`
+            ? `Post-dispatch evidence kept landing while this settlement was in flight, but the stagnation budget is exhausted at ${forceStagnation} consecutive attempts with no head advancement (PR_FIX_MAX_STAGNATION=${maxPrFixStagnation()}); parked (#1218, #1543).`
             : `Post-dispatch evidence kept landing while this settlement was in flight; forced a fresh attempt so the racing evidence is not absorbed (#1218).`,
         ]
           .filter(Boolean)
@@ -4753,6 +4825,8 @@ export async function requeuePrFixItem(client: PrFixQueueClient, rawInput: Reque
         recoveryAppliedAt: null,
         ...freshAttemptGeneration(),
         fixAttempts: 1,
+        // Operator reset: the consecutive-stagnation budget restarts too (#1543).
+        stagnationCount: 0,
         attemptHeadSha: existing.headSha ?? null,
         // A fresh operator requeue must not carry post-dispatch evidence
         // recorded for a prior attempt (#1119), nor hand-out records that
@@ -4913,7 +4987,8 @@ export interface ResolvePrFixFromAgentReportResult {
  * - Outcome `blocked` → mark BLOCKED immediately. Doesn't need PR state; the
  *   agent hit a wall.
  * - Outcome `failed` → settle the consumed generation (#1133): reopen a
- *   fresh attempt (counted toward PR_FIX_MAX_ATTEMPTS, #1107), or BLOCKED +
+ *   fresh attempt (fixAttempts stays attempt-chain telemetry; the stop is the
+ *   consecutive-stagnation budget, #1543), or BLOCKED +
  *   NEEDS_HUMAN past the cap. The bridge reconcile pass that used to own
  *   this decision is retired; leaving the item QUEUED at a generation the
  *   worker already consumed starves the lane behind the deduping worker.
@@ -5285,9 +5360,10 @@ export async function resolvePrFixFromAgentReport(
     // worker already consumed (#1133): the bridge reconcile pass that used
     // to own that cleanup is retired, so a consumed generation would sit
     // QUEUED forever and starve the lane behind the deduping worker.
-    // Settle the failure into a fresh dispatchable attempt — counted toward
-    // PR_FIX_MAX_ATTEMPTS (#1107) — or, past the cap, hand the PR to a
-    // human. No PR-state check: a fresh attempt absorbs late evidence by
+    // Settle the failure into a fresh dispatchable attempt — fixAttempts
+    // stays attempt-chain telemetry and the stop is the consecutive-stagnation
+    // budget (#1543), so an exhausted budget parks. No PR-state check: a
+    // fresh attempt absorbs late evidence by
     // construction (the bump makes it new work).
     //
     // The fresh attempt's per-attempt baseline must be derived from a row
@@ -5317,7 +5393,7 @@ export async function resolvePrFixFromAgentReport(
       if (expectedGeneration !== undefined && fresh.generation !== expectedGeneration) break;
       // #1327: the mechanical rebase lane is ONE attempt per DIRTY episode.
       // A failed REBASE never reopens a fresh attempt (the generic
-      // PR_FIX_MAX_ATTEMPTS ladder is for code-fix generations; retrying a
+      // stagnation ladder is for code-fix generations; retrying a
       // rebase on the same head is exactly the cheap-retry churn this lane
       // exists to remove). The bound keys on `attemptType` — the lane the
       // attempt was DISPATCHED as — because enqueue overwrites the row's
@@ -5328,13 +5404,22 @@ export async function resolvePrFixFromAgentReport(
       // through the #1253 recovery path (cooldown-gated), not the #940
       // FIXED-tombstone net.
       const rebaseTerminal = normalizePrFixType(fresh.attemptType ?? fresh.type) === "REBASE";
-      const capped = rebaseTerminal || (fresh.fixAttempts ?? 1) >= maxPrFixAttempts();
+      // #1543: a failed report proves progress only when the observed head
+      // advanced past the consumed attempt's baseline; otherwise it consumes
+      // one unit of the consecutive-stagnation budget, and an exhausted
+      // budget parks instead of re-queueing.
+      const failedStagnation = attemptHeadAdvanced(fresh.headSha, fresh.attemptHeadSha ?? fresh.headSha)
+        ? 0
+        : (fresh.stagnationCount ?? 0) + 1;
+      const capped = rebaseTerminal || failedStagnation >= maxPrFixStagnation();
       const data: Record<string, unknown> = capped
         ? {
             status: "PARKED",
             // #1503: a terminal park never demotes the exclusive lane.
             lane: preserveEscalationLane(fresh.lane),
             outcome: "no_progress",
+            // #1543: record the exhausted stagnation count.
+            stagnationCount: failedStagnation,
             decisionDetail: null,
             // #1253: disposition audit stamp (failed-report cap park).
             disposedAt: new Date(),
@@ -5352,6 +5437,8 @@ export async function resolvePrFixFromAgentReport(
             lane: preserveEscalationLane(fresh.lane),
             ...freshAttemptGeneration(),
             fixAttempts: { increment: 1 },
+            // #1543: reset after proven head advancement, accumulate otherwise.
+            stagnationCount: failedStagnation,
             attemptHeadSha: fresh.headSha ?? fresh.attemptHeadSha ?? null,
             // The fresh attempt's dispatched lane is stamped at its own
             // hand-out (#1327); the consumed attempt's stamp must not leak.
@@ -5395,7 +5482,7 @@ export async function resolvePrFixFromAgentReport(
               capped
                 ? rebaseTerminal
                   ? "Agent reported failed; the mechanical rebase lane gets one attempt per DIRTY episode (#1327) — parked instead of re-queuing."
-                  : `Agent reported failed; bounded at ${fresh.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}), parked instead of re-queuing (#1133).`
+                  : `Agent reported failed; the stagnation budget is exhausted at ${failedStagnation} consecutive attempts with no head advancement (PR_FIX_MAX_STAGNATION=${maxPrFixStagnation()}), parked instead of re-queuing (#1133, #1543).`
                 : `Agent reported failed; reopened as a fresh attempt so the consumed generation cannot strand the queue (#1133).`,
             ]
               .filter(Boolean)

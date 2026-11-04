@@ -353,7 +353,7 @@ function laneFor(feedback: string): "NORMAL" | "NEEDS_HUMAN" {
 /**
  * Lane for a CHANGES_REQUESTED review. An ai-pr-reviewer verdict carrying
  * concrete findings is actionable by definition, so route it to NORMAL and let
- * the coder attempt a fix — the PR_FIX_MAX_ATTEMPTS → ESCALATED → NEEDS_HUMAN
+ * the coder attempt a fix — the stagnation budget (#1543) → ESCALATED → NEEDS_HUMAN
  * ladder handles "coder can't fix it", exactly as it does for CI failures.
  * Without this, the reviewer's narrative prose matches no classifyFeedback
  * pattern and every AI review dead-ends at needs_human. Human prose reviews
@@ -372,7 +372,7 @@ function reviewLane(body: string): "NORMAL" | "NEEDS_HUMAN" {
   // for 13 hours while nothing acted on it.
   //
   // Escalation still exists, but on evidence instead of prediction: the coder
-  // attempts the fix, and PR_FIX_MAX_ATTEMPTS moves it to NEEDS_HUMAN once it has
+  // attempts the fix, and stagnation exhaustion (#1543) moves it to NEEDS_HUMAN once it has
   // actually failed. "A model tried and could not" beats "a regex guessed it would
   // not". An empty body carries nothing to act on, so that alone stays human.
   return body && body.trim() ? "NORMAL" : "NEEDS_HUMAN";
@@ -492,7 +492,7 @@ const INGEST_DESCRIPTORS: Record<PrFollowupEvent["eventType"], IngestDescriptor>
       return {
         // A failing check is actionable work for coder-revision by definition —
         // don't classify it by prose (an empty body would misroute to NEEDS_HUMAN).
-        // The escalation ladder (PR_FIX_MAX_ATTEMPTS -> ESCALATED -> NEEDS_HUMAN)
+        // The escalation ladder (stagnation exhaustion -> ESCALATED -> NEEDS_HUMAN, #1543)
         // handles "coder can't fix it".
         lane: "NORMAL",
         type: "CI_FAILURE",
