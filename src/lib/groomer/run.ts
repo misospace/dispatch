@@ -12,6 +12,13 @@ import { inFlightStatus, validateGroomingPlan, clearedReleaseSignalProjection, t
 import { buildEvidenceCatalog, typedVerdictDependencyKeys } from "./plan-evidence";
 import { collectPinnedReadContent } from "./close-grounding";
 import { getHostedGroomerConfig } from "./config";
+import {
+  deriveObserveDisposition,
+  isGroomerMode,
+  wouldMutate,
+  type GroomerMode,
+  type ObserveDisposition,
+} from "./observe";
 import { assessExternalEngagement } from "./trust";
 import { holdPendingReply } from "./pending-reply";
 import { buildRepositoryContext } from "./repository-context";
@@ -50,6 +57,10 @@ export interface GroomerRunResult {
   candidateNumber: number;
   repoFullName: string;
   dryRun: boolean;
+  /** Off/observe/auto rollout mode this run executed under (#1542). */
+  mode: GroomerMode;
+  /** Durable would-disposition when the run executed in observe mode. */
+  observeDisposition?: ObserveDisposition;
   output: any;
   /** The validated GroomingPlan; `output` is its legacy GroomerOutput view. */
   plan?: GroomingPlan;
@@ -62,6 +73,8 @@ export interface GroomerRunResult {
 
 export interface RunHostedGroomerOptions {
   dryRun?: boolean;
+  /** Explicit per-request rollout mode (#1542); wins over `dryRun` and config. */
+  mode?: GroomerMode;
   repoFullName?: string;
   issueNumber?: number;
   force?: boolean;
@@ -213,7 +226,21 @@ async function executeGroomerRun(
   deps: GroomerDeps = defaultDeps,
 ): Promise<GroomerRunResult | null> {
   const config = deps.getConfig();
-  const dryRun = options.dryRun ?? config.dryRun;
+  // Rollout mode (#1542): an explicit per-request mode wins, then an
+  // explicit per-request dryRun (true → observe, false → auto), then the
+  // configured mode. `dryRun` below stays the legacy write/no-write gate —
+  // it is exactly `mode !== "auto"`, so observe inherits the entire
+  // no-write behavior the dry-run path already enforces.
+  const mode: GroomerMode = isGroomerMode(options.mode)
+    ? options.mode
+    : options.dryRun === true
+      ? "observe"
+      : options.dryRun === false
+        ? "auto"
+        : (config.mode ?? (config.dryRun ? "observe" : "auto"));
+  if (mode === "off") return null;
+  const observe = mode === "observe";
+  const dryRun = mode !== "auto";
 
   // Select candidate
   const candidate = await deps.selectCandidate({
@@ -240,6 +267,7 @@ async function executeGroomerRun(
     issueNumber: candidate.number,
     issueUrl: candidate.url,
     dryRun,
+    mode,
     labelsBefore: candidate.labels,
     laneBefore: candidate.currentLane,
     model: config.model ?? null,
@@ -269,6 +297,11 @@ async function executeGroomerRun(
   // The last stage this run reached, so a failure records where it failed
   // rather than the "selected" the run was created with (#1125).
   let stage = "selected";
+  // Durable would-disposition (#1542): what this run would have done had it
+  // been allowed to act. Recorded only in observe mode; a failure after a
+  // disposition was derived still records `assessment_unavailable` because
+  // the run never completed its assessment path.
+  let observeDisposition: ObserveDisposition | null = null;
   // Set once the unreadable-issue backoff is written (#1063), so a later
   // failure does not overwrite it with the failed-run backoff (#1125).
   let unreadableBackoffWritten = false;
@@ -377,17 +410,21 @@ async function executeGroomerRun(
       const unverifiable: Record<string, unknown> = { outcome: "unverifiable", preconditionFailures: failures };
       const evidenceSummary = { evidence: summarizeEvidenceForPersistence(evidence) };
       if (dryRun) {
+        if (observe) observeDisposition = "assessment_unavailable";
         await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
           status: "dry_run_completed",
           stage: "selected",
           contextSummary: evidenceSummary,
           preconditionFailures: failures,
           applyOutcome: "unverifiable",
+          ...(observe ? { observeDisposition } : {}),
         });
         return {
           candidateNumber: candidate.number,
           repoFullName: candidate.repoFullName,
           dryRun: true,
+          mode,
+          observeDisposition: "assessment_unavailable",
           output: null,
           plannedLabels: candidate.labels,
           groomingRunId: groomingRun.id,
@@ -424,6 +461,7 @@ async function executeGroomerRun(
         candidateNumber: candidate.number,
         repoFullName: candidate.repoFullName,
         dryRun: false,
+        mode,
         output: null,
         plannedLabels: candidate.labels,
         groomingRunId: groomingRun.id,
@@ -790,6 +828,8 @@ async function executeGroomerRun(
       candidateNumber: candidate.number,
       repoFullName: candidate.repoFullName,
       dryRun,
+      mode,
+      ...(observe && observeDisposition !== null ? { observeDisposition } : {}),
       output,
       plan,
       plannedLabels: newLabels,
@@ -800,9 +840,11 @@ async function executeGroomerRun(
     });
 
     if (inFlight && dryRun) {
+      if (observe) observeDisposition = "would_refuse";
       await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
         status: "dry_run_completed",
         stage: "planned",
+        ...(observe ? { observeDisposition } : {}),
       });
       return result({});
     }
@@ -904,11 +946,35 @@ async function executeGroomerRun(
           ? "would_replay"
           : "dry_run";
       mutationPlan.applyOutcome = applyOutcome;
+      // The durable would-disposition (#1542): auto mode would have written
+      // only when the preconditions held and this exact plan had not already
+      // been applied (a replay writes nothing new). A held or suppressed
+      // reply is a refusal to speak, not a mutation, so it never counts as
+      // acting on its own.
+      if (observe) {
+        observeDisposition = deriveObserveDisposition({
+          applyOutcome,
+          wouldMutate: wouldMutate({
+            labelsStep: diff.labelsStep,
+            labelsBefore: diff.labelsBefore,
+            comment: diff.comment,
+            commentWouldPost: !held && !suppressed,
+            close: diff.close,
+            children: diff.children !== null,
+            title: diff.title,
+            body: diff.body,
+          }),
+          inFlight: false,
+          snapshotUnreadable: false,
+          commentHeldOnly: (held || suppressed) && diff.comment !== null,
+        });
+      }
       await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
         status: "dry_run_completed",
         stage: "planned",
         ...validationFields,
         applyOutcome,
+        ...(observe ? { observeDisposition } : {}),
       });
       return result({ dryRun: true });
     }
@@ -1506,6 +1572,9 @@ async function executeGroomerRun(
         stage,
         errorMessage: message,
         retryable: true,
+        // In observe mode a failed run records an unavailable assessment,
+        // not a disposition: the would-decision never completed (#1542).
+        ...(observe ? { observeDisposition: "assessment_unavailable" as ObserveDisposition } : {}),
       });
     } catch {
       // Don't mask the original error

@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useEffect, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { authedFetch } from "@/lib/client-auth";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -28,6 +28,8 @@ interface GroomingRunRow {
   issueUrl: string;
   status: string;
   dryRun: boolean;
+  mode: string | null;
+  observeDisposition: string | null;
   model: string | null;
   labelsBefore: string[];
   labelsAfter: string[];
@@ -283,10 +285,22 @@ function RunEvidencePanel({ run }: { run: GroomingRunRow }) {
   );
 }
 
+interface ObserveSummary {
+  windowMs: number;
+  since: string;
+  total: number;
+  would_act: number;
+  would_noop: number;
+  would_refuse: number;
+  assessment_unavailable: number;
+}
+
 interface GroomResult {
   candidateNumber: number | null;
   repoFullName?: string;
   dryRun?: boolean;
+  mode?: string;
+  observeDisposition?: string | null;
   output?: string;
   plannedLabels?: string[];
   groomingRunId?: string;
@@ -304,6 +318,26 @@ function StatusBadge({ status }: { status: string }) {
         ? "bg-red-100 text-red-700"
         : "bg-blue-100 text-blue-700";
   return <Badge className={cls}>{status.replace(/_/g, " ")}</Badge>;
+}
+
+/**
+ * The run's rollout mode (#1542). Observe rows carry their durable
+ * would-disposition inline; legacy rows recorded before the
+ * off/observe/auto contract fall back to the dry-run/write boolean.
+ */
+function ModeCell({ run }: { run: GroomingRunRow }) {
+  if (run.mode === "observe") {
+    return (
+      <div className="space-y-1">
+        <Badge className="bg-blue-100 text-blue-700">observe</Badge>
+        {run.observeDisposition && (
+          <div className="text-xs text-muted-foreground">{run.observeDisposition.replace(/_/g, " ")}</div>
+        )}
+      </div>
+    );
+  }
+  if (run.mode === "auto") return <Badge variant="secondary">write</Badge>;
+  return <Badge variant="secondary">{run.dryRun ? "dry-run" : "write"}</Badge>;
 }
 
 /**
@@ -365,7 +399,14 @@ function GroomResultSummary({ result }: { result: GroomResult }) {
             </div>
           )}
           {result.dryRun !== undefined && (
-            <div>Mode: {result.dryRun ? "dry-run" : "write"}</div>
+            <div>
+              Mode:{" "}
+              {result.mode === "observe"
+                ? `observe${result.observeDisposition ? ` (${result.observeDisposition.replace(/_/g, " ")})` : ""}`
+                : result.dryRun
+                  ? "dry-run"
+                  : "write"}
+            </div>
           )}
           {result.plannedLabels && result.plannedLabels.length > 0 && (
             <div className="flex flex-wrap gap-1 mt-2">
@@ -386,6 +427,11 @@ export default function GroomerHistoryPage() {
   const [runs, setRuns] = useState<GroomingRunRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [modeFilter, setModeFilter] = useState("");
+  // Mirrors modeFilter for loadRuns' default without making the function
+  // reactive (and the history effect's dependency list) lint-noisy.
+  const modeFilterRef = useRef("");
+  const [observeSummary, setObserveSummary] = useState<ObserveSummary | null>(null);
   const [pendingReplies, setPendingReplies] = useState<PendingReplyRow[]>([]);
   const [repliesLoading, setRepliesLoading] = useState(true);
   const [replyError, setReplyError] = useState("");
@@ -403,11 +449,12 @@ export default function GroomerHistoryPage() {
   const [specificRepo, setSpecificRepo] = useState("");
   const [specificIssue, setSpecificIssue] = useState("");
 
-  async function loadRuns() {
+  async function loadRuns(mode = modeFilterRef.current) {
     setLoading(true);
     setError("");
     try {
-      const res = await authedFetch("/api/groomer/runs?limit=100");
+      const suffix = mode ? `&mode=${encodeURIComponent(mode)}` : "";
+      const res = await authedFetch(`/api/groomer/runs?limit=100${suffix}`);
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error || "Failed to load grooming runs");
       setRuns(Array.isArray(data) ? data : []);
@@ -416,6 +463,18 @@ export default function GroomerHistoryPage() {
       setRuns([]);
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function loadObserveSummary() {
+    try {
+      const res = await authedFetch("/api/groomer/runs/summary");
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "Failed to load observe summary");
+      setObserveSummary(data && typeof data === "object" ? data : null);
+    } catch {
+      // The summary strip is informational; a failed load hides it.
+      setObserveSummary(null);
     }
   }
 
@@ -437,6 +496,7 @@ export default function GroomerHistoryPage() {
 
   useEffect(() => {
     void loadRuns();
+    void loadObserveSummary();
     void loadPendingReplies();
   }, []);
 
@@ -482,7 +542,7 @@ export default function GroomerHistoryPage() {
     } finally {
       setGrooming(false);
       // Refresh the history table after a short delay so the new run appears
-      setTimeout(() => { void loadRuns(); void loadPendingReplies(); }, 500);
+      setTimeout(() => { void loadRuns(); void loadObserveSummary(); void loadPendingReplies(); }, 500);
     }
   }
 
@@ -525,7 +585,7 @@ export default function GroomerHistoryPage() {
       setGroomError(err instanceof Error ? err.message : "Unknown error");
     } finally {
       setGrooming(false);
-      setTimeout(() => { void loadRuns(); void loadPendingReplies(); }, 500);
+      setTimeout(() => { void loadRuns(); void loadObserveSummary(); void loadPendingReplies(); }, 500);
     }
   }
 
@@ -538,10 +598,27 @@ export default function GroomerHistoryPage() {
             Visible history for Dispatch-hosted issue grooming runs.
           </p>
         </div>
-        <Button variant="outline" onClick={() => { void loadRuns(); void loadPendingReplies(); }} disabled={grooming}>
-          <RefreshCw className={`h-4 w-4 mr-2 ${loading || repliesLoading ? "animate-spin" : ""}`} />
-          Refresh
-        </Button>
+        <div className="flex items-center gap-2">
+          <select
+            aria-label="Filter runs by mode"
+            value={modeFilter}
+              onChange={(e) => {
+                setModeFilter(e.target.value);
+                modeFilterRef.current = e.target.value;
+                void loadRuns(e.target.value);
+              }}
+            disabled={loading}
+            className="h-9 rounded-md border border-input bg-transparent px-2 text-sm"
+          >
+            <option value="">All modes</option>
+            <option value="observe">observe</option>
+            <option value="auto">auto</option>
+          </select>
+          <Button variant="outline" onClick={() => { void loadRuns(); void loadObserveSummary(); void loadPendingReplies(); }} disabled={grooming}>
+            <RefreshCw className={`h-4 w-4 mr-2 ${loading || repliesLoading ? "animate-spin" : ""}`} />
+            Refresh
+          </Button>
+        </div>
       </div>
 
       {/* Run Groomer Section */}
@@ -717,6 +794,23 @@ export default function GroomerHistoryPage() {
         </CardContent>
       </Card>
 
+      {observeSummary && observeSummary.total > 0 && (
+        <Card>
+          <CardContent className="py-3">
+            <div className="flex flex-wrap items-center gap-2 text-sm">
+              <span className="font-medium">Observe mode, last 24h:</span>
+              <Badge className="bg-blue-100 text-blue-700">{observeSummary.would_act} would act</Badge>
+              <Badge variant="secondary">{observeSummary.would_noop} would no-op</Badge>
+              <Badge variant="secondary">{observeSummary.would_refuse} would refuse</Badge>
+              <Badge variant="secondary">{observeSummary.assessment_unavailable} unavailable</Badge>
+              <span className="text-muted-foreground">
+                of {observeSummary.total} observe run{observeSummary.total === 1 ? "" : "s"}
+              </span>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
       <Card>
         <CardHeader>
           <CardTitle>Recent Grooming Runs</CardTitle>
@@ -778,7 +872,7 @@ export default function GroomerHistoryPage() {
                       )}
                     </TableCell>
                     <TableCell>
-                      <Badge variant="secondary">{run.dryRun ? "dry-run" : "write"}</Badge>
+                      <ModeCell run={run} />
                     </TableCell>
                     <TableCell>
                       <VerdictCell plan={run.view?.plan} />

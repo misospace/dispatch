@@ -1,4 +1,5 @@
 import { buildGroomingRunView, serializeGroomingRunSummary } from "./run-view";
+import { summarizeObserveWindow } from "./observe";
 
 export { buildGroomingRunView, serializeGroomingRunSummary };
 
@@ -30,6 +31,8 @@ export interface CreateGroomingRunInput {
   candidateSource?: string;
   /** Stale reasons behind a freshness-driven re-groom (#1064). */
   staleReasons?: string[];
+  /** Off/observe/auto rollout mode for this run (#1542); observe/auto only. */
+  mode?: string | null;
 }
 
 export interface GroomingRunFilters {
@@ -37,6 +40,7 @@ export interface GroomingRunFilters {
   issueNumber?: number;
   status?: string;
   dryRun?: boolean;
+  mode?: string;
   model?: string;
   take?: number;
 }
@@ -75,6 +79,7 @@ export async function createGroomingRunRecord(
       maxContextBytes: input.maxContextBytes,
       ...(input.candidateSource ? { candidateSource: input.candidateSource } : {}),
       ...(input.staleReasons?.length ? { staleReasons: input.staleReasons } : {}),
+      ...(input.mode ? { mode: input.mode } : {}),
     },
   });
 }
@@ -113,6 +118,7 @@ export async function listGroomingRuns(
   if (filters.issueNumber !== undefined) where.issueNumber = filters.issueNumber;
   if (filters.status !== undefined) where.status = filters.status;
   if (filters.dryRun !== undefined) where.dryRun = filters.dryRun;
+  if (filters.mode !== undefined) where.mode = filters.mode;
   if (filters.model !== undefined) where.model = filters.model;
 
   const take = Math.max(1, Math.min(200, filters.take ?? 50));
@@ -152,4 +158,41 @@ export async function getGroomingRunDetail(
   // Raw model output and full context stay on the detail view for debugging;
   // the operator view adds the evidence/precondition/idempotency summary.
   return { ...run, view: buildGroomingRunView(run) };
+}
+
+const OBSERVE_WINDOW_MIN_MS = 60 * 60 * 1000;
+const OBSERVE_WINDOW_MAX_MS = 30 * 24 * 60 * 60 * 1000;
+const OBSERVE_WINDOW_DEFAULT_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * "How often would this automation act?" over a recent window (#1542):
+ * counts durable observe-mode dispositions. Read-only over the GroomingRun
+ * table; the generic would-disposition vocabulary keeps other automation
+ * able to adopt the same summary later.
+ */
+export async function summarizeObserveRuns(
+  prisma: PrismaLike,
+  options: { windowMs?: number; now?: Date } = {},
+): Promise<{
+  windowMs: number;
+  since: string;
+  total: number;
+  would_act: number;
+  would_noop: number;
+  would_refuse: number;
+  assessment_unavailable: number;
+}> {
+  const raw = options.windowMs ?? OBSERVE_WINDOW_DEFAULT_MS;
+  const windowMs = Math.min(Math.max(Number(raw) || 0, OBSERVE_WINDOW_MIN_MS), OBSERVE_WINDOW_MAX_MS);
+  const now = options.now ?? new Date();
+  const since = new Date(now.getTime() - windowMs);
+  const rows: Array<{ observeDisposition: string | null }> = await prisma.groomingRun.findMany({
+    where: { mode: "observe", createdAt: { gte: since } },
+    select: { observeDisposition: true },
+  });
+  return {
+    windowMs,
+    since: since.toISOString(),
+    ...summarizeObserveWindow(rows),
+  };
 }

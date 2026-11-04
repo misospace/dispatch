@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach } from "vitest";
+import { describe, expect, it, beforeEach, vi } from "vitest";
 import { getHostedGroomerConfig } from "./config";
 
 describe("groomer config", () => {
@@ -12,6 +12,7 @@ describe("groomer config", () => {
     delete process.env.DISPATCH_GROOMER_TIMEOUT_MS;
     delete process.env.DISPATCH_GROOMER_MAX_CONTEXT_BYTES;
     delete process.env.DISPATCH_GROOMER_DRY_RUN;
+    delete process.env.DISPATCH_GROOMER_MODE;
     delete process.env.DISPATCH_LLM_RESPONSE_FORMAT;
     delete process.env.DISPATCH_GROOMER_REPO_CONTEXT_ENABLED;
     delete process.env.DISPATCH_GROOMER_MAX_CONTEXT_FILES;
@@ -101,6 +102,58 @@ describe("groomer config", () => {
     process.env.DISPATCH_GROOMER_MODEL = "gpt-4o-mini";
     process.env.DISPATCH_GROOMER_DRY_RUN = "true";
     const config = getHostedGroomerConfig();
+    expect(config.dryRun).toBe(true);
+  });
+
+  it("maps an unset mode from the legacy dry-run boolean (#1542)", () => {
+    process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
+    process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
+    process.env.DISPATCH_LLM_API_KEY = "test-key";
+    process.env.DISPATCH_GROOMER_MODEL = "gpt-4o-mini";
+    expect(getHostedGroomerConfig().mode).toBe("observe");
+    process.env.DISPATCH_GROOMER_DRY_RUN = "false";
+    expect(getHostedGroomerConfig().mode).toBe("auto");
+    expect(getHostedGroomerConfig().dryRun).toBe(false);
+  });
+
+  it("an explicit mode wins over the dry-run boolean (#1542)", () => {
+    process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
+    process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
+    process.env.DISPATCH_LLM_API_KEY = "test-key";
+    process.env.DISPATCH_GROOMER_MODEL = "gpt-4o-mini";
+    process.env.DISPATCH_GROOMER_MODE = "auto";
+    process.env.DISPATCH_GROOMER_DRY_RUN = "true";
+    let config = getHostedGroomerConfig();
+    expect(config.mode).toBe("auto");
+    expect(config.dryRun).toBe(false);
+    process.env.DISPATCH_GROOMER_MODE = "observe";
+    process.env.DISPATCH_GROOMER_DRY_RUN = "false";
+    config = getHostedGroomerConfig();
+    expect(config.mode).toBe("observe");
+    expect(config.dryRun).toBe(true);
+  });
+
+  it("an unrecognized mode warns once and falls back to the dry-run mapping (#1542)", () => {
+    process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
+    process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
+    process.env.DISPATCH_LLM_API_KEY = "test-key";
+    process.env.DISPATCH_GROOMER_MODEL = "gpt-4o-mini";
+    process.env.DISPATCH_GROOMER_MODE = "shadow";
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const config = getHostedGroomerConfig();
+      expect(config.mode).toBe("observe");
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][0]).toContain("DISPATCH_GROOMER_MODE");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("a disabled groomer reports mode off", () => {
+    const config = getHostedGroomerConfig();
+    expect(config.enabled).toBe(false);
+    expect(config.mode).toBe("off");
     expect(config.dryRun).toBe(true);
   });
 

@@ -89,6 +89,24 @@ describe("GET /api/groomer/runs", () => {
     );
   });
 
+  it("passes a valid mode filter through (#1542)", async () => {
+    await GET(request("/api/groomer/runs?mode=observe"));
+
+    expect(mocks.listGroomingRuns).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ mode: "observe" }),
+    );
+  });
+
+  it("ignores an invalid mode filter (#1542)", async () => {
+    await GET(request("/api/groomer/runs?mode=shadow"));
+
+    expect(mocks.listGroomingRuns).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ mode: undefined }),
+    );
+  });
+
   it("defaults take to 50 when limit is absent", async () => {
     await GET(request());
 
