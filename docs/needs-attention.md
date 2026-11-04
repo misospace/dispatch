@@ -20,7 +20,7 @@ age, oldest first.
 | Category | Source record | Meaning |
 |---|---|---|
 | Human decision | `PrFixQueueItem` `BLOCKED` with outcome `human_decision` | A worker escalated a decision. The item shows the question, the options, and the evidence. |
-| Semantic conflict | `PrFixQueueItem` `BLOCKED` or `PARKED` with type `MERGE_CONFLICT` or `REBASE` | Automation refused a semantic rebase or conflict and waits for a call. |
+| Semantic conflict | `PrFixQueueItem` with type `MERGE_CONFLICT` or `REBASE` whose state names a human disposition: a `BLOCKED` hold, or a `PARKED` row whose outcome is not a transient automated state | Automation refused a semantic rebase or conflict and waits for a call. The type is the subject, not the disposition. |
 | Security failure | `PrFixQueueItem` `PARKED` with outcome `security_failure` | A durable security failure. Only a person can act. |
 | Ownership parked | `OwnershipReleaseIntent` `pending` with `parkedAt` set | An ownership release exhausted its bounded forge retries (#1254 §8.7) and parked. |
 | Review ready | `AgentExecution` `AWAITING_REVIEW`, not ended | An agent finished work and the PR awaits review. |
@@ -30,7 +30,13 @@ age, oldest first.
 
 Healthy autonomous work, ordinary queued work, and transient retry states
 stay out of the view. That includes `QUEUED` items, `WAITING_EXTERNAL` rows,
-and `PARKED` items with outcome `infra_failure` or `no_progress`. These
+and `PARKED` items with outcome `infra_failure` or `no_progress` — on any
+type, including `MERGE_CONFLICT` and `REBASE`. A `PARKED` row without an
+outcome carries the implicit `no_progress` park (#1218) and is excluded the
+same way. A conflict or rebase `type` is the subject of the work, not its
+disposition: it does not surface a row whose outcome names a transient
+automated state (#1546). A parked rebase with outcome `invalid_wait` stays
+visible, because an operator requeue is required (#1250). These excluded
 states have bounded automated recovery, so they must not take operator
 attention.
 
