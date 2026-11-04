@@ -8,7 +8,8 @@
  * Dispatch's Postgres cache with read-only queries and hands them here.
  *
  * Deliberately excluded: healthy autonomous work, ordinary queued work, and
- * transient retry states (WAITING_EXTERNAL, PARKED infra_failure) — those
+ * transient retry states (WAITING_EXTERNAL, PARKED infra_failure or
+ * no_progress — on any type, including conflict/rebase, #1546) — those
  * already have bounded automated recovery and must not consume operator
  * attention. Resolution is automatic by construction: when the underlying
  * record moves (e.g. fresh evidence requeues a BLOCKED human-decision item,
@@ -142,6 +143,20 @@ function prFixUrl(item: PrFixAttentionRow): string | null {
   return `https://github.com/${item.repo}/pull/${item.pr}`;
 }
 
+/**
+ * Outcomes that name a bounded automated state (#1546). #1544 excludes these
+ * from the view — they have bounded automated recovery — so a conflict/rebase
+ * `type` alone must not promote such a row into it. A PARKED row without an
+ * outcome carries the implicit `no_progress` park (`resolvePrFixOutcome`,
+ * #1218: PARKED is the explicit outcome or `no_progress`), so it counts as
+ * automated as well. Fail-closed parks that require an operator action
+ * (`invalid_wait`, #1250) are NOT automated states and stay visible.
+ */
+function isAutomatedDisposition(item: PrFixAttentionRow): boolean {
+  if (item.outcome === "no_progress" || item.outcome === "infra_failure") return true;
+  return item.status === "PARKED" && item.outcome === null;
+}
+
 function derivePrFixItem(item: PrFixAttentionRow): NeedsAttentionItem | null {
   const blockedOrParked = item.status === "BLOCKED" || item.status === "PARKED";
   if (!blockedOrParked) return null;
@@ -163,27 +178,11 @@ function derivePrFixItem(item: PrFixAttentionRow): NeedsAttentionItem | null {
       urgency: 1,
     };
   }
-  if (conflictType) {
-    // Semantic rebase/conflict the worker correctly refused (#1327 lane
-    // shape): mechanical automation must not churn on it, so it waits here
-    // for a human call.
-    return {
-      id: `semantic_conflict:${item.id}`,
-      category: "semantic_conflict",
-      title: item.title ?? `${item.repo}#${item.pr}`,
-      repo: item.repo,
-      issueNumber: item.issue,
-      prNumber: item.pr,
-      url: prFixUrl(item),
-      reason: "automation correctly refused a semantic rebase/conflict; operator decision required",
-      decision: null,
-      ageStartedAt: toIso(item.queuedAt),
-      urgency: 2,
-    };
-  }
   if (item.status === "PARKED" && item.outcome === "security_failure") {
     // Durable security failure (#1218): parked without the needs-human label
-    // because requeueing is never automatic — only a human can act.
+    // because requeueing is never automatic — only a human can act. The
+    // outcome names this disposition explicitly, so it outranks the type-based
+    // conflict classification below (#1546).
     return {
       id: `security_failure:${item.id}`,
       category: "security_failure",
@@ -193,6 +192,29 @@ function derivePrFixItem(item: PrFixAttentionRow): NeedsAttentionItem | null {
       prNumber: item.pr,
       url: prFixUrl(item),
       reason: "durable security failure parked for operator intervention",
+      decision: null,
+      ageStartedAt: toIso(item.queuedAt),
+      urgency: 2,
+    };
+  }
+  if (conflictType && !isAutomatedDisposition(item)) {
+    // Semantic rebase/conflict the worker correctly refused (#1327 lane
+    // shape): mechanical automation must not churn on it, so it waits here
+    // for a human call. The conflict/rebase `type` is only a subject, not a
+    // disposition (#1546): a row whose outcome names an automated state
+    // (no_progress / infra_failure, including PARKED's implicit no_progress)
+    // has bounded recovery and stays out of the view. A BLOCKED row carries
+    // the human-owned hold itself (#1218 reserves BLOCKED for a human
+    // decision), so legacy conflict rows without an outcome still surface.
+    return {
+      id: `semantic_conflict:${item.id}`,
+      category: "semantic_conflict",
+      title: item.title ?? `${item.repo}#${item.pr}`,
+      repo: item.repo,
+      issueNumber: item.issue,
+      prNumber: item.pr,
+      url: prFixUrl(item),
+      reason: "automation correctly refused a semantic rebase/conflict; operator decision required",
       decision: null,
       ageStartedAt: toIso(item.queuedAt),
       urgency: 2,
