@@ -967,18 +967,22 @@ async function executeGroomerRun(
       // an already-posted comment is a no-op, and a held reply — including a
       // prior pending reply — is a refusal to speak, not a mutation.
       if (observe) {
-        const commentGate = diff.comment
-          ? await resolveCommentGate({
-              applicationKey,
-              priorComment: readSteps(existing?.steps).comment,
-              recentComments: preconditions.recentComments,
-              commentPolicy,
-              force: options.force === true,
-              commentCooldownHours: config.commentCooldownHours,
-              issueId: candidate.id,
-              hasRecentComment: (issueId, since) => store.hasRecentComment(issueId, since),
-            })
-          : null;
+        // The gate is only consulted when the preconditions hold: a stale or
+        // unverifiable plan is a refusal regardless of comment eligibility,
+        // and a failed cooldown read must not erase that decided receipt.
+        const commentGate =
+          preconditions.ok && diff.comment
+            ? await resolveCommentGate({
+                applicationKey,
+                priorComment: readSteps(existing?.steps).comment,
+                recentComments: preconditions.recentComments,
+                commentPolicy,
+                force: options.force === true,
+                commentCooldownHours: config.commentCooldownHours,
+                issueId: candidate.id,
+                hasRecentComment: (issueId, since) => store.hasRecentComment(issueId, since),
+              })
+            : null;
         const commentWouldPost = diff.comment !== null && commentGate === null;
         observeDisposition = deriveObserveDisposition({
           applyOutcome,

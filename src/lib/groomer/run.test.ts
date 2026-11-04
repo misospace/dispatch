@@ -4936,6 +4936,63 @@ Investigate session handling in auth module.`;
       expect(result).toMatchObject({ mode: "observe", observeDisposition: "would_act" });
     });
 
+    it("records would_refuse when the prior application's comment is still held", async () => {
+      mocks.selectGroomingCandidate.mockResolvedValue({ ...mockCandidate, labels: ["status/backlog", "priority/p0"] });
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("backlog", { mutations: { githubComment: "Adding a grooming note." } }),
+      );
+      const first = await runHostedGroomer();
+      const applicationKey = first!.mutationPlan!.applicationKey as string;
+      // A prior attempt claimed this key and left its comment step held; the
+      // reply gate is NOT holding now, but the applier keeps the prior hold,
+      // so auto would write nothing and the pending reply still awaits
+      // approval — a refusal, not a no-op.
+      mocks.applications.set(applicationKey, {
+        applicationKey,
+        status: "in_progress",
+        steps: { comment: { status: "held", detail: "pending_approval:externally_engaged" } },
+        attempts: 1,
+        updatedAt: new Date(),
+      });
+
+      const second = await runHostedGroomer();
+
+      expectNoMutations();
+      expect(second).toMatchObject({ mode: "observe", observeDisposition: "would_refuse" });
+    });
+
+    it("records would_noop when the reply gate holds but this application's comment is already posted", async () => {
+      mocks.selectGroomingCandidate.mockResolvedValue({ ...mockCandidate, labels: ["status/backlog", "priority/p0"] });
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("backlog", { mutations: { githubComment: "Adding a grooming note." } }),
+      );
+      const first = await runHostedGroomer();
+      const applicationKey = first!.mutationPlan!.applicationKey as string;
+      // The issue is externally engaged (the gate would hold a new reply),
+      // but the comment carrying this application's own marker is already on
+      // GitHub: the applier replays it before consulting the gate, so auto
+      // would write nothing.
+      mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
+        ...mockEvidence,
+        issue: {
+          ...mockEvidence.issue,
+          labels: ["status/backlog", "priority/p0"],
+          author: "itsmiso-ai",
+          authorAssociation: "NONE",
+          commentsCount: 2,
+        },
+      });
+      mocks.fetchIssueComments.mockResolvedValue([
+        { id: 7, author: "alice", authorAssociation: "NONE", body: "I would like to contribute.", createdAt: "2026-10-08T00:00:00Z", url: "https://github.com/org/repo/issues/42#issuecomment-7" },
+        { id: 8, author: "itsmiso-ai", authorAssociation: "NONE", body: `Adding a grooming note.\n\n<!-- dispatch-groomer:apply=${applicationKey} -->`, createdAt: "2026-10-09T00:00:00Z", url: "https://github.com/org/repo/issues/42#issuecomment-8" },
+      ]);
+
+      const second = await runHostedGroomer();
+
+      expectNoMutations();
+      expect(second).toMatchObject({ mode: "observe", observeDisposition: "would_noop" });
+    });
+
     it("records assessment_unavailable when the model stage fails in observe mode", async () => {
       mocks.callGroomerLLM.mockRejectedValue(new Error("LLM down"));
       await expect(runHostedGroomer()).rejects.toThrow("LLM down");

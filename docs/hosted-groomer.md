@@ -116,6 +116,8 @@ Optional body:
 - `would_refuse` — the pipeline would have declined to act: in-flight status, stale or unverifiable evidence, or a held reply with no other mutation.
 - `assessment_unavailable` — no decision exists: the evidence snapshot could not capture the live issue, or the model stage failed.
 
+The comment decision in a disposition is the same one the write path makes (`resolveCommentGate`): a comment for this application already on GitHub replays to `would_noop`, a held reply — from the reply gate or a prior pending reply — is `would_refuse`, and a groomer comment inside `DISPATCH_GROOMER_COMMENT_COOLDOWN_HOURS` skips the comment, so a comment-only plan inside the cooldown is `would_noop`, not `would_act`. `force` bypasses the cooldown in both modes.
+
 The run record keeps the proposed mutations (`mutationPlan`, `validatedOutput`) and the evidence revision/freshness they were based on (`evidenceDigest`, `preconditions`), so an observe receipt can later be compared with what an auto run actually did. Runs carry `mode` (`observe`/`auto`; null on rows recorded before this contract), and `GET /api/groomer/runs?mode=observe` filters them. `GET /api/groomer/runs/summary?windowHours=24` answers "how often would this automation act?" over a recent window (default 24h, clamped 1h–720h). The `/groomer` history page shows an observe badge with the disposition, a mode filter, and the 24h summary strip. Ad-hoc dry-run requests (`dryRun: true`, or `DISPATCH_GROOMER_DRY_RUN=true`) map cleanly onto observe: they record `mode: "observe"` and a disposition too. Switching from observe to auto is an env or per-request change only — no prompt or rule-definition change.
 
 ## Rollout
