@@ -46,10 +46,55 @@ describe("summarizeGroomingOutput", () => {
     });
     expect(summary).toMatchObject({
       format: "grooming-plan",
-      actionability: "needs_info",
+      // #1557: the resolved class decides the presented disposition, so an
+      // incomplete investigation never reads as a needs-info question.
+      actionability: "backlog",
       ready: false,
       gapClass: "investigation_incomplete",
     });
+  });
+
+  it("presents an incomplete investigation as the not-ready disposition, never as needs_info (#1557)", () => {
+    // The history badge renders this value, so an incomplete investigation
+    // must not read as "Needs Info" (the issue's UI/history criterion).
+    const summary = summarizeGroomingOutput({
+      schemaVersion: 1,
+      verdict: {
+        actionability: "needs_info",
+        workType: "implementation",
+        lane: { id: "backlog" },
+        summary: "The investigation did not finish.",
+        uncertainties: [{ material: true }],
+      },
+      readiness: { ready: false, admission: null, gapClass: "investigation_incomplete" },
+    });
+    expect(summary.actionability).toBe("backlog");
+    expect(summary.gapClass).toBe("investigation_incomplete");
+  });
+
+  it("keeps a human question presented as needs_info (#1557)", () => {
+    const summary = summarizeGroomingOutput({
+      schemaVersion: 1,
+      verdict: { actionability: "needs_info", lane: { id: "backlog" } },
+      readiness: { ready: false, admission: null, gapClass: "human_question" },
+    });
+    expect(summary.actionability).toBe("needs_info");
+  });
+
+  it("keeps a legacy row's stored actionability (the gap class predates the plan contract)", () => {
+    // A legacy row carries no gap class — the class did not exist when it was
+    // recorded — so it keeps the actionability it was stored with.
+    const summary = summarizeGroomingOutput({
+      actionability: "needs_info",
+      needsInfoReason: "which page should the link point at?",
+      labelsToAdd: ["status/backlog"],
+      labelsToRemove: [],
+      lane: { id: "backlog", confidence: "medium", reason: "not ready" },
+      summary: "Waiting on a decision.",
+    });
+    expect(summary.format).toBe("legacy");
+    expect(summary.actionability).toBe("needs_info");
+    expect(summary.gapClass).toBeNull();
   });
 
   it("keeps a human_question gap class as-is", () => {

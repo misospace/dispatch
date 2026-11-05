@@ -35,7 +35,7 @@ The feature is disabled by default.
 | `DISPATCH_GROOMER_MAX_SEARCH_RESULTS` | `10` | Maximum code-search results returned to the model per `search_code` call. |
 | `DISPATCH_GROOMER_MAX_DIR_ENTRIES` | `60` | Maximum directory entries returned to the model per `list_directory` call. |
 | `DISPATCH_GROOMER_CONTEXT_MODE` | `medium` | Exploration budget preset: `small`, `medium`, `large`. See below. |
-| `DISPATCH_GROOMER_MODEL_CONTEXT_TOKENS` | unset | The model's real context window in tokens. When set, the exploration budget is derived from it and `DISPATCH_GROOMER_CONTEXT_MODE` is ignored, up to the 96 KB `large` preset cap. |
+| `DISPATCH_GROOMER_MODEL_CONTEXT_TOKENS` | unset | The model's real context window in tokens. When set, the exploration budget is derived from it and `DISPATCH_GROOMER_CONTEXT_MODE` is ignored. The derived budget has no fixed byte cap, and it never exceeds the share of the window reserved for exploration. |
 | `DISPATCH_GROOMER_EXPLORE_MAX_BYTES` | from mode | Overrides the exploration byte budget. |
 | `DISPATCH_GROOMER_EXPLORE_MAX_FILE_BYTES` | from mode | Overrides bytes per file returned to the model. Never exceeds the total budget. |
 | `DISPATCH_GROOMER_EXPLORE_TIMEOUT_MS` | from mode | Overrides the wall-clock cap on the exploration loop. |
@@ -78,13 +78,24 @@ that explores well but never volunteers findings is not discarded empty. The
 byte budget carries the same nudge when it runs out.
 
 The default suits a modest self-hosted model. If your model's window is much
-larger, setting `DISPATCH_GROOMER_MODEL_CONTEXT_TOKENS` avoids undersizing the
-loop, but derived budgets stop at the 96 KB `large` preset cap: a tool loop does
-not need to consume the model's full context window. A starved loop stops
-mid-investigation and reports fewer files, which shows up as
-`repository exploration hit its byte budget` in a run's `contextWarnings`. The
-resolved budget and which path produced it are recorded
-on every run under `contextSummary.exploration.budget`.
+larger, set `DISPATCH_GROOMER_MODEL_CONTEXT_TOKENS`. The derived budget takes
+35% of the declared window and converts it to bytes at 3.5 bytes per token.
+The budget never exceeds that 35% share, so a small window gets a small
+budget instead of an allowance the window cannot hold. There is no universal
+byte ceiling on the derived budget. A 131,072-token window derives about
+160 KB, and a 245,760-token window derives about 300 KB. The per-file cap is
+a quarter of the total budget, so a large source file is not truncated while
+context capacity remains. The cap never exceeds the total budget. A window
+whose share is under 2 KB gives one file the whole allowance.
+
+The model context window is the capacity boundary. Time and rounds are the
+runaway-work boundaries, and they stay bounded. The derived timeout is 60s
+plus 5s per KB, clamped to 300s, and `DISPATCH_GROOMER_MAX_ROUNDS` bounds the
+loop. Set `DISPATCH_GROOMER_EXPLORE_TIMEOUT_MS` when your model needs more
+wall-clock time. A starved loop stops mid-investigation and reports fewer
+files, which shows up as `repository exploration hit its byte budget` in a
+run's `contextWarnings`. The resolved budget and which path produced it are
+recorded on every run under `contextSummary.exploration.budget`.
 
 ## Endpoint
 
@@ -178,7 +189,7 @@ Other rules the validator enforces:
 
 ### What needs_info waits on (dispatch#1452)
 
-A `needs_info` verdict carries `verdict.infoGap`: a `kind` (`product_decision`, `external_fact`, `runtime_reproduction`, or `investigation_incomplete`), the one concrete `question`, and `whyToolsCannotAnswer` — why the repository and related-work evidence this run had cannot answer it. The run resolves the declaration against its own exploration facts and persists the class on `readiness.gapClass` (`human_question` or `investigation_incomplete`): failed tool calls, truncated reads, or an exhausted round/byte budget override a claimed human question into `investigation_incomplete`, because an investigation that never finished has not earned the right to ask. Both classes land non-claimable on `status/backlog` and re-groom on the existing bounded cooldown/freshness paths — no new retry channel, no schema change. The reason stored on `Issue.needsInfoReason` carries a machine prefix, `investigation_incomplete:` or `human_question(<kind>):`, so a board card or log reader can tell the two apart without parsing prose; an operator's manual `mark_needs_info` via `POST /api/issues/groom` stores the operator's text as given, with no prefix enforced there.
+A `needs_info` verdict carries `verdict.infoGap`: a `kind` (`product_decision`, `external_fact`, `runtime_reproduction`, or `investigation_incomplete`), the one concrete `question`, and `whyToolsCannotAnswer` — why the repository and related-work evidence this run had cannot answer it. The run resolves the declaration against its own exploration facts and persists the class on `readiness.gapClass` (`human_question` or `investigation_incomplete`): failed tool calls, truncated reads, or an exhausted round/byte budget override a claimed human question into `investigation_incomplete`, because an investigation that never finished has not earned the right to ask. Both classes land non-claimable on `status/backlog` and re-groom on the existing bounded cooldown/freshness paths — no new retry channel, no schema change. The two classes part ways at the persisted disposition (dispatch#1557): a `human_question` maps to `mark_needs_info` and stores its machine-prefixed reason (`human_question(<kind>):`) on `Issue.needsInfoReason`; an `investigation_incomplete` maps to `mark_not_ready` and stores its machine-prefixed reason (`investigation_incomplete:`) on `Issue.notReadyReason`, so an incomplete run is never presented as `Needs Info` — what it waits on is more machine investigation, not information a human owes. The same class decides what the run shows and posts: the legacy output and the history verdict badge present an incomplete investigation as the not-ready backlog disposition (never `Needs Info`), and the run posts no comment for it, because a comment would ask a human to do the investigation Dispatch owes itself — only a `human_question` reaches a maintainer. The deferral TTL (`DISPATCH_DEFERRAL_TTL_DAYS`) exists to keep a model-authored deferral sentence from being irreversible; the machine-authored `investigation_incomplete:` prefix is carved out of that clause in the grooming-state exclusion, so the class re-grooms on the ordinary 24h cooldown rather than the 14-day deferral window. Each verdict supersedes the other's field, so a flip from a human question to an incomplete investigation (or a later successful re-groom) leaves no stale `needsInfoReason` behind. Pre-fix rows that stored an incomplete investigation under `mark_needs_info`/`needsInfoReason` remain readable — the stored row is untouched, and the history reads their `readiness.gapClass` — with no destructive migration; the next bounded re-groom rewrites the row to the not-ready disposition. An operator's manual `mark_needs_info` via `POST /api/issues/groom` stores the operator's text as given, with no prefix enforced there.
 
 ### Close policy
 

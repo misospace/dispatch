@@ -2234,7 +2234,24 @@ Investigate session handling in auth module.`;
       );
       const result = await runHostedGroomer();
       expect(result!.appliedMutations?.outcome).toBe("applied");
-      expect(lastIssueUpdateData().needsInfoReason).toBe("investigation_incomplete: which tenant?");
+      // #1557: an incomplete investigation is mark_not_ready, not
+      // mark_needs_info — it persists a machine-prefixed notReadyReason and
+      // supersedes the prior human question's needsInfoReason, so no stale
+      // needs-info text is left behind.
+      expect(lastIssueUpdateData().needsInfoReason).toBeNull();
+      expect(lastIssueUpdateData().notReadyReason).toBe("investigation_incomplete: which tenant?");
+      expect(lastIssueUpdateData().nextGroomingAction).toBe("mark_not_ready");
+
+      // A later re-groom whose investigation completes and promotes to ready
+      // clears the incomplete-investigation state with the rest of the
+      // not-ready reasons.
+      mocks.prisma.issue.update.mockClear();
+      mocks.callGroomerLLM.mockResolvedValue(planDraft());
+      const promoted = await runHostedGroomer();
+      expect(promoted!.appliedMutations?.outcome).toBe("applied");
+      expect(lastIssueUpdateData().notReadyReason).toBeNull();
+      expect(lastIssueUpdateData().needsInfoReason).toBeNull();
+      expect(lastIssueUpdateData().nextGroomingAction).toBe("promote_to_ready");
     });
 
     it("a re-groom that changes nothing is still replayed: no duplicate comment, no duplicate label write", async () => {
@@ -2475,9 +2492,61 @@ Investigate session handling in auth module.`;
       const result = await runHostedGroomer();
 
       // The declared human question is outranked by the run's own failure:
-      // the issue keeps retrying instead of parking on an unasked question.
+      // the issue keeps retrying instead of parking on an unasked question
+      // (#1557: as mark_not_ready, never as Needs Info).
       expect(result!.plan!.readiness.gapClass).toBe("investigation_incomplete");
-      expect(result!.output.needsInfoReason).toBe("investigation_incomplete: which tenant?");
+      expect(result!.output.nextGroomingAction).toBe("mark_not_ready");
+      expect(result!.output.notReadyReason).toBe("investigation_incomplete: which tenant?");
+      expect(result!.output.needsInfoReason).toBeUndefined();
+      expect(result!.output.actionability).toBe("backlog");
+    });
+
+    it("posts no maintainer-facing comment for an incomplete investigation (#1557)", async () => {
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, toolLoopEnabled: true });
+      mocks.exploreRepository.mockResolvedValue({
+        ...mockExploration,
+        toolCalls: [
+          { name: "search_code", arguments: { query: "tenant" }, ok: false, bytes: 0, preview: "search unavailable", truncated: false },
+        ],
+        gaps: {
+          explorationRan: true,
+          toolFailures: ["search_code"],
+          truncatedReads: [],
+          budgetExhausted: false,
+          roundsExhausted: false,
+          aborted: false,
+          unavailable: false,
+        },
+      });
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("needs_info", {
+          verdict: {
+            rationale: "which tenant?",
+            infoGap: {
+              kind: "product_decision",
+              question: "Which tenant scope applies?",
+              whyToolsCannotAnswer: "The repository records no product-scope decision.",
+            },
+          },
+          mutations: { githubComment: "Which tenant reproduces this?" },
+        }),
+      );
+
+      const result = await runHostedGroomer();
+
+      expect(result!.plan!.readiness.gapClass).toBe("investigation_incomplete");
+      // The comment would ask a human to do the investigation Dispatch owes
+      // itself, so the run posts none for that class.
+      expect(mocks.addIssueComment).not.toHaveBeenCalled();
+      // The issue still lands not-ready with the machine-prefixed reason.
+      expect(mocks.prisma.issue.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            nextGroomingAction: "mark_not_ready",
+            notReadyReason: "investigation_incomplete: which tenant?",
+          }),
+        }),
+      );
     });
 
     it("gives the model the evidence catalog built from the snapshot", async () => {

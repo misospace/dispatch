@@ -34,6 +34,28 @@ export type InfoGapKind = (typeof INFO_GAP_KIND_VALUES)[number];
 export const INFO_GAP_RESOLUTION_VALUES = ["human_question", "investigation_incomplete"] as const;
 export type InfoGapResolution = (typeof INFO_GAP_RESOLUTION_VALUES)[number];
 
+/**
+ * The machine prefix every persisted incomplete-investigation reason carries
+ * (#1557): the groomer writes `investigation_incomplete: …` onto
+ * `Issue.notReadyReason`, and the grooming-state exclusion reads the same
+ * prefix so the class re-grooms on the ordinary 24h cooldown instead of the
+ * model-authored deferral TTL — an unfinished investigation is Dispatch's own
+ * retry debt, not a deferral a maintainer made.
+ */
+export const INCOMPLETE_INVESTIGATION_REASON_PREFIX = "investigation_incomplete:";
+
+/**
+ * The actionability an incomplete investigation is presented as (#1557):
+ * the not-ready backlog disposition, never the human-facing `needs_info`.
+ *
+ * The model's verdict stays `needs_info` on the plan (it is what the model
+ * declared), but every surface that shows or applies the run's disposition —
+ * the legacy output, the history/UI verdict badge, the comment the run posts
+ * — reads the resolved gap class instead, so an unfinished investigation is
+ * never presented as information a human owes.
+ */
+export const INCOMPLETE_INVESTIGATION_ACTIONABILITY = "backlog" as const;
+
 /** What the model declares in `verdict.infoGap` for a needs_info plan. */
 export interface InfoGap {
   kind: InfoGapKind;

@@ -1,5 +1,6 @@
 import { AGENT_PREFIX, isAgentLabel, isOwnerLabel, OWNER_PREFIX, STATUS_LABELS } from "@/types";
 import { UMBRELLA_LABEL } from "@/lib/decomposition";
+import { INCOMPLETE_INVESTIGATION_REASON_PREFIX } from "@/lib/groomer/investigation-gap";
 
 /**
  * Single source of truth for Renovate issue detection. Both the in-memory
@@ -177,8 +178,18 @@ export function buildGroomingStateExclusionWhere(cooldownHours: number = 24) {
       { OR: [{ groomedAt: null }, { groomedAt: { lt: cutoff } }] },
       // Not currently blocked
       { blockedReason: null },
-      // Not currently marked not-ready, unless the deferral has aged out
-      { OR: [{ notReadyReason: null }, { groomedAt: { lt: deferralCutoff } }] },
+      // Not currently marked not-ready, unless the deferral has aged out.
+      // Exception (#1557): an incomplete-investigation reason is machine-
+      // authored grooming retry debt (the groomer's own broken exploration),
+      // not a deferral a maintainer made, so it re-grooms on the ordinary
+      // cooldown below instead of the deferral TTL.
+      {
+        OR: [
+          { notReadyReason: null },
+          { notReadyReason: { startsWith: INCOMPLETE_INVESTIGATION_REASON_PREFIX } },
+          { groomedAt: { lt: deferralCutoff } },
+        ],
+      },
     ],
   };
 }

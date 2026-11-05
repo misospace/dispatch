@@ -325,11 +325,13 @@ export interface GroomingMutationDiff {
   close: boolean;
   /**
    * The reason text this verdict persists on the Issue row (dispatch#1461):
-   * the same value the run's mutation path writes (needs_info →
-   * needsInfoReason, blocked → blockedReason, backlog → notReadyReason), null
-   * when the verdict persists none. It is part of the application intent, so
-   * a re-groom whose verdict reason changed is applied — the Issue row
-   * carries the new text — rather than replayed with the stale one.
+   * the same value the run's mutation path writes (needs_info/human_question
+   * → needsInfoReason, needs_info with an incomplete investigation →
+   * notReadyReason via mark_not_ready (#1557), blocked → blockedReason,
+   * backlog → notReadyReason), null when the verdict persists none. It is
+   * part of the application intent, so a re-groom whose verdict reason
+   * changed is applied — the Issue row carries the new text — rather than
+   * replayed with the stale one.
    */
   persistedReason: string | null;
   /** The plan's decomposition intent; null when the plan does not decompose. */

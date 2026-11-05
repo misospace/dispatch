@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_CONTEXT_MODE,
-  MAX_DERIVED_EXPLORATION_BYTES,
   deriveFromContextTokens,
   resolveExplorationBudget,
 } from "./exploration-budget";
@@ -50,8 +49,9 @@ describe("resolveExplorationBudget", () => {
       DISPATCH_GROOMER_MODEL_CONTEXT_TOKENS: "131072",
     });
     expect(b.source).toBe("derived");
-    // The derived source ignores the named mode and reaches the grooming cap.
-    expect(b.maxTotalBytes).toBe(MAX_DERIVED_EXPLORATION_BYTES);
+    // The derived source ignores the named mode and scales with the window.
+    expect(b.maxTotalBytes).toBe(Math.floor(131_072 * 0.35 * 3.5));
+    expect(b.maxTotalBytes).toBeGreaterThan(98_304);
   });
 
   it("derives a small budget for a small window", () => {
@@ -68,7 +68,7 @@ describe("resolveExplorationBudget", () => {
     });
     expect(b.source).toBe("env");
     expect(b.maxTotalBytes).toBe(40_960);
-    expect(b.maxTotalBytes).toBeLessThan(MAX_DERIVED_EXPLORATION_BYTES);
+    expect(b.maxTotalBytes).toBeLessThan(Math.floor(262_144 * 0.35 * 3.5));
   });
 
   it("never lets a single file exceed the whole budget", () => {
@@ -108,15 +108,52 @@ describe("deriveFromContextTokens", () => {
     expect(d.maxTotalBytes).toBeLessThan(100_000 * 3.5 * 0.5);
   });
 
-  it("keeps a floor so a tiny window still gets a usable budget", () => {
-    expect(deriveFromContextTokens(1_024).maxTotalBytes).toBeGreaterThanOrEqual(4_096);
+  it("never lets a derived allowance exceed the window it came from", () => {
+    // A small window must fail safely: exploration can never be allowed more
+    // bytes than the window holds, and never more than the share reserved for
+    // it (dispatch#1558).
+    for (const tokens of [1_024, 2_048, 4_096, 8_192, 131_072, 245_760]) {
+      const d = deriveFromContextTokens(tokens);
+      expect(d.maxTotalBytes).toBeLessThanOrEqual(Math.floor(tokens * 3.5));
+      expect(d.maxTotalBytes).toBeLessThanOrEqual(Math.floor(tokens * 0.35 * 3.5));
+      expect(d.maxFileBytes).toBeLessThanOrEqual(d.maxTotalBytes);
+    }
   });
 
-  it("caps a large model window at the grooming exploration limit", () => {
-    const d = deriveFromContextTokens(262_144);
-    expect(d.maxTotalBytes).toBe(MAX_DERIVED_EXPLORATION_BYTES);
-    expect(d.maxFileBytes).toBe(MAX_DERIVED_EXPLORATION_BYTES / 4);
+  it("gives a tiny window a smaller allowance instead of a floor above its capacity", () => {
+    const d = deriveFromContextTokens(1_024);
+    expect(d.maxTotalBytes).toBe(Math.floor(1_024 * 0.35 * 3.5));
+    expect(d.maxTotalBytes).toBeLessThan(4_096);
+    expect(d.maxFileBytes).toBeLessThanOrEqual(d.maxTotalBytes);
+  });
+
+  it("scales derived budgets across small, 131k and 245k windows", () => {
+    const small = deriveFromContextTokens(8_192);
+    const mid = deriveFromContextTokens(131_072);
+    const large = deriveFromContextTokens(245_760);
+    expect(small.maxTotalBytes).toBe(Math.floor(8_192 * 0.35 * 3.5));
+    expect(mid.maxTotalBytes).toBe(Math.floor(131_072 * 0.35 * 3.5));
+    expect(large.maxTotalBytes).toBe(Math.floor(245_760 * 0.35 * 3.5));
+    expect(small.maxTotalBytes).toBeLessThan(mid.maxTotalBytes);
+    expect(mid.maxTotalBytes).toBeLessThan(large.maxTotalBytes);
+    // Neither window is pinned to the legacy 96 KiB `large` preset cap.
+    expect(mid.maxTotalBytes).toBeGreaterThan(98_304);
+    expect(large.maxTotalBytes).toBeGreaterThan(98_304);
+  });
+
+  it("lets exploration exceed the legacy 96 KiB cap when the window permits it", () => {
+    const d = deriveFromContextTokens(245_760);
+    expect(d.maxTotalBytes).toBeGreaterThan(98_304);
+    expect(d.maxFileBytes).toBeGreaterThan(24_576);
+    expect(d.maxFileBytes).toBe(Math.floor(d.maxTotalBytes / 4));
+    // Still bounded: a whole quarter of the budget per file, never more.
+    expect(d.maxFileBytes).toBeLessThan(d.maxTotalBytes);
+  });
+
+  it("keeps the derived timeout a bounded runaway limit", () => {
+    const d = deriveFromContextTokens(245_760);
     expect(d.timeoutMs).toBe(300_000);
+    expect(deriveFromContextTokens(8_192).timeoutMs).toBeLessThanOrEqual(300_000);
   });
 
   it("keeps per-file at a quarter of the budget", () => {

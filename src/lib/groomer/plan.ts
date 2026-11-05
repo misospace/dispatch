@@ -40,6 +40,8 @@ import {
   infoGapReadinessReason,
   resolveInfoGap,
   INFO_GAP_KIND_VALUES,
+  INCOMPLETE_INVESTIGATION_ACTIONABILITY,
+  INCOMPLETE_INVESTIGATION_REASON_PREFIX,
   type InfoGap,
   type InfoGapResolution,
   type InvestigationGapFacts,
@@ -1072,7 +1074,11 @@ function nextGroomingActionFor(plan: GroomingPlan): GroomAction | undefined {
     case "ready":
       return plan.readiness.admission === "escalation" ? "escalate" : "promote_to_ready";
     case "needs_info":
-      return "mark_needs_info";
+      // #1557: only a concrete human question earns mark_needs_info. An
+      // incomplete investigation waits on more machine work, not on a
+      // maintainer, so it lands as mark_not_ready on the same non-claimable
+      // backlog status and re-grooms on the existing bounded cooldown.
+      return plan.readiness.gapClass === "investigation_incomplete" ? "mark_not_ready" : "mark_needs_info";
     case "blocked":
       return "mark_blocked";
     case "backlog":
@@ -1091,27 +1097,47 @@ function nextGroomingActionFor(plan: GroomingPlan): GroomAction | undefined {
  * the exactly-one-status post-condition cannot keep a stale status/ready or a
  * foreign status. An issue carrying an in-flight status (in-progress/in-review)
  * keeps its status labels untouched.
+ *
+ * #1557: the resolved gap class decides the human-facing disposition. An
+ * incomplete investigation is presented as the not-ready backlog disposition
+ * (never `needs_info`) and carries no comment, because the missing input is
+ * more machine investigation, not an answer a human owes.
  */
 export function toGroomerOutput(plan: GroomingPlan, currentLabels: string[]): GroomerOutput {
   const { verdict, mutations } = plan;
   const status = mutations.status;
   const inFlight = inFlightStatus(currentLabels) !== null;
+  // #1557: an incomplete investigation is not a needs-info verdict. It waits
+  // on more machine work, so the output carries the not-ready disposition the
+  // run persists (backlog / mark_not_ready) and no maintainer-facing comment.
+  const incompleteInvestigation = plan.readiness.gapClass === "investigation_incomplete";
   // The derived status is the only status an applied groom leaves: every
   // other status/* label goes, including ones the groomer does not own
   // (the external groom route already strips them all).
   const staleStatuses = inFlight ? [] : currentLabels.filter((label) => label.startsWith("status/") && label !== status);
   const output: GroomerOutput = {
-    actionability: verdict.actionability,
+    actionability: incompleteInvestigation ? INCOMPLETE_INVESTIGATION_ACTIONABILITY : verdict.actionability,
     confidence: verdict.confidence,
     labelsToAdd: inFlight ? [...mutations.labelsToAdd] : [...mutations.labelsToAdd, status],
     labelsToRemove: [...new Set([...mutations.labelsToRemove, ...staleStatuses])],
     lane: { ...verdict.lane },
     summary: verdict.summary,
   };
-  if (mutations.githubComment) output.githubComment = mutations.githubComment;
+  // #1557: a comment on an incomplete investigation would ask a human to do
+  // the investigation Dispatch owes itself, so the run posts none for that
+  // class. A human question keeps its comment — that one is genuinely owed.
+  if (mutations.githubComment && !incompleteInvestigation) output.githubComment = mutations.githubComment;
   if (mutations.proposedTitle) output.proposedTitle = mutations.proposedTitle;
   if (mutations.proposedBody) output.proposedBody = mutations.proposedBody;
-  if (verdict.actionability === "needs_info") output.needsInfoReason = needsInfoReason(plan);
+  if (verdict.actionability === "needs_info") {
+    // #1557: the gap class decides which human-facing field the reason lands
+    // on. A human question persists needsInfoReason under mark_needs_info; an
+    // incomplete investigation persists a machine-prefixed notReadyReason
+    // under mark_not_ready, so no incomplete run is ever presented as
+    // information a human owes.
+    if (plan.readiness.gapClass === "investigation_incomplete") output.notReadyReason = gapReason(plan);
+    else output.needsInfoReason = gapReason(plan);
+  }
   if (verdict.actionability === "blocked") output.blockedReason = verdict.rationale;
   if (verdict.actionability === "backlog") output.notReadyReason = verdict.rationale;
   const action = nextGroomingActionFor(plan);
@@ -1120,18 +1146,18 @@ export function toGroomerOutput(plan: GroomingPlan, currentLabels: string[]): Gr
 }
 
 /**
- * The reason stored on Issue.needsInfoReason (#1452): the verdict rationale
- * with a machine-readable gap prefix, so a board card and any log reader can
- * tell an incomplete investigation from a genuine human question without
- * parsing prose. Plans whose gap predates the contract keep the bare
- * rationale.
+ * The machine-prefixed gap reason the verdict persists (#1452, #1557): the
+ * verdict rationale with a machine-readable gap prefix, so a board card and
+ * any log reader can tell an incomplete investigation from a genuine human
+ * question without parsing prose. #1557 sends the two classes to different
+ * fields — `human_question` to `Issue.needsInfoReason` under mark_needs_info,
+ * `investigation_incomplete` to `Issue.notReadyReason` under mark_not_ready —
+ * but the prefix text is shared. Plans whose gap predates the contract keep
+ * the bare rationale.
  */
-function needsInfoReason(plan: GroomingPlan): string {
+function gapReason(plan: GroomingPlan): string {
   const gap = plan.readiness.gapClass;
   if (!gap) return plan.verdict.rationale;
-  const code =
-    gap === "investigation_incomplete"
-      ? "investigation_incomplete"
-      : `human_question(${plan.verdict.infoGap?.kind ?? "unspecified"})`;
-  return `${code}: ${plan.verdict.rationale}`;
+  if (gap === "investigation_incomplete") return `${INCOMPLETE_INVESTIGATION_REASON_PREFIX} ${plan.verdict.rationale}`;
+  return `human_question(${plan.verdict.infoGap?.kind ?? "unspecified"}): ${plan.verdict.rationale}`;
 }

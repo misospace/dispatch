@@ -82,6 +82,7 @@ Evidence rules:
 
 Info gap rules (Dispatch reads the resolved gap class into the run; a needs_info verdict without a complete infoGap is rejected):
 - An unfinished investigation is NOT a human question: when a tool call failed or timed out, or required evidence stayed unread, kind must be investigation_incomplete — Dispatch re-runs the investigation on its bounded schedule; do not launder a broken search into a maintainer question.
+- An investigation_incomplete gap is a question for nobody: leave githubComment null for it. Dispatch posts no comment for that class, so a comment would only ask a human to do the investigation Dispatch owes itself.
 - needs_info must name the ONE concrete unanswered question (question) and why the repository and related-work evidence cannot answer it (whyToolsCannotAnswer). Ordinary implementation or research difficulty is not a human prerequisite — a worker reading code is not needs_info.
 
 Readiness rules (Dispatch rejects a "ready" plan that breaks any of these):

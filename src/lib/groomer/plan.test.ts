@@ -920,14 +920,58 @@ describe("needs_info gap classification (dispatch#1452)", () => {
     expect(plan.verdict.infoGap).toEqual(HUMAN_GAP);
   });
 
-  it("codes the stored needsInfoReason with the resolved gap", () => {
-    const incomplete = validateGroomingPlan(notReady("needs_info", { verdict: { infoGap: HUMAN_GAP } }), {
+  it("maps an incomplete investigation to mark_not_ready with a machine-prefixed notReadyReason (#1557)", () => {
+    for (const facts of [
+      gapFacts({ truncatedReads: ["src/auth/login.ts"], budgetExhausted: true }),
+      gapFacts({ toolFailures: ["search_code"] }),
+    ]) {
+      const incomplete = validateGroomingPlan(notReady("needs_info", { verdict: { infoGap: HUMAN_GAP } }), {
+        catalog: catalog(),
+        investigation: facts,
+      }).plan!;
+      const output = toGroomerOutput(incomplete, []);
+      expect(output.nextGroomingAction).toBe("mark_not_ready");
+      expect(output.notReadyReason).toBe(`investigation_incomplete: ${readyDraft().verdict.rationale}`);
+      expect(output.needsInfoReason).toBeUndefined();
+      // #1557: the output never presents an incomplete investigation as a
+      // needs-info question — the disposition is the not-ready backlog one.
+      expect(output.actionability).toBe("backlog");
+    }
+  });
+
+  it("posts no comment for an incomplete investigation and keeps the human question's (#1557)", () => {
+    // A comment on an incomplete investigation would ask a human to do the
+    // investigation Dispatch owes itself, so the run carries none for it.
+    const incomplete = validateGroomingPlan(
+      notReady("needs_info", {
+        verdict: { infoGap: HUMAN_GAP },
+        mutations: { githubComment: "Which page should this link to?" },
+      }),
+      { catalog: catalog(), investigation: gapFacts({ toolFailures: ["search_code"] }) },
+    ).plan!;
+    const incompleteOutput = toGroomerOutput(incomplete, []);
+    expect(incompleteOutput.githubComment).toBeUndefined();
+
+    const human = validateGroomingPlan(
+      notReady("needs_info", {
+        verdict: { infoGap: HUMAN_GAP },
+        mutations: { githubComment: "Which page should this link to?" },
+      }),
+      { catalog: catalog(), investigation: gapFacts() },
+    ).plan!;
+    const humanOutput = toGroomerOutput(human, []);
+    expect(humanOutput.actionability).toBe("needs_info");
+    expect(humanOutput.githubComment).toBe("Which page should this link to?");
+  });
+
+  it("maps a human question to mark_needs_info with a machine-prefixed needsInfoReason", () => {
+    const human = validateGroomingPlan(notReady("needs_info", { verdict: { infoGap: HUMAN_GAP } }), {
       catalog: catalog(),
-      investigation: gapFacts({ aborted: true }),
     }).plan!;
-    expect(toGroomerOutput(incomplete, []).needsInfoReason).toBe(
-      `investigation_incomplete: ${readyDraft().verdict.rationale}`,
-    );
+    const output = toGroomerOutput(human, []);
+    expect(output.nextGroomingAction).toBe("mark_needs_info");
+    expect(output.needsInfoReason).toBe(`human_question(product_decision): ${readyDraft().verdict.rationale}`);
+    expect(output.notReadyReason).toBeUndefined();
   });
 
   it("an incomplete investigation stays non-claimable and never becomes ready", () => {

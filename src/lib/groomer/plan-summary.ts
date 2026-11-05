@@ -8,7 +8,11 @@
  * components can import it.
  */
 
-import { INFO_GAP_RESOLUTION_VALUES, type InfoGapResolution } from "./investigation-gap";
+import {
+  INFO_GAP_RESOLUTION_VALUES,
+  INCOMPLETE_INVESTIGATION_ACTIONABILITY,
+  type InfoGapResolution,
+} from "./investigation-gap";
 
 export interface GroomingOutputSummary {
   format: "grooming-plan" | "legacy" | "unknown";
@@ -58,6 +62,20 @@ const EMPTY: GroomingOutputSummary = {
   materialUncertaintyCount: 0,
 };
 
+/**
+ * The actionability a row is presented as (#1557). An incomplete
+ * investigation is presented as the not-ready backlog disposition, never as
+ * `needs_info`: the run waits on more machine work, not on a human answer.
+ *
+ * The resolved gap class on the plan is the machine truth. A legacy row
+ * (recorded before the plan contract) carries no gap class and predates the
+ * class itself, so it keeps the actionability it was stored with.
+ */
+function presentedActionability(actionability: string | null, gapClass: InfoGapResolution | null): string | null {
+  if (gapClass === "investigation_incomplete") return INCOMPLETE_INVESTIGATION_ACTIONABILITY;
+  return actionability;
+}
+
 export function summarizeGroomingOutput(validatedOutput: unknown): GroomingOutputSummary {
   if (!isObj(validatedOutput)) return { ...EMPTY };
 
@@ -67,19 +85,18 @@ export function summarizeGroomingOutput(validatedOutput: unknown): GroomingOutpu
     const evidence = isObj(validatedOutput.evidence) ? validatedOutput.evidence : {};
     const lane = isObj(verdict.lane) ? verdict.lane : {};
     const uncertainties = Array.isArray(verdict.uncertainties) ? verdict.uncertainties : [];
-    const gapClass = str(readiness.gapClass);
+    const rawGapClass = str(readiness.gapClass);
+    const gapClass =
+      rawGapClass !== null && GAP_CLASS_VALUES.has(rawGapClass) ? (rawGapClass as InfoGapResolution) : null;
     return {
       format: "grooming-plan",
       schemaVersion: validatedOutput.schemaVersion,
-      actionability: str(verdict.actionability),
+      actionability: presentedActionability(str(verdict.actionability), gapClass),
       workType: str(verdict.workType),
       lane: str(lane.id),
       summary: str(verdict.summary),
       ready: typeof readiness.ready === "boolean" ? readiness.ready : null,
-      gapClass:
-        gapClass !== null && GAP_CLASS_VALUES.has(gapClass)
-          ? (gapClass as InfoGapResolution)
-          : null,
+      gapClass,
       admission: str(readiness.admission),
       evidenceDigest: str(evidence.evidenceDigest),
       citationCount: Array.isArray(validatedOutput.citations) ? validatedOutput.citations.length : 0,
