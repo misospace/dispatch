@@ -64,10 +64,50 @@ Delivery statuses recorded on the `ExternalContributionRequest` ledger row:
 
 | Status | Meaning | Retry |
 |---|---|---|
-| `pending` | Persisted, not yet submitted (or submission in flight) | Next submission retries, bounded |
+| `pending` | Persisted, not yet submitted | Next submission claims the attempt, bounded |
+| `in_flight` | One admission attempt is actively being delivered, under a bounded lease (`inFlightUntil`) | Never stolen while the lease is live; other callers get the row back as `in_flight` without a network call |
 | `accepted` | Courier returned an identity (201 or 200-resume) | Never re-admitted; replays return the stored identity |
 | `rejected` | Explicit Courier refusal (any 4xx, mirrored in the response status) | Terminal — a new contribution needs a new request |
 | `uncertain` | Timeout, network failure, refused redirect, 5xx, or a malformed 2xx body — delivery outcome unknown | Retried with the ORIGINAL key, bounded by `MAX_DELIVERY_ATTEMPTS` (5) |
+
+## Concurrency invariant
+
+Dispatch never intentionally has two live Courier admission HTTP requests for
+the same `ExternalContributionRequest` — across processes and Dispatch
+instances. An `attemptCount` alone cannot express "an attempt is active" (a
+caller reading the already-incremented count would fence successfully and
+double-submit), so attempt ownership is durable state:
+
+1. **Atomic claim.** A caller acquires an attempt through ONE conditional
+   `updateMany` — atomic at the database, so it holds across instances. The
+   claim matches only rows that are `pending` or `uncertain`, or `in_flight`
+   with an **expired** lease, and only while `attemptCount <
+   MAX_DELIVERY_ATTEMPTS`. Winning it flips the row to `in_flight`, increments
+   `attemptCount`, stamps `lastAttemptAt`, and writes a fresh random
+   `attemptToken`.
+2. **Live lease is never stolen.** A caller that reads (or races on) a row
+   whose lease is still live loses the claim and receives the row as
+   `in_flight` — no attempt increment, no Courier call, no key or payload
+   change. In-memory mutexes are not involved; the database is the
+   coordinator.
+3. **Bounded lease.** The lease expires `inFlightLeaseMs` after attempt start:
+   the configured Courier admission timeout
+   (`DISPATCH_COURIER_ADMISSION_TIMEOUT_MS`, default 30s) plus a fixed
+   `IN_FLIGHT_LEASE_MARGIN_MS` (5s) so it outlives any response the timeout can
+   produce, with margin for inter-instance clock skew (each instance judges
+   expiry against its own wall clock; a premature steal is still safe — it
+   consumes one bounded retry with the SAME key, which Courier dedupes).
+4. **Crash recovery.** If Dispatch dies after claiming an attempt but before
+   recording the outcome, the row stays `in_flight` until the lease expires;
+   the next submission then recovers it with the SAME idempotency key,
+   consuming the next bounded attempt and never creating a second ledger row.
+   Recovery needs no background worker or scheduler.
+5. **Token-guarded settlement.** An attempt's result applies only while its
+   `attemptToken` still owns an `in_flight` row. A recovered newer attempt
+   rewrites the token, so a delayed response from a stale attempt (e.g. one
+   whose request was retried after recovery) can never overwrite the newer
+   attempt's result — it is dropped and the caller reports the row's current
+   truth.
 
 ## Exactly-once rules
 
@@ -75,8 +115,8 @@ Delivery statuses recorded on the `ExternalContributionRequest` ledger row:
    the first network call; the Courier call is always rebuilt from the
    persisted row.
 2. One idempotency key is one contribution identity: repeated clicks,
-   concurrent requests (unique-key race + attempt-count fence), restarts, and
-   lost success responses all resolve to the same row and the same key.
+   concurrent requests (unique-key race + atomic in-flight claim), restarts,
+   and lost success responses all resolve to the same row and the same key.
 3. A changed payload under an existing key is a 409.
 4. A deliberate new contribution is a separate explicit submission with its own
    (new) identity.

@@ -1,12 +1,12 @@
 // @vitest-environment node
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
-import { Prisma } from "@prisma/client";
 import {
   TEST_AGENT_TOKEN as mockToken,
   makeDispatchEnvMockWithSafeEqual,
   authedRequest,
 } from "@/test/route-helpers";
 import { MAX_DELIVERY_ATTEMPTS } from "@/lib/external-contribution";
+import type { ContributionLedgerRow } from "@/test/external-contribution-ledger";
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
@@ -20,37 +20,13 @@ vi.mock("@/lib/auth-next", () => ({
 
 // #1537: POST /api/external-contributions — persist-before-network request
 // ledger + exactly-once admission through Courier. The submission state
-// machine and the Courier client run UNMOCKED; only the Prisma client (an
-// in-memory ledger store) and global fetch are stubbed, so the route-level
-// pins exercise the production behavior.
+// machine and the Courier client run UNMOCKED; only the Prisma client (the
+// faithful in-memory ledger from `@/test/external-contribution-ledger`) and
+// global fetch are stubbed, so the route-level pins exercise the production
+// behavior.
 
 const COURIER_TOKEN = "courier-secret-token";
 const ENDPOINT = "https://courier.internal/v1/contributions";
-
-interface LedgerRow {
-  id: string;
-  idempotencyKey: string;
-  createdBy: string;
-  namespace: string;
-  lane: string;
-  baseRepo: string;
-  baseRef: string;
-  workRepo: string;
-  goal: string;
-  upstreamIssue: string | null;
-  payloadDigest: string;
-  deliveryStatus: string;
-  courierRun: string | null;
-  courierNamespace: string | null;
-  courierWorkItemId: string | null;
-  resumed: boolean | null;
-  courierHttpStatus: number | null;
-  lastError: string | null;
-  attemptCount: number;
-  lastAttemptAt: Date | null;
-  createdAt: Date;
-  updatedAt: Date;
-}
 
 // A deterministic digest for the canonical baseline payload below, so tests
 // can plant rows without recomputing the hash. The baseline body every test
@@ -67,10 +43,12 @@ const BASE_BODY = {
 
 const { harnessHolder } = vi.hoisted(() => ({ harnessHolder: { current: null as any } }));
 
-vi.mock("@/lib/prisma", () => {
-  const rows: LedgerRow[] = [];
+vi.mock("@/lib/prisma", async () => {
+  const { createContributionLedger } = await import("@/test/external-contribution-ledger");
+  const ledger = createContributionLedger();
+  const rows = ledger.rows;
+  const calls = ledger.calls;
   const audits: any[] = [];
-  const calls: string[] = [];
   const issueSpies = {
     update: vi.fn(),
     updateMany: vi.fn(),
@@ -79,65 +57,10 @@ vi.mock("@/lib/prisma", () => {
     create: vi.fn(),
     upsert: vi.fn(),
   };
-  let rowSeq = 0;
-  let failNextCreateWithConflict = false;
-  let findUniqueCall = 0;
-
-  const delegate = {
-    async findUnique({ where }: { where: { idempotencyKey: string } }) {
-      findUniqueCall += 1;
-      if (failNextCreateWithConflict && findUniqueCall === 1) return null; // simulate losing a concurrent create
-      return rows.find((r) => r.idempotencyKey === where.idempotencyKey) ?? null;
-    },
-    async create({ data }: { data: Record<string, unknown> }) {
-      calls.push("create");
-      if (failNextCreateWithConflict) {
-        failNextCreateWithConflict = false;
-        throw new Prisma.PrismaClientKnownRequestError("Unique constraint failed", {
-          code: "P2002",
-          clientVersion: "test",
-        });
-      }
-      const now = new Date();
-      const row = {
-        id: `row-${++rowSeq}`,
-        courierRun: null,
-        courierNamespace: null,
-        courierWorkItemId: null,
-        resumed: null,
-        courierHttpStatus: null,
-        lastError: null,
-        lastAttemptAt: null,
-        upstreamIssue: null,
-        ...data,
-        createdAt: now,
-        updatedAt: now,
-      } as LedgerRow;
-      rows.push(row);
-      return row;
-    },
-    async update({ where, data }: { where: { id: string }; data: Record<string, unknown> }) {
-      const row = rows.find((r) => r.id === where.id);
-      if (!row) throw new Error("row not found");
-      Object.assign(row, data, { updatedAt: new Date() });
-      return row;
-    },
-    async updateMany({ where, data }: { where: any; data: Record<string, unknown> }) {
-      let count = 0;
-      for (const row of rows) {
-        if (row.idempotencyKey !== where.idempotencyKey) continue;
-        if (row.attemptCount !== where.attemptCount) continue;
-        if (!where.deliveryStatus.in.includes(row.deliveryStatus)) continue;
-        Object.assign(row, data);
-        count += 1;
-      }
-      return { count };
-    },
-  };
 
   harnessHolder.current = {
     prisma: {
-      externalContributionRequest: delegate,
+      externalContributionRequest: ledger.delegate,
       auditLog: {
         create: vi.fn(async (args: { data: any }) => {
           audits.push(args.data);
@@ -152,38 +75,10 @@ vi.mock("@/lib/prisma", () => {
     calls,
     issueSpies,
     setLoseNextCreateRace(lose: boolean) {
-      failNextCreateWithConflict = lose;
-      findUniqueCall = 0;
+      ledger.setLostCreateRace(lose);
     },
-    plantRow(overrides: Partial<LedgerRow> = {}): LedgerRow {
-      const now = new Date();
-      const row = {
-        id: `row-${++rowSeq}`,
-        idempotencyKey: "planted-key",
-        createdBy: "operator",
-        namespace: "team-alpha",
-        lane: "contribution",
-        baseRepo: "acme/widgets",
-        baseRef: "main",
-        workRepo: "acme/widgets-fork",
-        goal: "Add a widget",
-        upstreamIssue: "https://github.com/acme/widgets/issues/12",
-        payloadDigest: "",
-        deliveryStatus: "pending",
-        courierRun: null,
-        courierNamespace: null,
-        courierWorkItemId: null,
-        resumed: null,
-        courierHttpStatus: null,
-        lastError: null,
-        attemptCount: 0,
-        lastAttemptAt: null,
-        createdAt: now,
-        updatedAt: now,
-        ...overrides,
-      } as LedgerRow;
-      rows.push(row);
-      return row;
+    plantRow(overrides: Partial<ContributionLedgerRow> = {}): ContributionLedgerRow {
+      return ledger.plantRow(overrides);
     },
   };
   return { prisma: harnessHolder.current.prisma };
@@ -303,14 +198,18 @@ describe("POST /api/external-contributions", () => {
   });
 
   it("persists the request BEFORE the first network call and records a 201 identity from Courier", async () => {
-    fetchMock.mockResolvedValue(
-      courierBody(201, { run: "run-77", namespace: "team-alpha", workItemId: "wi-9", resumed: false }),
-    );
+    fetchMock.mockImplementation(async () => {
+      // Ordering: the ledger row exists (create) AND the attempt is claimed
+      // (updateMany) before the credential leaves the process.
+      expect(harness.calls).toEqual(["create", "updateMany"]);
+      expect(harness.rows[0].deliveryStatus).toBe("in_flight");
+      return courierBody(201, { run: "run-77", namespace: "team-alpha", workItemId: "wi-9", resumed: false });
+    });
     const res = await post({ ...BASE_BODY, idempotencyKey: "key-abc" });
     expect(res.status).toBe(201);
 
-    // Ordering: the ledger row exists before the credential leaves the process.
-    expect(harness.calls).toEqual(["create"]);
+    // create (persist) → updateMany (claim) → fetch → updateMany (settlement).
+    expect(harness.calls).toEqual(["create", "updateMany", "updateMany"]);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(harness.rows).toHaveLength(1);
 
@@ -382,6 +281,29 @@ describe("POST /api/external-contributions", () => {
     expect((await changed.json()).error).toMatch(/does not match/i);
     expect(fetchMock).not.toHaveBeenCalled();
     expect(harness.rows).toHaveLength(1);
+  });
+
+  it("returns the in-flight row (200) without a Courier call while a live lease holds the attempt", async () => {
+    // Another caller's attempt is active under a fresh lease (#1556 review).
+    harness.plantRow({
+      idempotencyKey: "key-inflight",
+      payloadDigest: digestOfBody({ ...BASE_BODY, idempotencyKey: "key-inflight" }),
+      deliveryStatus: "in_flight",
+      attemptCount: 1,
+      attemptToken: "active-attempt",
+      lastAttemptAt: new Date(),
+      inFlightUntil: new Date(Date.now() + 60_000),
+    });
+
+    const res = await post({ ...BASE_BODY, idempotencyKey: "key-inflight" });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.status).toBe("in_flight");
+    expect(body.attempts).toBe(1); // no attempt slot was burned
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(harness.rows[0].attemptCount).toBe(1);
+    expect(harness.rows[0].attemptToken).toBe("active-attempt");
+    expect(harness.rows[0].idempotencyKey).toBe("key-inflight");
   });
 
   it("keeps one identity when a concurrent create loses the unique race", async () => {
