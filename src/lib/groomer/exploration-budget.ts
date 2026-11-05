@@ -65,21 +65,27 @@ function parseIntEnv(raw: string | undefined, min = 1): number | null {
  *
  * The window is the capacity boundary: exploration gets `WINDOW_SHARE` of the
  * declared tokens, converted to bytes at the conservative `BYTES_PER_TOKEN`
- * rate, floored so a tiny configured window still gets a usable budget. The
- * floor is a usability exception: below roughly 3.4k tokens it can exceed the
- * 35% share, but a window that small cannot run the groomer at all. There
- * is no universal byte ceiling on top — a larger declared window simply
- * permits more exploration (dispatch#1558). Runaway work is bounded instead by
- * the derived timeout and by `DISPATCH_GROOMER_MAX_ROUNDS`.
+ * rate. The allowance is that share and never more. A window too small to
+ * cover the share therefore gets a smaller share, so a small model fails
+ * safely before exploration can overflow the provider context
+ * (dispatch#1558). There is no universal byte ceiling on top either — a
+ * larger declared window simply permits more exploration. Runaway work is
+ * bounded instead by the derived timeout and by
+ * `DISPATCH_GROOMER_MAX_ROUNDS`.
  */
 export function deriveFromContextTokens(tokens: number): Omit<ExplorationBudget, "source"> {
-  const usable = Math.floor(tokens * WINDOW_SHARE * BYTES_PER_TOKEN);
-  const maxTotalBytes = Math.max(4_096, usable);
+  // The window's own byte capacity, and the slice of it exploration owns.
+  const windowBytes = Math.floor(tokens * BYTES_PER_TOKEN);
+  const shareBytes = Math.floor(tokens * WINDOW_SHARE * BYTES_PER_TOKEN);
+  // Never more than the reserved share, and never more than the window itself.
+  const maxTotalBytes = Math.min(shareBytes, windowBytes);
   return {
     maxTotalBytes,
     // A quarter of the budget, so no single file can consume the whole thing
-    // and leave nothing for the searches that found it.
-    maxFileBytes: Math.max(2_048, Math.floor(maxTotalBytes / 4)),
+    // and leave nothing for the searches that found it. Never more than the
+    // total budget: a window too small for a 2 KB read gets its whole
+    // allowance as the per-file cap.
+    maxFileBytes: Math.min(maxTotalBytes, Math.max(2_048, Math.floor(maxTotalBytes / 4))),
     // 60s of headroom plus 5s per KB, matching the grooming call's own curve.
     timeoutMs: Math.max(60_000, Math.min(300_000, 60_000 + Math.ceil(maxTotalBytes / 1024) * 5_000)),
   };

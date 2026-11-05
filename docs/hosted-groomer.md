@@ -34,7 +34,7 @@ The feature is disabled by default.
 | `DISPATCH_GROOMER_MAX_SEARCH_RESULTS` | `10` | Maximum code-search results returned to the model per `search_code` call. |
 | `DISPATCH_GROOMER_MAX_DIR_ENTRIES` | `60` | Maximum directory entries returned to the model per `list_directory` call. |
 | `DISPATCH_GROOMER_CONTEXT_MODE` | `medium` | Exploration budget preset: `small`, `medium`, `large`. See below. |
-| `DISPATCH_GROOMER_MODEL_CONTEXT_TOKENS` | unset | The model's real context window in tokens. When set, the exploration budget is derived from it and `DISPATCH_GROOMER_CONTEXT_MODE` is ignored. The derived budget has no fixed byte cap. |
+| `DISPATCH_GROOMER_MODEL_CONTEXT_TOKENS` | unset | The model's real context window in tokens. When set, the exploration budget is derived from it and `DISPATCH_GROOMER_CONTEXT_MODE` is ignored. The derived budget has no fixed byte cap, and it never exceeds the share of the window reserved for exploration. |
 | `DISPATCH_GROOMER_EXPLORE_MAX_BYTES` | from mode | Overrides the exploration byte budget. |
 | `DISPATCH_GROOMER_EXPLORE_MAX_FILE_BYTES` | from mode | Overrides bytes per file returned to the model. Never exceeds the total budget. |
 | `DISPATCH_GROOMER_EXPLORE_TIMEOUT_MS` | from mode | Overrides the wall-clock cap on the exploration loop. |
@@ -78,11 +78,13 @@ byte budget carries the same nudge when it runs out.
 
 The default suits a modest self-hosted model. If your model's window is much
 larger, set `DISPATCH_GROOMER_MODEL_CONTEXT_TOKENS`. The derived budget takes
-35% of the declared window and converts it to bytes at 3.5 bytes per token,
-with a 4 KB floor. There is no universal byte ceiling on the derived budget: a
-131,072-token window derives about 160 KB and a 245,760-token window derives
-about 300 KB. The per-file cap is a quarter of the total budget, so a large
-source file is not truncated while context capacity remains.
+35% of the declared window and converts it to bytes at 3.5 bytes per token.
+The budget never exceeds that 35% share, so a small window gets a small
+budget instead of an allowance the window cannot hold. There is no universal
+byte ceiling on the derived budget. A 131,072-token window derives about
+160 KB, and a 245,760-token window derives about 300 KB. The per-file cap is
+a quarter of the total budget, so a large source file is not truncated while
+context capacity remains.
 
 The model context window is the capacity boundary. Time and rounds are the
 runaway-work boundaries, and they stay bounded. The derived timeout is 60s

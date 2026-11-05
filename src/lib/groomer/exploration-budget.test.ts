@@ -108,8 +108,23 @@ describe("deriveFromContextTokens", () => {
     expect(d.maxTotalBytes).toBeLessThan(100_000 * 3.5 * 0.5);
   });
 
-  it("keeps a floor so a tiny window still gets a usable budget", () => {
-    expect(deriveFromContextTokens(1_024).maxTotalBytes).toBeGreaterThanOrEqual(4_096);
+  it("never lets a derived allowance exceed the window it came from", () => {
+    // A small window must fail safely: exploration can never be allowed more
+    // bytes than the window holds, and never more than the share reserved for
+    // it (dispatch#1558).
+    for (const tokens of [1_024, 2_048, 4_096, 8_192, 131_072, 245_760]) {
+      const d = deriveFromContextTokens(tokens);
+      expect(d.maxTotalBytes).toBeLessThanOrEqual(Math.floor(tokens * 3.5));
+      expect(d.maxTotalBytes).toBeLessThanOrEqual(Math.floor(tokens * 0.35 * 3.5));
+      expect(d.maxFileBytes).toBeLessThanOrEqual(d.maxTotalBytes);
+    }
+  });
+
+  it("gives a tiny window a smaller allowance instead of a floor above its capacity", () => {
+    const d = deriveFromContextTokens(1_024);
+    expect(d.maxTotalBytes).toBe(Math.floor(1_024 * 0.35 * 3.5));
+    expect(d.maxTotalBytes).toBeLessThan(4_096);
+    expect(d.maxFileBytes).toBeLessThanOrEqual(d.maxTotalBytes);
   });
 
   it("scales derived budgets across small, 131k and 245k windows", () => {
