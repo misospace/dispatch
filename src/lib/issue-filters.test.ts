@@ -300,15 +300,33 @@ describe("deferral TTL", () => {
     ) as { OR: Array<Record<string, unknown>> };
 
     expect(deferralClause).toBeDefined();
-    // Either no deferral at all, or one whose last groom is older than the TTL.
+    // Either no deferral at all, an incomplete-investigation retry debt
+    // (#1557 — rides the ordinary cooldown, not the TTL), or one whose last
+    // groom is older than the TTL.
     expect(deferralClause.OR).toEqual([
       { notReadyReason: null },
+      { notReadyReason: { startsWith: "investigation_incomplete:" } },
       { groomedAt: { lt: expect.any(Date) } },
     ]);
 
-    const cutoff = (deferralClause.OR[1].groomedAt as { lt: Date }).lt;
+    const cutoff = (deferralClause.OR[2].groomedAt as { lt: Date }).lt;
     const daysAgo = (Date.now() - cutoff.getTime()) / 86_400_000;
     expect(daysAgo).toBeGreaterThan(13);
     expect(daysAgo).toBeLessThan(15);
+  });
+
+  it("exempts the incomplete-investigation prefix from the deferral TTL but not a model-authored deferral (#1557)", () => {
+    // The deferral TTL exists so a groomer-written deferral sentence is not
+    // irreversible. An incomplete-investigation reason is machine-authored
+    // retry debt the groomer must revisit on the ordinary bounded cooldown,
+    // so it is carved out of the TTL clause by its machine prefix.
+    const where = buildGroomingStateExclusionWhere(24) as {
+      AND: Array<Record<string, unknown>>;
+    };
+    const deferralClause = where.AND.find(
+      (c) => Array.isArray(c.OR) && JSON.stringify(c.OR).includes("notReadyReason"),
+    ) as { OR: Array<{ notReadyReason?: { startsWith?: string } | null }> };
+    const prefixFilter = deferralClause.OR.find((c) => c.notReadyReason?.startsWith);
+    expect(prefixFilter?.notReadyReason?.startsWith).toBe("investigation_incomplete:");
   });
 });

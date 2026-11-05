@@ -210,6 +210,12 @@ describe("buildGroomerSystemPrompt", () => {
       expect(prompt).toContain("do not launder a broken search into a maintainer question");
     });
 
+    it("asks for no comment on an incomplete investigation (dispatch#1557)", () => {
+      const prompt = buildGroomerSystemPrompt(baseParams);
+      expect(prompt).toContain("An investigation_incomplete gap is a question for nobody");
+      expect(prompt).toContain("leave githubComment null for it");
+    });
+
     it("requires the one concrete question and the tools-cannot-answer reason", () => {
       const prompt = buildGroomerSystemPrompt(baseParams);
       expect(prompt).toContain("ONE concrete unanswered question");

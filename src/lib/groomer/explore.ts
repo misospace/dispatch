@@ -457,7 +457,8 @@ export async function exploreRepository(
         if (!result.ok) {
           // Tool names come from the model (an unknown-tool failure names
           // whatever the model asked for), and these facts persist into the
-          // plan's readiness reasons and Issue.needsInfoReason — channels the
+          // plan's readiness reasons and the issue row's groom reason field
+          // (needsInfoReason or, since #1557, notReadyReason) — channels the
           // model-answer sanitizer never sees. Strip control characters and
           // clamp at intake (#1130 discipline, dispatch#1452).
           //

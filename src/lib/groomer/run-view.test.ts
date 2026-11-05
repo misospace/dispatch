@@ -174,7 +174,9 @@ describe("buildGroomingRunView", () => {
 
     const view = buildGroomingRunView(run);
     expect(view.plan.format).toBe("grooming-plan");
-    expect(view.plan.actionability).toBe("needs_info");
+    // #1557: an incomplete investigation is presented as the not-ready
+    // disposition, never as "Needs Info".
+    expect(view.plan.actionability).toBe("backlog");
     expect(view.plan.ready).toBe(false);
     expect(view.plan.gapClass).toBe("investigation_incomplete");
   });
