@@ -40,6 +40,7 @@ import {
   infoGapReadinessReason,
   resolveInfoGap,
   INFO_GAP_KIND_VALUES,
+  INCOMPLETE_INVESTIGATION_ACTIONABILITY,
   INCOMPLETE_INVESTIGATION_REASON_PREFIX,
   type InfoGap,
   type InfoGapResolution,
@@ -1096,24 +1097,36 @@ function nextGroomingActionFor(plan: GroomingPlan): GroomAction | undefined {
  * the exactly-one-status post-condition cannot keep a stale status/ready or a
  * foreign status. An issue carrying an in-flight status (in-progress/in-review)
  * keeps its status labels untouched.
+ *
+ * #1557: the resolved gap class decides the human-facing disposition. An
+ * incomplete investigation is presented as the not-ready backlog disposition
+ * (never `needs_info`) and carries no comment, because the missing input is
+ * more machine investigation, not an answer a human owes.
  */
 export function toGroomerOutput(plan: GroomingPlan, currentLabels: string[]): GroomerOutput {
   const { verdict, mutations } = plan;
   const status = mutations.status;
   const inFlight = inFlightStatus(currentLabels) !== null;
+  // #1557: an incomplete investigation is not a needs-info verdict. It waits
+  // on more machine work, so the output carries the not-ready disposition the
+  // run persists (backlog / mark_not_ready) and no maintainer-facing comment.
+  const incompleteInvestigation = plan.readiness.gapClass === "investigation_incomplete";
   // The derived status is the only status an applied groom leaves: every
   // other status/* label goes, including ones the groomer does not own
   // (the external groom route already strips them all).
   const staleStatuses = inFlight ? [] : currentLabels.filter((label) => label.startsWith("status/") && label !== status);
   const output: GroomerOutput = {
-    actionability: verdict.actionability,
+    actionability: incompleteInvestigation ? INCOMPLETE_INVESTIGATION_ACTIONABILITY : verdict.actionability,
     confidence: verdict.confidence,
     labelsToAdd: inFlight ? [...mutations.labelsToAdd] : [...mutations.labelsToAdd, status],
     labelsToRemove: [...new Set([...mutations.labelsToRemove, ...staleStatuses])],
     lane: { ...verdict.lane },
     summary: verdict.summary,
   };
-  if (mutations.githubComment) output.githubComment = mutations.githubComment;
+  // #1557: a comment on an incomplete investigation would ask a human to do
+  // the investigation Dispatch owes itself, so the run posts none for that
+  // class. A human question keeps its comment — that one is genuinely owed.
+  if (mutations.githubComment && !incompleteInvestigation) output.githubComment = mutations.githubComment;
   if (mutations.proposedTitle) output.proposedTitle = mutations.proposedTitle;
   if (mutations.proposedBody) output.proposedBody = mutations.proposedBody;
   if (verdict.actionability === "needs_info") {

@@ -2495,6 +2495,55 @@ Investigate session handling in auth module.`;
       expect(result!.output.nextGroomingAction).toBe("mark_not_ready");
       expect(result!.output.notReadyReason).toBe("investigation_incomplete: which tenant?");
       expect(result!.output.needsInfoReason).toBeUndefined();
+      expect(result!.output.actionability).toBe("backlog");
+    });
+
+    it("posts no maintainer-facing comment for an incomplete investigation (#1557)", async () => {
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, toolLoopEnabled: true });
+      mocks.exploreRepository.mockResolvedValue({
+        ...mockExploration,
+        toolCalls: [
+          { name: "search_code", arguments: { query: "tenant" }, ok: false, bytes: 0, preview: "search unavailable", truncated: false },
+        ],
+        gaps: {
+          explorationRan: true,
+          toolFailures: ["search_code"],
+          truncatedReads: [],
+          budgetExhausted: false,
+          roundsExhausted: false,
+          aborted: false,
+          unavailable: false,
+        },
+      });
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("needs_info", {
+          verdict: {
+            rationale: "which tenant?",
+            infoGap: {
+              kind: "product_decision",
+              question: "Which tenant scope applies?",
+              whyToolsCannotAnswer: "The repository records no product-scope decision.",
+            },
+          },
+          mutations: { githubComment: "Which tenant reproduces this?" },
+        }),
+      );
+
+      const result = await runHostedGroomer();
+
+      expect(result!.plan!.readiness.gapClass).toBe("investigation_incomplete");
+      // The comment would ask a human to do the investigation Dispatch owes
+      // itself, so the run posts none for that class.
+      expect(mocks.addIssueComment).not.toHaveBeenCalled();
+      // The issue still lands not-ready with the machine-prefixed reason.
+      expect(mocks.prisma.issue.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            nextGroomingAction: "mark_not_ready",
+            notReadyReason: "investigation_incomplete: which tenant?",
+          }),
+        }),
+      );
     });
 
     it("gives the model the evidence catalog built from the snapshot", async () => {
