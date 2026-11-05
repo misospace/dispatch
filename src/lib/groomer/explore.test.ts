@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { RelatedWorkNotFoundError } from "@/lib/github-related-work";
 import { exploreRepository, type ExploreDeps, type ExploreOptions } from "./explore";
+import { resolveExplorationBudget } from "./exploration-budget";
 import { explorationCallsForFreshness, hasNegativeSearchResult } from "./freshness";
 
 const options: ExploreOptions = {
@@ -173,6 +174,44 @@ describe("exploreRepository", () => {
 
     expect(result.warnings).toContain("repository exploration hit its byte budget");
     expect(deps.tools.readFile).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps exploring past the legacy 96 KiB ceiling when the window allows it", async () => {
+    // The budget a 245,760-token window derives (dispatch#1558). The loop has
+    // to be able to spend more than the old fixed ceiling, and it does so
+    // because the window allows it, not because a cap was raised.
+    const budget = resolveExplorationBudget({
+      DISPATCH_GROOMER_MODEL_CONTEXT_TOKENS: "245760",
+    });
+    expect(budget.maxTotalBytes).toBeGreaterThan(98_304);
+
+    const body = "x".repeat(40_000);
+    const fetchImpl = fetchReturning(
+      { content: null, tool_calls: [toolCall("1", "read_file", { path: "a.ts" })] },
+      { content: null, tool_calls: [toolCall("2", "read_file", { path: "b.ts" })] },
+      { content: null, tool_calls: [toolCall("3", "read_file", { path: "c.ts" })] },
+      {
+        content: null,
+        tool_calls: [toolCall("4", "submit_findings", { files: ["a.ts"], ask: "where the bug lives" })],
+      },
+    );
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue(body) }, fetchImpl);
+
+    const result = await exploreRepository(
+      {
+        ...options,
+        maxTotalBytes: budget.maxTotalBytes,
+        maxFileBytes: budget.maxFileBytes,
+        maxRounds: 8,
+      },
+      deps,
+    );
+
+    // Three 40 KB reads spend more than the old 96 KiB ceiling, and the run
+    // still has budget left: exploration continued past the ceiling.
+    expect(result.bytes).toBeGreaterThan(98_304);
+    expect(result.gaps.budgetExhausted).toBe(false);
+    expect(deps.tools.readFile).toHaveBeenCalledTimes(3);
   });
 
   it("records related-work queries and refs from the related-work tools", async () => {
