@@ -2,9 +2,10 @@ import { prisma } from "@/lib/prisma";
 
 /**
  * Parse a comma/newline-delimited list into trimmed, deduped entries
- * (order preserved). Shared by the agent, excluded-label, and repo parsers.
+ * (order preserved). Shared by the agent, excluded-label, repo, and Courier
+ * admission-namespace parsers (#1537).
  */
-function parseDelimitedList(input: string | undefined): string[] {
+export function parseDelimitedList(input: string | undefined): string[] {
   if (!input) return [];
 
   const seen = new Set<string>();
