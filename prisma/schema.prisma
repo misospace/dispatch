@@ -1481,3 +1481,59 @@ model AgentExecution {
   @@index([executionState, lastObservedAt])
   @@index([agentName, lastObservedAt])
 }
+
+// (#1537, parent #1349) Dispatch-owned external contribution request for
+// Courier's HTTP admission API (Courier #708; at v0.1.18 the adhoc source
+// accepts POST /v1/contributions only). The row is persisted BEFORE the first
+// network call so the same idempotency key and canonical request fields
+// survive timeouts, restarts, and lost success responses: a repeat submission
+// with the same key and an identical payload replays the stored state (or
+// retries an uncertain delivery with the ORIGINAL key, bounded), while a
+// changed payload under an existing key is rejected. A deliberate new
+// contribution is a separate request row with its own key.
+//
+// Boundaries: the upstream issue named in `upstreamIssue` is never mutated
+// from here (no claim/label/assign/comment/close), Courier credentials stay
+// server-side (never in this table), and Courier owns fork approval,
+// publication authority, branch identity, and PR creation. `deliveryStatus`
+// records three distinct outcomes — `accepted` (Courier returned an
+// identity), `rejected` (explicit Courier refusal), `uncertain` (timeout /
+// network / malformed response, delivery outcome unknown).
+model ExternalContributionRequest {
+  id                String    @id @default(cuid())
+  // Stable idempotency key sent to Courier — one key is one contribution
+  // identity. Generated server-side when the caller does not supply one.
+  idempotencyKey    String    @unique
+  // Dispatch actor (from authorizeRequest) that created the request.
+  createdBy         String
+  // Canonical AdmissionRequest fields. The Courier call is always rebuilt
+  // from these columns, never from the latest caller body.
+  namespace         String
+  lane              String
+  baseRepo          String
+  baseRef           String
+  workRepo          String
+  goal              String    @db.Text
+  upstreamIssue     String?
+  // sha256 over the canonical request fields; a second submission with the
+  // same key and a different digest is a changed payload → rejected.
+  payloadDigest     String
+  // pending | accepted | rejected | uncertain (see header comment).
+  deliveryStatus    String    @default("pending")
+  // Identity Courier returned (recorded verbatim; identity is NOT proof of
+  // execution or publication).
+  courierRun        String?
+  courierNamespace  String?
+  courierWorkItemId String?
+  // true when Courier answered 200 (resume) vs 201 (creation).
+  resumed           Boolean?
+  courierHttpStatus Int?
+  // Last safe diagnostic (bounded, token-redacted). Never the credential.
+  lastError         String?   @db.Text
+  attemptCount      Int       @default(0)
+  lastAttemptAt     DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@index([createdAt])
+}
