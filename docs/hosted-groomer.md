@@ -84,7 +84,8 @@ budget instead of an allowance the window cannot hold. There is no universal
 byte ceiling on the derived budget. A 131,072-token window derives about
 160 KB, and a 245,760-token window derives about 300 KB. The per-file cap is
 a quarter of the total budget, so a large source file is not truncated while
-context capacity remains.
+context capacity remains. The cap never exceeds the total budget. A window
+whose share is under 2 KB gives one file the whole allowance.
 
 The model context window is the capacity boundary. Time and rounds are the
 runaway-work boundaries, and they stay bounded. The derived timeout is 60s

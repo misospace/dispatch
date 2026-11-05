@@ -82,9 +82,9 @@ export function deriveFromContextTokens(tokens: number): Omit<ExplorationBudget,
   return {
     maxTotalBytes,
     // A quarter of the budget, so no single file can consume the whole thing
-    // and leave nothing for the searches that found it. Never more than the
-    // total budget: a window too small for a 2 KB read gets its whole
-    // allowance as the per-file cap.
+    // and leave nothing for the searches that found it. At least 2 KB, and
+    // never more than the total budget: a window whose share is under 2 KB
+    // gives one file the whole allowance.
     maxFileBytes: Math.min(maxTotalBytes, Math.max(2_048, Math.floor(maxTotalBytes / 4))),
     // 60s of headroom plus 5s per KB, matching the grooming call's own curve.
     timeoutMs: Math.max(60_000, Math.min(300_000, 60_000 + Math.ceil(maxTotalBytes / 1024) * 5_000)),
