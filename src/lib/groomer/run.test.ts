@@ -561,7 +561,10 @@ describe("runHostedGroomer", () => {
     expect(mocks.prisma.issueLane.create).not.toHaveBeenCalled();
     expect(mocks.prisma.agentRun.create).not.toHaveBeenCalled();
     expect(mocks.prisma.auditLog.create).not.toHaveBeenCalled();
-    expect(mocks.releaseLeaseIfUnchanged).toHaveBeenCalledWith({ id: "lease-1" });
+    // Legacy dryRun maps to observe mode (#1542): queue/lease state is
+    // read-only — no lease mint and therefore nothing to release.
+    expect(mocks.upsertLease).not.toHaveBeenCalled();
+    expect(mocks.releaseLeaseIfUnchanged).not.toHaveBeenCalled();
   });
 
   it("persists related-work queries and refs in the explored context summary", async () => {
@@ -4780,6 +4783,34 @@ Investigate session handling in auth module.`;
       expectNoMutations();
       expect(result).toMatchObject({ mode: "observe", observeDisposition: "would_refuse" });
       expect(completedRun()).toMatchObject({ status: "dry_run_completed", observeDisposition: "would_refuse" });
+    });
+
+    it("never acquires or releases the hosted-groomer lease (#1542)", async () => {
+      const result = await runHostedGroomer();
+
+      expectNoMutations();
+      expect(result).toMatchObject({ mode: "observe", observeDisposition: "would_act" });
+      expect(mocks.upsertLease).not.toHaveBeenCalled();
+      expect(mocks.releaseLeaseIfUnchanged).not.toHaveBeenCalled();
+    });
+
+    it("respects a pre-existing conflicting lease with would_refuse and no lease writes (#1542)", async () => {
+      mocks.findActiveLeasesForIssue.mockResolvedValue([{ agentName: "other-agent" }]);
+
+      const result = await runHostedGroomer();
+
+      expect(result).toBeNull();
+      expectNoMutations();
+      expect(mocks.callGroomerLLM).not.toHaveBeenCalled();
+      // The lease is inspected (findActiveLeases) but never created, renewed
+      // or released: queue state is untouched in observe mode (#1542).
+      expect(mocks.upsertLease).not.toHaveBeenCalled();
+      expect(mocks.releaseLeaseIfUnchanged).not.toHaveBeenCalled();
+      expect(completedRun()).toMatchObject({
+        status: "dry_run_completed",
+        stage: "lease_acquisition",
+        observeDisposition: "would_refuse",
+      });
     });
 
     it("records would_refuse when apply preconditions find the evidence stale", async () => {

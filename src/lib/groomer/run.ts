@@ -313,12 +313,27 @@ async function executeGroomerRun(
     const activeLeases = await deps.findActiveLeases(candidate.id);
     const hasOtherLease = activeLeases.some((active: { agentName?: string }) => active.agentName !== "hosted-groomer");
     if (hasOtherLease && !options.force) {
-      await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
-        status: "deferred", stage, errorMessage: null, retryable: true,
-      });
+      if (observe) {
+        // Observe (#1542): another actor owns the issue — the identical auto
+        // assessment would defer here, i.e. decline to act. Record the
+        // refusal on the durable receipt and stop, still without touching
+        // lease or queue state.
+        await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
+          status: "dry_run_completed", stage, observeDisposition: "would_refuse",
+        });
+      } else {
+        await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
+          status: "deferred", stage, errorMessage: null, retryable: true,
+        });
+      }
       return null;
     }
-    {
+    if (!observe) {
+      // Observe (#1542) is read-only over Dispatch queue state: `upsertLease`
+      // mints or renews the hosted-groomer lease row, so lease acquisition
+      // is auto-only. In observe `lease` stays undefined, so the fenced
+      // release in the `finally` below cannot fire either; the assessment
+      // itself never needs the lease.
       const leaseReceipt = await deps.upsertLease({
         agentName: "hosted-groomer",
         issueId: candidate.id,

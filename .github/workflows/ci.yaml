@@ -143,6 +143,25 @@ jobs:
           npx prisma db execute --file scripts/revert-blocked-reconciliation-migration.sql
           npm run db:deploy
           npx prisma db execute --file scripts/verify-blocked-reconciliation-migration.sql
+      # The #1542 observe-mode migration against a COPY OF THE PRODUCTION
+      # SCHEMA: a database that already carries the production schema and
+      # legacy GroomingRun rows, rewound to the pre-migration state, so the
+      # migration is exercised the way a production instance would run it —
+      # with real rows in the table, not an empty database. The verification
+      # proves both nullable columns and the rollup index landed, that the
+      # legacy rows survived with their values intact (still readable through
+      # the dryRun boolean), and that mode back-fills nothing.
+      - name: Create the production copy for the observe-mode migration
+        run: echo 'CREATE DATABASE dispatch_production_copy_groomer;' | npx prisma db execute --stdin
+      - name: Verify the observe-mode migration on a copy of the production schema
+        env:
+          DATABASE_URL: "postgresql://test:test@localhost:5432/dispatch_production_copy_groomer"
+        run: |
+          npm run db:deploy
+          npx prisma db execute --file scripts/seed-production-copy-grooming-runs.sql
+          npx prisma db execute --file scripts/revert-add-groomer-observe-mode-migration.sql
+          npm run db:deploy
+          npx prisma db execute --file scripts/verify-add-groomer-observe-mode-migration.sql
 
   database-integration:
     name: Database integration
