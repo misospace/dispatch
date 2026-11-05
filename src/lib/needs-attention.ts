@@ -11,7 +11,10 @@
  * transient retry states (WAITING_EXTERNAL, PARKED infra_failure or
  * no_progress — on any type, including conflict/rebase, #1546) — those
  * already have bounded automated recovery and must not consume operator
- * attention. Resolution is automatic by construction: when the underlying
+ * attention. Fail-closed parks that only an operator can clear stay visible:
+ * the PARKED `invalid_wait` disposition (#1250) surfaces on every type
+ * (#1548) — the disposition, not the type, decides visibility.
+ * Resolution is automatic by construction: when the underlying
  * record moves (e.g. fresh evidence requeues a BLOCKED human-decision item,
  * which also clears `decisionDetail`), the item simply stops being derived.
  */
@@ -20,6 +23,7 @@ export type NeedsAttentionCategory =
   | "human_decision"
   | "semantic_conflict"
   | "security_failure"
+  | "invalid_wait"
   | "review_ready"
   | "ownership_parked"
   | "no_pr_conclusion";
@@ -197,6 +201,27 @@ function derivePrFixItem(item: PrFixAttentionRow): NeedsAttentionItem | null {
       urgency: 2,
     };
   }
+  if (item.status === "PARKED" && item.outcome === "invalid_wait") {
+    // Fail-closed invalid external wait (#1250): an external wait without a
+    // verifiable dependency parked the row and an operator requeue is
+    // required (it sits in FAIL_CLOSED_PARK_OUTCOMES next to
+    // security_failure, src/lib/pr-fix-recovery.ts). The disposition, not
+    // the type, decides visibility (#1548), so this surfaces on every type —
+    // it outranks the type-gated conflict classification below.
+    return {
+      id: `invalid_wait:${item.id}`,
+      category: "invalid_wait",
+      title: item.title ?? `${item.repo}#${item.pr}`,
+      repo: item.repo,
+      issueNumber: item.issue,
+      prNumber: item.pr,
+      url: prFixUrl(item),
+      reason: "fail-closed park: external wait without a verifiable dependency; operator requeue required",
+      decision: null,
+      ageStartedAt: toIso(item.queuedAt),
+      urgency: 2,
+    };
+  }
   if (conflictType && !isAutomatedDisposition(item)) {
     // Semantic rebase/conflict the worker correctly refused (#1327 lane
     // shape): mechanical automation must not churn on it, so it waits here
@@ -318,6 +343,7 @@ export const NEEDS_ATTENTION_CATEGORIES: Array<{
   { category: "human_decision", label: "Human decision", urgency: 1 },
   { category: "semantic_conflict", label: "Semantic conflict", urgency: 2 },
   { category: "security_failure", label: "Security failure", urgency: 2 },
+  { category: "invalid_wait", label: "Invalid external wait", urgency: 2 },
   { category: "ownership_parked", label: "Ownership parked", urgency: 2 },
   { category: "review_ready", label: "Review ready", urgency: 3 },
   { category: "no_pr_conclusion", label: "No-PR conclusion", urgency: 3 },

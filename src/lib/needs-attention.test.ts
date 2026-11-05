@@ -131,13 +131,34 @@ describe("computeNeedsAttention", () => {
     expect(items).toEqual([]);
   });
 
-  it("keeps a fail-closed invalid_wait conflict park visible (#1546)", () => {
+  it("classifies a fail-closed invalid_wait park by its disposition, not its type (#1548)", () => {
     // invalid_wait is not a transient automated state: an operator requeue is
-    // required (#1250), so a conflict-type row parked that way stays visible.
+    // required (#1250). The disposition decides visibility (#1548), so even a
+    // conflict-typed row parked that way surfaces under the invalid_wait
+    // category with the honest operator-requeue reason, not as a semantic
+    // conflict.
     const { items } = compute({
       prFixItems: [prFix({ status: "PARKED", type: "REBASE", outcome: "invalid_wait", decisionDetail: null })],
     });
-    expect(items.map((i) => i.category)).toEqual(["semantic_conflict"]);
+    expect(items.map((i) => i.category)).toEqual(["invalid_wait"]);
+    expect(items[0].id).toBe("invalid_wait:pfix1");
+    expect(items[0].urgency).toBe(2);
+    expect(items[0].reason).toContain("operator requeue required");
+  });
+
+  it("surfaces a fail-closed invalid_wait park on every type (#1548)", () => {
+    // The park waits on the same operator requeue regardless of the row's
+    // type, so CI_FAILURE / OTHER / REVIEW_FEEDBACK rows parked invalid_wait
+    // are no longer invisible.
+    const { items } = compute({
+      prFixItems: (["MERGE_CONFLICT", "CI_FAILURE", "REVIEW_FEEDBACK", "OTHER", "REBASE"] as const).map((type, i) =>
+        prFix({ id: `iw${i}`, type, status: "PARKED", outcome: "invalid_wait", decisionDetail: null }),
+      ),
+    });
+    expect(items.map((i) => i.category)).toEqual(["invalid_wait", "invalid_wait", "invalid_wait", "invalid_wait", "invalid_wait"]);
+    for (const item of items) {
+      expect(item.reason).toBe("fail-closed park: external wait without a verifiable dependency; operator requeue required");
+    }
   });
 
   it("classifies a conflict-typed security_failure park by its outcome, not its type", () => {

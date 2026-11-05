@@ -22,6 +22,7 @@ age, oldest first.
 | Human decision | `PrFixQueueItem` `BLOCKED` with outcome `human_decision` | A worker escalated a decision. The item shows the question, the options, and the evidence. |
 | Semantic conflict | `PrFixQueueItem` with type `MERGE_CONFLICT` or `REBASE` whose state names a human disposition: a `BLOCKED` hold, or a `PARKED` row whose outcome is not a transient automated state | Automation refused a semantic rebase or conflict and waits for a call. The type is the subject, not the disposition. |
 | Security failure | `PrFixQueueItem` `PARKED` with outcome `security_failure` | A durable security failure. Only a person can act. |
+| Invalid external wait | `PrFixQueueItem` `PARKED` with outcome `invalid_wait`, on any type | An external wait without a verifiable dependency parked the item fail-closed (#1250). The disposition, not the type, decides visibility (#1548): an operator requeue is required. |
 | Ownership parked | `OwnershipReleaseIntent` `pending` with `parkedAt` set | An ownership release exhausted its bounded forge retries (#1254 §8.7) and parked. |
 | Review ready | `AgentExecution` `AWAITING_REVIEW`, not ended | An agent finished work and the PR awaits review. |
 | No-PR conclusion | `NoPrConclusion` rows | An agent concluded that no changes are needed. Clear the park or edit the issue to resume. |
@@ -35,8 +36,9 @@ type, including `MERGE_CONFLICT` and `REBASE`. A `PARKED` row without an
 outcome carries the implicit `no_progress` park (#1218) and is excluded the
 same way. A conflict or rebase `type` is the subject of the work, not its
 disposition: it does not surface a row whose outcome names a transient
-automated state (#1546). A parked rebase with outcome `invalid_wait` stays
-visible, because an operator requeue is required (#1250). These excluded
+automated state (#1546). A parked row with outcome `invalid_wait` stays
+visible on every type, in its own group, because an operator requeue is
+required (#1250, #1548). These excluded
 states have bounded automated recovery, so they must not take operator
 attention.
 
