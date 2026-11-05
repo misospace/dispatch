@@ -2231,7 +2231,24 @@ Investigate session handling in auth module.`;
       );
       const result = await runHostedGroomer();
       expect(result!.appliedMutations?.outcome).toBe("applied");
-      expect(lastIssueUpdateData().needsInfoReason).toBe("investigation_incomplete: which tenant?");
+      // #1557: an incomplete investigation is mark_not_ready, not
+      // mark_needs_info — it persists a machine-prefixed notReadyReason and
+      // supersedes the prior human question's needsInfoReason, so no stale
+      // needs-info text is left behind.
+      expect(lastIssueUpdateData().needsInfoReason).toBeNull();
+      expect(lastIssueUpdateData().notReadyReason).toBe("investigation_incomplete: which tenant?");
+      expect(lastIssueUpdateData().nextGroomingAction).toBe("mark_not_ready");
+
+      // A later re-groom whose investigation completes and promotes to ready
+      // clears the incomplete-investigation state with the rest of the
+      // not-ready reasons.
+      mocks.prisma.issue.update.mockClear();
+      mocks.callGroomerLLM.mockResolvedValue(planDraft());
+      const promoted = await runHostedGroomer();
+      expect(promoted!.appliedMutations?.outcome).toBe("applied");
+      expect(lastIssueUpdateData().notReadyReason).toBeNull();
+      expect(lastIssueUpdateData().needsInfoReason).toBeNull();
+      expect(lastIssueUpdateData().nextGroomingAction).toBe("promote_to_ready");
     });
 
     it("a re-groom that changes nothing is still replayed: no duplicate comment, no duplicate label write", async () => {
@@ -2472,9 +2489,12 @@ Investigate session handling in auth module.`;
       const result = await runHostedGroomer();
 
       // The declared human question is outranked by the run's own failure:
-      // the issue keeps retrying instead of parking on an unasked question.
+      // the issue keeps retrying instead of parking on an unasked question
+      // (#1557: as mark_not_ready, never as Needs Info).
       expect(result!.plan!.readiness.gapClass).toBe("investigation_incomplete");
-      expect(result!.output.needsInfoReason).toBe("investigation_incomplete: which tenant?");
+      expect(result!.output.nextGroomingAction).toBe("mark_not_ready");
+      expect(result!.output.notReadyReason).toBe("investigation_incomplete: which tenant?");
+      expect(result!.output.needsInfoReason).toBeUndefined();
     });
 
     it("gives the model the evidence catalog built from the snapshot", async () => {

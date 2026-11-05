@@ -1278,8 +1278,9 @@ async function executeGroomerRun(
     if (output.summary) issueData.groomingSummary = output.summary;
     // #1453: an applied verdict is the issue's only current grooming
     // explanation. Each verdict owns exactly one persisted reason field
-    // (needs_info → needsInfoReason, blocked → blockedReason, backlog →
-    // notReadyReason). The owned field is replaced only when this verdict
+    // (needs_info/human_question → needsInfoReason, needs_info with an
+    // incomplete investigation → notReadyReason via mark_not_ready (#1557),
+    // blocked → blockedReason, backlog → notReadyReason). The owned field is replaced only when this verdict
     // carries text — a verdict never erases its own current reason without
     // a replacement — and every reason field owned by a different verdict
     // is superseded and cleared, so a promote_to_ready (or any verdict

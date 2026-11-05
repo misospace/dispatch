@@ -34,6 +34,16 @@ export type InfoGapKind = (typeof INFO_GAP_KIND_VALUES)[number];
 export const INFO_GAP_RESOLUTION_VALUES = ["human_question", "investigation_incomplete"] as const;
 export type InfoGapResolution = (typeof INFO_GAP_RESOLUTION_VALUES)[number];
 
+/**
+ * The machine prefix every persisted incomplete-investigation reason carries
+ * (#1557): the groomer writes `investigation_incomplete: …` onto
+ * `Issue.notReadyReason`, and the grooming-state exclusion reads the same
+ * prefix so the class re-grooms on the ordinary 24h cooldown instead of the
+ * model-authored deferral TTL — an unfinished investigation is Dispatch's own
+ * retry debt, not a deferral a maintainer made.
+ */
+export const INCOMPLETE_INVESTIGATION_REASON_PREFIX = "investigation_incomplete:";
+
 /** What the model declares in `verdict.infoGap` for a needs_info plan. */
 export interface InfoGap {
   kind: InfoGapKind;
