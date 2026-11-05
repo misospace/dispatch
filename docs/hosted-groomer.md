@@ -109,11 +109,11 @@ Optional body:
 
 ## Observe mode (#1542)
 
-`observe` executes the same read/evidence/freshness path as write-mode planning — the same selector, evidence snapshot, model call, plan validation and read-only apply preconditions — but performs no GitHub or queue mutation. A positive decision is durably recorded on the run as `observeDisposition` (not merely a generic dry run):
+`observe` executes the same read/evidence/freshness path as write-mode planning — the same selector, evidence snapshot, model call, plan validation and read-only apply preconditions — but performs no GitHub or queue mutation. That includes the per-issue lease: observe reads active leases and declines (`would_refuse`, run recorded `dry_run_completed`) when another actor owns the issue, but never creates, renews or releases a lease — lease state stays untouched, unlike an auto run, which acquires and releases the fenced hosted-groomer lease. A positive decision is durably recorded on the run as `observeDisposition` (not merely a generic dry run):
 
 - `would_act` — the plan carried at least one mutation auto would have written (labels, comment, close, children, title/body).
 - `would_noop` — the assessment decided but nothing external would have changed, including a plan whose application key was already applied (auto would have replayed, writing nothing new).
-- `would_refuse` — the pipeline would have declined to act: in-flight status, stale or unverifiable evidence, or a held reply with no other mutation.
+- `would_refuse` — the pipeline would have declined to act: in-flight status, stale or unverifiable evidence, a held reply with no other mutation, or another actor holding the issue lease.
 - `assessment_unavailable` — no decision exists: the evidence snapshot could not capture the live issue, or the model stage failed.
 
 The comment decision in a disposition is the same one the write path makes (`resolveCommentGate`): a comment for this application already on GitHub replays to `would_noop`, a held reply — from the reply gate or a prior pending reply — is `would_refuse`, and a groomer comment inside `DISPATCH_GROOMER_COMMENT_COOLDOWN_HOURS` skips the comment, so a comment-only plan inside the cooldown is `would_noop`, not `would_act`. `force` bypasses the cooldown in both modes.
