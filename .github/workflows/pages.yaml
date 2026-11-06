@@ -25,10 +25,28 @@ jobs:
           node-version: 26
           cache: npm
           cache-dependency-path: site/package-lock.json
+      # The site tree carried no audit gate of its own: the install below
+      # passes --no-audit and the app-level audit gate only reads the root
+      # lockfile, so a vulnerable site dependency could reach the published
+      # Pages site unnoticed (#1566). The same command the Security Audit
+      # workflow runs against site/ runs here, so this pipeline refuses to
+      # build a tree with a known high-severity advisory. It is kept
+      # separate from that workflow on purpose: this one is scoped to
+      # site/** paths, so it also covers pull requests that target a branch
+      # other than main, which the Security Audit workflow does not run for.
+      - name: npm audit (site/ dependency tree)
+        run: npm audit --include=dev --audit-level=high --fetch-retries=5 --fetch-timeout=120000 --fetch-retry-mintimeout=20000 --fetch-retry-maxtimeout=120000
+        working-directory: site
       - name: Install and production-build site/
         run: npm ci --no-audit --no-fund && npm run build
         working-directory: site
   build:
+    # The publish depends on the validation: without this, a red audit (or a
+    # broken site install) would only turn the workflow red while the build
+    # and the publish still went out with the previously deployed artifact —
+    # which is exactly the path a vulnerable site dependency would take
+    # (#1566).
+    needs: validate
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
