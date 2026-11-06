@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { errorResponse } from "@/lib/api-errors";
+import { errorResponse, readJsonObjectBody } from "@/lib/api-errors";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { ciParkPrFixItem, parseCIParkInput } from "@/lib/pr-fix-ci-park";
 import { normalizeQueueRepo } from "@/lib/pr-fix-queue";
@@ -31,14 +31,10 @@ export async function POST(request: Request) {
   const limited = enforceRateLimit(`pr-fix-cipark:${auth.throttleKey}`, RATE_LIMIT);
   if (limited) return limited;
 
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
-    return errorResponse("Invalid JSON body", 400);
-  }
+  const parsed = await readJsonObjectBody(request);
+  if ("error" in parsed) return parsed.error;
 
-  const input = parseCIParkInput(body);
+  const input = parseCIParkInput(parsed.body);
   if ("error" in input) return errorResponse(input.error, 400);
 
   // The audit actor falls back to the agent the notice acts FOR: a

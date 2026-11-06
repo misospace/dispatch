@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { errorResponse } from "@/lib/api-errors";
+import { errorResponse, readJsonObjectBody } from "@/lib/api-errors";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { enqueuePrFixItem, parseEnqueuePrFixInput } from "@/lib/pr-fix-queue";
 import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
@@ -19,14 +19,10 @@ export async function POST(request: Request) {
   const auditActor = getAuthorizedActor(auth, request);
 
   try {
-    let body: unknown;
-    try {
-      body = await request.json();
-    } catch {
-      return errorResponse("Invalid JSON body", 400);
-    }
+    const parsed = await readJsonObjectBody(request);
+    if ("error" in parsed) return parsed.error;
 
-    const input = parseEnqueuePrFixInput(body);
+    const input = parseEnqueuePrFixInput(parsed.body);
     if ("error" in input) return errorResponse(input.error, 400);
 
     const item = await enqueuePrFixItem(asPrFixQueueClient(prisma), input);

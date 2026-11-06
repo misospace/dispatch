@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { errorResponse } from "@/lib/api-errors";
+import { errorResponse, readJsonObjectBody } from "@/lib/api-errors";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { ackPrFixHandout, parseAckPrFixHandoutInput } from "@/lib/pr-fix-queue";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
@@ -61,14 +61,10 @@ export async function POST(request: Request) {
   const limited = enforceRateLimit(`pr-fix-ack:${auth.throttleKey}`, RATE_LIMIT);
   if (limited) return limited;
 
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
-    return errorResponse("Invalid JSON body", 400);
-  }
+  const parsed = await readJsonObjectBody(request);
+  if ("error" in parsed) return parsed.error;
 
-  const input = parseAckPrFixHandoutInput(body);
+  const input = parseAckPrFixHandoutInput(parsed.body);
   if ("error" in input) return errorResponse(input.error, 400);
 
   // Identity scope (#1207 review): a worker-tier bearer must be bound to the

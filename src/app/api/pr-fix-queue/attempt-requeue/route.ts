@@ -19,7 +19,7 @@
 // connector's credential, and the agent it names is bound by the issued
 // receipt the transition validates.
 import { NextResponse } from "next/server";
-import { errorResponse } from "@/lib/api-errors";
+import { errorResponse, readJsonObjectBody } from "@/lib/api-errors";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { attemptRequeuePrFixItem, parseAttemptRequeueInput } from "@/lib/issue-requeue";
 import { normalizeQueueRepo } from "@/lib/pr-fix-queue";
@@ -47,14 +47,10 @@ export async function POST(request: Request) {
   const limited = enforceRateLimit(`pr-fix-attempt-requeue:${auth.throttleKey}`, RATE_LIMIT);
   if (limited) return limited;
 
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
-    return errorResponse("Invalid JSON body", 400);
-  }
+  const parsed = await readJsonObjectBody(request);
+  if ("error" in parsed) return parsed.error;
 
-  const input = parseAttemptRequeueInput(body);
+  const input = parseAttemptRequeueInput(parsed.body);
   if ("error" in input) return errorResponse(input.error, 400);
 
   // The audit actor falls back to the agent the requeue acts FOR (see the
