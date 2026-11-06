@@ -1,10 +1,8 @@
 import { NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
-import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { processPrFollowupEvents, extractLinkedIssue, PrFollowupEvent } from "@/lib/pr-followup-ingestion";
-import { enforceRateLimit } from "@/lib/rate-limit";
-import { getSignatureVerificationMode, verifyWebhookSignature } from "@/lib/webhook-signature";
+import { authenticateWebhookDelivery } from "@/lib/webhook-signature";
 
 /**
  * GitHub Webhook Handler for PR Follow-up Events
@@ -194,48 +192,12 @@ export async function POST(request: Request) {
     const rawBody = await request.arrayBuffer();
     const payload = Buffer.from(rawBody);
 
-    // Webhook signature verification: fail-closed by default.
-    // If WEBHOOK_SECRET is set, always verify. If not set, only skip when
-    // WEBHOOK_GATEWAY_MODE=true (explicit opt-out for gateway deployments).
-    //
-    // When WEBHOOK_SECRET is configured, a valid HMAC signature is treated as
-    // sufficient authentication for the webhook (matches GitHub's delivery
-    // shape, which carries no Authorization header). authorizeRequest is then
-    // skipped so direct GitHub deliveries work in oidc/legacy/basic auth modes.
-    // Invalid signatures are still rejected with 401.
-    const sigMode = getSignatureVerificationMode();
-    if (sigMode === "reject") {
-      return errorResponse(
-        "Webhook signature verification is not configured. Set WEBHOOK_SECRET or enable WEBHOOK_GATEWAY_MODE.",
-        503,
-      );
-    }
-    if (sigMode === "verify") {
-      const webhookSecret = process.env.WEBHOOK_SECRET!;
-      const signature = request.headers.get("x-hub-signature-256");
-      if (!signature) {
-        return errorResponse("Missing x-hub-signature-256 header", 401);
-      }
-      if (!verifyWebhookSignature(webhookSecret, payload, signature)) {
-        return errorResponse("Invalid webhook signature", 401);
-      }
-    }
-
-    // Authenticate the request (Bearer token, Basic Auth, or OIDC session).
-    // When sigMode === "verify" the HMAC check above is the authentication
-    // gate, so we skip authorizeRequest to let signature-only GitHub deliveries
-    // through. In all other modes we still require the normal auth layer.
-    let actor = "webhook";
-    if (sigMode !== "verify") {
-      const auth = await authorizeRequest(request);
-      if (!auth.authorized) {
-        return authErrorResponse(auth);
-      }
-      actor = auth.throttleKey;
-    }
-
-    const limited = enforceRateLimit(`pr-followup-webhook:${actor}`, { limit: 30, windowMs: 10_000 });
-    if (limited) return limited;
+    // Webhook authentication: mode selection, HMAC verification, the
+    // authorizeRequest fallback, actor resolution, and the rate-limit bucket
+    // are owned by the shared helper so this route and the issues route
+    // cannot drift apart.
+    const deliveryAuth = await authenticateWebhookDelivery(request, payload, "pr-followup-webhook");
+    if (!deliveryAuth.authenticated) return deliveryAuth.response;
 
     // Parse JSON payload from the already-read buffer
     let jsonPayload: unknown;
