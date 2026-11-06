@@ -10,7 +10,8 @@ import {
 } from "@/lib/agent-task";
 import { isBacklogLane, prFixLaneForRequest } from "@/lib/lane-config";
 import { fetchAgentQueueData } from "@/lib/agent-queue-fetch";
-import { agentAlreadyHanded, agentHandoutToken, createLinkedPrFixItem, enforcePrFixHandoutLaneExclusivity, handoutReceipt, hasInFlightRebaseHandout, isRebaseLaneAgent, newHandoutToken, normalizeQueueRepo, withHandoutLaneExclusivityFence, withRebaseLaneAdmission, type PrFixQueueClient } from "@/lib/pr-fix-queue";
+import { agentAlreadyHanded, agentHandoutToken, backfillPrFixClaimant, createLinkedPrFixItem, enforcePrFixHandoutLaneExclusivity, evaluatePrFixHandoutOwnership, handoutReceipt, hasInFlightRebaseHandout, isRebaseLaneAgent, linkedIssueEscalationClassified, newHandoutToken, normalizeQueueRepo, prFixOwnershipMode, withHandoutLaneExclusivityFence, withRebaseLaneAdmission, type PrFixQueueClient } from "@/lib/pr-fix-queue";
+import { prFixOwnershipEvidence } from "@/lib/pr-fix-ownership";
 import { fetchPullRequestLabels, fetchPullRequestHeadSha } from "@/lib/github";
 import { NEEDS_HUMAN_LABEL } from "@/lib/pr-fix-surfacing";
 import { CONFLICTING_STATUSES } from "@/lib/linked-pr-health";
@@ -52,6 +53,16 @@ type PrFixCandidate = {
    * `fixType` can be rewritten mid-attempt by a re-observation.
    */
   attemptType?: PrFixType | null;
+  /** The PR author login (#1569: fallback claimant when no issue owns it). */
+  author?: string | null;
+  /**
+   * #1569: the recorded ORIGINAL CLAIMANT and its provenance (null/absent =
+   * unresolved: missing, ambiguous, or a legacy row). The ownership gate
+   * backfills a resolvable value before deciding; an unresolved row is never
+   * auto-handed to a declared-lane consumer.
+   */
+  claimant?: string | null;
+  claimantSource?: string | null;
 };
 
 /**
@@ -92,10 +103,16 @@ type PrFixCandidate = {
    agentName: string,
    excluded: (repo: string, pr: number, generation: number) => boolean,
    client: PrFixQueueClient = asPrFixQueueClient(prisma),
- ): Promise<{ generation: number; reason: string; feedback: string[]; lane: string | null; attemptType: PrFixType | undefined } | null> {
+ ): Promise<{ generation: number; reason: string; feedback: string[]; lane: string | null; attemptType: PrFixType | undefined; claimant: string | null; claimantSource: string | null; author: string | null } | null> {
    let dispatchReason = candidate.reason;
    let dispatchFeedback = candidate.feedback;
    let dispatchLane = candidate.lane ?? null;
+   // #1569: ORIGINAL CLAIMANT pair + PR author, tracked from the confirming
+   // snapshot so the ownership re-check and shipped evidence match the row
+   // this hand-out is issued against.
+   let dispatchClaimant: string | null = candidate.claimant ?? null;
+   let dispatchClaimantSource: string | null = candidate.claimantSource ?? null;
+   let dispatchAuthor: string | null = candidate.author ?? null;
    // #1327 review: the DISPATCHED lane as persisted — `attemptType` (stamped
    // on the first hand-out of the generation and immutable after), falling
    // back to the row's `type` only for rows stamped before the column
@@ -168,8 +185,14 @@ type PrFixCandidate = {
            feedback: true,
            generation: true,
            status: true,
-           lane: true,
-           agentHandouts: true,
+            lane: true,
+            // #1569: the ORIGINAL CLAIMANT pair rides the SAME confirming
+            // snapshot as the payload, so the hand-out ships evidence that
+            // matches the exact row state it was issued against.
+            claimant: true,
+            claimantSource: true,
+            author: true,
+            agentHandouts: true,
            // #1327 review: read back the persisted dispatched lane so the
            // task ships the lane settlement will bound, not the candidate's
            // mutable type.
@@ -192,6 +215,10 @@ type PrFixCandidate = {
        dispatchReason = fresh.reason;
        dispatchFeedback = fresh.feedback ?? [];
        dispatchLane = fresh.lane ?? null;
+       // #1569: ownership pair + PR author from the SAME confirming snapshot.
+       dispatchClaimant = fresh.claimant ?? null;
+       dispatchClaimantSource = fresh.claimantSource ?? null;
+       dispatchAuthor = fresh.author ?? null;
        dispatchAttemptType =
          fresh.attemptType != null || fresh.type != null
            ? normalizePrFixType(String(fresh.attemptType ?? fresh.type))
@@ -240,7 +267,7 @@ type PrFixCandidate = {
    if (confirmedGeneration !== null && newlyDispatchedGeneration === confirmedGeneration) {
      await stampAttemptEvidenceWatermark(candidate.id, confirmedGeneration, dispatchEvidenceSequence, client);
    }
-   return { generation: confirmedGeneration, reason: dispatchReason, feedback: dispatchFeedback, lane: dispatchLane, attemptType: dispatchAttemptType };
+    return { generation: confirmedGeneration, reason: dispatchReason, feedback: dispatchFeedback, lane: dispatchLane, attemptType: dispatchAttemptType, claimant: dispatchClaimant, claimantSource: dispatchClaimantSource, author: dispatchAuthor };
  }
 
 /**
@@ -501,6 +528,43 @@ export async function GET(
           return null;
         }
 
+        // #1569: cheap early OWNERSHIP refusal from the queue-read snapshot,
+        // BEFORE the dispatch stamp — a row that is already known-unresolved
+        // must not be stamped, and gets one lazy re-resolution attempt from
+        // the authoritative records (live Lease → single agent label → single
+        // owner label → PR author; conditional backfill pinned on
+        // `claimant IS NULL`) so legacy rows self-heal on first contact. The
+        // authoritative re-decision against the CONFIRMED row still runs in
+        // `issueHandout`; this arm exists so a deterministic refusal never
+        // disturbs the row at all. Skipped entirely in "off" mode.
+        if (prFixOwnershipMode() !== "off") {
+          const snapshotOwnership = {
+            id: candidate.id,
+            repo: candidate.repo,
+            pr: candidate.pr,
+            generation: candidate.generation,
+            lane: candidate.lane ?? null,
+            issue: candidate.issue ?? null,
+            author: candidate.author ?? null,
+            claimant: candidate.claimant ?? null,
+            claimantSource: candidate.claimantSource ?? null,
+          };
+          if (snapshotOwnership.claimant === null) {
+            const backfilled = await backfillPrFixClaimant(asPrFixQueueClient(prisma), {
+              id: candidate.id,
+              repo: candidate.repo,
+              issue: snapshotOwnership.issue,
+              author: snapshotOwnership.author,
+              claimant: null,
+            });
+            if (backfilled.claimant !== null) {
+              snapshotOwnership.claimant = backfilled.claimant;
+              snapshotOwnership.claimantSource = backfilled.claimantSource;
+            }
+          }
+          if (evaluatePrFixHandoutOwnership(snapshotOwnership).decision === "refuse") return null;
+        }
+
         // #1503: escalation-lane exclusivity at hand-out — defense in depth
         // behind the read filter. Work whose linked issue is authoritatively
         // escalation-classified, or whose stored lane is already ESCALATED,
@@ -564,6 +628,49 @@ export async function GET(
          if (!confirmed) return null;
 
          if (excluded(candidate.repo, candidate.pr, confirmed.generation)) return null;
+         // #1569: the OWNERSHIP arm of the hand-out gate, decided against the
+         // CONFIRMED live row (not the queue-read snapshot) inside the same
+         // issuance boundary the fence/admission transaction provides — a
+         // concurrent ownership change is reflected honestly, and the
+         // shipped evidence can never name a claimant the live row lacks.
+         // A row whose ORIGINAL CLAIMANT is unresolved (legacy, missing, or
+         // ambiguous) first gets one lazy re-resolution attempt from the
+         // authoritative records (live Lease → single agent label → single
+         // owner label → PR author, backfilled conditionally); if ownership
+         // still cannot be established the hand-out is REFUSED — missing or
+         // ambiguous ownership never authorizes an automatic hand-out. The
+         // early arm above this candidate (before the pool/capability/
+         // concurrency gates) may already have read the claimant facts and
+         // performed one pinned, idempotent `claimant IS NULL` backfill, so a
+         // refused-by-gate poll can leave a resolved claimant recorded; it
+         // never leaves a dispatch stamp, a watermark change, or a hand-out.
+         let ownershipClaimant: string | null = confirmed.claimant;
+         let ownershipClaimantSource: string | null = confirmed.claimantSource;
+         if (ownershipClaimant === null && prFixOwnershipMode() !== "off") {
+           const backfilled = await backfillPrFixClaimant(client, {
+             id: candidate.id,
+             repo: candidate.repo,
+             issue: candidate.issue ?? null,
+             author: confirmed.author,
+             claimant: null,
+           });
+           if (backfilled.claimant !== null) {
+             ownershipClaimant = backfilled.claimant;
+             ownershipClaimantSource = backfilled.claimantSource;
+           }
+         }
+         const liveOwnership = evaluatePrFixHandoutOwnership({
+           id: candidate.id,
+           repo: candidate.repo,
+           pr: candidate.pr,
+           generation: confirmed.generation,
+           lane: confirmed.lane,
+           issue: candidate.issue ?? null,
+           author: confirmed.author,
+           claimant: ownershipClaimant,
+           claimantSource: ownershipClaimantSource,
+         });
+         if (liveOwnership.decision === "refuse") return null;
          // Mint the per-hand-out receipt token (#1256 review): every issuance
          // rotates in a fresh opaque token, pushed atomically with the hand-out
          // record (one conditional write — the hand-out/receipt bijection never
@@ -627,10 +734,17 @@ export async function GET(
          }
 
          const reasons = [...new Set([confirmed.reason, ...confirmed.feedback].filter(Boolean))];
-         return createFollowupPrTask({
-           agentName,
-           lane: confirmed.lane ?? undefined,
-           pullRequest: {
+          return createFollowupPrTask({
+            agentName,
+            lane: confirmed.lane ?? undefined,
+            // #1569: the versioned OWNING-side evidence (owning lane +
+            // original claimant, provenance-tagged), re-decided against the
+            // confirmed row above. Shipped only when this poll was granted
+            // the `pr-ownership-evidence:1` intake capability (#1532
+            // negotiation), so an un-negotiated consumer's task stays
+            // byte-identical to the pre-contract shape.
+            ownership: negotiation.prOwnershipEvidenceGranted ? liveOwnership.evidence : undefined,
+            pullRequest: {
              repoFullName: candidate.repo,
              number: candidate.pr,
              url: candidate.url ?? undefined,
@@ -841,12 +955,33 @@ export async function GET(
       const labels = await fetchPullRequestLabels(repo, pr);
       if (labels === null || labels.some((label) => label.toLowerCase() === NEEDS_HUMAN_LABEL)) continue;
 
-      // Lane for the materialized item: the issue's lane when it has a PR-fix
-      // equivalent (default -> NORMAL, escalation -> ESCALATED). A claimable
-      // lane with no role (e.g. a "cloud" lane) has no PR-fix equivalent, but
-      // that must not silently drop discovered work — fall back to NORMAL,
-      // the same lane the default claimable lane consumes.
-      const queueLane = prFixLaneForRequest(followupItem.lane) ?? "NORMAL";
+      // Lane for the materialized item (#1569, was the NORMAL-fallback gap):
+      // the LINKED ISSUE's authoritative tri-state classification decides.
+      // ESCALATED -> the exclusive escalation lane; NOT_ESCALATED -> NORMAL;
+      // UNKNOWN (the classification read failed) -> DEFER materialization for
+      // this poll rather than launder possibly-frontier work into the shared
+      // NORMAL queue with a silent fallback. A claimable lane with no role
+      // (e.g. a "cloud" lane) still has no PR-fix equivalent for the POLLER,
+      // but that never drops the discovered work: the row materializes into
+      // the lane its parent authorizes and the capable lane's poll picks it
+      // up (#1046 consumption check below stays the gate for the consumer).
+      const materializeClass = await linkedIssueEscalationClassified(
+        asPrFixQueueClient(prisma),
+        repo,
+        followupItem.number,
+      );
+      if (materializeClass === "UNKNOWN") {
+        console.info("[next-task-pr-fix] deferring linked-PR materialization with an UNVERIFIABLE parent classification (#1569)", {
+          repoFullName: repo,
+          issueNumber: followupItem.number,
+          pullRequestNumber: pr,
+        });
+        continue;
+      }
+      const queueLane =
+        materializeClass === "ESCALATED"
+          ? "ESCALATED"
+          : prFixLaneForRequest(followupItem.lane) ?? "NORMAL";
       const reasons = [...new Set(
         (health.followupReasons.length > 0 ? health.followupReasons : ["Linked PR needs follow-up"])
           .filter((reason): reason is string => Boolean(reason)),
@@ -921,6 +1056,12 @@ export async function GET(
         // enters the mechanical rebase lane (REBASE); every other linked-PR
         // materialization stays the ordinary fix lane (OTHER).
         fixType: materialized.item.type ?? "OTHER",
+        // #1569: the ownership pair createLinkedPrFixItem resolved at
+        // creation rides the candidate so the ownership gate (and a granted
+        // poll's evidence) sees the row's own recorded values.
+        claimant: materialized.item.claimant ?? null,
+        claimantSource: materialized.item.claimantSource ?? null,
+        author: materialized.item.author ?? null,
       };
       const task = await dispatchPrFixCandidate(candidate);
       if (task) {

@@ -179,6 +179,8 @@ If the old client cannot execute the work, the operator paths stay available.
 
 The escalation-lane exclusivity gate keeps escalation-classified issue work away from a declared-normal consumer.
 
+#1569 made the gate bidirectional: a declared-escalation consumer is also refused work whose linked issue is authoritatively NORMAL, and an UNVERIFIABLE classification now refuses BOTH declared lanes (the unfiltered #1046 poll stays unrestricted on the lane arm). Linked-PR materialization derives the row's lane from the issue's tri-state classification and defers on UNKNOWN instead of falling back to NORMAL. Ownership evidence (original claimant vs hand-out recipient) is specced in [pr-fix-ownership-contract.md](pr-fix-ownership-contract.md).
+
 A REBASE item is the declared mechanical exception to that gate. A conflicted PR is rebase work, not issue-classified implementation work. Its task carries the mechanical instruction wall instead of the issue's implementation semantics. The wall says: rebase onto the base, resolve conflicts mechanically only, push with `--force-with-lease`, and stop for a human on a semantic conflict.
 
 The exception never routes escalation-classified issue work to the local rebase lane.

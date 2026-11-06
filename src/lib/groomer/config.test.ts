@@ -1,27 +1,43 @@
-import { describe, expect, it, beforeEach, vi } from "vitest";
+import { describe, expect, it, beforeEach, afterAll, vi } from "vitest";
 import { getHostedGroomerConfig } from "./config";
 
-describe("groomer config", () => {
-  const originalEnv = process.env;
+// The env keys this suite mutates. Cleared BEFORE each test and AFTER the
+// last one: this file runs in the shared `jsdom-shared` (vmThreads, non-
+// isolated) worker, so a value left set at file end leaks into whatever suite
+// the scheduler places next in the same worker — `lesson-feed`'s legacy-
+// fallback warning test asserts an exact `console.warn` count and fails when a
+// leaked `DISPATCH_LLM_BASE_URL` makes the fallback disappear.
+const MANAGED_ENV_KEYS = [
+  "DISPATCH_HOSTED_GROOMER_ENABLED",
+  "DISPATCH_LLM_BASE_URL",
+  "DISPATCH_LLM_API_KEY",
+  "DISPATCH_GROOMER_MODEL",
+  "DISPATCH_GROOMER_TIMEOUT_MS",
+  "DISPATCH_GROOMER_MAX_CONTEXT_BYTES",
+  "DISPATCH_GROOMER_DRY_RUN",
+  "DISPATCH_GROOMER_MODE",
+  "DISPATCH_LLM_RESPONSE_FORMAT",
+  "DISPATCH_GROOMER_REPO_CONTEXT_ENABLED",
+  "DISPATCH_GROOMER_MAX_CONTEXT_FILES",
+  "DISPATCH_GROOMER_MAX_SEARCHES",
+  "DISPATCH_GROOMER_MAX_FILE_BYTES",
+  "DISPATCH_GROOMER_COMMENT_COOLDOWN_HOURS",
+  "DISPATCH_GROOMER_TOKEN",
+  "DISPATCH_GROOMER_TRUSTED_LOGINS",
+  "DISPATCH_GROOMER_EXTERNAL_REPLIES",
+];
 
+function clearManagedEnv() {
+  for (const key of MANAGED_ENV_KEYS) delete process.env[key];
+}
+
+describe("groomer config", () => {
   beforeEach(() => {
-    delete process.env.DISPATCH_HOSTED_GROOMER_ENABLED;
-    delete process.env.DISPATCH_LLM_BASE_URL;
-    delete process.env.DISPATCH_LLM_API_KEY;
-    delete process.env.DISPATCH_GROOMER_MODEL;
-    delete process.env.DISPATCH_GROOMER_TIMEOUT_MS;
-    delete process.env.DISPATCH_GROOMER_MAX_CONTEXT_BYTES;
-    delete process.env.DISPATCH_GROOMER_DRY_RUN;
-    delete process.env.DISPATCH_GROOMER_MODE;
-    delete process.env.DISPATCH_LLM_RESPONSE_FORMAT;
-    delete process.env.DISPATCH_GROOMER_REPO_CONTEXT_ENABLED;
-    delete process.env.DISPATCH_GROOMER_MAX_CONTEXT_FILES;
-    delete process.env.DISPATCH_GROOMER_MAX_SEARCHES;
-    delete process.env.DISPATCH_GROOMER_MAX_FILE_BYTES;
-    delete process.env.DISPATCH_GROOMER_COMMENT_COOLDOWN_HOURS;
-    delete process.env.DISPATCH_GROOMER_TOKEN;
-    delete process.env.DISPATCH_GROOMER_TRUSTED_LOGINS;
-    delete process.env.DISPATCH_GROOMER_EXTERNAL_REPLIES;
+    clearManagedEnv();
+  });
+
+  afterAll(() => {
+    clearManagedEnv();
   });
 
   it("is disabled by default and includes safe external-reply defaults", () => {

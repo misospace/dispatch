@@ -1,0 +1,301 @@
+/**
+ * #1569: PR-fix ownership evidence contract.
+ *
+ * PR-fix work must preserve its OWNING LANE and its ORIGINAL CLAIMANT, and
+ * both must be observable separately from the receiving consumer of a
+ * hand-out. Dispatch records and exposes the evidence; it never maps
+ * claimants to lanes or tiers itself (that binding is the consuming client's
+ * own configuration), and it never infers ownership from an agent display
+ * name, a prefix, or any per-agent special case.
+ *
+ * Boundaries (three different identities, one row):
+ * - `originalClaimant` — who OWNED the work when the row was ingested.
+ * - `author`           — the PR author login (who pushed the branch).
+ * - the task's `agentName` — the RECEIVING consumer of THIS hand-out.
+ * A new hand-out recipient is not the original claimant; a groomer
+ * lane change does not transfer ownership.
+ *
+ * Provenance of the claimant (resolution order, first match wins):
+ * 1. "lease"       — a live `Lease` on the linked issue names the holder.
+ * 2. "agent-label" — exactly one distinct `agent/<name>` label on the issue.
+ * 3. "owner-label" — exactly one distinct `owner/<name>` label on the issue.
+ * 4. "pr-author"   — no linked issue: the PR author login is the fallback
+ *                    owner of PR repair work.
+ * 5. "operator"    — an explicit operator stamp (recovery path).
+ * Failure states:
+ * - "ambiguous" — the available sources DISAGREE (a live lease and a
+ *   different agent label, two different agent labels, ...). Conflicting
+ *   ownership is never resolved by preference: it parks for recovery.
+ * - "missing"   — no source resolved (issue with no lease and no owner/agent
+ *   label, or a row with neither issue nor author).
+ * - "legacy"    — a row created before this contract (`claimantSource` NULL).
+ *   Treated exactly like "missing" for authorization.
+ *
+ * Authorization rule (fail closed): "missing" / "ambiguous" / "legacy"
+ * NEVER authorize an automatic hand-out to a declared-lane consumer. The
+ * unfiltered operator poll (#1046) stays unrestricted by contract, and
+ * recovery is explicit: re-ingestion re-resolves while unresolved, an
+ * operator requeue re-resolves, or `POST /api/pr-fix-queue/claimant` stamps
+ * an identity as "operator".
+ *
+ * Versioning: the evidence object carries `contract: 1` and rides on the
+ * #1532 intake negotiation. A consumer receives it only after declaring and
+ * being granted the `pr-ownership-evidence:1` capability — an un-negotiated
+ * peer gets the byte-identical legacy payload (safe mixed-version behavior),
+ * while a negotiated peer can REQUIRE ownership evidence before accepting a
+ * hand-out and can tell "server too old to send evidence" (capability not
+ * granted) from "row has no resolvable claimant" (`originalClaimant: null`).
+ */
+
+export const PR_FIX_OWNERSHIP_CONTRACT_VERSION = 1 as const;
+
+/** Capability a poll declares to receive + require ownership evidence. */
+export const PR_OWNERSHIP_EVIDENCE_CAPABILITY = "pr-ownership-evidence";
+export const PR_OWNERSHIP_EVIDENCE_CAPABILITY_VERSION = 1;
+
+/** How a resolved claimant was established. */
+export type PrFixClaimantSource =
+  | "lease"
+  | "agent-label"
+  | "owner-label"
+  | "pr-author"
+  | "operator";
+
+/** Non-resolving states stored in / derived from `claimantSource`. */
+export type PrFixOwnershipUnresolved = "missing" | "ambiguous" | "legacy";
+
+export type PrFixOwnershipProvenance = PrFixClaimantSource | PrFixOwnershipUnresolved;
+
+/** The versioned evidence block shipped with a negotiated followup-pr task. */
+export interface PrFixOwnershipEvidence {
+  contract: typeof PR_FIX_OWNERSHIP_CONTRACT_VERSION;
+  /** The row's authoritative owning lane (its `lane` column). */
+  owningLane: string;
+  /** The original claimant identity; null when unresolved. */
+  originalClaimant: string | null;
+  provenance: PrFixOwnershipProvenance;
+  /**
+   * The PR author login (`author` column) when present — the transport
+   * identity that authored the branch, kept separate from the claimant.
+   */
+  prAuthor?: string | null;
+}
+
+export const AGENT_LABEL_PREFIX = "agent/";
+export const OWNER_LABEL_PREFIX = "owner/";
+
+/** Facts read from authoritative records for one linked issue. */
+export interface ClaimantIssueFacts {
+  /** Agent named by a LIVE (unexpired) Lease on the linked issue, if any. */
+  leaseAgent: string | null;
+  /** Names behind `agent/<name>` labels on the linked issue. */
+  agentLabelNames: string[];
+  /** Names behind `owner/<name>` labels on the linked issue. */
+  ownerLabelNames: string[];
+}
+
+export type ClaimantResolution =
+  | { state: "resolved"; claimant: string; source: PrFixClaimantSource }
+  | { state: "ambiguous" }
+  | { state: "missing" }
+  /**
+   * A claimant-fact read FAILED (database/transport error). Deliberately not
+   * a persisted state: storing "missing" here would record confident knowledge
+   * of an absence that was never observed. Callers write nothing and retry on
+   * the next observation.
+   */
+  | { state: "unavailable" };
+
+/**
+ * The durable claimant patch for one ingestion observation, or null when the
+ * observation must NOT write: a resolved identity, an honest failure state
+ * ("missing" / "ambiguous"), and never a read failure.
+ */
+export function ingestionClaimantPatch(
+  resolution: ClaimantResolution,
+): { claimant: string | null; claimantSource: string } | null {
+  if (resolution.state === "resolved") {
+    return { claimant: resolution.claimant, claimantSource: resolution.source };
+  }
+  if (resolution.state === "unavailable") return null;
+  return { claimant: null, claimantSource: resolution.state };
+}
+
+function distinct(names: Iterable<string>): string[] {
+  return [...new Set(names)];
+}
+
+/**
+ * Pure claimant resolution from authoritative issue facts (no Courier
+ * knowledge, no per-agent special case):
+ * - live lease + agent labels: every candidate must name the SAME identity,
+ *   otherwise "ambiguous" (conflicting ownership never resolves by preference);
+ * - live lease alone → "lease"; single distinct agent label → "agent-label";
+ * - no lease, no agent labels: a single distinct owner label → "owner-label";
+ *   several conflicting owner labels → "ambiguous";
+ * - nothing → "missing".
+ */
+export function resolveClaimantFromIssueFacts(facts: ClaimantIssueFacts): ClaimantResolution {
+  const agentLabels = distinct(facts.agentLabelNames);
+  const ownerLabels = distinct(facts.ownerLabelNames);
+  const lease = facts.leaseAgent?.trim() || null;
+
+  if (lease !== null && agentLabels.length > 0) {
+    const candidates = distinct([lease, ...agentLabels]);
+    if (candidates.length === 1) return { state: "resolved", claimant: lease, source: "lease" };
+    return { state: "ambiguous" };
+  }
+  if (lease !== null) return { state: "resolved", claimant: lease, source: "lease" };
+  if (agentLabels.length === 1) return { state: "resolved", claimant: agentLabels[0], source: "agent-label" };
+  if (agentLabels.length > 1) return { state: "ambiguous" };
+  if (ownerLabels.length === 1) return { state: "resolved", claimant: ownerLabels[0], source: "owner-label" };
+  if (ownerLabels.length > 1) return { state: "ambiguous" };
+  return { state: "missing" };
+}
+
+export function splitClaimantLabels(labels: readonly string[] | null | undefined): {
+  agentLabelNames: string[];
+  ownerLabelNames: string[];
+} {
+  const agentLabelNames: string[] = [];
+  const ownerLabelNames: string[] = [];
+  for (const label of labels ?? []) {
+    if (label.startsWith(AGENT_LABEL_PREFIX)) {
+      const name = label.slice(AGENT_LABEL_PREFIX.length).trim();
+      if (name !== "") agentLabelNames.push(name);
+    } else if (label.startsWith(OWNER_LABEL_PREFIX)) {
+      const name = label.slice(OWNER_LABEL_PREFIX.length).trim();
+      if (name !== "") ownerLabelNames.push(name);
+    }
+  }
+  return { agentLabelNames, ownerLabelNames };
+}
+
+/** Minimal read surface needed to resolve claimant facts (testable). */
+export interface ClaimantFactsClient {
+  issue?: { findFirst(args?: any): Promise<{ id: string; labels: string[] } | null | undefined> };
+  lease?: { findFirst(args?: any): Promise<{ agentName: string } | null | undefined> };
+}
+
+/**
+ * Read the authoritative facts for one linked issue and resolve the claimant.
+ * A read failure returns null — "could not evaluate", NOT "missing": callers
+ * must never downgrade an existing record on a failed read, and must not
+ * store a confident failure state either.
+ * `repo` is the queue-folded repo; `Issue.repository.fullName` keeps GitHub
+ * casing, so the issue lookup matches case-insensitively (#1145 convention).
+ */
+export async function resolvePrFixClaimantFacts(
+  client: ClaimantFactsClient,
+  repo: string,
+  issueNumber: number,
+  now: Date = new Date(),
+): Promise<ClaimantResolution | null> {
+  try {
+    const row = await client.issue?.findFirst({
+      where: {
+        repository: { fullName: { equals: repo, mode: "insensitive" } },
+        number: issueNumber,
+      },
+      select: { id: true, labels: true },
+    });
+    if (!row) {
+      // No issue row is a DEFINITIVE "no source": like the #1503 missing-row
+      // rule, a pruned row cannot conceal a live claim, and treating it as a
+      // read failure would strand the row forever.
+      return { state: "missing" };
+    }
+    const { agentLabelNames, ownerLabelNames } = splitClaimantLabels(row.labels as string[]);
+    let leaseAgent: string | null = null;
+    if (client.lease) {
+      const lease = await client.lease.findFirst({
+        where: { issueId: row.id, expiredAt: { gt: now } },
+        orderBy: { expiredAt: "desc" },
+        select: { agentName: true },
+      });
+      leaseAgent = lease?.agentName ?? null;
+    }
+    return resolveClaimantFromIssueFacts({ leaseAgent, agentLabelNames, ownerLabelNames });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve the claimant for a row being ingested: linked issue when present
+ * (issue facts win over the PR author), else the PR author login. A failed
+ * issue read returns "unavailable" — nothing is recorded, and a later
+ * ingestion/recovery re-resolves it, so a transient database error can never
+ * be stored as a provenance the row does not actually have.
+ */
+export async function resolveIngestionClaimant(
+  client: ClaimantFactsClient,
+  repo: string,
+  issueNumber: number | null | undefined,
+  prAuthor: string | null | undefined,
+  now: Date = new Date(),
+): Promise<ClaimantResolution> {
+  if (issueNumber !== null && issueNumber !== undefined) {
+    const resolved = await resolvePrFixClaimantFacts(client, repo, issueNumber, now);
+    if (resolved) return resolved;
+    return { state: "unavailable" };
+  }
+  const author = prAuthor?.trim();
+  if (author) return { state: "resolved", claimant: author, source: "pr-author" };
+  return { state: "missing" };
+}
+
+/** Persisted `claimantSource` values written alongside a resolved claimant. */
+export function claimantSourceValue(resolution: ClaimantResolution): string | null {
+  if (resolution.state === "resolved") return resolution.source;
+  // "unavailable" is a read failure, never a stored provenance.
+  if (resolution.state === "unavailable") return null;
+  return resolution.state;
+}
+
+/**
+ * Derive the versioned evidence object from a queue row. Missing claimant
+ * with no recorded source is "legacy" (pre-contract row); with a recorded
+ * failure state it is that state. `author` rides along as `prAuthor` so a
+ * negotiated consumer can distinguish PR transport identity from claimant.
+ */
+export function prFixOwnershipEvidence(row: {
+  lane?: string | null;
+  claimant?: string | null;
+  claimantSource?: string | null;
+  author?: string | null;
+}): PrFixOwnershipEvidence {
+  const claimant = typeof row.claimant === "string" && row.claimant.trim() !== "" ? row.claimant : null;
+  let provenance: PrFixOwnershipProvenance;
+  if (claimant !== null) {
+    const source = row.claimantSource;
+    provenance =
+      source === "lease" || source === "agent-label" || source === "owner-label" || source === "pr-author" || source === "operator"
+        ? source
+        // A claimant with an unknown/absent source is still a recorded
+        // identity; the honest provenance is "legacy" (pre-contract write).
+        : "legacy";
+  } else if (row.claimantSource === "ambiguous") {
+    provenance = "ambiguous";
+  } else if (row.claimantSource === "missing") {
+    provenance = "missing";
+  } else {
+    provenance = "legacy";
+  }
+  return {
+    contract: PR_FIX_OWNERSHIP_CONTRACT_VERSION,
+    owningLane: row.lane ?? "NORMAL",
+    originalClaimant: claimant,
+    provenance,
+    ...(row.author !== undefined ? { prAuthor: row.author } : {}),
+  };
+}
+
+/**
+ * The fail-closed issuance predicate: unresolved ownership ("missing",
+ * "ambiguous", or a legacy row with no recorded claimant) never authorizes an
+ * automatic hand-out. Only a resolved claimant identity authorizes one.
+ */
+export function ownershipAuthorizesHandout(evidence: PrFixOwnershipEvidence): boolean {
+  return evidence.originalClaimant !== null;
+}
