@@ -1,8 +1,16 @@
 import { resolveExplorationBudget, type ExplorationBudget } from "./exploration-budget";
+import { resolveGroomerMode, type GroomerMode } from "./observe";
 
 export interface HostedGroomerConfig {
   enabled: boolean;
+  /**
+   * Legacy convenience view of the rollout mode (#1542): true whenever the
+   * mode is not `auto`. Kept so existing dry-run consumers keep working;
+   * `mode` is the source of truth.
+   */
   dryRun: boolean;
+  /** Off/observe/auto rollout mode (#1542); optional for legacy harness configs; getHostedGroomerConfig always populates it. */
+  mode?: GroomerMode;
   llmBaseUrl: string | null;
   apiKey: string | null;
   model: string;
@@ -55,6 +63,7 @@ function parseTrustedLogins(value: string | undefined): string[] {
 }
 
 let warnedExternalReplyPolicy: string | null = null;
+let warnedGroomerMode: string | null = null;
 
 function parseExternalReplyPolicy(value: string | undefined): "pending" | "off" {
   const normalized = value?.trim().toLowerCase();
@@ -77,6 +86,7 @@ export function getHostedGroomerConfig(): HostedGroomerConfig {
   if (!enabled) {
     return {
       enabled: false,
+      mode: "off",
       dryRun: true,
       llmBaseUrl: null,
       apiKey: null,
@@ -114,9 +124,26 @@ export function getHostedGroomerConfig(): HostedGroomerConfig {
     throw new Error("DISPATCH_HOSTED_GROOMER_ENABLED requires DISPATCH_GROOMER_MODEL");
   }
 
+  // Rollout mode (#1542): an explicit DISPATCH_GROOMER_MODE wins; an unset
+  // value maps from the legacy dry-run boolean. An unrecognized value falls
+  // back to the same mapping with a one-time warning, so a typo can never
+  // silently flip the groomer into write mode.
+  const modeRaw = process.env.DISPATCH_GROOMER_MODE;
+  const dryRunRaw = parseBool(process.env.DISPATCH_GROOMER_DRY_RUN, true);
+  const mode = resolveGroomerMode(modeRaw, dryRunRaw);
+  if (modeRaw && modeRaw.trim().toLowerCase() !== mode) {
+    if (warnedGroomerMode !== modeRaw) {
+      warnedGroomerMode = modeRaw;
+      console.warn(
+        `[hosted-groomer] unrecognised DISPATCH_GROOMER_MODE="${modeRaw}"; expected off, observe or auto. Using ${mode}.`,
+      );
+    }
+  }
+
   const config = {
     enabled: true,
-    dryRun: parseBool(process.env.DISPATCH_GROOMER_DRY_RUN, true),
+    mode,
+    dryRun: mode !== "auto",
     llmBaseUrl: baseUrl,
     apiKey,
     model,

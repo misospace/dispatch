@@ -29,6 +29,7 @@ import {
   listGroomingRuns,
   getGroomingRunDetail,
   updateGroomingRunRecord,
+  summarizeObserveRuns,
 } from "./history";
 
 describe("createGroomingRunRecord", () => {
@@ -299,6 +300,86 @@ describe("listGroomingRuns", () => {
         where: expect.objectContaining({ dryRun: true }),
       }),
     );
+  });
+
+  it("passes mode filter (#1542)", async () => {
+    await listGroomingRuns(mockPrisma, { mode: "observe" });
+
+    expect(mocks.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ mode: "observe" }),
+      }),
+    );
+  });
+
+  it("persists mode on the run record when provided (#1542)", async () => {
+    const input = {
+      issueId: "issue-42",
+      repoId: "repo-1",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      issueUrl: "https://github.com/org/repo/issues/42",
+      dryRun: true,
+      mode: "observe",
+      labelsBefore: [],
+      laneBefore: null,
+      model: null,
+      provider: null,
+      timeoutMs: null,
+      maxContextBytes: null,
+    };
+
+    await createGroomingRunRecord(mockPrisma, input);
+
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ dryRun: true, mode: "observe" }),
+      }),
+    );
+  });
+
+  describe("summarizeObserveRuns (#1542)", () => {
+    beforeEach(() => {
+      vi.clearAllMocks();
+    });
+
+    it("counts dispositions over the observe-mode window", async () => {
+      mocks.findMany.mockResolvedValue([
+        { observeDisposition: "would_act" },
+        { observeDisposition: "would_act" },
+        { observeDisposition: "would_noop" },
+        { observeDisposition: "would_refuse" },
+        { observeDisposition: "assessment_unavailable" },
+        { observeDisposition: null },
+      ]);
+      const now = new Date("2026-11-04T12:00:00.000Z");
+
+      const summary = await summarizeObserveRuns(mockPrisma, { windowMs: 24 * 60 * 60 * 1000, now });
+
+      expect(summary).toEqual({
+        windowMs: 24 * 60 * 60 * 1000,
+        since: new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString(),
+        total: 6,
+        would_act: 2,
+        would_noop: 1,
+        would_refuse: 1,
+        assessment_unavailable: 1,
+      });
+      expect(mocks.findMany).toHaveBeenCalledWith({
+        where: { mode: "observe", createdAt: { gte: new Date(now.getTime() - 24 * 60 * 60 * 1000) } },
+        select: { observeDisposition: true },
+      });
+    });
+
+    it("clamps the window to 1h..30d", async () => {
+      mocks.findMany.mockResolvedValue([]);
+      const now = new Date("2026-11-04T12:00:00.000Z");
+
+      expect((await summarizeObserveRuns(mockPrisma, { windowMs: 1000, now })).windowMs).toBe(60 * 60 * 1000);
+      expect((await summarizeObserveRuns(mockPrisma, { windowMs: 60 * 24 * 60 * 60 * 1000, now })).windowMs).toBe(
+        30 * 24 * 60 * 60 * 1000,
+      );
+    });
   });
 
   it("passes model filter", async () => {

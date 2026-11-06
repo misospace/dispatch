@@ -807,7 +807,7 @@ export interface ApplyResult {
   failure: { step: ApplyStep; error: string } | null;
 }
 
-function readSteps(value: unknown): ApplySteps {
+export function readSteps(value: unknown): ApplySteps {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const steps: ApplySteps = {};
   for (const step of APPLY_STEPS) {
@@ -821,6 +821,58 @@ function readSteps(value: unknown): ApplySteps {
 
 function landed(result: ApplyStepResult | undefined): boolean {
   return result?.status === "applied" || result?.status === "replayed";
+}
+
+export interface CommentGateInput {
+  applicationKey: string;
+  /** The prior application's recorded comment step, if any. */
+  priorComment: ApplyStepResult | undefined;
+  /** Comments re-read by the preconditions, newest first. */
+  recentComments: LiveComment[];
+  commentPolicy?: CommentPolicy;
+  force: boolean;
+  commentCooldownHours: number;
+  issueId: string;
+  hasRecentComment(issueId: string, since: Date): Promise<boolean>;
+  now?: () => Date;
+}
+
+/**
+ * The one comment-eligibility decision both the write path and the observe
+ * disposition (#1542) share, so observe always reports what auto would have
+ * done: this application's comment already on GitHub or recorded as landed
+ * replays, the reply gate (or a prior hold) holds it, a groomer comment
+ * inside the cooldown skips it, and otherwise auto would post. Returns the
+ * step result to record without writing, or null when the comment would be
+ * posted. The landed-prior branch is only reached by observe callers; the
+ * write path replays a landed prior through its own step runner.
+ */
+export async function resolveCommentGate(input: CommentGateInput): Promise<ApplyStepResult | null> {
+  if (landed(input.priorComment)) {
+    return { ...input.priorComment!, status: "replayed" };
+  }
+  const own = input.recentComments.find((c) => groomerCommentKey(c) === input.applicationKey);
+  if (own) {
+    return { status: "replayed", detail: "already posted for this application", commentUrl: own.url };
+  }
+  if (input.priorComment?.status === "held") {
+    return input.priorComment;
+  }
+  if (input.commentPolicy?.mode === "hold") {
+    return { status: "held", detail: `pending_approval:${input.commentPolicy.reason}` };
+  }
+  if (!input.force && input.commentCooldownHours > 0) {
+    const now = input.now ?? (() => new Date());
+    const since = new Date(now().getTime() - input.commentCooldownHours * 60 * 60 * 1000);
+    const markedRecently = input.recentComments.some((c) => {
+      const at = Date.parse(c.createdAt);
+      return groomerCommentKey(c) !== null && Number.isFinite(at) && at >= since.getTime();
+    });
+    if (markedRecently || (await input.hasRecentComment(input.issueId, since))) {
+      return { status: "skipped", detail: "cooldown" };
+    }
+  }
+  return null;
 }
 
 function errorMessage(err: unknown): string {
@@ -1000,29 +1052,27 @@ export async function applyGroomingMutations(
   // 2. Comment. A comment carrying this key's marker is already this
   //    application's comment; a groomer comment inside the cooldown window
   //    (recorded on a run, or found on GitHub by its marker) suppresses a new one.
+  //    The eligibility decision is shared with the observe disposition
+  //    (resolveCommentGate, #1542) so both paths always agree.
   let commentDecision: ApplyStepResult | null = null;
   if (!failure && !landed(prior.comment) && diff.comment) {
-    const own = input.recentComments.find((c) => groomerCommentKey(c) === applicationKey);
-    if (own) {
-      commentDecision = { status: "replayed", detail: "already posted for this application", commentUrl: own.url };
-      commentUrl = own.url;
-    } else if (prior.comment?.status === "held") {
-      commentDecision = prior.comment;
-    } else if (input.commentPolicy?.mode === "hold") {
-      commentDecision = { status: "held", detail: `pending_approval:${input.commentPolicy.reason}` };
-    } else if (!input.force && input.commentCooldownHours > 0) {
-      const since = new Date(now().getTime() - input.commentCooldownHours * 60 * 60 * 1000);
-      const markedRecently = input.recentComments.some((c) => {
-        const at = Date.parse(c.createdAt);
-        return groomerCommentKey(c) !== null && Number.isFinite(at) && at >= since.getTime();
-      });
-      if (markedRecently || (await store.hasRecentComment(input.issueId, since))) {
-        commentDecision = { status: "skipped", detail: "cooldown" };
-      }
-    }
+    commentDecision = await resolveCommentGate({
+      applicationKey,
+      priorComment: prior.comment,
+      recentComments: input.recentComments,
+      commentPolicy: input.commentPolicy,
+      force: input.force,
+      commentCooldownHours: input.commentCooldownHours,
+      issueId: input.issueId,
+      hasRecentComment: (issueId, since) => store.hasRecentComment(issueId, since),
+      now: input.now,
+    });
   }
   if (commentDecision) {
     steps.comment = commentDecision;
+    if (commentDecision.status === "replayed" && commentDecision.commentUrl) {
+      commentUrl = commentDecision.commentUrl;
+    }
     await persist("in_progress");
   } else {
     await run("comment", diff.comment !== null, async () => {

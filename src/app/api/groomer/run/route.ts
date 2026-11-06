@@ -63,8 +63,10 @@ export async function POST(request: Request) {
   }
 
   try {
+    const bodyMode = typeof body.mode === "string" ? body.mode : undefined;
     const result = await runHostedGroomer({
       dryRun: typeof body.dryRun === "boolean" ? body.dryRun : undefined,
+      mode: bodyMode === "observe" || bodyMode === "auto" ? bodyMode : undefined,
       repoFullName: typeof body.repoFullName === "string" ? body.repoFullName : undefined,
       issueNumber: typeof body.issueNumber === "number" && Number.isInteger(body.issueNumber)
         ? body.issueNumber
@@ -73,13 +75,15 @@ export async function POST(request: Request) {
     });
 
     if (!result) {
-      return NextResponse.json({ candidateNumber: null, dryRun: config.dryRun });
+      return NextResponse.json({ candidateNumber: null, dryRun: config.dryRun, mode: config.mode });
     }
 
     return NextResponse.json({
       candidateNumber: result.candidateNumber,
       repoFullName: result.repoFullName,
       dryRun: result.dryRun,
+      mode: result.mode,
+      observeDisposition: result.observeDisposition ?? null,
       output: result.output,
       plan: result.plan,
       plannedLabels: result.plannedLabels,

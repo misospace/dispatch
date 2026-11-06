@@ -942,6 +942,17 @@ model GroomingRun {
   staleReasons    String[] @default([])
   stage           String   @default("selected")
 
+  // Rollout mode for this run (#1542): "observe" (full assessment ran, no
+  // writes, would-disposition recorded) or "auto" (writes allowed). Null on
+  // rows recorded before the off/observe/auto contract; those stay readable
+  // through the dryRun boolean.
+  mode               String?
+  // What this run would have done had it been allowed to act (#1542).
+  // Generalized would-disposition so other Dispatch automation can adopt the
+  // same record later: would_act | would_noop | would_refuse |
+  // assessment_unavailable. Null on auto-mode and legacy rows.
+  observeDisposition String?
+
   model           String?
   provider        String?
   promptVersion   String  @default("hosted-groomer-v1")
@@ -990,6 +1001,9 @@ model GroomingRun {
   @@index([issueId, createdAt])
   @@index([repoId, status, createdAt])
   @@index([issueId, status])
+  // Observe-mode receipt rollups (#1542): the summary seek filters mode +
+  // a recent createdAt window to count would-dispositions.
+  @@index([mode, createdAt])
   // Groomer-stall baseline (#1420/#1437): newest applied completed run seeked
   // by the observability collector on every snapshot; predicate matches
   // status + dryRun + stage, sort stays on completedAt DESC.

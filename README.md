@@ -122,7 +122,8 @@ Dispatch can optionally run issue grooming itself by calling an OpenAI-compatibl
 | `DISPATCH_CI_FAILURE_LABELS` | No | Comma-separated labels applied to those issues. Defaults to `type/bug,status/ready`. Set to an empty string to apply none. |
 | `DISPATCH_GROOMER_CONTEXT_MODE` | No | Exploration budget preset: `small`, `medium` (default), `large`. |
 | `DISPATCH_GROOMER_MODEL_CONTEXT_TOKENS` | No | The model's real context window in tokens. Derives the exploration budget from it and ignores the preset. Recommended for self-hosted models. |
-| `DISPATCH_GROOMER_DRY_RUN` | No | Defaults to `true`; when true, returns a mutation plan without GitHub or DB writes. |
+| `DISPATCH_GROOMER_DRY_RUN` | No | Defaults to `true`; when true, returns a mutation plan without GitHub or DB writes. Legacy boolean view of `DISPATCH_GROOMER_MODE`. |
+| `DISPATCH_GROOMER_MODE` | No | Off/observe/auto rollout mode (#1542). `observe` runs the full assessment with zero external writes and records a durable `would_act`/`would_noop`/`would_refuse`/`assessment_unavailable` disposition on the run; `auto` writes; `off` disables. Unset maps from `DISPATCH_GROOMER_DRY_RUN` (`true` → `observe`, `false` → `auto`); an explicit mode wins over the dry-run boolean. |
 | `DISPATCH_LLM_RESPONSE_FORMAT` | No | Defaults to `true`: the groomer and lesson feed send `response_format` (`json_schema`, falling back to `json_object`). Set `false` for backends that implement neither; the prompts still demand JSON and the output is still validated. |
 | `DISPATCH_GROOMER_REPO_CONTEXT_ENABLED` | No | Enables bounded GitHub API repository context. Defaults to `false`. |
 | `DISPATCH_GROOMER_MAX_CONTEXT_FILES` | No | Maximum files included in repository context. Defaults to `5`. |
@@ -510,7 +511,7 @@ List agent runs. Query params: `limit`
 Create agent run. Requires `DISPATCH_AGENT_TOKEN` bearer auth.
 
 ### POST /api/groomer/run
-Run the optional hosted LLM issue groomer for at most one issue. Requires `DISPATCH_AGENT_TOKEN` bearer auth (or `DISPATCH_GROOMER_TOKEN` when configured) and `DISPATCH_HOSTED_GROOMER_ENABLED=true`. Defaults to dry-run unless `DISPATCH_GROOMER_DRY_RUN=false` or the request body sets `{ "dryRun": false }`. Every run is recorded in a dedicated `GroomingRun` history table visible at `/automation/groomer`. Optional body fields: `dryRun`, `repoFullName`, `issueNumber`, `force`.
+Run the optional hosted LLM issue groomer for at most one issue. Requires `DISPATCH_AGENT_TOKEN` bearer auth (or `DISPATCH_GROOMER_TOKEN` when configured) and `DISPATCH_HOSTED_GROOMER_ENABLED=true`. Defaults to dry-run unless `DISPATCH_GROOMER_DRY_RUN=false` or `DISPATCH_GROOMER_MODE=auto`, or the request body sets `{ "dryRun": false }` or `{ "mode": "auto" }`. Every run is recorded in a dedicated `GroomingRun` history table visible at `/automation/groomer`. Optional body fields: `dryRun`, `mode` (`observe` or `auto`), `repoFullName`, `issueNumber`, `force`.
 
 ### GET /api/audit
 List audit logs. Query params: `limit`, `repo`

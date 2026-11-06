@@ -12,6 +12,13 @@ import { inFlightStatus, validateGroomingPlan, clearedReleaseSignalProjection, t
 import { buildEvidenceCatalog, typedVerdictDependencyKeys } from "./plan-evidence";
 import { collectPinnedReadContent } from "./close-grounding";
 import { getHostedGroomerConfig } from "./config";
+import {
+  deriveObserveDisposition,
+  isGroomerMode,
+  wouldMutate,
+  type GroomerMode,
+  type ObserveDisposition,
+} from "./observe";
 import { assessExternalEngagement } from "./trust";
 import { holdPendingReply } from "./pending-reply";
 import { buildRepositoryContext } from "./repository-context";
@@ -41,6 +48,8 @@ import {
   computeApplicationKey,
   computeMutationDiff,
   makePrismaApplicationStore,
+  readSteps,
+  resolveCommentGate,
   type ApplicationStore,
   type ApplierGitHub,
   type ApplyResult,
@@ -50,6 +59,10 @@ export interface GroomerRunResult {
   candidateNumber: number;
   repoFullName: string;
   dryRun: boolean;
+  /** Off/observe/auto rollout mode this run executed under (#1542). */
+  mode: GroomerMode;
+  /** Durable would-disposition when the run executed in observe mode. */
+  observeDisposition?: ObserveDisposition;
   output: any;
   /** The validated GroomingPlan; `output` is its legacy GroomerOutput view. */
   plan?: GroomingPlan;
@@ -62,6 +75,8 @@ export interface GroomerRunResult {
 
 export interface RunHostedGroomerOptions {
   dryRun?: boolean;
+  /** Explicit per-request rollout mode (#1542); wins over `dryRun` and config. */
+  mode?: GroomerMode;
   repoFullName?: string;
   issueNumber?: number;
   force?: boolean;
@@ -213,7 +228,21 @@ async function executeGroomerRun(
   deps: GroomerDeps = defaultDeps,
 ): Promise<GroomerRunResult | null> {
   const config = deps.getConfig();
-  const dryRun = options.dryRun ?? config.dryRun;
+  // Rollout mode (#1542): an explicit per-request mode wins, then an
+  // explicit per-request dryRun (true → observe, false → auto), then the
+  // configured mode. `dryRun` below stays the legacy write/no-write gate —
+  // it is exactly `mode !== "auto"`, so observe inherits the entire
+  // no-write behavior the dry-run path already enforces.
+  const mode: GroomerMode = isGroomerMode(options.mode)
+    ? options.mode
+    : options.dryRun === true
+      ? "observe"
+      : options.dryRun === false
+        ? "auto"
+        : (config.mode ?? (config.dryRun ? "observe" : "auto"));
+  if (mode === "off") return null;
+  const observe = mode === "observe";
+  const dryRun = mode !== "auto";
 
   // Select candidate
   const candidate = await deps.selectCandidate({
@@ -240,6 +269,7 @@ async function executeGroomerRun(
     issueNumber: candidate.number,
     issueUrl: candidate.url,
     dryRun,
+    mode,
     labelsBefore: candidate.labels,
     laneBefore: candidate.currentLane,
     model: config.model ?? null,
@@ -269,6 +299,11 @@ async function executeGroomerRun(
   // The last stage this run reached, so a failure records where it failed
   // rather than the "selected" the run was created with (#1125).
   let stage = "selected";
+  // Durable would-disposition (#1542): what this run would have done had it
+  // been allowed to act. Recorded only in observe mode; a failure after a
+  // disposition was derived still records `assessment_unavailable` because
+  // the run never completed its assessment path.
+  let observeDisposition: ObserveDisposition | null = null;
   // Set once the unreadable-issue backoff is written (#1063), so a later
   // failure does not overwrite it with the failed-run backoff (#1125).
   let unreadableBackoffWritten = false;
@@ -278,12 +313,27 @@ async function executeGroomerRun(
     const activeLeases = await deps.findActiveLeases(candidate.id);
     const hasOtherLease = activeLeases.some((active: { agentName?: string }) => active.agentName !== "hosted-groomer");
     if (hasOtherLease && !options.force) {
-      await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
-        status: "deferred", stage, errorMessage: null, retryable: true,
-      });
+      if (observe) {
+        // Observe (#1542): another actor owns the issue — the identical auto
+        // assessment would defer here, i.e. decline to act. Record the
+        // refusal on the durable receipt and stop, still without touching
+        // lease or queue state.
+        await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
+          status: "dry_run_completed", stage, observeDisposition: "would_refuse",
+        });
+      } else {
+        await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
+          status: "deferred", stage, errorMessage: null, retryable: true,
+        });
+      }
       return null;
     }
-    {
+    if (!observe) {
+      // Observe (#1542) is read-only over Dispatch queue state: `upsertLease`
+      // mints or renews the hosted-groomer lease row, so lease acquisition
+      // is auto-only. In observe `lease` stays undefined, so the fenced
+      // release in the `finally` below cannot fire either; the assessment
+      // itself never needs the lease.
       const leaseReceipt = await deps.upsertLease({
         agentName: "hosted-groomer",
         issueId: candidate.id,
@@ -377,17 +427,21 @@ async function executeGroomerRun(
       const unverifiable: Record<string, unknown> = { outcome: "unverifiable", preconditionFailures: failures };
       const evidenceSummary = { evidence: summarizeEvidenceForPersistence(evidence) };
       if (dryRun) {
+        if (observe) observeDisposition = "assessment_unavailable";
         await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
           status: "dry_run_completed",
           stage: "selected",
           contextSummary: evidenceSummary,
           preconditionFailures: failures,
           applyOutcome: "unverifiable",
+          ...(observe ? { observeDisposition } : {}),
         });
         return {
           candidateNumber: candidate.number,
           repoFullName: candidate.repoFullName,
           dryRun: true,
+          mode,
+          observeDisposition: "assessment_unavailable",
           output: null,
           plannedLabels: candidate.labels,
           groomingRunId: groomingRun.id,
@@ -424,6 +478,7 @@ async function executeGroomerRun(
         candidateNumber: candidate.number,
         repoFullName: candidate.repoFullName,
         dryRun: false,
+        mode,
         output: null,
         plannedLabels: candidate.labels,
         groomingRunId: groomingRun.id,
@@ -790,6 +845,8 @@ async function executeGroomerRun(
       candidateNumber: candidate.number,
       repoFullName: candidate.repoFullName,
       dryRun,
+      mode,
+      ...(observe && observeDisposition !== null ? { observeDisposition } : {}),
       output,
       plan,
       plannedLabels: newLabels,
@@ -800,9 +857,11 @@ async function executeGroomerRun(
     });
 
     if (inFlight && dryRun) {
+      if (observe) observeDisposition = "would_refuse";
       await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
         status: "dry_run_completed",
         stage: "planned",
+        ...(observe ? { observeDisposition } : {}),
       });
       return result({});
     }
@@ -892,6 +951,18 @@ async function executeGroomerRun(
       preconditionFailures: preconditions.failures,
       mutationPlan,
     };
+    // The reply gate is one comment policy for both the write path and the
+    // observe disposition, so observe always sees the eligibility auto would.
+    const commentPolicy = (held || suppressed)
+      ? {
+          mode: "hold" as const,
+          reason: engagementReason,
+          detail: engagement.participants
+            .filter((participant) => !participant.trusted)
+            .map((participant) => `untrusted: ${participant.login || "unknown"} (${participant.reason})`)
+            .join("; ") || "trust assessment failed; no participants available",
+        }
+      : undefined;
 
     if (dryRun) {
       const existing = preconditions.ok ? await store.find(applicationKey) : null;
@@ -904,11 +975,53 @@ async function executeGroomerRun(
           ? "would_replay"
           : "dry_run";
       mutationPlan.applyOutcome = applyOutcome;
+      // The durable would-disposition (#1542): auto mode would have written
+      // only when the preconditions held and this exact plan had not already
+      // been applied (a replay writes nothing new). Comment eligibility is
+      // the shared gate decision (resolveCommentGate), so a cooldown skip or
+      // an already-posted comment is a no-op, and a held reply — including a
+      // prior pending reply — is a refusal to speak, not a mutation.
+      if (observe) {
+        // The gate is only consulted when the preconditions hold: a stale or
+        // unverifiable plan is a refusal regardless of comment eligibility,
+        // and a failed cooldown read must not erase that decided receipt.
+        const commentGate =
+          preconditions.ok && diff.comment
+            ? await resolveCommentGate({
+                applicationKey,
+                priorComment: readSteps(existing?.steps).comment,
+                recentComments: preconditions.recentComments,
+                commentPolicy,
+                force: options.force === true,
+                commentCooldownHours: config.commentCooldownHours,
+                issueId: candidate.id,
+                hasRecentComment: (issueId, since) => store.hasRecentComment(issueId, since),
+              })
+            : null;
+        const commentWouldPost = diff.comment !== null && commentGate === null;
+        observeDisposition = deriveObserveDisposition({
+          applyOutcome,
+          wouldMutate: wouldMutate({
+            labelsStep: diff.labelsStep,
+            labelsBefore: diff.labelsBefore,
+            comment: diff.comment,
+            commentWouldPost,
+            close: diff.close,
+            children: diff.children !== null,
+            title: diff.title,
+            body: diff.body,
+          }),
+          inFlight: false,
+          snapshotUnreadable: false,
+          commentHeldOnly: commentGate?.status === "held",
+        });
+      }
       await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
         status: "dry_run_completed",
         stage: "planned",
         ...validationFields,
         applyOutcome,
+        ...(observe ? { observeDisposition } : {}),
       });
       return result({ dryRun: true });
     }
@@ -994,16 +1107,7 @@ async function executeGroomerRun(
         recentComments: preconditions.recentComments,
         force: options.force === true,
         commentCooldownHours: config.commentCooldownHours,
-        commentPolicy: (held || suppressed)
-          ? {
-              mode: "hold",
-              reason: engagementReason,
-              detail: engagement.participants
-                .filter((participant) => !participant.trusted)
-                .map((participant) => `untrusted: ${participant.login || "unknown"} (${participant.reason})`)
-                .join("; ") || "trust assessment failed; no participants available",
-            }
-          : undefined,
+        commentPolicy,
       },
       github,
       store,
@@ -1507,6 +1611,9 @@ async function executeGroomerRun(
         stage,
         errorMessage: message,
         retryable: true,
+        // In observe mode a failed run records an unavailable assessment,
+        // not a disposition: the would-decision never completed (#1542).
+        ...(observe ? { observeDisposition: "assessment_unavailable" as ObserveDisposition } : {}),
       });
     } catch {
       // Don't mask the original error

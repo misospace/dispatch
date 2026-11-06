@@ -561,7 +561,10 @@ describe("runHostedGroomer", () => {
     expect(mocks.prisma.issueLane.create).not.toHaveBeenCalled();
     expect(mocks.prisma.agentRun.create).not.toHaveBeenCalled();
     expect(mocks.prisma.auditLog.create).not.toHaveBeenCalled();
-    expect(mocks.releaseLeaseIfUnchanged).toHaveBeenCalledWith({ id: "lease-1" });
+    // Legacy dryRun maps to observe mode (#1542): queue/lease state is
+    // read-only — no lease mint and therefore nothing to release.
+    expect(mocks.upsertLease).not.toHaveBeenCalled();
+    expect(mocks.releaseLeaseIfUnchanged).not.toHaveBeenCalled();
   });
 
   it("persists related-work queries and refs in the explored context summary", async () => {
@@ -4759,6 +4762,361 @@ Investigate session handling in auth module.`;
         expect("releaseSignal" in data).toBe(false);
       }
       expect(mocks.issueProjection).toBeNull();
+    });
+  });
+
+  describe("observe mode (#1542)", () => {
+    // The dry-run config is the observe default; every observe test asserts
+    // the same no-write invariant the dry-run path has always enforced, plus
+    // the durable would-disposition receipt.
+    beforeEach(() => {
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true });
+    });
+
+    function expectNoMutations() {
+      expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+      expect(mocks.addIssueComment).not.toHaveBeenCalled();
+      expect(mocks.updateIssueTitleAndBody).not.toHaveBeenCalled();
+      expect(mocks.closeIssue).not.toHaveBeenCalled();
+      expect(mocks.createIssue).not.toHaveBeenCalled();
+      expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+      expect(mocks.prisma.issue.update).not.toHaveBeenCalled();
+      expect(mocks.prisma.issueLane.create).not.toHaveBeenCalled();
+      expect(mocks.prisma.agentRun.create).not.toHaveBeenCalled();
+      expect(mocks.prisma.auditLog.create).not.toHaveBeenCalled();
+      expect(mocks.prisma.groomingApplication.create).not.toHaveBeenCalled();
+    }
+
+    function completedRun(): Record<string, any> {
+      const call = mocks.prisma.groomingRun.update.mock.calls.findLast((c) => "completedAt" in c[0].data);
+      expect(call).toBeDefined();
+      return call![0].data;
+    }
+
+    it("records would_act and never mutates when the plan closes, comments and relabels", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("already_done", {
+          mutations: {
+            labelsToAdd: ["priority/p1"],
+            labelsToRemove: ["priority/p0"],
+            proposedTitle: "Fix the login bug",
+            proposedBody: "Enriched body",
+            githubComment: "Verified on the default branch: the step is gone, so closing as already resolved.",
+            close: {
+              reason: "already_done",
+              rationale: "login.ts no longer has the step",
+              evidenceRefs: ["repo:src/auth/login.ts"],
+              criteria: GROUNDED_CRITERIA,
+            },
+          },
+        }),
+      );
+
+      const result = await runHostedGroomer();
+
+      expectNoMutations();
+      expect(result).toMatchObject({
+        dryRun: true,
+        mode: "observe",
+        observeDisposition: "would_act",
+      });
+      expect(mocks.prisma.groomingRun.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ dryRun: true, mode: "observe" }),
+        }),
+      );
+      expect(completedRun()).toMatchObject({
+        status: "dry_run_completed",
+        observeDisposition: "would_act",
+        applyOutcome: "dry_run",
+      });
+    });
+
+    it("auto mode wins over a dry-run config and applies the plan", async () => {
+      const result = await runHostedGroomer({ mode: "auto" });
+      expect(result).toMatchObject({ dryRun: false, mode: "auto" });
+      expect(result).not.toHaveProperty("observeDisposition");
+      expect(mocks.prisma.groomingRun.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ dryRun: false, mode: "auto" }),
+        }),
+      );
+      expect(mocks.updateIssueLabels).toHaveBeenCalledWith("org/repo", 42, expect.arrayContaining(["status/ready"]));
+      expect(completedRun()).toMatchObject({ status: "completed" });
+      expect(completedRun().observeDisposition).toBeUndefined();
+    });
+
+    it("records would_refuse for an in-flight issue", async () => {
+      mocks.selectGroomingCandidate.mockResolvedValue({ ...mockCandidate, labels: ["status/in-progress"] });
+      const result = await runHostedGroomer();
+      expectNoMutations();
+      expect(result).toMatchObject({ mode: "observe", observeDisposition: "would_refuse" });
+      expect(completedRun()).toMatchObject({ status: "dry_run_completed", observeDisposition: "would_refuse" });
+    });
+
+    it("never acquires or releases the hosted-groomer lease (#1542)", async () => {
+      const result = await runHostedGroomer();
+
+      expectNoMutations();
+      expect(result).toMatchObject({ mode: "observe", observeDisposition: "would_act" });
+      expect(mocks.upsertLease).not.toHaveBeenCalled();
+      expect(mocks.releaseLeaseIfUnchanged).not.toHaveBeenCalled();
+    });
+
+    it("respects a pre-existing conflicting lease with would_refuse and no lease writes (#1542)", async () => {
+      mocks.findActiveLeasesForIssue.mockResolvedValue([{ agentName: "other-agent" }]);
+
+      const result = await runHostedGroomer();
+
+      expect(result).toBeNull();
+      expectNoMutations();
+      expect(mocks.callGroomerLLM).not.toHaveBeenCalled();
+      // The lease is inspected (findActiveLeases) but never created, renewed
+      // or released: queue state is untouched in observe mode (#1542).
+      expect(mocks.upsertLease).not.toHaveBeenCalled();
+      expect(mocks.releaseLeaseIfUnchanged).not.toHaveBeenCalled();
+      expect(completedRun()).toMatchObject({
+        status: "dry_run_completed",
+        stage: "lease_acquisition",
+        observeDisposition: "would_refuse",
+      });
+    });
+
+    it("records would_refuse when apply preconditions find the evidence stale", async () => {
+      mocks.collectGroomingEvidenceSnapshot
+        .mockResolvedValueOnce(mockEvidence)
+        .mockResolvedValueOnce({ ...mockEvidence, issue: { ...mockEvidence.issue, title: "Retitled" } });
+      const result = await runHostedGroomer();
+      expectNoMutations();
+      expect(result).toMatchObject({ mode: "observe", observeDisposition: "would_refuse" });
+      expect(completedRun()).toMatchObject({ status: "dry_run_completed", applyOutcome: "stale", observeDisposition: "would_refuse" });
+    });
+
+    it("records would_noop for a plan that changes nothing", async () => {
+      // A backlog groom on an issue that already carries status/backlog
+      // writes nothing external: the derived status already matches.
+      mocks.selectGroomingCandidate.mockResolvedValue({ ...mockCandidate, labels: ["status/backlog", "priority/p0"] });
+      mocks.callGroomerLLM.mockResolvedValue(notReadyDraft("backlog"));
+      const result = await runHostedGroomer();
+      expectNoMutations();
+      expect(result).toMatchObject({ mode: "observe", observeDisposition: "would_noop" });
+      expect(completedRun()).toMatchObject({ status: "dry_run_completed", applyOutcome: "dry_run", observeDisposition: "would_noop" });
+    });
+
+    it("records would_noop when the exact plan was already applied", async () => {
+      const first = await runHostedGroomer();
+      expect(first!.mutationPlan).toMatchObject({ applyOutcome: "dry_run" });
+      mocks.getHostedGroomerConfig.mockReturnValue(mockConfig);
+      await runHostedGroomer();
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true });
+      // The second run above intentionally wrote; clear the write spies so
+      // only the third (observe) run's behavior is asserted.
+      mocks.updateIssueLabels.mockClear();
+      mocks.addIssueComment.mockClear();
+      mocks.updateIssueTitleAndBody.mockClear();
+      mocks.closeIssue.mockClear();
+      mocks.createIssue.mockClear();
+      mocks.addIssueLabel.mockClear();
+      mocks.prisma.issue.update.mockClear();
+      mocks.prisma.issueLane.create.mockClear();
+      mocks.prisma.agentRun.create.mockClear();
+      mocks.prisma.auditLog.create.mockClear();
+      const third = await runHostedGroomer();
+      expect(third!.mutationPlan).toMatchObject({ applyOutcome: "would_replay" });
+      expect(third).toMatchObject({ mode: "observe", observeDisposition: "would_noop" });
+      expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+      expect(mocks.addIssueComment).not.toHaveBeenCalled();
+      expect(mocks.closeIssue).not.toHaveBeenCalled();
+      expect(mocks.prisma.issue.update).not.toHaveBeenCalled();
+    });
+
+    it("returns null without selecting when the mode is off", async () => {
+      const result = await runHostedGroomer({ mode: "off" });
+      expect(result).toBeNull();
+      expect(mocks.selectGroomingCandidate).not.toHaveBeenCalled();
+    });
+
+    it("records would_refuse when the only mutation is a reply the gate holds", async () => {
+      mocks.selectGroomingCandidate.mockResolvedValue({ ...mockCandidate, labels: ["status/backlog", "priority/p0"] });
+      mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
+        ...mockEvidence,
+        issue: {
+          ...mockEvidence.issue,
+          labels: ["status/backlog", "priority/p0"],
+          author: "itsmiso-ai",
+          authorAssociation: "NONE",
+          commentsCount: 1,
+        },
+      });
+      mocks.fetchIssueComments.mockResolvedValue([
+        { id: 7, author: "alice", authorAssociation: "NONE", body: "I would like to contribute.", createdAt: "2026-10-08T00:00:00Z" },
+      ]);
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("backlog", {
+          mutations: { githubComment: "Thanks for offering to contribute." },
+        }),
+      );
+
+      const result = await runHostedGroomer();
+
+      expectNoMutations();
+      expect(result).toMatchObject({ mode: "observe", observeDisposition: "would_refuse" });
+      expect(completedRun()).toMatchObject({ status: "dry_run_completed", observeDisposition: "would_refuse" });
+    });
+
+    it("records would_act for a comment-only plan when no groomer comment is recent", async () => {
+      mocks.selectGroomingCandidate.mockResolvedValue({ ...mockCandidate, labels: ["status/backlog", "priority/p0"] });
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("backlog", { mutations: { githubComment: "Adding a grooming note." } }),
+      );
+
+      const result = await runHostedGroomer();
+
+      expectNoMutations();
+      expect(result).toMatchObject({ mode: "observe", observeDisposition: "would_act" });
+    });
+
+    it("records would_noop for a comment-only plan inside the comment cooldown", async () => {
+      // The applier's cooldown rule consults the application store's
+      // hasRecentComment (a GroomingRun with a commentUrl since the window
+      // start); observe must consult the same rule, so auto would skip the
+      // comment and write nothing — a no-op, not an act.
+      mocks.selectGroomingCandidate.mockResolvedValue({ ...mockCandidate, labels: ["status/backlog", "priority/p0"] });
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("backlog", { mutations: { githubComment: "Adding a grooming note." } }),
+      );
+      mocks.prisma.groomingRun.findFirst.mockResolvedValue({
+        id: "gr-recent",
+        commentUrl: "https://github.com/org/repo/issues/42#issuecomment-1",
+        updatedAt: new Date(),
+      });
+
+      const result = await runHostedGroomer();
+
+      expectNoMutations();
+      expect(result).toMatchObject({ mode: "observe", observeDisposition: "would_noop" });
+      expect(completedRun()).toMatchObject({ status: "dry_run_completed", observeDisposition: "would_noop" });
+      // The cooldown read is the same store call the apply path makes.
+      expect(mocks.prisma.groomingRun.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({ where: expect.objectContaining({ issueId: "issue-42", commentUrl: { not: null } }) }),
+      );
+    });
+
+    it("records would_act for a comment-only plan when force bypasses the cooldown", async () => {
+      mocks.selectGroomingCandidate.mockResolvedValue({ ...mockCandidate, labels: ["status/backlog", "priority/p0"] });
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("backlog", { mutations: { githubComment: "Adding a grooming note." } }),
+      );
+      mocks.prisma.groomingRun.findFirst.mockResolvedValue({
+        id: "gr-recent",
+        commentUrl: "https://github.com/org/repo/issues/42#issuecomment-1",
+        updatedAt: new Date(),
+      });
+
+      const result = await runHostedGroomer({ force: true });
+
+      expectNoMutations();
+      expect(result).toMatchObject({ mode: "observe", observeDisposition: "would_act" });
+    });
+
+    it("records would_act when the cooldown skips the comment but labels still change", async () => {
+      mocks.selectGroomingCandidate.mockResolvedValue({ ...mockCandidate, labels: ["status/backlog", "priority/p0"] });
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("backlog", { mutations: { githubComment: "Adding a grooming note.", labelsToAdd: ["type/chore"] } }),
+      );
+      mocks.prisma.groomingRun.findFirst.mockResolvedValue({
+        id: "gr-recent",
+        commentUrl: "https://github.com/org/repo/issues/42#issuecomment-1",
+        updatedAt: new Date(),
+      });
+
+      const result = await runHostedGroomer();
+
+      expectNoMutations();
+      expect(result).toMatchObject({ mode: "observe", observeDisposition: "would_act" });
+    });
+
+    it("records would_refuse when the prior application's comment is still held", async () => {
+      mocks.selectGroomingCandidate.mockResolvedValue({ ...mockCandidate, labels: ["status/backlog", "priority/p0"] });
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("backlog", { mutations: { githubComment: "Adding a grooming note." } }),
+      );
+      const first = await runHostedGroomer();
+      const applicationKey = first!.mutationPlan!.applicationKey as string;
+      // A prior attempt claimed this key and left its comment step held; the
+      // reply gate is NOT holding now, but the applier keeps the prior hold,
+      // so auto would write nothing and the pending reply still awaits
+      // approval — a refusal, not a no-op.
+      mocks.applications.set(applicationKey, {
+        applicationKey,
+        status: "in_progress",
+        steps: { comment: { status: "held", detail: "pending_approval:externally_engaged" } },
+        attempts: 1,
+        updatedAt: new Date(),
+      });
+
+      const second = await runHostedGroomer();
+
+      expectNoMutations();
+      expect(second).toMatchObject({ mode: "observe", observeDisposition: "would_refuse" });
+    });
+
+    it("records would_noop when the reply gate holds but this application's comment is already posted", async () => {
+      mocks.selectGroomingCandidate.mockResolvedValue({ ...mockCandidate, labels: ["status/backlog", "priority/p0"] });
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("backlog", { mutations: { githubComment: "Adding a grooming note." } }),
+      );
+      const first = await runHostedGroomer();
+      const applicationKey = first!.mutationPlan!.applicationKey as string;
+      // The issue is externally engaged (the gate would hold a new reply),
+      // but the comment carrying this application's own marker is already on
+      // GitHub: the applier replays it before consulting the gate, so auto
+      // would write nothing.
+      mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
+        ...mockEvidence,
+        issue: {
+          ...mockEvidence.issue,
+          labels: ["status/backlog", "priority/p0"],
+          author: "itsmiso-ai",
+          authorAssociation: "NONE",
+          commentsCount: 2,
+        },
+      });
+      mocks.fetchIssueComments.mockResolvedValue([
+        { id: 7, author: "alice", authorAssociation: "NONE", body: "I would like to contribute.", createdAt: "2026-10-08T00:00:00Z", url: "https://github.com/org/repo/issues/42#issuecomment-7" },
+        { id: 8, author: "itsmiso-ai", authorAssociation: "NONE", body: `Adding a grooming note.\n\n<!-- dispatch-groomer:apply=${applicationKey} -->`, createdAt: "2026-10-09T00:00:00Z", url: "https://github.com/org/repo/issues/42#issuecomment-8" },
+      ]);
+
+      const second = await runHostedGroomer();
+
+      expectNoMutations();
+      expect(second).toMatchObject({ mode: "observe", observeDisposition: "would_noop" });
+    });
+
+    it("records assessment_unavailable when the model stage fails in observe mode", async () => {
+      mocks.callGroomerLLM.mockRejectedValue(new Error("LLM down"));
+      await expect(runHostedGroomer()).rejects.toThrow("LLM down");
+      expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+      expect(mocks.addIssueComment).not.toHaveBeenCalled();
+      expect(mocks.closeIssue).not.toHaveBeenCalled();
+      expect(mocks.prisma.issue.update).not.toHaveBeenCalled();
+      expect(completedRun()).toMatchObject({ status: "failed", observeDisposition: "assessment_unavailable" });
+    });
+
+    it("records assessment_unavailable when the evidence snapshot cannot capture the live issue", async () => {
+      mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
+        ...mockEvidence,
+        issue: { ...mockEvidence.issue, state: "unknown" },
+        warnings: ["evidence: failed to fetch live issue state: 404"],
+      });
+      const result = await runHostedGroomer();
+      expectNoMutations();
+      expect(result).toMatchObject({ mode: "observe", observeDisposition: "assessment_unavailable" });
+      expect(completedRun()).toMatchObject({
+        status: "dry_run_completed",
+        applyOutcome: "unverifiable",
+        observeDisposition: "assessment_unavailable",
+      });
     });
   });
 });

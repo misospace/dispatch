@@ -22,7 +22,8 @@ The feature is disabled by default.
 | `DISPATCH_GROOMER_MODEL` | required when enabled | Model sent to the chat completions API. Must be set explicitly when the hosted groomer is enabled. |
 | `DISPATCH_GROOMER_TIMEOUT_MS` | Scaled | LLM request timeout. Defaults to `60s + 5s/KB of maxContextBytes`, clamped to 60s–300s. |
 | `DISPATCH_GROOMER_MAX_CONTEXT_BYTES` | `8192` | Budget for issue context sent to the model. |
-| `DISPATCH_GROOMER_DRY_RUN` | `true` | Keeps rollout safe by returning a mutation plan without writes. |
+| `DISPATCH_GROOMER_DRY_RUN` | `true` | Keeps rollout safe by returning a mutation plan without writes. Legacy boolean view of `DISPATCH_GROOMER_MODE`. |
+| `DISPATCH_GROOMER_MODE` | derived | Off/observe/auto rollout mode (#1542): `observe` runs the full assessment with zero external writes and records a would-disposition receipt; `auto` writes; `off` disables. Unset maps from `DISPATCH_GROOMER_DRY_RUN` (`true` → `observe`, `false` → `auto`); an explicit mode wins over the dry-run boolean; an unrecognized value warns once and falls back to the dry-run mapping. |
 | `DISPATCH_LLM_RESPONSE_FORMAT` | `true` | Send `response_format` (`json_schema`, then `json_object`). Set `false` for backends that implement neither. |
 | `DISPATCH_GROOMER_REPO_CONTEXT_ENABLED` | `false` | Enables bounded GitHub API repository context. When true, the groomer gathers repository metadata, code-search snippets, and file text through GitHub REST APIs only — it never clones repositories or runs shell commands. |
 | `DISPATCH_GROOMER_MAX_CONTEXT_FILES` | `5` | Maximum number of files included in repository context. |
@@ -115,13 +116,26 @@ Optional body:
 }
 ```
 
-`dryRun` overrides the environment default for a single request. `repoFullName` and `issueNumber` target a specific synced issue. `force` lets the hosted groomer proceed when another active issue lease exists.
+`dryRun` overrides the environment default for a single request. `mode` (`observe` or `auto`) overrides the configured rollout mode for a single request. `repoFullName` and `issueNumber` target a specific synced issue. `force` lets the hosted groomer proceed when another active issue lease exists.
+
+## Observe mode (#1542)
+
+`observe` executes the same read/evidence/freshness path as write-mode planning — the same selector, evidence snapshot, model call, plan validation and read-only apply preconditions — but performs no GitHub or queue mutation. That includes the per-issue lease: observe reads active leases and declines (`would_refuse`, run recorded `dry_run_completed`) when another actor owns the issue, but never creates, renews or releases a lease — lease state stays untouched, unlike an auto run, which acquires and releases the fenced hosted-groomer lease. A positive decision is durably recorded on the run as `observeDisposition` (not merely a generic dry run):
+
+- `would_act` — the plan carried at least one mutation auto would have written (labels, comment, close, children, title/body).
+- `would_noop` — the assessment decided but nothing external would have changed, including a plan whose application key was already applied (auto would have replayed, writing nothing new).
+- `would_refuse` — the pipeline would have declined to act: in-flight status, stale or unverifiable evidence, a held reply with no other mutation, or another actor holding the issue lease.
+- `assessment_unavailable` — no decision exists: the evidence snapshot could not capture the live issue, or the model stage failed.
+
+The comment decision in a disposition is the same one the write path makes (`resolveCommentGate`): a comment for this application already on GitHub replays to `would_noop`, a held reply — from the reply gate or a prior pending reply — is `would_refuse`, and a groomer comment inside `DISPATCH_GROOMER_COMMENT_COOLDOWN_HOURS` skips the comment, so a comment-only plan inside the cooldown is `would_noop`, not `would_act`. `force` bypasses the cooldown in both modes.
+
+The run record keeps the proposed mutations (`mutationPlan`, `validatedOutput`) and the evidence revision/freshness they were based on (`evidenceDigest`, `preconditions`), so an observe receipt can later be compared with what an auto run actually did. Runs carry `mode` (`observe`/`auto`; null on rows recorded before this contract), and `GET /api/groomer/runs?mode=observe` filters them. `GET /api/groomer/runs/summary?windowHours=24` answers "how often would this automation act?" over a recent window (default 24h, clamped 1h–720h). The `/groomer` history page shows an observe badge with the disposition, a mode filter, and the 24h summary strip. Ad-hoc dry-run requests (`dryRun: true`, or `DISPATCH_GROOMER_DRY_RUN=true`) map cleanly onto observe: they record `mode: "observe"` and a disposition too. Switching from observe to auto is an env or per-request change only — no prompt or rule-definition change.
 
 ## Rollout
 
-1. Configure the LLM endpoint and keep `DISPATCH_GROOMER_DRY_RUN=true`.
-2. Invoke `POST /api/groomer/run` and inspect the returned `plannedLabels` and model output.
-3. Once plans look safe, set `dryRun=false` for a targeted request or change `DISPATCH_GROOMER_DRY_RUN=false`.
+1. Configure the LLM endpoint and keep `DISPATCH_GROOMER_DRY_RUN=true` (equivalently `DISPATCH_GROOMER_MODE=observe`).
+2. Invoke `POST /api/groomer/run` and inspect the returned `plannedLabels` and model output; watch the `observeDisposition` receipts and the summary to measure precision.
+3. Once plans look safe, set `mode=auto` for a targeted request or change `DISPATCH_GROOMER_MODE=auto` (or the legacy `DISPATCH_GROOMER_DRY_RUN=false`).
 
 Write mode first re-validates the plan against live GitHub state, then applies only what differs from the live issue: labels, at most one comment when the model returned `githubComment`, a bad-title rewrite or managed body section, and the `already_done` close. It then updates Dispatch grooming fields and lane history, records the result's freshness baseline (see [Grooming Freshness](#grooming-freshness)), and records `AgentRun`/`AuditLog` rows. A plan whose preconditions changed applies nothing (see [Applying a plan](#applying-a-plan)).
 
