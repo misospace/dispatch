@@ -50,6 +50,7 @@ model Issue {
   ownershipReleaseIntents     OwnershipReleaseIntent[]
   ownershipReconcileCandidate OwnershipReconcileCandidate?
   noPrConclusion              NoPrConclusion?
+  blockedExternalPark         BlockedExternalPark?
 
   // Escalated lane outcome tracking
   decomposed     Boolean   @default(false)
@@ -185,6 +186,42 @@ model NoPrConclusion {
   updatedAt          DateTime @updatedAt
 
   @@index([createdAt])
+}
+
+// #1562: a worker's repeated blocked settlements on issue work (`blocked` /
+// `waiting-external` implement reports carrying the same missing-prerequisite
+// descriptor) park the issue out of the agent queue after a bounded
+// threshold, so the same verification loop cannot run forever. The row is the
+// accumulating counter AND the park: it goes live at
+// `consecutiveCount >= DISPATCH_BLOCKED_EXTERNAL_PARK_THRESHOLD` while the
+// issue content fingerprint still matches (a title/body edit is fresh
+// evidence and ends it). A settlement carrying a DIFFERENT descriptor resets
+// the count: a changed prerequisite is fresh information, and the first
+// settlement after any reset stays fully re-offerable. Dispatch-side queue
+// policy only: no GitHub label or close is written. Operator clears:
+// DELETE /api/issues/[issueId]/blocked-external, a status set, a board move,
+// or a maintainer force-claim.
+model BlockedExternalPark {
+  id               String   @id @default(cuid())
+  issueId          String   @unique
+  issue            Issue    @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  agentName        String
+  outcome          String
+  // Bounded missing-prerequisite descriptor (grammar in
+  // lib/blocked-external-park.ts): exact string equality decides "same
+  // prerequisite" for the consecutive count.
+  descriptor       String
+  consecutiveCount Int      @default(1)
+  summary          String?  @db.Text
+  // sha256 over canonical { title, body } at record time (same normalizer as
+  // NoPrConclusion: labels/state excluded on purpose — status churn must
+  // never end a park; a content edit always does).
+  contentFingerprint String
+  lastSettledAt    DateTime @default(now())
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([lastSettledAt])
 }
 
 enum PrFixLane {

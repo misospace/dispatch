@@ -341,6 +341,29 @@ worker and reviewer that keep disagreeing without head movement end
   still accepted but parks nothing. See
   [no-pr-conclusion-park.md](./no-pr-conclusion-park.md).
 
+## Repeated blocked-settlement park (#1562)
+
+A worker that cannot start work because of an outside blocker reports
+`outcome: "blocked"` or `outcome: "waiting-external"` (with the structured
+`externalWait` contract) on an `implement` task. One settlement is recoverable:
+Dispatch offers the issue again. Dispatch counts consecutive settlements that
+name the SAME missing-prerequisite descriptor (a structured `externalWait`
+ref, or a digest of the `error`/`summary` text; the coarse `blockReason`
+class is deliberately not part of the descriptor). When the count reaches
+`DISPATCH_BLOCKED_EXTERNAL_PARK_THRESHOLD` (default 3, clamped 2..10), the
+settlement parks the issue out of queue pickup. A settlement that names a
+different descriptor resets the count. An `implement` report that carries a
+`prFixItem` is PR-fix work and never counts toward the issue park, the same
+shape rule as the #1506 conclusion park. A worker-tier report may only count
+on an issue its agent actually owns (live `agent/<bound agent>` label check).
+The park is a Dispatch-side ledger row (no GitHub writes); it ends on an
+issue title/body edit, an operator clear
+(`DELETE /api/issues/{issueId}/blocked-external`, a status set, a board move,
+a maintainer force-claim), or a later implement report that shows real
+progress or a terminal conclusion (not a failed/handed-off/capacity release).
+The report response echoes the decision in `blockedExternalPark`.
+See [blocked-external-park.md](./blocked-external-park.md).
+
 ## Fenced capacity-exhaustion handoff (#1256)
 
 A worker whose execution capacity cannot run a handed attempt returns it with

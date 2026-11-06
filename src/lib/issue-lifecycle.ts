@@ -54,6 +54,10 @@ export const LIFECYCLE_EVENT_KINDS = [
   "conclusion_parked",
   /** A conclusion park ended: operator clear, content edit, or force-claim (#1506). */
   "conclusion_cleared",
+  /** A worker's repeated blocked-external settlement parked the issue out of the queue (#1562). */
+  "blocked_external_parked",
+  /** A blocked-external park ended: operator clear, content edit, force-claim, or fresh work (#1562). */
+  "blocked_external_cleared",
 ] as const;
 
 export type LifecycleEventKind = (typeof LIFECYCLE_EVENT_KINDS)[number];
@@ -87,6 +91,8 @@ export const LIFECYCLE_SOURCES = [
   "api:ownership",
   /** DELETE /api/issues/[id]/no-pr-conclusion (#1506 operator park clear). */
   "api:no-pr-conclusion",
+  /** DELETE /api/issues/[id]/blocked-external (#1562 operator park clear). */
+  "api:blocked-external",
   /** A bounded backfill over already-observed records (#1203). */
   "backfill",
 ] as const;

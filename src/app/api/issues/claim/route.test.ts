@@ -40,6 +40,8 @@ const { mocks } = vi.hoisted(() => ({
     agentWorkDeleteMany: vi.fn().mockResolvedValue({ count: 0 }),
     noPrConclusionFindUnique: vi.fn().mockResolvedValue(null),
     noPrConclusionDelete: vi.fn().mockResolvedValue({ id: "park-1" }),
+    blockedExternalParkFindUnique: vi.fn().mockResolvedValue(null),
+    blockedExternalParkDelete: vi.fn().mockResolvedValue({ id: "park-1" }),
     transaction: vi.fn((arg: any) => {
       if (typeof arg === "function") {
         return Promise.resolve(
@@ -96,6 +98,12 @@ vi.mock("@/lib/prisma", () => ({
     noPrConclusion: {
       findUnique: mocks.noPrConclusionFindUnique,
       delete: mocks.noPrConclusionDelete,
+    },
+    // #1562: the claim route reads (and a force-claim discharges) the
+    // repeated-blocked-settlement park row.
+    blockedExternalPark: {
+      findUnique: mocks.blockedExternalParkFindUnique,
+      delete: mocks.blockedExternalParkDelete,
     },
     $transaction: mocks.transaction,
   },
@@ -1519,5 +1527,128 @@ describe("POST /api/issues/claim — terminal no-PR conclusion park gate (#1506)
 
     expect(res.status).toBe(409);
     expect(mocks.noPrConclusionDelete).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/issues/claim — repeated blocked-settlement park (#1562)", () => {
+  // Same issue shape the #1506 block uses; local to this describe.
+  const BLOCKED_ISSUE = {
+    id: "issue-1",
+    state: "open",
+    number: 42,
+    title: "Fix flaky test suite",
+    body: "Already fixed upstream; no changes needed here.",
+    repository: { fullName: "org/repo" },
+    labels: [] as string[],
+  };
+  const savedMode = process.env.DISPATCH_BLOCKED_EXTERNAL_PARK_MODE;
+  const savedThreshold = process.env.DISPATCH_BLOCKED_EXTERNAL_PARK_THRESHOLD;
+
+  beforeEach(() => {
+    // Re-establish the hoisted defaults a preceding describe's
+    // mockResolvedValue overrides left behind (clearAllMocks does not reset
+    // implementations), so the #1506 gate stays inert in this block.
+    vi.clearAllMocks();
+    mocks.findUnique.mockResolvedValue(BLOCKED_ISSUE);
+    mocks.updateIssue.mockResolvedValue(BLOCKED_ISSUE);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.getLiveIssueLabels.mockResolvedValue([] as string[]);
+    mocks.leaseFindMany.mockResolvedValue([]);
+    mocks.leaseDeleteMany.mockResolvedValue({ count: 0 });
+    mocks.leaseUpdateMany.mockResolvedValue({ count: 0 });
+    mocks.leaseFindUnique.mockResolvedValue(null);
+    mocks.leaseFindFirst.mockResolvedValue(null);
+    mocks.leaseCreate.mockResolvedValue({
+      id: "l-1", agentName: "test-agent", issueId: "issue-1", checkpoint: "issue_claimed",
+      claimToken: "claim_tk_1", renewedAt: new Date(), createdAt: new Date(),
+    });
+    mocks.leaseUpdate.mockResolvedValue({
+      id: "l-1", agentName: "test-agent", issueId: "issue-1", checkpoint: "issue_claimed",
+      claimToken: "claim_tk_1", renewedAt: new Date(), createdAt: new Date(),
+    });
+    mocks.intentFindFirst.mockResolvedValue(null);
+    mocks.noPrConclusionFindUnique.mockResolvedValue(null);
+    mocks.noPrConclusionDelete.mockResolvedValue({ id: "park-1" });
+    mocks.blockedExternalParkFindUnique.mockResolvedValue(null);
+    mocks.blockedExternalParkDelete.mockResolvedValue({ id: "blocked-1" });
+  });
+
+  afterEach(() => {
+    if (savedMode === undefined) delete process.env.DISPATCH_BLOCKED_EXTERNAL_PARK_MODE;
+    else process.env.DISPATCH_BLOCKED_EXTERNAL_PARK_MODE = savedMode;
+    if (savedThreshold === undefined) delete process.env.DISPATCH_BLOCKED_EXTERNAL_PARK_THRESHOLD;
+    else process.env.DISPATCH_BLOCKED_EXTERNAL_PARK_THRESHOLD = savedThreshold;
+  });
+
+  // A live blocked-external row for issue-1: the fingerprint matches the
+  // issue's current title/body, so the row evaluates live.
+  function blockedRow(count: number) {
+    return {
+      id: "blocked-1",
+      issueId: "issue-1",
+      agentName: "courier",
+      outcome: "blocked",
+      descriptor: "blocked:abc123",
+      consecutiveCount: count,
+      summary: null,
+      contentFingerprint: computeConclusionContentFingerprint(BLOCKED_ISSUE),
+      createdAt: new Date("2026-11-06T00:00:00.000Z"),
+      updatedAt: new Date("2026-11-06T00:00:00.000Z"),
+    };
+  }
+
+  it("holds a non-force claim with retryable 409 while a live park is in force (enforce mode)", async () => {
+    mocks.blockedExternalParkFindUnique.mockResolvedValue(blockedRow(3));
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toContain("parked");
+    expect(body.error).toContain("courier");
+    expect(body.error).toContain("blocked-external");
+    // The gate fires before live label fetch and before any write: no
+    // GitHub call, no lease, no cache touch.
+    expect(mocks.getLiveIssueLabels).not.toHaveBeenCalled();
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.leaseCreate).not.toHaveBeenCalled();
+    // A held claim never discharges the park.
+    expect(mocks.blockedExternalParkDelete).not.toHaveBeenCalled();
+  });
+
+  it("a sub-threshold counter does not hold the claim", async () => {
+    mocks.blockedExternalParkFindUnique.mockResolvedValue(blockedRow(2));
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(200);
+    expect(mocks.getLiveIssueLabels).toHaveBeenCalled();
+    expect(mocks.blockedExternalParkDelete).not.toHaveBeenCalled();
+  });
+
+  it("audit mode: the park does not hold the claim", async () => {
+    process.env.DISPATCH_BLOCKED_EXTERNAL_PARK_MODE = "audit";
+    mocks.blockedExternalParkFindUnique.mockResolvedValue(blockedRow(5));
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(200);
+    expect(mocks.blockedExternalParkDelete).not.toHaveBeenCalled();
+  });
+
+  it("a maintainer force-claim supersedes a live park and discharges it after the claim commit", async () => {
+    mocks.blockedExternalParkFindUnique.mockResolvedValue(blockedRow(3));
+    const res = await POST(makeRequest({ force: true }));
+    expect(res.status).toBe(200);
+    // The park row is retired only after the claim transaction committed.
+    expect(mocks.blockedExternalParkDelete).toHaveBeenCalledWith({ where: { issueId: "issue-1" } });
+    expect(mocks.createLifecycleEvent).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        issueId: "issue-1",
+        kind: "blocked_external_cleared",
+        source: "api:claim",
+        metadata: expect.objectContaining({
+          parkedBy: "courier",
+          parkedOutcome: "blocked",
+          reason: "force-claim supersedes the blocked-external park",
+        }),
+      }),
+    });
   });
 });

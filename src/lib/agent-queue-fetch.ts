@@ -20,6 +20,13 @@ import {
   toNoPrConclusionMark,
   type NoPrConclusionRow,
 } from "@/lib/no-pr-conclusion";
+import {
+  blockedExternalParkThreshold,
+  getBlockedExternalParkMode,
+  loadLiveBlockedExternalParks,
+  toBlockedExternalParkMark,
+  type BlockedExternalParkRow,
+} from "@/lib/blocked-external-park";
 import type { RankedIssue } from "@/lib/agent-queue";
 
 /**
@@ -66,8 +73,9 @@ export interface AgentQueueFetchResult {
   fullQueue: RankedIssue[];
   /**
    * Issues withheld from pickup (enforce modes only): admission-withheld
-   * entries carrying `admission`, plus issues parked by a terminal no-PR
-   * conclusion carrying `noPrConclusion`.
+   * entries carrying `admission`, issues parked by a terminal no-PR
+   * conclusion carrying `noPrConclusion`, and issues parked by repeated
+   * blocked-external settlements carrying `blockedExternalPark` (#1562).
    */
   withheldQueue: RankedIssue[];
   /** The grooming admission mode this fetch ran under. */
@@ -223,6 +231,29 @@ export async function fetchAgentQueueData(
   const isParkWithheld = (item: { issueId?: string }): boolean =>
     noPrMode === "enforce" && item.issueId !== undefined && liveParks.has(item.issueId);
 
+  // Repeated blocked-external settlement parks (#1562): one small ledger
+  // read, only when the mode is on. Like the conclusion park the decision is
+  // pure content-fingerprint + count evaluation; no GitHub call happens here.
+  const blockedMode = getBlockedExternalParkMode();
+  const blockedThreshold = blockedExternalParkThreshold();
+  let liveBlockedParks: Map<string, BlockedExternalParkRow> = new Map();
+  if (blockedMode !== "off") {
+    try {
+      liveBlockedParks = await loadLiveBlockedExternalParks(
+        filteredIssues.map((issue) => ({ id: issue.id, title: issue.title, body: issue.body })),
+        blockedThreshold,
+      );
+    } catch (error) {
+      // Same degrade-to-nothing contract as the conclusion park read: this
+      // poll withholds nothing and the claim gate stays fail-closed.
+      console.warn(
+        `[blocked-external] park ledger read failed; this poll withholds nothing: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+  const isBlockedWithheld = (item: { issueId?: string }): boolean =>
+    blockedMode === "enforce" && item.issueId !== undefined && liveBlockedParks.has(item.issueId);
+
   // Open-issue key set for dependency gating (issues are already filtered to state: "open")
   const openIssueKeys = new Set(issues.map((i) => dependencyKey(i.repository.fullName, i.number)));
 
@@ -255,25 +286,37 @@ export async function fetchAgentQueueData(
   );
 
   // Attach park marks before admission annotation so they survive onto the
-  // withheld entries (#1506). The mark is carried in every mode except off.
+  // withheld entries (#1506, #1562). The marks are carried in every mode
+  // except off.
   if (noPrMode !== "off") {
     for (const item of rankedQueue) {
       const park = item.issueId ? liveParks.get(item.issueId) : undefined;
       if (park) item.noPrConclusion = toNoPrConclusionMark(park);
     }
   }
+  if (blockedMode !== "off") {
+    for (const item of rankedQueue) {
+      const park = item.issueId ? liveBlockedParks.get(item.issueId) : undefined;
+      if (park) item.blockedExternalPark = toBlockedExternalParkMark(park, blockedThreshold);
+    }
+  }
+
+  // Either park kind withholds in its own enforce mode; the two holds are
+  // independent knobs.
+  const isWithheldByAnyPark = (item: { issueId?: string }): boolean =>
+    isParkWithheld(item) || isBlockedWithheld(item);
 
   const prFixItems = prFixItemsRaw.map(toAgentQueuePrFixItem);
 
   if (admissionMode === "off") {
     const conclusionWithheld = rankedQueue
-      .filter(isParkWithheld)
+      .filter(isWithheldByAnyPark)
       .map((item) => ({ ...item, claimable: false }));
     return {
       resolvedLane,
       laneValid: true,
       rankedQueue: conclusionWithheld.length
-        ? rankedQueue.filter((item) => !isParkWithheld(item))
+        ? rankedQueue.filter((item) => !isWithheldByAnyPark(item))
         : rankedQueue,
       // fullQueue feeds linked-PR follow-up routing, which is PR work and
       // was never gated by issue-side holds — parked issues stay visible to
@@ -308,16 +351,17 @@ export async function fetchAgentQueueData(
   });
 
   if (admissionMode === "audit") {
-    // The two holds are independent knobs: admission-audit annotates without
-    // filtering, but a conclusion-enforce park still withholds here (#1506).
+    // The holds are independent knobs: admission-audit annotates without
+    // filtering, but an enforce park of either kind still withholds here
+    // (#1506, #1562).
     const admissionAuditWithheld = fullQueue
-      .filter(isParkWithheld)
+      .filter(isWithheldByAnyPark)
       .map((item) => ({ ...item, claimable: false }));
     return {
       resolvedLane,
       laneValid: true,
       rankedQueue: admissionAuditWithheld.length
-        ? fullQueue.filter((item) => !isParkWithheld(item))
+        ? fullQueue.filter((item) => !isWithheldByAnyPark(item))
         : fullQueue,
       fullQueue,
       withheldQueue: admissionAuditWithheld,
@@ -332,15 +376,16 @@ export async function fetchAgentQueueData(
     .map((item) => ({ ...item, claimable: false }));
   const admitted = fullQueue.filter((item) => item.admission?.admitted !== false);
   // A parked issue that admission also withheld is counted once, on the
-  // admission side; the park never double-lists it.
+  // admission side; a park never double-lists it, and an item withheld by
+  // both park kinds appears once (single filter pass) (#1506, #1562).
   return {
     resolvedLane,
     laneValid: true,
-    rankedQueue: admitted.filter((item) => !isParkWithheld(item)),
+    rankedQueue: admitted.filter((item) => !isWithheldByAnyPark(item)),
     fullQueue,
     withheldQueue: [
       ...admissionWithheld,
-      ...admitted.filter(isParkWithheld).map((item) => ({ ...item, claimable: false })),
+      ...admitted.filter(isWithheldByAnyPark).map((item) => ({ ...item, claimable: false })),
     ],
     admissionMode,
     prFixItems,

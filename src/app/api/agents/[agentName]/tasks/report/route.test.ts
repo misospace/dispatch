@@ -47,6 +47,14 @@ const { mocks, mockAgentRun, mockDedupe, prFixResolveMock, closeResolveMock, pri
       upsert: vi.fn().mockResolvedValue({}),
       delete: vi.fn().mockResolvedValue({}),
     },
+    // #1562: repeated-blocked-settlement park ledger. Same inert-by-default
+    // contract: the read finds no row, so a blocked report on an issue with
+    // no history stays a no-op.
+    blockedExternalPark: {
+      findUnique: vi.fn().mockResolvedValue(null),
+      upsert: vi.fn().mockResolvedValue({ consecutiveCount: 1 }),
+      delete: vi.fn().mockResolvedValue({}),
+    },
     issueLifecycleEvent: {
       create: vi.fn().mockResolvedValue({ id: "evt-1" }),
       upsert: vi.fn().mockResolvedValue({ id: "evt-1" }),
@@ -86,6 +94,9 @@ const { mocks, mockAgentRun, mockDedupe, prFixResolveMock, closeResolveMock, pri
       issueFindUnique: prismaMock.issue.findUnique,
       noPrConclusionUpsert: prismaMock.noPrConclusion.upsert,
       noPrConclusionFindUnique: prismaMock.noPrConclusion.findUnique,
+      blockedParkFindUnique: prismaMock.blockedExternalPark.findUnique,
+      blockedParkUpsert: prismaMock.blockedExternalPark.upsert,
+      blockedParkDelete: prismaMock.blockedExternalPark.delete,
     },
     prismaMock,
     getLiveIssueLabelsMock: vi.fn(),
@@ -3348,5 +3359,450 @@ describe("POST /api/agents/[agentName]/tasks/report — park worker ownership (#
       outcome: "no_changes_needed",
       reason: "parked",
     });
+  });
+});
+
+describe("POST /api/agents/[agentName]/tasks/report — repeated blocked-settlement park (#1562)", () => {
+  // Re-establish the hoisted defaults a preceding describe's mockReset() may
+  // have stripped, so the park path starts from well-known state.
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+    resetRateLimits();
+    mocks.repoFindUnique.mockResolvedValue({ id: "repo-1" });
+    mocks.issueFindUnique.mockResolvedValue(issueRow());
+    prismaMock.issueLifecycleEvent.create.mockResolvedValue({ id: "evt-1" });
+    prFixResolveMock.mockReset().mockResolvedValue({
+      matched: false,
+      action: "none",
+      itemId: null,
+      reason: "no matching pr-fix queue item",
+    });
+    // The blocked-external mocks carry per-test implementations (stateful
+    // stores, rejection cases); reset them so nothing leaks between tests.
+    mocks.blockedParkFindUnique.mockReset().mockResolvedValue(null);
+    mocks.blockedParkUpsert.mockReset().mockResolvedValue({ consecutiveCount: 1 });
+    mocks.blockedParkDelete.mockReset().mockResolvedValue({});
+    // Sane live-label default for the worker-tier tests; tests that need a
+    // different assignment override it with mockResolvedValueOnce.
+    getLiveIssueLabelsMock.mockReset().mockResolvedValue(["agent/test-agent", "status/ready"]);
+  });
+
+  const issueRow = (over: Record<string, unknown> = {}) => ({
+    id: "issue-42",
+    title: "Fix login redirect",
+    body: "Steps to reproduce: log in, then click settings",
+    state: "open",
+    ...over,
+  });
+
+  function workerPostRequest(body: unknown) {
+    return POST(
+      authedRequest("http://localhost/api/agents/test-agent/tasks/report", {
+        method: "POST",
+        token: "bound-report-agent",
+        body,
+      }),
+      { params: Promise.resolve({ agentName: "test-agent" }) },
+    );
+  }
+
+  const blockedBody = {
+    taskType: "implement",
+    outcome: "blocked",
+    repoFullName: "org/repo",
+    issueNumber: 42,
+    summary: "harness missing on main",
+  };
+
+  it("the first blocked settlement counts without parking (first attempt unchanged)", async () => {
+    const res = await postRequest(blockedBody);
+    expect(res.status).toBe(200);
+    expect(mocks.blockedParkFindUnique).toHaveBeenCalledWith({ where: { issueId: "issue-42" } });
+    expect(mocks.blockedParkUpsert).toHaveBeenCalledTimes(1);
+    const arg = mocks.blockedParkUpsert.mock.calls[0][0];
+    expect(arg.where).toEqual({ issueId: "issue-42" });
+    expect(arg.create).toEqual(
+      expect.objectContaining({
+        issueId: "issue-42",
+        agentName: "test-agent",
+        outcome: "blocked",
+        descriptor: expect.stringMatching(/^blocked:[0-9a-f]{16}$/),
+        consecutiveCount: 1,
+        contentFingerprint: expect.any(String),
+      }),
+    );
+    // No park event on the first settlement (the route also records the
+    // generic attempt_failed lifecycle event for a blocked outcome, so the
+    // assertion filters by kind).
+    const parkEvents = prismaMock.issueLifecycleEvent.create.mock.calls
+      .map((c: any[]) => c[0].data)
+      .filter((d: any) => d.kind === "blocked_external_parked");
+    expect(parkEvents).toHaveLength(0);
+    const body = await res.json();
+    expect(body.blockedExternalPark).toEqual({ recorded: true, count: 1, threshold: 3, live: false, reason: "counted" });
+  });
+
+  it("three consecutive same-descriptor settlements park once, on the crossing write", async () => {
+    // A faithful in-memory prisma table: upsert applies `create` only when
+    // the row is absent and `update` only when it exists, with atomic
+    // increments. The counting business logic runs for real in the module.
+    let stored: Record<string, unknown> | null = null;
+    mocks.blockedParkFindUnique.mockImplementation(async () => stored);
+    mocks.blockedParkUpsert.mockImplementation(async ({ where, create, update }: any) => {
+      if (!stored) {
+        stored = { id: "blocked-1", issueId: where.issueId, ...create };
+      } else {
+        const next = { ...stored } as Record<string, unknown>;
+        for (const [k, v] of Object.entries(update as Record<string, unknown>)) {
+          if (v !== null && typeof v === "object" && "increment" in (v as Record<string, unknown>)) {
+            next[k] = ((next[k] as number) ?? 0) + (v as { increment: number }).increment;
+          } else {
+            next[k] = v;
+          }
+        }
+        stored = next;
+      }
+      return { ...stored };
+    });
+
+    const first = await postRequest(blockedBody);
+    expect((await first.json()).blockedExternalPark).toMatchObject({ count: 1, live: false, reason: "counted" });
+
+    const second = await postRequest(blockedBody);
+    expect((await second.json()).blockedExternalPark).toMatchObject({ count: 2, live: false, reason: "counted" });
+
+    const third = await postRequest(blockedBody);
+    const body = await third.json();
+    expect(body.blockedExternalPark).toMatchObject({ count: 3, threshold: 3, live: true, reason: "parked" });
+    // Exactly one crossing event, on the third write.
+    const parkEvents = prismaMock.issueLifecycleEvent.create.mock.calls
+      .map((c: any[]) => c[0].data)
+      .filter((d: any) => d.kind === "blocked_external_parked");
+    expect(parkEvents).toHaveLength(1);
+    expect(parkEvents[0]).toMatchObject({ issueId: "issue-42", agentName: "test-agent" });
+    expect(parkEvents[0].metadata).toMatchObject({ outcome: "blocked", count: 3, threshold: 3 });
+
+    // The fourth settlement counts silently — no second event.
+    await postRequest(blockedBody);
+    expect(
+      prismaMock.issueLifecycleEvent.create.mock.calls.filter((c: any[]) => c[0].data.kind === "blocked_external_parked"),
+    ).toHaveLength(1);
+  });
+
+  it("a differently-worded blocker resets the count (a changed prerequisite is fresh)", async () => {
+    let stored: Record<string, unknown> | null = null;
+    mocks.blockedParkFindUnique.mockImplementation(async () => stored);
+    mocks.blockedParkUpsert.mockImplementation(async ({ where, create, update }: any) => {
+      if (!stored) stored = { id: "blocked-1", issueId: where.issueId, ...create };
+      else {
+        const next = { ...stored } as Record<string, unknown>;
+        for (const [k, v] of Object.entries(update as Record<string, unknown>)) {
+          if (v !== null && typeof v === "object" && "increment" in (v as Record<string, unknown>)) {
+            next[k] = ((next[k] as number) ?? 0) + (v as { increment: number }).increment;
+          } else next[k] = v;
+        }
+        stored = next;
+      }
+      return { ...stored };
+    });
+
+    await postRequest(blockedBody);
+    await postRequest(blockedBody);
+    const res = await postRequest({ ...blockedBody, summary: "a different blocker now" });
+    const body = await res.json();
+    expect(body.blockedExternalPark).toMatchObject({ count: 1, live: false, reason: "counted" });
+  });
+
+  it("an issue content edit between settlements resets the count (#1562 review B1)", async () => {
+    let stored: Record<string, unknown> | null = null;
+    mocks.blockedParkFindUnique.mockImplementation(async () => stored);
+    mocks.blockedParkUpsert.mockImplementation(async ({ where, create, update }: any) => {
+      if (!stored) stored = { id: "blocked-1", issueId: where.issueId, ...create };
+      else {
+        const next = { ...stored } as Record<string, unknown>;
+        for (const [k, v] of Object.entries(update as Record<string, unknown>)) {
+          if (v !== null && typeof v === "object" && "increment" in (v as Record<string, unknown>)) {
+            next[k] = ((next[k] as number) ?? 0) + (v as { increment: number }).increment;
+          } else next[k] = v;
+        }
+        stored = next;
+      }
+      return { ...stored };
+    });
+
+    await postRequest(blockedBody);
+    await postRequest(blockedBody);
+    // A human edits the issue body; the next same-text settlement restarts.
+    mocks.issueFindUnique.mockResolvedValue(issueRow({ body: "edited body" }));
+    const res = await postRequest(blockedBody);
+    const body = await res.json();
+    expect(body.blockedExternalPark).toMatchObject({ count: 1, live: false, reason: "counted" });
+  });
+
+  it("an idempotent duplicate replay neither counts nor clears", async () => {
+    let stored: Record<string, unknown> | null = null;
+    mocks.blockedParkFindUnique.mockImplementation(async () => stored);
+    mocks.blockedParkUpsert.mockImplementation(async ({ where, create }: any) => {
+      if (!stored) stored = { id: "blocked-1", issueId: where.issueId, ...create };
+      return { ...stored };
+    });
+
+    // Idempotent-reporting harness (#1044): the first claim stores its
+    // payload hash; the retry collides on the unique index and replays.
+    let storedHash: string | null = null;
+    mockDedupe.create.mockImplementationOnce(async (args: any) => {
+      storedHash = args.data.payloadHash;
+      return { id: "claim-1", agentRunId: null };
+    });
+    await postRequest({ ...blockedBody, idempotencyKey: "run-1" });
+    expect(stored).not.toBeNull();
+    const storedAfterFirst: Record<string, unknown> = { ...(stored as unknown as Record<string, unknown>) };
+
+    mockDedupe.create.mockRejectedValueOnce(
+      new Prisma.PrismaClientKnownRequestError("P2002", {
+        code: "P2002",
+        meta: { target: ["agentName_idempotencyKey"] },
+        clientVersion: "5.0.0",
+      }),
+    );
+    mockDedupe.findUnique.mockResolvedValueOnce({
+      agentName: "test-agent",
+      idempotencyKey: "run-1",
+      payloadHash: storedHash,
+      agentRunId: "run-1",
+      prFixResolution: null,
+      closeResolution: null,
+    });
+    const retry = await postRequest({ ...blockedBody, idempotencyKey: "run-1" });
+    const body = await retry.json();
+    expect(body.duplicate).toBe(true);
+    // The stored row is untouched by the replay.
+    expect(stored).toEqual(storedAfterFirst);
+    expect(body.blockedExternalPark).toBeUndefined();
+  });
+
+  it("a token-bearing blocked report is PR-fix work and does not count", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const res = await postRequest({
+      ...blockedBody,
+      prFixItem: { id: "item-9", generation: 1 },
+    });
+    expect(res.status).toBe(200);
+    expect(mocks.blockedParkFindUnique).not.toHaveBeenCalled();
+    expect(mocks.blockedParkUpsert).not.toHaveBeenCalled();
+    const body = await res.json();
+    expect(body.blockedExternalPark).toEqual({ reason: "pr-fix-attempt" });
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("item-9"));
+    warn.mockRestore();
+  });
+
+  it("a worker report for an issue NOT live-assigned to it does not count", async () => {
+    getLiveIssueLabelsMock.mockResolvedValueOnce(["status/ready", "priority/p1"]);
+
+    const res = await workerPostRequest(blockedBody);
+    expect(res.status).toBe(200);
+    expect(getLiveIssueLabelsMock).toHaveBeenCalledWith("org/repo", 42);
+    expect(mocks.blockedParkFindUnique).not.toHaveBeenCalled();
+    expect(mocks.blockedParkUpsert).not.toHaveBeenCalled();
+    const body = await res.json();
+    expect(body.blockedExternalPark).toEqual({ reason: "not-assigned" });
+  });
+
+  it("a worker report for its live-assigned issue counts", async () => {
+    getLiveIssueLabelsMock.mockResolvedValueOnce(["agent/test-agent", "status/ready"]);
+
+    const res = await workerPostRequest(blockedBody);
+    expect(res.status).toBe(200);
+    expect(mocks.blockedParkUpsert).toHaveBeenCalledTimes(1);
+    const body = await res.json();
+    expect(body.blockedExternalPark).toMatchObject({ recorded: true, count: 1, live: false });
+  });
+
+  it("a maintainer report counts without any live assignment", async () => {
+    const res = await postRequest(blockedBody);
+    expect(res.status).toBe(200);
+    expect(getLiveIssueLabelsMock).not.toHaveBeenCalled();
+    expect(mocks.blockedParkUpsert).toHaveBeenCalledTimes(1);
+  });
+
+  it("a closed issue is not counted (skipped, not an error)", async () => {
+    mocks.issueFindUnique.mockResolvedValue(issueRow({ state: "closed" }));
+
+    const res = await postRequest(blockedBody);
+    expect(res.status).toBe(200);
+    expect(mocks.blockedParkFindUnique).not.toHaveBeenCalled();
+    expect(mocks.blockedParkUpsert).not.toHaveBeenCalled();
+    const body = await res.json();
+    expect(body.blockedExternalPark).toEqual({ reason: "issue-not-open" });
+  });
+
+  it("a record-write failure does not fail the report", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mocks.blockedParkUpsert.mockRejectedValueOnce(new Error("db down"));
+
+    const res = await postRequest(blockedBody);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.blockedExternalPark).toEqual({ reason: "record-write-failed" });
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("blocked-external"));
+    warnSpy.mockRestore();
+  });
+
+  it("a fresh-work outcome clears a stored count and echoes the clearance", async () => {
+    mocks.blockedParkFindUnique.mockResolvedValue({
+      id: "blocked-1",
+      issueId: "issue-42",
+      agentName: "test-agent",
+      outcome: "blocked",
+      descriptor: "blocked:abc",
+      consecutiveCount: 3,
+      summary: null,
+      contentFingerprint: "stale",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      pullRequestNumber: 7,
+    });
+    expect(res.status).toBe(200);
+    expect(mocks.blockedParkDelete).toHaveBeenCalledWith({ where: { issueId: "issue-42" } });
+    const clearEvents = prismaMock.issueLifecycleEvent.create.mock.calls
+      .map((c: any[]) => c[0].data)
+      .filter((d: any) => d.kind === "blocked_external_cleared");
+    expect(clearEvents).toHaveLength(1);
+    const body = await res.json();
+    expect(body.blockedExternalPark).toEqual({ cleared: true, reason: "fresh-outcome" });
+  });
+
+  it("a failed outcome clears nothing (it says nothing about the prerequisite)", async () => {
+    mocks.blockedParkFindUnique.mockResolvedValue({
+      id: "blocked-1",
+      issueId: "issue-42",
+      agentName: "test-agent",
+      outcome: "blocked",
+      descriptor: "blocked:abc",
+      consecutiveCount: 2,
+      summary: null,
+      contentFingerprint: "stale",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "failed",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      error: "build broke",
+    });
+    expect(res.status).toBe(200);
+    expect(mocks.blockedParkDelete).not.toHaveBeenCalled();
+    const body = await res.json();
+    expect(body.blockedExternalPark).toBeUndefined();
+  });
+
+  it("a token-bearing fresh-work report clears nothing (PR-fix work owns its own lane)", async () => {
+    mocks.blockedParkFindUnique.mockResolvedValue({
+      id: "blocked-1",
+      issueId: "issue-42",
+      agentName: "test-agent",
+      outcome: "blocked",
+      descriptor: "blocked:abc",
+      consecutiveCount: 3,
+      summary: null,
+      contentFingerprint: "stale",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      pullRequestNumber: 7,
+      prFixItem: { id: "item-9", generation: 1 },
+    });
+    expect(res.status).toBe(200);
+    expect(mocks.blockedParkDelete).not.toHaveBeenCalled();
+  });
+
+  it("a worker fresh-work report on an issue NOT live-assigned to it clears nothing", async () => {
+    getLiveIssueLabelsMock.mockResolvedValueOnce(["agent/bravo", "status/ready"]);
+
+    const res = await workerPostRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      pullRequestNumber: 7,
+    });
+    expect(res.status).toBe(200);
+    expect(getLiveIssueLabelsMock).toHaveBeenCalledWith("org/repo", 42);
+    expect(mocks.blockedParkDelete).not.toHaveBeenCalled();
+  });
+
+  it("an already_done worker report makes only ONE live-label call (the close path's gate)", async () => {
+    // The already_done close path (#1143) verifies the live assignment; the
+    // blocked-external clear must not repeat that round-trip.
+    getLiveIssueLabelsMock.mockResolvedValueOnce(["agent/test-agent", "status/ready"]);
+
+    const res = await workerPostRequest({
+      taskType: "implement",
+      outcome: "already_done",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      idempotencyKey: "close-1",
+      evidence: "shipped",
+      close: { criteria: [{ criterion: "harness documented", path: "docs/run.md", excerpt: "run the harness locally" }] },
+    });
+    expect(res.status).toBe(200);
+    expect(getLiveIssueLabelsMock).toHaveBeenCalledTimes(1);
+    // The stored row (if any) was still cleared, without a second gate call.
+    expect(mocks.blockedParkDelete).not.toHaveBeenCalled(); // no row stored in this test
+  });
+
+  it("fresh work on a closed issue clears the park WITHOUT a live-label call", async () => {
+    // A successful already_done close lands before the park block, so the
+    // tracked issue is already closed here. The clear is fail-open
+    // housekeeping (the row withholds nothing while closed) and must not
+    // resurrect on a reopen — the open-check protects the gate call, not
+    // the clear itself.
+    mocks.blockedParkFindUnique.mockResolvedValue({
+      id: "blocked-1",
+      issueId: "issue-42",
+      agentName: "test-agent",
+      outcome: "blocked",
+      descriptor: "blocked:abc",
+      consecutiveCount: 3,
+      summary: null,
+      contentFingerprint: "stale",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    mocks.issueFindUnique.mockResolvedValue(issueRow({ state: "closed" }));
+
+    const res = await workerPostRequest({
+      taskType: "implement",
+      outcome: "already_done",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      idempotencyKey: "close-2",
+      evidence: "shipped",
+      close: { criteria: [{ criterion: "harness documented", path: "docs/run.md", excerpt: "run the harness locally" }] },
+    });
+    expect(res.status).toBe(200);
+    expect(getLiveIssueLabelsMock).toHaveBeenCalledTimes(1); // close path only
+    expect(mocks.blockedParkDelete).toHaveBeenCalledWith({ where: { issueId: "issue-42" } });
+    const body = await res.json();
+    expect(body.blockedExternalPark).toEqual({ cleared: true, reason: "fresh-outcome" });
   });
 });
