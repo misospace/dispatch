@@ -8,6 +8,7 @@ import { transitionIssueStatus } from "@/lib/issue-status";
 import { getLiveIssueLabels } from "@/lib/claim-gate";
 import { recordStatusTransition } from "@/lib/issue-lifecycle";
 import { clearNoPrConclusionPark, type ConclusionWriteClient } from "@/lib/no-pr-conclusion";
+import { clearBlockedExternalPark, type BlockedExternalParkWriteClient } from "@/lib/blocked-external-park";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
 const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
@@ -195,6 +196,19 @@ export async function POST(request: Request) {
               reason: `status ${targetLabel}`,
             },
             tx as unknown as ConclusionWriteClient,
+          );
+          // #1562: the same operator authority ends a blocked-external park,
+          // in the same commit.
+          await clearBlockedExternalPark(
+            {
+              issueId: issueId as string,
+              repoFullName: effectiveRepo,
+              issueNumber: effectiveNumber,
+              actor: actorName,
+              source: "api:status",
+              reason: `status ${targetLabel}`,
+            },
+            tx as unknown as BlockedExternalParkWriteClient,
           );
         }
       });

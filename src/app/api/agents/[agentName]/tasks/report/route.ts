@@ -23,6 +23,14 @@ import { PLAN_LIMITS } from "@/lib/groomer/plan";
 import { getLiveIssueLabels } from "@/lib/claim-gate";
 import { recordLifecycleEventQuietly } from "@/lib/issue-lifecycle";
 import { isNoPrConclusionOutcome, recordNoPrConclusion } from "@/lib/no-pr-conclusion";
+import {
+  clearBlockedExternalPark,
+  deriveBlockedExternalDescriptor,
+  isBlockedExternalOutcome,
+  isFreshWorkOutcome,
+  recordBlockedExternalSettlement,
+  type BlockedExternalOutcome,
+} from "@/lib/blocked-external-park";
 import { AGENT_PREFIX, getAgentFromLabels } from "@/types";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
@@ -997,6 +1005,163 @@ export async function POST(
       }
     }
 
+    // #1562: a repeated blocked settlement on ISSUE work parks the issue out
+    // of the queue after a bounded threshold of consecutive same-descriptor
+    // settlements. One blocked settlement stays recoverable and re-offerable
+    // (the first attempt is unchanged); only the repetition parks. Like the
+    // conclusion park above it is issue-work-shaped (an implement report
+    // WITHOUT a prFixItem token — a token makes it PR-fix work, and the
+    // PR-fix lane owns its own settlement state), best-effort, and skipped on
+    // an idempotent replay. The count is recorded in every
+    // DISPATCH_BLOCKED_EXTERNAL_PARK_MODE (the mode only decides whether the
+    // queue enforces the withhold, like the conclusion park), so a later
+    // switch to enforce reflects the history the operator already saw. A
+    // fresh-work implement outcome (real progress or a terminal conclusion —
+    // NOT a failed/handed-off/capacity release, which says nothing about the
+    // prerequisite) ends any stored count/park, under the same ownership rule.
+    let blockedExternalPark:
+      | { recorded?: boolean; cleared?: boolean; count?: number; threshold?: number; live?: boolean; reason: string }
+      | undefined;
+    if (report.taskType === "implement" && !duplicate && issueId && report.repoFullName && report.issueNumber !== undefined) {
+      // Narrowed once: the union stays stable through the nested awaits below
+      // where aliased type-guard narrowing would be lost.
+      const blockedOutcome: BlockedExternalOutcome | null = isBlockedExternalOutcome(report.outcome)
+        ? report.outcome
+        : null;
+      const freshWork = !blockedOutcome && isFreshWorkOutcome(report.outcome);
+      // A token-bearing report is off the issue-work contract entirely: it
+      // must not count a park and must not clear one (PR-fix work owns its
+      // own lane state).
+      if (report.prFixItem == null && (blockedOutcome || freshWork)) {
+        const trackedIssue = await prisma.issue.findUnique({
+          where: { id: issueId },
+          select: { title: true, body: true, state: true },
+        }).catch(() => null);
+        if (blockedOutcome) {
+          if (!trackedIssue) {
+            blockedExternalPark = { reason: "issue-not-tracked" };
+          } else if (trackedIssue.state !== "open") {
+            blockedExternalPark = { reason: "issue-not-open" };
+          } else {
+            // Same ownership rule as the conclusion park (#1510 review): a
+            // worker-tier settlement may only count toward a park on an issue
+            // its agent actually owns — live GitHub labels are authoritative.
+            // The gate is a skip, never a refusal: the report must land. It
+            // runs after the tracked/open checks, matching the conclusion
+            // park's ordering (a closed issue never costs a live-label call).
+            let parkSkipReason: string | null;
+            try {
+              parkSkipReason = await parkAssignmentSkipReason(auth, report.repoFullName, report.issueNumber);
+            } catch (error) {
+              console.warn(
+                `[blocked-external] could not verify live assignment of ${report.repoFullName}#${report.issueNumber} for ${agentName}: ${error instanceof Error ? error.message : String(error)}`,
+              );
+              parkSkipReason = "assignment-unverified";
+            }
+            if (parkSkipReason) {
+              console.warn(
+                `[blocked-external] ${agentName} reported ${report.outcome} for ${report.repoFullName}#${report.issueNumber} without a live assignment (${parkSkipReason}); the settlement does not count toward an issue park`,
+              );
+              blockedExternalPark = { reason: parkSkipReason };
+            } else {
+              try {
+                const descriptor = deriveBlockedExternalDescriptor({
+                  outcome: blockedOutcome,
+                  error: report.error,
+                  summary: report.summary,
+                  externalWait: report.externalWait,
+                });
+                const settlement = await recordBlockedExternalSettlement({
+                  issueId,
+                  repoFullName: report.repoFullName,
+                  issueNumber: report.issueNumber,
+                  agentName,
+                  outcome: blockedOutcome,
+                  descriptor,
+                  summary: report.summary ?? null,
+                  issue: { title: trackedIssue.title, body: trackedIssue.body },
+                });
+                // The raw descriptor can carry report-derived text, so it is
+                // recorded internally but never echoed to the caller.
+                blockedExternalPark = {
+                  recorded: true,
+                  count: settlement.nextCount,
+                  threshold: settlement.threshold,
+                  live: settlement.nextCount >= settlement.threshold,
+                  reason: settlement.crossed ? "parked" : "counted",
+                };
+              } catch (error) {
+                console.warn(
+                  `[blocked-external] failed to record ${report.outcome} settlement for ${report.repoFullName}#${report.issueNumber}: ${error instanceof Error ? error.message : String(error)}`,
+                );
+                blockedExternalPark = { reason: "record-write-failed" };
+              }
+            }
+          }
+        } else {
+          // Fresh work ends any stored count/park — on a closed issue too:
+          // a successful already_done close lands before this block, so
+          // skipping the clear there would leave a park row that revives on
+          // a reopen without a content edit (#1562 review). The row
+          // withholds nothing while the issue is closed (the queue reads
+          // open issues only), so the clear is fail-open housekeeping. What
+          // the open-check protects is the live-label gate call, so the GATE
+          // is what an open issue buys: a worker-tier clear on an open issue
+          // requires its agent to own it (same rule as the count path).
+          // An already_done report skips the gate: its close path (#1143)
+          // just verified the same live assignment (or the caller is
+          // maintainer), so the gate would only double the live-label
+          // round-trip.
+          try {
+            if (trackedIssue) {
+              const gateNeeded =
+                trackedIssue.state === "open" &&
+                !(isAlreadyDone && auth.type === "bearer" && auth.tier === "worker");
+              let clearSkipReason: string | null = null;
+              if (gateNeeded) {
+                try {
+                  clearSkipReason = await parkAssignmentSkipReason(auth, report.repoFullName, report.issueNumber);
+                } catch (error) {
+                  console.warn(
+                    `[blocked-external] could not verify live assignment of ${report.repoFullName}#${report.issueNumber} for ${agentName}: ${error instanceof Error ? error.message : String(error)}`,
+                  );
+                  clearSkipReason = "assignment-unverified";
+                }
+              }
+              if (clearSkipReason) {
+                console.warn(
+                  `[blocked-external] ${agentName} reported ${report.outcome} for ${report.repoFullName}#${report.issueNumber} without a live assignment (${clearSkipReason}); the park is not cleared`,
+                );
+              } else {
+                const cleared = await clearBlockedExternalPark({
+                  issueId,
+                  repoFullName: report.repoFullName,
+                  issueNumber: report.issueNumber,
+                  actor: agentName,
+                  source: "agent-report",
+                  reason: `fresh ${report.outcome} implement report`,
+                });
+                if (cleared) {
+                  blockedExternalPark = { cleared: true, reason: "fresh-outcome" };
+                }
+              }
+            }
+          } catch (error) {
+            console.warn(
+              `[blocked-external] failed to clear park for ${report.repoFullName}#${report.issueNumber} after ${report.outcome}: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        }
+      } else if (report.prFixItem != null && blockedOutcome) {
+        // Invisible otherwise: a token-bearing blocked report is off the
+        // issue-work contract and must not count toward an issue-side park.
+        console.warn(
+          `[blocked-external] ${agentName} reported ${report.outcome} with a PR-fix attempt token (${report.prFixItem.id}); the settlement does not count toward an issue park`,
+        );
+        blockedExternalPark = { reason: "pr-fix-attempt" };
+      }
+    }
+
     // A failed or blocked attempt is a lifecycle event of its own (#1202): it
     // is the evidence that distinguishes "released because the work finished"
     // from "released because the worker gave up", which a status label alone
@@ -1038,6 +1203,7 @@ export async function POST(
       prFixResolution,
       ...(closeResolution ? { closeResolution } : {}),
       ...(conclusionPark ? { conclusionPark } : {}),
+      ...(blockedExternalPark ? { blockedExternalPark } : {}),
       ...(duplicate ? { duplicate: true } : {}),
     });
   } catch (error) {

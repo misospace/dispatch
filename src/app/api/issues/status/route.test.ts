@@ -13,6 +13,8 @@ const { mocks } = vi.hoisted(() => ({
     getLiveIssueLabels: vi.fn().mockResolvedValue([] as string[]),
     noPrConclusionFindUnique: vi.fn().mockResolvedValue(null),
     noPrConclusionDelete: vi.fn().mockResolvedValue({}),
+    blockedExternalParkFindUnique: vi.fn().mockResolvedValue(null),
+    blockedExternalParkDelete: vi.fn().mockResolvedValue({}),
   },
 }));
 
@@ -33,6 +35,11 @@ vi.mock("@/lib/prisma", () => ({
       findUnique: mocks.noPrConclusionFindUnique,
       delete: mocks.noPrConclusionDelete,
     },
+    // #1562: a status change retires the blocked-external park row too.
+    blockedExternalPark: {
+      findUnique: mocks.blockedExternalParkFindUnique,
+      delete: mocks.blockedExternalParkDelete,
+    },
     // The status write and its lifecycle event commit together (#1202).
     $transaction: (arg: any) =>
       Promise.resolve(
@@ -46,6 +53,10 @@ vi.mock("@/lib/prisma", () => ({
               noPrConclusion: {
                 findUnique: mocks.noPrConclusionFindUnique,
                 delete: mocks.noPrConclusionDelete,
+              },
+              blockedExternalPark: {
+                findUnique: mocks.blockedExternalParkFindUnique,
+                delete: mocks.blockedExternalParkDelete,
               },
             })
           : Promise.all(arg),

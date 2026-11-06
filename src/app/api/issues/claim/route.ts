@@ -15,6 +15,7 @@ import { enforceRateLimit } from "@/lib/rate-limit";
 import { withIssueMutationGuard } from "@/lib/issue-mutation-guard";
 import { supersedeOwnershipReleaseIntent } from "@/lib/ownership-reconciliation";
 import { clearNoPrConclusionPark, getLiveNoPrConclusion, getNoPrConclusionMode } from "@/lib/no-pr-conclusion";
+import { clearBlockedExternalPark, getBlockedExternalParkMode, getLiveBlockedExternalPark } from "@/lib/blocked-external-park";
 
 const IN_PROGRESS_STATUS = "status/in-progress";
 const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
@@ -138,6 +139,21 @@ export async function POST(request: Request) {
       if (park) {
         return errorResponse(
           `Issue is parked by ${park.agentName}'s terminal no-PR conclusion (${park.outcome}); an operator can clear it with DELETE /api/issues/${issue.id}/no-pr-conclusion or by setting the issue's status`,
+          409,
+        );
+      }
+    }
+
+    // #1562: a live repeated-blocked-settlement park is the same class of
+    // durable stop — the same enforce-mode 409 and the same sole override.
+    // A stale or below-threshold row (a mid-accumulation counter) has no
+    // effect here; the queue filter is the first line, this is the
+    // enforcement.
+    if (getBlockedExternalParkMode() === "enforce" && force !== true) {
+      const blockedPark = await getLiveBlockedExternalPark({ id: issue.id, title: issue.title, body: issue.body });
+      if (blockedPark) {
+        return errorResponse(
+          `Issue is parked after ${blockedPark.consecutiveCount} consecutive blocked settlements (${blockedPark.outcome} by ${blockedPark.agentName}); an operator can clear it with DELETE /api/issues/${issue.id}/blocked-external or by setting the issue's status`,
           409,
         );
       }
@@ -484,6 +500,19 @@ export async function POST(request: Request) {
           });
         } catch (error) {
           console.warn(`no-PR conclusion park clear failed after force claim on issue #${issueNumber}:`, error);
+        }
+        // #1562: the same override discharges a blocked-external park.
+        try {
+          await clearBlockedExternalPark({
+            issueId: issueId as string,
+            repoFullName,
+            issueNumber,
+            actor,
+            source: "api:claim",
+            reason: "force-claim supersedes the blocked-external park",
+          });
+        } catch (error) {
+          console.warn(`blocked-external park clear failed after force claim on issue #${issueNumber}:`, error);
         }
       }
 
