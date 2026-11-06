@@ -17,7 +17,7 @@
 // gate; the requested agent is authorized by the FENCE, and
 // `enforceWorkerAgentScope` still scopes any bound worker credential.
 import { NextResponse } from "next/server";
-import { errorResponse } from "@/lib/api-errors";
+import { errorResponse, readJsonObjectBody } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { requeueIssueAttempt, parseIssueRequeueInput } from "@/lib/issue-requeue";
 import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
@@ -44,14 +44,10 @@ export async function POST(request: Request) {
   const limited = enforceRateLimit(`issues-requeue:${auth.throttleKey}`, RATE_LIMIT);
   if (limited) return limited;
 
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
-    return errorResponse("Invalid JSON body", 400);
-  }
+  const parsed = await readJsonObjectBody(request);
+  if ("error" in parsed) return parsed.error;
 
-  const input = parseIssueRequeueInput(body);
+  const input = parseIssueRequeueInput(parsed.body);
   if ("error" in input) return errorResponse(input.error, 400);
 
   const auditActor = getAuthorizedActor(auth, request, input.agentName);

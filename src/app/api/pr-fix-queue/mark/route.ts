@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { errorResponse } from "@/lib/api-errors";
+import { errorResponse, readJsonObjectBody } from "@/lib/api-errors";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { markPrFixItem, parseMarkPrFixInput, isPrFixRepoArchived } from "@/lib/pr-fix-queue";
 import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
@@ -21,14 +21,10 @@ export async function POST(request: Request) {
   const auditActor = getAuthorizedActor(auth, request);
 
   try {
-    let body: unknown;
-    try {
-      body = await request.json();
-    } catch {
-      return errorResponse("Invalid JSON body", 400);
-    }
+    const parsed = await readJsonObjectBody(request);
+    if ("error" in parsed) return parsed.error;
 
-    const input = parseMarkPrFixInput(body);
+    const input = parseMarkPrFixInput(parsed.body);
     if ("error" in input) return errorResponse(input.error, 400);
 
     // Worker tokens may settle attempts (FIXED/BLOCKED/PARKED/STALE) or defer a
@@ -85,8 +81,8 @@ export async function POST(request: Request) {
     const actorTier: "worker" | "maintainer" =
       auth.tier === "maintainer" ? "maintainer" : "worker";
     const allowStickyReclassify =
-      actorTier === "maintainer" && body && typeof body === "object" && !Array.isArray(body)
-        ? (body as Record<string, unknown>).allowStickyReclassify === true
+      actorTier === "maintainer" && !Array.isArray(parsed.body)
+        ? (parsed.body as Record<string, unknown>).allowStickyReclassify === true
         : false;
 
     // Every external wait consumes a handed-out generation, including operator
