@@ -457,31 +457,41 @@ export async function backfillPrFixClaimant(
  * "ambiguous" rows; provenance becomes "operator" and no ingestion path may
  * overwrite it. The claimant is a plain identity string (agent name or
  * login) — Dispatch never maps it to lanes or tiers.
+ *
+ * Preservation rule: an already-recorded claimant is NEVER transferred. The
+ * write is a `claimant IS NULL` conditional update, and the successful stamp
+ * plus its PrFixHistory note commit in ONE transaction — there is no window
+ * where a stamped row exists without its audit row, and a concurrent
+ * resolution can never be clobbered. A stamp that finds an existing
+ * claimant is refused (`reason: "already_set"`), not silently applied.
  */
 export async function setPrFixClaimant(
   client: PrFixQueueClient,
   input: { repo: string; pr: number; claimant: string },
-): Promise<{ updated: boolean }> {
+): Promise<{ updated: boolean; reason?: "not_found" | "already_set" }> {
   const repo = normalizeQueueRepo(input.repo);
   const claimant = input.claimant.trim();
-  if (claimant === "") return { updated: false };
-  const existing = await client.prFixQueueItem.findUnique({
-    where: { repo_pr: { repo, pr: input.pr } },
-    select: { id: true, claimant: true },
+  if (claimant === "") return { updated: false, reason: "not_found" };
+  return client.$transaction(async (tx) => {
+    const existing = await tx.prFixQueueItem.findUnique({
+      where: { repo_pr: { repo, pr: input.pr } },
+      select: { id: true },
+    });
+    if (!existing) return { updated: false, reason: "not_found" } as const;
+    const { count } = await tx.prFixQueueItem.updateMany({
+      where: { id: existing.id, claimant: null },
+      data: { claimant, claimantSource: "operator" },
+    });
+    if (count !== 1) return { updated: false, reason: "already_set" } as const;
+    await tx.prFixHistory.create({
+      data: {
+        itemId: existing.id,
+        action: "mark",
+        note: `#1569 operator claimant stamp: (unset) -> ${claimant} (provenance "operator").`,
+      },
+    });
+    return { updated: true } as const;
   });
-  if (!existing) return { updated: false };
-  await client.prFixQueueItem.update({
-    where: { id: existing.id },
-    data: { claimant, claimantSource: "operator" },
-  });
-  await client.prFixHistory.create({
-    data: {
-      itemId: existing.id,
-      action: "mark",
-      note: `#1569 operator claimant stamp: ${existing.claimant ?? "(unset)"} -> ${claimant} (provenance "operator").`,
-    },
-  });
-  return { updated: true };
 }
 
 // #1121: upper bound on an already_addressed evidence string, shared by the

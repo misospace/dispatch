@@ -32,7 +32,7 @@ Only the recovery endpoint can stamp `operator`.
 
 Failure states:
 
-- `ambiguous` — authoritative sources disagree. Never resolved by preference. Parks for recovery.
+- `ambiguous` — authoritative sources disagree. Never resolved by preference. Two or more distinct `owner/<name>` labels are a conflict even when a live lease or a single `agent/<name>` label would otherwise resolve: the contradictory owner evidence parks the row, the higher source does not out-vote it. Parks for recovery.
 - `missing` — no source resolved.
 - `legacy` — the row predates this contract, so `claimantSource` is NULL. Treated like missing.
 
@@ -56,7 +56,7 @@ Mode env `DISPATCH_PR_FIX_OWNERSHIP_MODE`:
 
 1. Re-ingestion while unresolved.
 2. Operator requeue (re-resolves).
-3. `POST /api/pr-fix-queue/claimant` with `{ repo, pr, claimant }` — maintainer-only; stamps provenance `operator`.
+3. `POST /api/pr-fix-queue/claimant` with `{ repo, pr, claimant }` — maintainer-only; stamps provenance `operator`. The stamp is a `claimant IS NULL` conditional write, atomic with its `PrFixHistory` audit row: a row that already carries a claimant is refused with `409` instead of transferred.
 
 ## Lane isolation at issuance
 
@@ -102,7 +102,7 @@ Queue listings carry `claimant`, `claimantSource`, and `ownership` additively.
 
 ## Write rules
 
-- A claimant is written at row creation, and afterwards only by a write pinned on `claimant IS NULL` (re-ingestion backfill, issuance backfill, operator requeue). The pin is the invariant: a claimant an operator stamped, or a backfill that committed first, can never be transferred or cleared by a later writer.
+- A claimant is written at row creation, and afterwards only by a write pinned on `claimant IS NULL` (re-ingestion backfill, issuance backfill, operator requeue, operator stamp). The pin is the invariant: a claimant an operator stamped, or a backfill that committed first, can never be transferred or cleared by a later writer — including the operator stamp endpoint itself, which refuses (`409`) when a claimant is already recorded.
 - Re-ingestion and requeue write only a RESOLVED value. An unresolved observation leaves an existing row untouched instead of rewriting a failure state every cycle.
 - A failed claimant-fact read records nothing at all. The row stays unresolved (`claimantSource` NULL, reported as `legacy`), and a later observation or recovery re-resolves it — a transient database error is never stored as provenance.
 - A refused hand-out disturbs nothing on the row: no dispatch stamp, no evidence-watermark change, no hand-out record.

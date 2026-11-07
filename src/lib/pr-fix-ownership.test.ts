@@ -97,6 +97,24 @@ describe("resolveClaimantFromIssueFacts", () => {
     ).toEqual({ state: "ambiguous" });
   });
 
+  it("parks as ambiguous for conflicting owner labels even with a live lease", () => {
+    expect(
+      resolveClaimantFromIssueFacts({ leaseAgent: "alpha", agentLabelNames: [], ownerLabelNames: ["alice", "bob"] }),
+    ).toEqual({ state: "ambiguous" });
+  });
+
+  it("parks as ambiguous for conflicting owner labels even with a single agent label", () => {
+    expect(
+      resolveClaimantFromIssueFacts({ leaseAgent: null, agentLabelNames: ["alpha"], ownerLabelNames: ["alice", "bob"] }),
+    ).toEqual({ state: "ambiguous" });
+  });
+
+  it("resolves the lease with a lease and a single distinct owner label coexisting", () => {
+    expect(
+      resolveClaimantFromIssueFacts({ leaseAgent: "alpha", agentLabelNames: [], ownerLabelNames: ["alice"] }),
+    ).toEqual({ state: "resolved", claimant: "alpha", source: "lease" });
+  });
+
   it("returns missing when no source is present", () => {
     expect(
       resolveClaimantFromIssueFacts({ leaseAgent: null, agentLabelNames: [], ownerLabelNames: [] }),

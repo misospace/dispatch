@@ -24,8 +24,10 @@
  * 5. "operator"    — an explicit operator stamp (recovery path).
  * Failure states:
  * - "ambiguous" — the available sources DISAGREE (a live lease and a
- *   different agent label, two different agent labels, ...). Conflicting
- *   ownership is never resolved by preference: it parks for recovery.
+ *   different agent label, two different agent labels, two different owner
+ *   labels — the owner conflict parks the row even when a lease or agent
+ *   label would otherwise resolve). Conflicting ownership is never resolved
+ *   by preference: it parks for recovery.
  * - "missing"   — no source resolved (issue with no lease and no owner/agent
  *   label, or a row with neither issue nor author).
  * - "legacy"    — a row created before this contract (`claimantSource` NULL).
@@ -128,17 +130,28 @@ function distinct(names: Iterable<string>): string[] {
 /**
  * Pure claimant resolution from authoritative issue facts (no Courier
  * knowledge, no per-agent special case):
+ * - conflicting owner evidence (two or more distinct owner labels) is
+ *   "ambiguous" FIRST, even when a live lease or agent label would otherwise
+ *   resolve — a higher source never silently out-votes contradictory
+ *   ownership (conflicting ownership never resolves by preference);
  * - live lease + agent labels: every candidate must name the SAME identity,
- *   otherwise "ambiguous" (conflicting ownership never resolves by preference);
+ *   otherwise "ambiguous";
  * - live lease alone → "lease"; single distinct agent label → "agent-label";
- * - no lease, no agent labels: a single distinct owner label → "owner-label";
- *   several conflicting owner labels → "ambiguous";
+ * - no lease, no agent labels, no owner conflict: a single distinct owner
+ *   label → "owner-label";
  * - nothing → "missing".
+ *
+ * A SINGLE owner label coexisting with a lease/agent identity is category
+ * evidence, not a conflict: `owner/*` names the board owner, `agent/*` and
+ * the lease name the working claimant (the owner-label source only fires
+ * when nothing higher exists).
  */
 export function resolveClaimantFromIssueFacts(facts: ClaimantIssueFacts): ClaimantResolution {
   const agentLabels = distinct(facts.agentLabelNames);
   const ownerLabels = distinct(facts.ownerLabelNames);
   const lease = facts.leaseAgent?.trim() || null;
+
+  if (ownerLabels.length > 1) return { state: "ambiguous" };
 
   if (lease !== null && agentLabels.length > 0) {
     const candidates = distinct([lease, ...agentLabels]);
@@ -149,7 +162,6 @@ export function resolveClaimantFromIssueFacts(facts: ClaimantIssueFacts): Claima
   if (agentLabels.length === 1) return { state: "resolved", claimant: agentLabels[0], source: "agent-label" };
   if (agentLabels.length > 1) return { state: "ambiguous" };
   if (ownerLabels.length === 1) return { state: "resolved", claimant: ownerLabels[0], source: "owner-label" };
-  if (ownerLabels.length > 1) return { state: "ambiguous" };
   return { state: "missing" };
 }
 

@@ -335,6 +335,16 @@ describe("setPrFixClaimant (#1569)", () => {
     const client = makeClient(null);
     const result = await setPrFixClaimant(client, { repo: "org/repo", pr: 42, claimant: "x" });
     expect(result.updated).toBe(false);
+    expect(result.reason).toBe("not_found");
+    expect(client.history).toHaveLength(0);
+  });
+
+  it("refuses to transfer an already-recorded claimant and writes nothing (#1569)", async () => {
+    const client = makeClient(makeQueueRow({ claimant: "original-owner", claimantSource: "lease" }));
+    const result = await setPrFixClaimant(client, { repo: "org/repo", pr: 42, claimant: "usurper" });
+    expect(result).toEqual({ updated: false, reason: "already_set" });
+    expect(client.row.claimant).toBe("original-owner");
+    expect(client.row.claimantSource).toBe("lease");
     expect(client.history).toHaveLength(0);
   });
 });

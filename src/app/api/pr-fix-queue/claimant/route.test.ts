@@ -245,14 +245,51 @@ describe("POST /api/pr-fix-queue/claimant", () => {
     expect(body.repo).toBe("org/repo");
   });
 
+  it("returns 400 when repo contains a NUL byte (PostgreSQL text cannot store it)", async () => {
+    const res = await postRequest({ repo: "org\u0000/repo", pr: 42, claimant: "alpha" });
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("repo must not contain control characters");
+    expect(mocks.setPrFixClaimant).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 when claimant contains a NUL byte", async () => {
+    const res = await postRequest({ repo: "org/repo", pr: 42, claimant: "alpha\u0000" });
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("claimant must not contain control characters");
+    expect(mocks.setPrFixClaimant).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 when claimant contains another control character", async () => {
+    const res = await postRequest({ repo: "org/repo", pr: 42, claimant: "alpha\u0007-7" });
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("claimant must not contain control characters");
+    expect(mocks.setPrFixClaimant).not.toHaveBeenCalled();
+  });
+
   it("returns 404 when no queue row matches (updated: false)", async () => {
-    mocks.setPrFixClaimant.mockResolvedValue({ updated: false });
+    mocks.setPrFixClaimant.mockResolvedValue({ updated: false, reason: "not_found" });
 
     const res = await postRequest({ repo: "org/repo", pr: 42, claimant: "alpha" });
 
     expect(res.status).toBe(404);
     const body = await res.json();
     expect(body.error).toBe("pr-fix item not found");
+  });
+
+  it("returns 409 when the row already has a recorded claimant (#1569 preservation rule)", async () => {
+    mocks.setPrFixClaimant.mockResolvedValue({ updated: false, reason: "already_set" });
+
+    const res = await postRequest({ repo: "org/repo", pr: 42, claimant: "alpha" });
+
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toMatch(/already has a recorded claimant/);
   });
 
   it("returns 500 when the stamp throws", async () => {
