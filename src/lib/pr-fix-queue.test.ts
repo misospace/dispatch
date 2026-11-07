@@ -7066,16 +7066,19 @@ describe("#1503 escalation-lane exclusivity", () => {
       expect(client.history.some((h: any) => String(h.note ?? "").includes("#1503"))).toBe(false);
     });
 
-    it("keeps an unverifiable classification eligible for escalation and unfiltered polls", async () => {
+    it("refuses an unverifiable classification for BOTH declared lanes (#1569), unfiltered stays eligible", async () => {
       const row = await makeMisclassifiedRow(922);
       client.issue.findFirst = async () => {
         throw new Error("db down");
       };
-      // An escalation consumer is authorized for escalation work regardless of
-      // the parent's verifiability; the #1046 unfiltered poll is unrestricted
-      // by contract. Neither gets a correction CAS.
+      // #1569 widened the #1503 UNKNOWN arm to be symmetric: an unverifiable
+      // classification authorizes NEITHER declared lane (neither the shared
+      // queue nor the frontier tier). The #1046 unfiltered poll remains
+      // unrestricted by contract. None gets a correction CAS.
       expect(await enforcePrFixHandoutLaneExclusivity(client, candidate(row), "ESCALATED"))
-        .toEqual({ decision: "eligible", correctedLane: false });
+        .toEqual({ decision: "refuse", correctedLane: false });
+      expect(await enforcePrFixHandoutLaneExclusivity(client, candidate(row), "NORMAL"))
+        .toEqual({ decision: "refuse", correctedLane: false });
       expect(await enforcePrFixHandoutLaneExclusivity(client, candidate(row), undefined))
         .toEqual({ decision: "eligible", correctedLane: false });
       expect(client.items[0].lane).toBe("NORMAL");

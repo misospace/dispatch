@@ -7,6 +7,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } from "@/test/route-helpers";
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
+// #1569: this suite predates the PR-fix ownership contract — its fixtures
+// carry no claimant, so the ownership gate is switched OFF here to keep the
+// pre-#1569 dispatch paths exactly as they were tested. The gate's
+// enforce/audit semantics are covered in src/lib/pr-fix-queue.test.ts and
+// src/lib/pr-fix-ownership.test.ts.
+process.env.DISPATCH_PR_FIX_OWNERSHIP_MODE = "off";
 
 vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock());
 
@@ -37,7 +43,13 @@ vi.mock("@/lib/prisma", () => {
   };
   return {
     prisma: {
-      issue: { findMany: mocks.issueFindMany },
+      issue: {
+        findMany: mocks.issueFindMany,
+        // #1569: linked-PR materialization now re-derives the parent's
+        // escalation classification through the module client before
+        // creating the row; "no row" is the definitive NOT_ESCALATED read.
+        findFirst: async () => null,
+      },
       // #1506: the terminal no-PR conclusion park ledger read/cleanup.
       noPrConclusion: {
         findMany: mocks.noPrConclusionFindMany,

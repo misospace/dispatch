@@ -30,6 +30,25 @@ export const REBASE_EXECUTOR_CAPABILITY = "rebase-executor";
 export const REBASE_EXECUTOR_CAPABILITY_VERSION = 1;
 
 /**
+ * #1569: the PR-fix ownership-evidence capability. A poll that declares and
+ * is granted `pr-ownership-evidence:1` receives the versioned ownership
+ * evidence block on every followup-pr task and can require it before
+ * accepting a hand-out. Rows whose ownership is unresolved are refused at
+ * issuance for declared consumers, so a negotiated peer never silently
+ * receives work whose owning lane / original claimant it cannot see.
+ * The constants are defined once in `pr-fix-ownership.ts` and re-exported
+ * here so the negotiation and the payload cannot drift.
+ */
+export {
+  PR_OWNERSHIP_EVIDENCE_CAPABILITY,
+  PR_OWNERSHIP_EVIDENCE_CAPABILITY_VERSION,
+} from "@/lib/pr-fix-ownership";
+import {
+  PR_OWNERSHIP_EVIDENCE_CAPABILITY,
+  PR_OWNERSHIP_EVIDENCE_CAPABILITY_VERSION,
+} from "@/lib/pr-fix-ownership";
+
+/**
  * The only work-scope version defined in contract version 1. The scope
  * version is separate from the contract version: a scope version pins the
  * SHAPE of one scope, while the contract version pins the whole contract.
@@ -94,6 +113,13 @@ export interface IntakeNegotiation {
   optedIn: boolean;
   /** Whether the `rebase-executor` v1 capability was declared AND granted. */
   rebaseExecutorGranted: boolean;
+  /**
+   * #1569: whether the `pr-ownership-evidence` v1 capability was declared
+   * AND granted. A granted poll receives the versioned ownership evidence
+   * block on followup-pr tasks, and unresolved-ownership rows are refused
+   * to it at issuance.
+   */
+  prOwnershipEvidenceGranted: boolean;
 }
 
 /**
@@ -112,6 +138,14 @@ export interface IntakeNegotiation {
 function negotiateCapability(name: string, version: number): CapabilityNegotiation {
   if (name === REBASE_EXECUTOR_CAPABILITY) {
     if (version === REBASE_EXECUTOR_CAPABILITY_VERSION) {
+      return { name, requested: version, granted: true };
+    }
+    return { name, requested: version, granted: false, reason: "unsupported-version" };
+  }
+  // #1569: the ownership-evidence contract. Same fail-closed versioning:
+  // an unsupported version grants nothing and never broadens the queue.
+  if (name === PR_OWNERSHIP_EVIDENCE_CAPABILITY) {
+    if (version === PR_OWNERSHIP_EVIDENCE_CAPABILITY_VERSION) {
       return { name, requested: version, granted: true };
     }
     return { name, requested: version, granted: false, reason: "unsupported-version" };
@@ -239,6 +273,8 @@ export function parseIntakeRequest(
       capabilities,
       optedIn: scope !== null || capabilities.length > 0,
       rebaseExecutorGranted: rebaseExecutor?.granted === true,
+      prOwnershipEvidenceGranted:
+        capabilities.find((capability) => capability.name === PR_OWNERSHIP_EVIDENCE_CAPABILITY)?.granted === true,
     },
   };
 }
