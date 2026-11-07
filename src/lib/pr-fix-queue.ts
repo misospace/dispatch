@@ -412,6 +412,10 @@ export function evaluatePrFixHandoutOwnership(
  * churn writes); the failure state is persisted by ingestion.
  * Returns the row's effective claimant pair after the attempt (the input
  * value when one was already recorded, else the freshly resolved one).
+ * When the conditional write loses a concurrent race (a sibling backfill or
+ * the operator stamp persisted first), the persisted claimant is re-read and
+ * echoed — a rejected local resolution is never reported as effective — and
+ * a failed re-read resolves to nothing (fail closed).
  */
 export async function backfillPrFixClaimant(
   client: PrFixQueueClient,
@@ -439,7 +443,14 @@ export async function backfillPrFixClaimant(
     });
     if (count === 1) {
       console.info(`[pr-fix-queue] backfilled PR-fix claimant ${resolution.claimant} via ${resolution.source} (${row.repo} ${row.id}) (#1569)`);
+      return { claimant: resolution.claimant, claimantSource: resolution.source };
     }
+    // Lost the write race: a concurrent writer (operator stamp, sibling
+    // backfill) recorded a claimant between this read and the conditional
+    // write. The locally resolved identity was REJECTED — it is not persisted,
+    // so it must never be returned as the row's effective claimant (the caller
+    // would authorize and transport an identity the row does not carry).
+    console.info(`[pr-fix-queue] claimant backfill lost the write race for ${row.repo}/${row.id} (#1569); echoing the persisted claimant`);
   } catch (error) {
     // Best-effort: a failed backfill leaves the row unresolved for THIS
     // poll (the gate refuses); the next poll or ingestion retries.
@@ -448,7 +459,25 @@ export async function backfillPrFixClaimant(
       error instanceof Error ? error.message : error,
     );
   }
-  return { claimant: resolution.claimant, claimantSource: resolution.source };
+  // Either the write lost the race or failed outright: the only claimant this
+  // caller may report is one actually persisted on the row. A failed re-read
+  // resolves to nothing — fail closed, the gate refuses an unresolved row.
+  try {
+    const persisted = await client.prFixQueueItem.findUnique({
+      where: { id: row.id },
+      select: { claimant: true, claimantSource: true },
+    });
+    return {
+      claimant: persisted?.claimant ?? null,
+      claimantSource: persisted?.claimantSource ?? null,
+    };
+  } catch (error) {
+    console.warn(
+      `[pr-fix-queue] claimant re-read failed for ${row.repo}/${row.id} (#1569):`,
+      error instanceof Error ? error.message : error,
+    );
+    return { claimant: null, claimantSource: null };
+  }
 }
 
 /**

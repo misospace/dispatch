@@ -104,6 +104,7 @@ Queue listings carry `claimant`, `claimantSource`, and `ownership` additively.
 
 - A claimant is written at row creation, and afterwards only by a write pinned on `claimant IS NULL` (re-ingestion backfill, issuance backfill, operator requeue, operator stamp). The pin is the invariant: a claimant an operator stamped, or a backfill that committed first, can never be transferred or cleared by a later writer — including the operator stamp endpoint itself, which refuses (`409`) when a claimant is already recorded.
 - Re-ingestion and requeue write only a RESOLVED value. An unresolved observation leaves an existing row untouched instead of rewriting a failure state every cycle.
+- A backfill that loses its `claimant IS NULL` write race (a sibling backfill or the operator stamp committed first) re-reads the row and reports the PERSISTED claimant. The losing caller's locally resolved identity was rejected and is never shipped; if the re-read fails, the caller reports no claimant and the gate refuses.
 - A failed claimant-fact read records nothing at all. The row stays unresolved (`claimantSource` NULL, reported as `legacy`), and a later observation or recovery re-resolves it — a transient database error is never stored as provenance.
 - A refused hand-out disturbs nothing on the row: no dispatch stamp, no evidence-watermark change, no hand-out record.
 

@@ -319,6 +319,33 @@ describe("backfillPrFixClaimant (#1569)", () => {
     expect(result.claimant).toBe("original-owner");
     expect(client.row).toEqual(row);
   });
+
+  it("echoes the persisted claimant when the pinned write loses a concurrent race (#1569 review)", async () => {
+    const row = makeQueueRow({ claimant: null });
+    const client = makeClient(row, { issueRow: { id: "iss-1", labels: ["agent/courier-x"] } });
+    // A concurrent operator stamp commits while the facts read runs, so the
+    // subsequent `claimant IS NULL` write matches zero rows.
+    const originalFindFirst = client.issue.findFirst;
+    client.issue.findFirst = async (args: any) => {
+      client.row.claimant = "operator-stamp";
+      client.row.claimantSource = "operator";
+      return originalFindFirst(args);
+    };
+    const result = await backfillPrFixClaimant(client, { id: "item-1", repo: "org/repo", issue: 7, author: "bot", claimant: null });
+    expect(result).toEqual({ claimant: "operator-stamp", claimantSource: "operator" });
+    expect(client.row.claimant).toBe("operator-stamp");
+  });
+
+  it("fails closed on a failed write: an unpersisted resolution is never reported", async () => {
+    const row = makeQueueRow({ claimant: null });
+    const client = makeClient(row, { issueRow: { id: "iss-1", labels: ["agent/courier-x"] } });
+    client.prFixQueueItem.updateMany = async () => {
+      throw new Error("db down");
+    };
+    const result = await backfillPrFixClaimant(client, { id: "item-1", repo: "org/repo", issue: 7, author: "bot", claimant: null });
+    expect(result).toEqual({ claimant: null, claimantSource: null });
+    expect(client.row.claimant).toBeNull();
+  });
 });
 
 describe("setPrFixClaimant (#1569)", () => {
