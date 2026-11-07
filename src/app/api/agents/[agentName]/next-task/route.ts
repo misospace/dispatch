@@ -1132,17 +1132,23 @@ export async function GET(
       : null;
 
     if (withheldQueue.length > 0) {
-      // #1506: tell a grooming-admission hold apart from a terminal no-PR
-      // conclusion park — an operator un-parks a concluded issue differently
+      // #1506/#1562: tell a grooming-admission hold apart from a park — an
+      // operator un-parks a concluded or blocked-parked issue differently
       // than they re-groom a stale one. Attribution order matters: an item
-      // withheld by admission carries a park mark too, and it is listed on the
-      // admission side (a parked item is never double-listed).
-      const admissionCount = withheldQueue.filter((item) => item.admission?.admitted === false).length;
-      const conclusionCount = withheldQueue.length - admissionCount;
+      // withheld by admission carries park marks too, and it is listed on the
+      // admission side (a parked item is never double-listed). Between the
+      // park kinds, a no-PR conclusion mark wins the attribution; an item
+      // carrying neither mark on the park side is a repeated blocked-settlement
+      // park (#1562).
       const plural = (n: number) => (n === 1 ? "" : "s");
+      const admissionCount = withheldQueue.filter((item) => item.admission?.admitted === false).length;
+      const nonAdmission = withheldQueue.filter((item) => item.admission?.admitted !== false);
+      const conclusionCount = nonAdmission.filter((item) => item.noPrConclusion).length;
+      const blockedCount = nonAdmission.length - conclusionCount;
       const withheldNote = [
         admissionCount > 0 ? `${admissionCount} ready issue${plural(admissionCount)} withheld by grooming admission` : null,
         conclusionCount > 0 ? `${conclusionCount} issue${plural(conclusionCount)} parked by a terminal no-PR conclusion` : null,
+        blockedCount > 0 ? `${blockedCount} issue${plural(blockedCount)} parked by repeated blocked settlements` : null,
       ]
         .filter(Boolean)
         .join(" and ");

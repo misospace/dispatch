@@ -14,6 +14,9 @@ const { mocks } = vi.hoisted(() => ({
     // #1506: the terminal no-PR conclusion park ledger read/cleanup.
     noPrFindMany: vi.fn().mockResolvedValue([]),
     noPrDeleteMany: vi.fn().mockResolvedValue({ count: 0 }),
+    // #1562: the repeated-blocked-settlement park ledger read/cleanup.
+    blockedFindMany: vi.fn().mockResolvedValue([]),
+    blockedDeleteMany: vi.fn().mockResolvedValue({ count: 0 }),
   },
 }));
 
@@ -21,6 +24,7 @@ vi.mock("@/lib/prisma", () => ({
   prisma: {
     issue: { findMany: mocks.findMany },
     noPrConclusion: { findMany: mocks.noPrFindMany, deleteMany: mocks.noPrDeleteMany },
+    blockedExternalPark: { findMany: mocks.blockedFindMany, deleteMany: mocks.blockedDeleteMany },
   },
   asPrFixQueueClient: (c: unknown) => c,
 }));
@@ -48,6 +52,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   delete process.env.DISPATCH_NO_PR_CONCLUSION_MODE;
   delete process.env.DISPATCH_QUEUE_ADMISSION_MODE;
+  delete process.env.DISPATCH_BLOCKED_EXTERNAL_PARK_MODE;
+  delete process.env.DISPATCH_BLOCKED_EXTERNAL_PARK_THRESHOLD;
   mocks.findMany.mockResolvedValue([]);
   mocks.findLeasedIssueIds.mockResolvedValue([]);
   mocks.listQueuedPrFixItems.mockResolvedValue([]);
@@ -55,6 +61,8 @@ beforeEach(() => {
   mocks.resolveRequestLane.mockReturnValue(null);
   mocks.noPrFindMany.mockResolvedValue([]);
   mocks.noPrDeleteMany.mockResolvedValue({ count: 0 });
+  mocks.blockedFindMany.mockResolvedValue([]);
+  mocks.blockedDeleteMany.mockResolvedValue({ count: 0 });
 });
 
 describe("fetchAgentQueueData", () => {
@@ -262,5 +270,184 @@ describe("fetchAgentQueueData — terminal no-PR conclusion park (#1506)", () =>
     expect(r.withheldQueue).toEqual([]);
     expect(r.rankedQueue[0].noPrConclusion).toBeUndefined();
     expect(mocks.noPrDeleteMany).toHaveBeenCalledWith({ where: { id: { in: ["park-edited"] } } });
+  });
+});
+
+describe("fetchAgentQueueData — repeated blocked-external settlement park (#1562)", () => {
+  // Build a LIVE blocked-external row for issue `id`: fingerprint matches the
+  // issue's current title/body and the count has reached the default
+  // threshold (3), so the loader treats it as a live park.
+  function blockedFor(id: string, over: Record<string, unknown> = {}) {
+    return {
+      id: `blocked-${id}`,
+      issueId: id,
+      agentName: "courier",
+      outcome: "blocked",
+      descriptor: "blocked:abc123",
+      consecutiveCount: 3,
+      summary: "harness missing on main",
+      contentFingerprint: computeConclusionContentFingerprint({ title: `#${id}`, body: null }),
+      lastSettledAt: new Date("2026-11-06T12:00:00Z"),
+      createdAt: new Date("2026-11-06T00:00:00Z"),
+      updatedAt: new Date("2026-11-06T12:00:00Z"),
+      ...over,
+    };
+  }
+
+  it("enforce: a live park withholds the issue into withheldQueue and out of rankedQueue", async () => {
+    process.env.DISPATCH_BLOCKED_EXTERNAL_PARK_MODE = "enforce";
+    mocks.findMany.mockResolvedValue([issue("looped")]);
+    mocks.blockedFindMany.mockResolvedValue([blockedFor("looped")]);
+    mocks.buildAgentQueue.mockReturnValue([{ issueId: "looped", title: "#looped", labels: [] }]);
+
+    const r = await fetchAgentQueueData(params());
+
+    expect(r.rankedQueue).toEqual([]);
+    expect(r.withheldQueue).toEqual([
+      expect.objectContaining({
+        issueId: "looped",
+        claimable: false,
+        blockedExternalPark: expect.objectContaining({ agentName: "courier", count: 3, threshold: 3 }),
+      }),
+    ]);
+    expect(r.fullQueue.map((i) => i.issueId)).toEqual(["looped"]);
+  });
+
+  it("a sub-threshold counter is not a park: nothing withheld", async () => {
+    process.env.DISPATCH_BLOCKED_EXTERNAL_PARK_MODE = "enforce";
+    mocks.findMany.mockResolvedValue([issue("looped")]);
+    mocks.blockedFindMany.mockResolvedValue([blockedFor("looped", { consecutiveCount: 2 })]);
+    mocks.buildAgentQueue.mockReturnValue([{ issueId: "looped", title: "#looped", labels: [] }]);
+
+    const r = await fetchAgentQueueData(params());
+
+    expect(r.rankedQueue.map((i) => i.issueId)).toEqual(["looped"]);
+    expect(r.withheldQueue).toEqual([]);
+    // The counter still annotates the item in a non-off mode.
+    expect(r.rankedQueue[0].blockedExternalPark).toBeUndefined();
+  });
+
+  it("audit mode: a live park attaches the mark but withholds nothing", async () => {
+    process.env.DISPATCH_BLOCKED_EXTERNAL_PARK_MODE = "audit";
+    mocks.findMany.mockResolvedValue([issue("looped")]);
+    mocks.blockedFindMany.mockResolvedValue([blockedFor("looped")]);
+    mocks.buildAgentQueue.mockReturnValue([{ issueId: "looped", title: "#looped", labels: [] }]);
+
+    const r = await fetchAgentQueueData(params());
+
+    expect(r.withheldQueue).toEqual([]);
+    expect(r.rankedQueue).toEqual([
+      expect.objectContaining({
+        issueId: "looped",
+        blockedExternalPark: expect.objectContaining({ agentName: "courier", outcome: "blocked" }),
+      }),
+    ]);
+  });
+
+  it("off: no park ledger read and no mark is attached", async () => {
+    process.env.DISPATCH_BLOCKED_EXTERNAL_PARK_MODE = "off";
+    mocks.findMany.mockResolvedValue([issue("looped")]);
+    mocks.blockedFindMany.mockResolvedValue([blockedFor("looped")]);
+    mocks.buildAgentQueue.mockReturnValue([{ issueId: "looped", title: "#looped", labels: [] }]);
+
+    const r = await fetchAgentQueueData(params());
+
+    expect(mocks.blockedFindMany).not.toHaveBeenCalled();
+    expect(r.rankedQueue.map((i) => i.issueId)).toEqual(["looped"]);
+    expect(r.withheldQueue).toEqual([]);
+    expect(r.rankedQueue[0].blockedExternalPark).toBeUndefined();
+  });
+
+  it("an expired park (fingerprint mismatch) is not live: nothing withheld, stale row cleaned up", async () => {
+    process.env.DISPATCH_BLOCKED_EXTERNAL_PARK_MODE = "enforce";
+    mocks.findMany.mockResolvedValue([issue("edited")]);
+    const staleRow = blockedFor("edited", {
+      contentFingerprint: computeConclusionContentFingerprint({ title: "#edited-OLD", body: null }),
+    });
+    mocks.blockedFindMany.mockResolvedValue([staleRow]);
+    mocks.buildAgentQueue.mockReturnValue([{ issueId: "edited", title: "#edited", labels: [] }]);
+
+    const r = await fetchAgentQueueData(params());
+
+    expect(r.rankedQueue.map((i) => i.issueId)).toEqual(["edited"]);
+    expect(r.withheldQueue).toEqual([]);
+    expect(mocks.blockedDeleteMany).toHaveBeenCalledWith({ where: { id: { in: ["blocked-edited"] } } });
+  });
+
+  it("a ledger read failure degrades the poll open instead of halting pickup", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    process.env.DISPATCH_BLOCKED_EXTERNAL_PARK_MODE = "enforce";
+    mocks.findMany.mockResolvedValue([issue("looped")]);
+    mocks.blockedFindMany.mockRejectedValue(new Error("table missing"));
+    mocks.buildAgentQueue.mockReturnValue([{ issueId: "looped", title: "#looped", labels: [] }]);
+
+    const r = await fetchAgentQueueData(params());
+
+    expect(r.rankedQueue.map((i) => i.issueId)).toEqual(["looped"]);
+    expect(r.withheldQueue).toEqual([]);
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it("admission-audit + blocked-enforce: the park still withholds (knob independence)", async () => {
+    process.env.DISPATCH_BLOCKED_EXTERNAL_PARK_MODE = "enforce";
+    process.env.DISPATCH_QUEUE_ADMISSION_MODE = "audit";
+    mocks.findMany.mockResolvedValue([issue("looped")]);
+    mocks.blockedFindMany.mockResolvedValue([blockedFor("looped")]);
+    mocks.buildAgentQueue.mockReturnValue([{ issueId: "looped", title: "#looped", labels: [] }]);
+
+    const r = await fetchAgentQueueData(params());
+
+    expect(r.admissionMode).toBe("audit");
+    expect(r.rankedQueue).toEqual([]);
+    expect(r.withheldQueue).toEqual([
+      expect.objectContaining({ issueId: "looped", claimable: false }),
+    ]);
+  });
+
+  it("admission-enforce + a live park: the issue is counted once in withheldQueue", async () => {
+    process.env.DISPATCH_BLOCKED_EXTERNAL_PARK_MODE = "enforce";
+    process.env.DISPATCH_QUEUE_ADMISSION_MODE = "enforce";
+    // labels [] keeps grooming admission "not_gated", so the park alone
+    // withholds the item — and the admission-withheld / park-withheld lists
+    // stay disjoint, proving no double-listing in the merged return.
+    mocks.findMany.mockResolvedValue([issue("looped")]);
+    mocks.blockedFindMany.mockResolvedValue([blockedFor("looped")]);
+    mocks.buildAgentQueue.mockReturnValue([{ issueId: "looped", title: "#looped", labels: [] }]);
+
+    const r = await fetchAgentQueueData(params());
+
+    const listed = r.withheldQueue.filter((i) => i.issueId === "looped");
+    expect(listed).toHaveLength(1);
+    expect(listed[0].claimable).toBe(false);
+    expect(r.rankedQueue).toEqual([]);
+  });
+
+  it("both parks live on one issue: the issue is withheld once, carrying both marks", async () => {
+    process.env.DISPATCH_NO_PR_CONCLUSION_MODE = "enforce";
+    process.env.DISPATCH_BLOCKED_EXTERNAL_PARK_MODE = "enforce";
+    mocks.findMany.mockResolvedValue([issue("doubled")]);
+    mocks.noPrFindMany.mockResolvedValue([
+      {
+        id: "park-doubled",
+        issueId: "doubled",
+        agentName: "worker",
+        outcome: "no_changes_needed",
+        contentFingerprint: computeConclusionContentFingerprint({ title: "#doubled", body: null }),
+        createdAt: new Date("2026-01-01T00:00:00Z"),
+        summary: null,
+      },
+    ]);
+    mocks.blockedFindMany.mockResolvedValue([blockedFor("doubled")]);
+    mocks.buildAgentQueue.mockReturnValue([{ issueId: "doubled", title: "#doubled", labels: [] }]);
+
+    const r = await fetchAgentQueueData(params());
+
+    expect(r.rankedQueue).toEqual([]);
+    const listed = r.withheldQueue.filter((i) => i.issueId === "doubled");
+    expect(listed).toHaveLength(1);
+    expect(listed[0].claimable).toBe(false);
+    expect(listed[0].noPrConclusion).toBeDefined();
+    expect(listed[0].blockedExternalPark).toBeDefined();
   });
 });

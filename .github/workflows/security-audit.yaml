@@ -25,3 +25,32 @@ jobs:
       - name: npm audit (dev dependencies, informational)
         continue-on-error: true
         run: npm audit --include=dev --audit-level=high --fetch-retries=5 --fetch-timeout=120000 --fetch-retry-mintimeout=20000 --fetch-retry-maxtimeout=120000
+
+  audit-site:
+    name: npm audit (site/)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+      # site/ is a separate Astro project with its own package-lock.json and
+      # it ships to GitHub Pages, so the app-level gate above never sees its
+      # dependency tree (#1566): `npm audit` reads the lockfile of the
+      # directory it runs in, and the app tree has no site/ packages in it.
+      #
+      # Blocking at --audit-level=high, exactly like the app's production
+      # gate. The dev-inclusive scope covers the whole site tree today: the
+      # site declares no devDependencies and its lockfile flags no package
+      # as dev-only, so there is no prod/dev split to preserve the way
+      # #1166 preserved one for the app. A future site devDependency would
+      # widen the blocking scope past the app's prod-only gate — deliberate,
+      # because a build-time dependency still shapes the published artifact.
+      # Moderate advisories stay non-fatal because the threshold is high.
+      #
+      # `npm audit` reads the lockfile, so no install is needed before it.
+      - name: npm audit (site/ dependency tree)
+        run: npm audit --include=dev --audit-level=high --fetch-retries=5 --fetch-timeout=120000 --fetch-retry-mintimeout=20000 --fetch-retry-maxtimeout=120000
+        working-directory: site

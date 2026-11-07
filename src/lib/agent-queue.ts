@@ -17,6 +17,7 @@ import {
 } from "@/lib/issue-dependencies";
 import type { QueueAdmission } from "@/lib/queue-admission";
 import type { NoPrConclusionMark } from "@/lib/no-pr-conclusion";
+import type { BlockedExternalParkMark } from "@/lib/blocked-external-park";
 
 export { isRenovateIssue } from "@/lib/issue-filters";
 
@@ -71,6 +72,13 @@ export interface RankedIssue {
    * instead.
    */
   noPrConclusion?: NoPrConclusionMark | null;
+  /**
+   * Live repeated-blocked-settlement park (#1562). Present only when
+   * DISPATCH_BLOCKED_EXTERNAL_PARK_MODE is audit or enforce; in enforce the
+   * item is withheld from the ranked queue and carried in the withheld queue
+   * instead.
+   */
+  blockedExternalPark?: BlockedExternalParkMark | null;
 }
 
 // ─── Anti-starvation aging ──────────────────────────────────────────────────

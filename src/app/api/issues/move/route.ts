@@ -8,6 +8,7 @@ import { enforceRateLimit } from "@/lib/rate-limit";
 import { transitionIssueStatus } from "@/lib/issue-status";
 import { recordStatusTransition } from "@/lib/issue-lifecycle";
 import { clearNoPrConclusionPark, type ConclusionWriteClient } from "@/lib/no-pr-conclusion";
+import { clearBlockedExternalPark, type BlockedExternalParkWriteClient } from "@/lib/blocked-external-park";
 
 // Generous per-actor rate limit — normal kanban drag-and-drop and agent
 // status transitions stay far below this.
@@ -112,6 +113,19 @@ export async function POST(request: Request) {
                 reason: "board move",
               },
               tx as unknown as ConclusionWriteClient,
+            );
+            // #1562: the same operator authority ends a blocked-external
+            // park, in the same commit.
+            await clearBlockedExternalPark(
+              {
+                issueId: issueId as string,
+                repoFullName: repoFullName as string,
+                issueNumber: issueNumber as number,
+                actor: moveActor,
+                source: "api:move",
+                reason: "board move",
+              },
+              tx as unknown as BlockedExternalParkWriteClient,
             );
           }
         });

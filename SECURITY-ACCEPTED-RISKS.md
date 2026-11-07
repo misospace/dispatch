@@ -1,10 +1,22 @@
 # Accepted Security Risks
 
-**Last updated: 2026-10-24**
+**Last updated: 2026-11-06**
 
 There are currently no accepted npm runtime advisories.
 
 `npm audit --omit=dev --include=prod` reports **0 vulnerabilities** (at every severity) across the production dependency tree (17 direct production dependencies plus optional/native deps such as the Next.js platform binaries). The blocking gate runs the same query with `--audit-level=high`; the vulnerable version ranges of the advisories remediated in #1386 are pinned by `package-advisory-ranges.test.ts`, so a later lock refresh cannot silently reintroduce a vulnerable build. Those pins hold the **union of every advisory the npm feed lists for the five packages**, across all major lines they publish, not only the advisories #1386 named: `fast-uri` for example is flagged on 2.x, 3.x **and** 4.x, so the guard pins all three boundaries.
+
+## Site Dependency Tree
+
+`site/` is a separate Astro project with its own `package-lock.json`, and it ships publicly to GitHub Pages. The app-level gate described above reads the root lockfile, so until #1566 no workflow audited the site's dependency tree at all: the Pages workflow installed it with `npm ci --no-audit`, and Renovate bumps the site's `astro` dependency regularly.
+
+- **Mitigation:** `npm audit --include=dev --audit-level=high` runs against `site/` (working directory `site/`) in two places, and fails the build on high/critical vulnerabilities:
+  - the `audit-site` job in `.github/workflows/security-audit.yaml` — every push to `main` and every pull request targeting `main`;
+  - the validate job in `.github/workflows/pages.yaml` — every push or pull request that touches `site/**`, which also covers pull requests that target a branch other than `main`. The Pages build and deploy depend on that job, so a red gate stops the publish instead of only turning the workflow red.
+- The dev-inclusive scope covers the whole site tree today: the site declares no `devDependencies` and its lockfile flags no package as dev-only, so the gate resolves to exactly the tree the build installs. A future site `devDependency` would widen the blocking scope past the app's prod-only gate (`#1166`) — deliberate, because a build-time dependency still shapes the published artifact.
+- The `--audit-level=high` threshold keeps moderate advisories non-fatal, the same severity policy the app gate uses.
+- `npm audit` reads the lockfile, so the gate needs no install of its own; the fetch-retry flags mirror the app gate and reduce transient registry failures — a sustained advisory-endpoint outage still fails the gate closed.
+- Both call sites are pinned to the identical command by `site-package-audit.test.ts`.
 
 ## Non-NPM Risks
 

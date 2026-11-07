@@ -14,6 +14,8 @@ const { mocks } = vi.hoisted(() => ({
     auth: vi.fn(),
     noPrConclusionFindUnique: vi.fn().mockResolvedValue(null),
     noPrConclusionDelete: vi.fn().mockResolvedValue({}),
+    blockedExternalParkFindUnique: vi.fn().mockResolvedValue(null),
+    blockedExternalParkDelete: vi.fn().mockResolvedValue({}),
   },
 }));
 
@@ -38,6 +40,11 @@ vi.mock("@/lib/prisma", () => ({
       findUnique: mocks.noPrConclusionFindUnique,
       delete: mocks.noPrConclusionDelete,
     },
+    // #1562: a board move retires the blocked-external park row too.
+    blockedExternalPark: {
+      findUnique: mocks.blockedExternalParkFindUnique,
+      delete: mocks.blockedExternalParkDelete,
+    },
     // The move commits the cache write and its lifecycle event together (#1202).
     $transaction: (arg: any) =>
       Promise.resolve(
@@ -51,6 +58,10 @@ vi.mock("@/lib/prisma", () => ({
               noPrConclusion: {
                 findUnique: mocks.noPrConclusionFindUnique,
                 delete: mocks.noPrConclusionDelete,
+              },
+              blockedExternalPark: {
+                findUnique: mocks.blockedExternalParkFindUnique,
+                delete: mocks.blockedExternalParkDelete,
               },
             })
           : Promise.all(arg),
