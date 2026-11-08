@@ -187,7 +187,10 @@ export async function POST(request: NextRequest) {
           // The list endpoint omits mergeability; the per-PR GET carries it. Without
           // this, pr.mergeable is always undefined and merge conflicts are invisible
           // to the ingestion below.
-          fetchPullRequestMergeState(repoFullName, pr.number),
+          fetchPullRequestMergeState(repoFullName, pr.number).catch(() => ({
+            mergeableState: null,
+            mergeable: null,
+          })),
         ]);
 
         // Map the REST merge_state to the enum the conflict ingestion expects.
@@ -202,6 +205,17 @@ export async function POST(request: NextRequest) {
             : mergeableState && mergeableState !== "unknown"
               ? "MERGEABLE"
               : undefined;
+        // #1575 observability: when the per-PR mergeability read fails outright
+        // (auth gap, error swallowed to null — NOT GitHub's documented
+        // still-computing `unknown`), the PR is neither enqueued nor cleared
+        // this cycle and previously left no trace: a conflicted PR stayed
+        // invisible to the rebase lane while the job still reported ok. Make
+        // the skip visible so an operator can tell "no signal" from "no work".
+        if (mergeState.mergeableState === null && mergeState.mergeable === null) {
+          console.warn(
+            `[pr-followup] merge state unavailable for ${repoFullName}#${pr.number}; conflict detection deferred this cycle`,
+          );
+        }
 
         // PR head SHA captured at sync time. Stored on PrFixQueueItem.headSha so a
         // later FIXED transition can verify the workload actually pushed something

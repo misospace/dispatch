@@ -2408,6 +2408,26 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
         const reopenFixStale =
           identityKnown && headShaUnchanged && !isConditionKind && !isNonActionableVersion;
 
+        // #1575: a REBASE conflict episode is closed by the conflict CLEARING
+        // (`clearResolvedConflictItems`), not by an attempt settling. A re-read
+        // CONFLICTING observation of the same (identity, version) at a FIXED
+        // tombstone therefore is not settled "known evidence": the earlier
+        // attempt left the PR exactly as conflicted as it found it (the head
+        // never moves — the BASE advanced), and the sticky arm kept the row
+        // closed while the rebase lane starved. Reopen it as a fresh attempt.
+        // The loop stays bounded by every existing guard: only FIXED reaches
+        // here (terminal STALE/IGNORED are sticky above, PARKED/BLOCKED/
+        // WAITING_EXTERNAL route through `evaluateRecovery`, and an unchanged
+        // condition on an already-QUEUED row stays the same attempt); the head
+        // has not advanced, so the #1543 stagnation budget below counts this
+        // reopen and parks at the cap instead of churning; and the pinned
+        // generation write rejects decisions computed from a row that moved
+        // under us.
+        const rebaseEpisodeOpen =
+          type === "REBASE" &&
+          snapshot.status === "FIXED" &&
+          input.evidenceActionable === true;
+
         // STALE/IGNORED stay sticky inline (#1000): terminal states never
         // reactivate on evidence and are operator-only, so they are kept OUT
         // of the recovery module's decision path entirely. The three
@@ -2485,6 +2505,8 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           if (recovery.setStaleDisposition) recoveryNote = recovery.reason;
         } else if (reopenFixStale) {
           resolvedStatus = nextStatus; // #940 recovery from a no-progress FIXED tombstone
+        } else if (isKnownEvidence && rebaseEpisodeOpen) {
+          resolvedStatus = nextStatus; // #1575: a still-conflicting PR re-enters the rebase lane
         } else if (isKnownEvidence) {
           resolvedStatus = snapshot.status; // #25 anti-churn: repeat evidence never flips status
         } else {
