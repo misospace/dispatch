@@ -2,13 +2,15 @@ import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } from "@/test/route-helpers";
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
-// #1569: this suite predates the PR-fix ownership contract — its fixtures
-// carry no claimant, so the ownership gate is switched OFF here to keep the
-// pre-#1569 dispatch paths exactly as they were tested. The #1569 describes
-// below set the mode explicitly; the gate's enforce/audit semantics and the
-// claimant capture are covered in src/lib/pr-fix-queue.test.ts (#1569) and
-// src/lib/pr-fix-ownership.test.ts.
-process.env.DISPATCH_PR_FIX_OWNERSHIP_MODE = "off";
+// #1569: the ownership gate refuses a row with no recorded claimant in EVERY
+// mode, so this suite's fixtures carry a resolved claimant (injected by the
+// prisma mock below, so a fixture that does not state one is still owned).
+// The gate therefore runs here exactly as it runs in production, and the
+// pre-#1569 dispatch paths are tested against a RESOLVED row — the one state
+// in which they still dispatch. The #1569 describes below script the
+// unresolved states explicitly; the gate's per-mode semantics and the
+// claimant capture are covered in src/lib/pr-fix-ownership-queue.test.ts.
+process.env.DISPATCH_PR_FIX_OWNERSHIP_MODE = "enforce";
 
 vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock(mockToken, { "test-worker-token": "worker" }, { "bound-token": "alpha" }));
 
@@ -47,13 +49,26 @@ const { mocks } = vi.hoisted(() => ({
 }));
 
 vi.mock("@/lib/prisma", () => {
+  // #1569: unresolved ownership never authorizes an automatic hand-out, in
+  // any mode, so this suite's fixtures must carry a RESOLVED claimant. A
+  // fixture that states its own `claimant` (the #1569 describes script the
+  // unresolved states explicitly) is left untouched.
+  const withClaimant = (row: any) => {
+    if (!row || row.claimant !== undefined) return row;
+    const author = typeof row.author === "string" && row.author.trim() !== "" ? row.author : null;
+    return {
+      ...row,
+      claimant: author ?? "fixture-owner",
+      claimantSource: author ? "pr-author" : "operator",
+    };
+  };
   const prFixQueueItem = {
-    findMany: mocks.prFixFindMany,
+    findMany: async (args: any) => ((await mocks.prFixFindMany(args)) ?? []).map(withClaimant),
     findUnique: vi.fn(async ({ where }: any) => {
-      const rows = [...mocks.linkedRows, ...((await mocks.prFixFindMany()) ?? [])];
+      const rows = [...mocks.linkedRows, ...((await mocks.prFixFindMany()) ?? [])].map(withClaimant);
       if (where?.id !== undefined) {
         const byId = await mocks.prFixFindUnique({ where });
-        return byId ?? rows.find((row: any) => row.id === where.id) ?? null;
+        return withClaimant(byId) ?? rows.find((row: any) => row.id === where.id) ?? null;
       }
       if (where?.repo_pr) return mocks.prFixFindUniqueByRepo({ where });
       if (where?.repo !== undefined && where?.pr !== undefined) {
@@ -380,7 +395,12 @@ function linkedIssue(number: number, pr: number, overrides: Record<string, unkno
     number,
     title: `Issue ${number}`,
     url: `https://github.com/org/repo/issues/${number}`,
-    labels: ["priority/p0", "status/ready"],
+    // #1569: the `owner/<name>` label is the linked issue's ownership
+    // evidence. A linked PR materialized from an issue WITHOUT ownership
+    // evidence records an unresolved claimant and is refused at the hand-out
+    // boundary — the fixtures therefore state an owner. An `owner/*` label
+    // (not `agent/*`) keeps the issue visible to every poller's queue.
+    labels: ["priority/p0", "status/ready", "owner/board-owner"],
     currentLane: "local",
     decomposed: false,
     repository: { fullName: "org/repo" },
@@ -1174,7 +1194,16 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     mocks.issueFindMany.mockResolvedValue([]);
     // #1503: no linked issue resolves as escalation-classified unless a test
     // opts in (keeps the hand-out gate inert for pre-existing fixtures).
-    mocks.issueFindFirst.mockResolvedValue(null);
+    // #1569: the CLAIMANT-FACT read (select: id/labels) is a different
+    // question — it must see the real issue row, so the linked issue's
+    // ownership evidence is available. Serve the row the route already read
+    // for that issue number; the lane read (select: currentLane) keeps the
+    // scripted "no row" answer.
+    mocks.issueFindFirst.mockImplementation(async ({ where, select }: any = {}) => {
+      if (select?.id === undefined && select?.labels === undefined) return null;
+      const rows = (await mocks.issueFindMany()) ?? [];
+      return rows.find((row: any) => row.number === where?.number) ?? null;
+    });
     // #1503 review: the fence's locked parent read defaults to "no linked
     // issue row" (definitive NOT_ESCALATED) unless a test scripts it.
     mocks.issueFindFirstLocked.mockResolvedValue(null);
@@ -1398,6 +1427,9 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     const item = await enqueuePrFixItem(client, {
       repo: "org/repo", pr: 123, lane: "NORMAL", reason: "review changes requested",
       feedback: "please update tests", evidenceKey: "review:123",
+      // #1569: no linked issue, so the PR author is the claimant source. A row
+      // with no resolvable claimant is refused at the hand-out boundary.
+      author: "pr-author",
     });
     await markPrFixItem(client, {
       repo: "org/repo", pr: 123, status: "WAITING_EXTERNAL",
@@ -1445,6 +1477,9 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       reason: "review changes requested",
       feedback: "please update tests",
       evidenceKey: "review:1",
+      // #1569: no linked issue, so the PR author is the claimant source. A row
+      // with no resolvable claimant is refused at the hand-out boundary.
+      author: "pr-author",
     });
 
     const first = await GET(
@@ -3208,16 +3243,16 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       {
         id: "issue-1",
         number: 42,
-        title: "Fix login bug",
-        url: "https://github.com/org/repo/issues/42",
-        labels: ["priority/p0", "status/ready"],
-        currentLane: "local",
-        decomposed: false,
-        repository: { fullName: "org/repo" },
-        linkedPrNumber: 15,
-        linkedPrUrl: "https://github.com/org/repo/pull/15",
-        linkedPrNeedsFollowup: true,
-        linkedPrFollowupReasons: [],
+      title: "Fix login bug",
+      url: "https://github.com/org/repo/issues/42",
+      labels: ["priority/p0", "status/ready", "owner/board-owner"],
+      currentLane: "local",
+      decomposed: false,
+      repository: { fullName: "org/repo" },
+      linkedPrNumber: 15,
+      linkedPrUrl: "https://github.com/org/repo/pull/15",
+      linkedPrNeedsFollowup: true,
+      linkedPrFollowupReasons: [],
         linkedPrReviewDecision: null,
         linkedPrMergeState: null,
         linkedPrHealthCheckedAt: new Date("2026-01-01T00:00:00Z"),
@@ -4209,7 +4244,7 @@ describe("GET next-task PR-fix ownership evidence (#1569)", () => {
   });
   afterEach(() => {
     // Restore the file-level default for any later describes.
-    process.env.DISPATCH_PR_FIX_OWNERSHIP_MODE = "off";
+    process.env.DISPATCH_PR_FIX_OWNERSHIP_MODE = "enforce";
   });
 
   /** A queued NORMAL-lane PR-fix row linked to issue 737, with #1569 fields. */
@@ -4285,6 +4320,63 @@ describe("GET next-task PR-fix ownership evidence (#1569)", () => {
     const writes = handoutWrites();
     expect(writes.filter((args) => args.data?.claimant !== undefined)).toHaveLength(0);
     expect(writes.filter((args) => Array.isArray(args.data?.agentHandouts?.push))).toHaveLength(0);
+  });
+
+  it("audit mode refuses an unresolved row — no mode authorizes an automatic hand-out", async () => {
+    process.env.DISPATCH_PR_FIX_OWNERSHIP_MODE = "audit";
+    const row = ownershipRow(57); // no recorded claimant, no recorded source
+    mocks.prFixFindMany.mockResolvedValue([row]);
+    scriptConfirmed(row);
+    // The linked issue row is missing (a definitive read): resolution stays
+    // "missing", so the backfill writes nothing and the gate refuses.
+    const body = await (
+      await GET(request("/api/agents/example-agent/next-task?lane=local"), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })
+    ).json();
+    expect(body.type).toBe("idle");
+    // A refusal in ANY mode disturbs no row state: no dispatch stamp, no
+    // backfill write, no hand-out append.
+    expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.prFixHistoryCreate).not.toHaveBeenCalled();
+  });
+
+  it("off mode refuses an unresolved row and performs no issuance-side write", async () => {
+    process.env.DISPATCH_PR_FIX_OWNERSHIP_MODE = "off";
+    const row = ownershipRow(58); // no recorded claimant, no recorded source
+    mocks.prFixFindMany.mockResolvedValue([row]);
+    scriptConfirmed(row);
+    // The live evidence WOULD resolve this row (exactly one agent label) —
+    // but "off" performs no issuance-side write, so the claimant is never
+    // backfilled and the unresolved row is refused. Recovery is operator
+    // driven (re-ingestion, operator requeue, or the stamp endpoint).
+    mocks.issueFindFirst.mockResolvedValue({ id: "issue-737", labels: ["agent/worker-7"] });
+    const body = await (
+      await GET(request("/api/agents/example-agent/next-task?lane=local"), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })
+    ).json();
+    expect(body.type).toBe("idle");
+    // No dispatch stamp, no backfill write, no hand-out append.
+    expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.prFixHistoryCreate).not.toHaveBeenCalled();
+  });
+
+  it("audit mode still self-heals a resolvable row (the lazy backfill is not disabled)", async () => {
+    process.env.DISPATCH_PR_FIX_OWNERSHIP_MODE = "audit";
+    const row = ownershipRow(59); // unresolved at the hand-out boundary...
+    mocks.prFixFindMany.mockResolvedValue([row]);
+    scriptConfirmed(row);
+    // ...but the live evidence resolves it: exactly one agent label.
+    mocks.issueFindFirst.mockResolvedValue({ id: "issue-737", labels: ["agent/worker-7"] });
+    const body = await (
+      await GET(request("/api/agents/example-agent/next-task?lane=local"), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })
+    ).json();
+    expect(body.type).toBe("followup-pr");
+    const backfill = handoutWrites().find((args) => args.data?.claimant !== undefined);
+    expect(backfill?.data).toEqual({ claimant: "worker-7", claimantSource: "agent-label" });
   });
 
   it("backfills the original claimant from the linked issue's agent label and hands out", async () => {

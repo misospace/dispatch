@@ -7,11 +7,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } from "@/test/route-helpers";
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
-// #1569: this suite predates the PR-fix ownership contract — its fixtures
-// carry no claimant, so the ownership gate is switched OFF here to keep the
-// pre-#1569 dispatch paths exactly as they were tested. The gate's
-// enforce/audit semantics are covered in src/lib/pr-fix-queue.test.ts and
-// src/lib/pr-fix-ownership.test.ts.
+// #1569: the ownership gate refuses a row with no recorded claimant in EVERY
+// mode, so this suite's fixtures carry a resolved claimant. The mode stays
+// "off" (no issuance-side writes) — the gate still refuses an unresolved row
+// there, it just performs no lazy backfill. The gate's per-mode semantics and
+// the claimant capture are covered in src/lib/pr-fix-ownership-queue.test.ts.
 process.env.DISPATCH_PR_FIX_OWNERSHIP_MODE = "off";
 
 vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock());
@@ -45,10 +45,17 @@ vi.mock("@/lib/prisma", () => {
     prisma: {
       issue: {
         findMany: mocks.issueFindMany,
-        // #1569: linked-PR materialization now re-derives the parent's
-        // escalation classification through the module client before
-        // creating the row; "no row" is the definitive NOT_ESCALATED read.
-        findFirst: async () => null,
+        // #1569: linked-PR materialization re-derives the parent's escalation
+        // classification through the module client before creating the row;
+        // "no row" is the definitive NOT_ESCALATED read. The CLAIMANT-FACT
+        // read (select: id/labels) is a different question — it must see the
+        // real issue row, so the linked issue's ownership evidence is
+        // available to the materialized row.
+        findFirst: async ({ where, select }: any = {}) => {
+          if (select?.id === undefined && select?.labels === undefined) return null;
+          const rows = (await mocks.issueFindMany()) ?? [];
+          return rows.find((row: any) => row.number === where?.number) ?? null;
+        },
       },
       // #1506: the terminal no-PR conclusion park ledger read/cleanup.
       noPrConclusion: {
@@ -199,6 +206,10 @@ const PR_FIX = {
   feedback: [],
   evidenceKeys: ["ci:1"],
   author: "itsmiso-ai",
+  // #1569: unresolved ownership never authorizes an automatic hand-out, in
+  // any mode, so a dispatchable row states its original claimant.
+  claimant: "itsmiso-ai",
+  claimantSource: "pr-author",
   generation: 1,
   queuedAt: new Date("2026-09-20T00:00:00Z"),
   updatedAt: new Date("2026-09-20T00:00:00Z"),
@@ -429,7 +440,7 @@ describe("admission enforce", () => {
 
   it("linked-PR follow-up routing still reaches a withheld issue's PR", async () => {
     mocks.issueFindMany.mockImplementation(async () => [
-      row("i10", 10, ["status/ready", "priority/p0"], {
+      row("i10", 10, ["status/ready", "priority/p0", "owner/board-owner"], {
         linkedPrNumber: 88,
         linkedPrUrl: "https://github.com/org/repo/pull/88",
         linkedPrNeedsFollowup: true,

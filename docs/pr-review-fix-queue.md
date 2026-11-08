@@ -78,11 +78,12 @@ recipient never becomes the claimant, and a lane re-classification never
 transfers ownership. At issuance the lane gate is bidirectional (normal
 cannot take frontier work; frontier cannot take normal work; an unverifiable
 classification refuses both declared lanes), and a row whose ownership is
-unresolved ("missing", "ambiguous", or legacy) is never auto-handed out —
-resolution comes from re-ingestion, an operator requeue, or
+unresolved ("missing", "ambiguous", or legacy) is never auto-handed out in
+any rollout mode — resolution comes from re-ingestion, an operator requeue, or
 `POST /api/pr-fix-queue/claimant`. Rollout mode:
-`DISPATCH_PR_FIX_OWNERSHIP_MODE` (default `enforce`). Full contract,
-provenance order, and the capability-gated `ownership` payload on the
+`DISPATCH_PR_FIX_OWNERSHIP_MODE` (default `enforce`); the mode changes the log
+marker and whether the issuance-side backfill runs, never the refusal. Full
+contract, provenance order, and the capability-gated `ownership` payload on the
 hand-out: [pr-fix-ownership-contract.md](pr-fix-ownership-contract.md).
 
 ## Mechanical rebase lane (#1327)

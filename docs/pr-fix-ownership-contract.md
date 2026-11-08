@@ -42,15 +42,17 @@ A recorded claimant is never overwritten, refreshed, or cleared by re-ingestion.
 
 The ownership gate applies to every automatic hand-out: normal, escalation, unfiltered operator poll, and REBASE alike.
 
-Unresolved ownership never authorizes an automatic hand-out. Refusal is logged with the provenance.
+Unresolved ownership never authorizes an automatic hand-out, in every rollout mode. The gate logs each refusal with the provenance.
 
-Before refusing, the gate makes one lazy re-resolution attempt from the authoritative records (Lease, labels, PR author) and backfills conditionally, only when `claimant` is NULL. That is the bulk recovery path for legacy rows.
+Before refusing, the gate makes one lazy re-resolution attempt from the authoritative records (Lease, labels, PR author) and backfills conditionally, only when `claimant` is NULL. That is the bulk recovery path for legacy rows. The `off` mode does not run this attempt.
 
 Mode env `DISPATCH_PR_FIX_OWNERSHIP_MODE`:
 
-- `enforce` — default. Gate active and backfill enabled.
-- `audit` — log-only migration window.
-- `off` — also disables issuance backfill.
+The mode never allows an automatic hand-out of a row with unresolved ownership. Every mode refuses that row. The mode controls only what the system does around the refusal.
+
+- `enforce` — the default. The gate refuses the row and logs the refusal. The issuance-side backfill runs, so a row that the authoritative records can resolve repairs itself on first contact.
+- `audit` — the gate refuses the row and logs the refusal with an `AUDIT` marker. The issuance-side backfill runs. Use this mode during a migration to list the rows that still need a claimant.
+- `off` — the gate refuses the row and logs the refusal. The issuance-side backfill does not run, so Dispatch writes nothing to the row at hand-out time. An operator repairs the row through re-ingestion, an operator requeue, or the claimant endpoint.
 
 ## Recovery paths for an unresolved row
 
@@ -96,8 +98,8 @@ Queue listings carry `claimant`, `claimantSource`, and `ownership` additively.
 
 - `originalClaimant` is the authority. A row that carries a claimant dispatches, whatever its `provenance` says.
 - `provenance: "legacy"` means the row predates this contract (no recorded source). It does not by itself mean "unowned": a claimant-bearing row with no recorded source still reports `legacy` and still dispatches.
-- `missing` / `ambiguous` are the recorded failure states, and both refuse automatic hand-out in `enforce`.
-- In `audit` and `off` modes a negotiated poll can receive `originalClaimant: null`. A capability grant is not a promise of a claimant.
+- `missing` and `ambiguous` are the recorded failure states. Both refuse an automatic hand-out in every mode.
+- A negotiated poll can receive `originalClaimant: null`. A capability grant is not a promise of a claimant.
 - `owningLane` is the ROW's lane, not the dispatched lane. A `REBASE` hand-out ships `owningLane` from the row (often `NORMAL`) alongside `prFixItem.fixType: "REBASE"`. Bind identity to the row, never to the execution lane.
 
 ## Write rules

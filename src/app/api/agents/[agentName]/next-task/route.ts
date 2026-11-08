@@ -536,34 +536,40 @@ export async function GET(
         // `claimant IS NULL`) so legacy rows self-heal on first contact. The
         // authoritative re-decision against the CONFIRMED row still runs in
         // `issueHandout`; this arm exists so a deterministic refusal never
-        // disturbs the row at all. Skipped entirely in "off" mode.
-        if (prFixOwnershipMode() !== "off") {
-          const snapshotOwnership = {
+        // disturbs the row at all.
+        //
+        // The refusal itself runs in EVERY mode: unresolved ownership never
+        // authorizes an automatic hand-out (#1569's rule is absolute), so a
+        // refusal must land before the dispatch stamp in every mode too. Only
+        // the lazy re-resolution — a WRITE — is mode-gated: "off" performs no
+        // issuance-side write, so an unresolved row waits for operator
+        // recovery (re-ingestion, operator requeue, or the stamp endpoint)
+        // instead of self-healing.
+        const snapshotOwnership = {
+          id: candidate.id,
+          repo: candidate.repo,
+          pr: candidate.pr,
+          generation: candidate.generation,
+          lane: candidate.lane ?? null,
+          issue: candidate.issue ?? null,
+          author: candidate.author ?? null,
+          claimant: candidate.claimant ?? null,
+          claimantSource: candidate.claimantSource ?? null,
+        };
+        if (snapshotOwnership.claimant === null && prFixOwnershipMode() !== "off") {
+          const backfilled = await backfillPrFixClaimant(asPrFixQueueClient(prisma), {
             id: candidate.id,
             repo: candidate.repo,
-            pr: candidate.pr,
-            generation: candidate.generation,
-            lane: candidate.lane ?? null,
-            issue: candidate.issue ?? null,
-            author: candidate.author ?? null,
-            claimant: candidate.claimant ?? null,
-            claimantSource: candidate.claimantSource ?? null,
-          };
-          if (snapshotOwnership.claimant === null) {
-            const backfilled = await backfillPrFixClaimant(asPrFixQueueClient(prisma), {
-              id: candidate.id,
-              repo: candidate.repo,
-              issue: snapshotOwnership.issue,
-              author: snapshotOwnership.author,
-              claimant: null,
-            });
-            if (backfilled.claimant !== null) {
-              snapshotOwnership.claimant = backfilled.claimant;
-              snapshotOwnership.claimantSource = backfilled.claimantSource;
-            }
+            issue: snapshotOwnership.issue,
+            author: snapshotOwnership.author,
+            claimant: null,
+          });
+          if (backfilled.claimant !== null) {
+            snapshotOwnership.claimant = backfilled.claimant;
+            snapshotOwnership.claimantSource = backfilled.claimantSource;
           }
-          if (evaluatePrFixHandoutOwnership(snapshotOwnership).decision === "refuse") return null;
         }
+        if (evaluatePrFixHandoutOwnership(snapshotOwnership).decision === "refuse") return null;
 
         // #1503: escalation-lane exclusivity at hand-out — defense in depth
         // behind the read filter. Work whose linked issue is authoritatively

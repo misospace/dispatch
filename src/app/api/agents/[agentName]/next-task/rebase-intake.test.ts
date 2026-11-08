@@ -9,6 +9,13 @@ import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } from "@/test/route-helpers";
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
+// #1569: the ownership gate refuses a row with no recorded claimant in every
+// mode, so the rollout mode is pinned here instead of inherited from whichever
+// suite the worker ran before (the mode is process-global). The fixtures
+// below carry a resolved claimant, so the hand-out path is the same in every
+// mode; the gate's per-mode semantics are covered in
+// src/lib/pr-fix-ownership-queue.test.ts.
+process.env.DISPATCH_PR_FIX_OWNERSHIP_MODE = "enforce";
 
 vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock(mockToken));
 
@@ -220,6 +227,11 @@ function rebaseRow(pr = 41, over: Record<string, unknown> = {}) {
     feedback: ["MECHANICALLY ONLY"],
     evidenceKeys: ["review:1"],
     author: "bot",
+    // #1569: unresolved ownership never authorizes an automatic hand-out, in
+    // any mode. This row has no linked issue, so its claimant is the PR
+    // author — stated here so the row dispatches in every mode.
+    claimant: "bot",
+    claimantSource: "pr-author",
     generation: 1,
     queuedAt: new Date("2026-01-01T00:00:00Z"),
     updatedAt: new Date("2026-01-01T00:00:00Z"),

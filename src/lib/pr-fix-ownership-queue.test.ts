@@ -4,7 +4,7 @@
  * resolution rules live in src/lib/pr-fix-ownership.test.ts; the route-level
  * hand-out paths are covered in the next-task route suite's #1569 describe.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   backfillPrFixClaimant,
   createLinkedPrFixItem,
@@ -160,9 +160,40 @@ describe("evaluatePrFixHandoutOwnership (#1569)", () => {
     });
   });
 
-  it("audit hands out anyway; off hands out without evaluating evidence refusal", () => {
-    expect(evaluatePrFixHandoutOwnership(unresolved, "audit").decision).toBe("eligible");
-    expect(evaluatePrFixHandoutOwnership(unresolved, "off").decision).toBe("eligible");
+  it("refuses an unresolved row in EVERY mode — no rollout mode authorizes a hand-out", () => {
+    // #1569's rule is absolute: missing or ambiguous ownership never
+    // authorizes an automatic hand-out. The rollout mode selects the side
+    // effects around the refusal (the "audit" log marker, the "off"
+    // no-write posture), never the decision itself.
+    expect(evaluatePrFixHandoutOwnership(unresolved, "enforce").decision).toBe("refuse");
+    expect(evaluatePrFixHandoutOwnership(unresolved, "audit").decision).toBe("refuse");
+    expect(evaluatePrFixHandoutOwnership(unresolved, "off").decision).toBe("refuse");
+    // An AMBIGUOUS row (contradictory owner evidence) refuses in every mode
+    // too — ambiguity is not a weaker kind of unresolved.
+    const ambiguous = { ...unresolved, claimantSource: "ambiguous" };
+    expect(evaluatePrFixHandoutOwnership(ambiguous, "enforce").decision).toBe("refuse");
+    expect(evaluatePrFixHandoutOwnership(ambiguous, "audit").decision).toBe("refuse");
+    expect(evaluatePrFixHandoutOwnership(ambiguous, "off").decision).toBe("refuse");
+    // A RESOLVED row still dispatches in every mode.
+    expect(evaluatePrFixHandoutOwnership(resolved, "enforce").decision).toBe("eligible");
+    expect(evaluatePrFixHandoutOwnership(resolved, "audit").decision).toBe("eligible");
+    expect(evaluatePrFixHandoutOwnership(resolved, "off").decision).toBe("eligible");
+  });
+
+  it("keeps the audit marker observable while refusing the hand-out", () => {
+    const infos: unknown[][] = [];
+    const spy = vi.spyOn(console, "info").mockImplementation((...args: unknown[]) => {
+      infos.push(args);
+    });
+    try {
+      expect(evaluatePrFixHandoutOwnership(unresolved, "audit").decision).toBe("refuse");
+      expect(infos.some(([message]) => String(message).includes("AUDIT"))).toBe(true);
+      infos.length = 0;
+      expect(evaluatePrFixHandoutOwnership(unresolved, "enforce").decision).toBe("refuse");
+      expect(infos.some(([message]) => String(message).includes("AUDIT"))).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 

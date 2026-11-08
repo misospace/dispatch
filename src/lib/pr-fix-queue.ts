@@ -322,19 +322,30 @@ export async function withHandoutLaneExclusivityFence<T>(
 
 // ─── PR-fix ownership enforcement (#1569) ──────────────────────────────────
 /**
- * Rollout mode for the #1569 ownership gate at issuance:
- * - "enforce" (DEFAULT): a row whose ownership is unresolved ("missing",
- *   "ambiguous", or a legacy row with no recorded claimant) is REFUSED to
- *   every automatic hand-out path (next-task, including unfiltered and
- *   REBASE dispatches). The issue's rule is absolute: missing or ambiguous
- *   ownership never authorizes an automatic hand-out.
- * - "audit": evaluate and log the refusal that WOULD happen, hand out
- *   anyway. Migration window for operators.
- * - "off": gate disabled, including the issuance-side lazy backfill
- *   (escape hatch; ingestion-side capture — the claimant columns and the
- *   provenance they record — keeps running, and a negotiated poll still
- *   receives the evidence object).
- * Unresolved rows are NOT silently stranded: at issuance the gate first
+ * Rollout mode for the #1569 ownership gate at issuance.
+ *
+ * The AUTHORIZATION is mode-independent: a row whose ownership is unresolved
+ * ("missing", "ambiguous", or a legacy row with no recorded claimant) is
+ * REFUSED to every automatic hand-out path (next-task, including unfiltered
+ * and REBASE dispatches) in EVERY mode. The issue's rule is absolute —
+ * missing or ambiguous ownership never authorizes an automatic hand-out — so
+ * no rollout mode may hand an unresolved row out. The mode selects the
+ * side effects around that refusal, never the refusal itself:
+ * - "enforce" (DEFAULT): refuse; the issuance-side lazy backfill runs (a
+ *   resolved claimant is written back, so legacy rows self-heal on first
+ *   contact); the refusal is logged.
+ * - "audit": refuse exactly like "enforce"; the refusal is logged with an
+ *   AUDIT marker so an operator can enumerate the rows that still need a
+ *   claimant. Migration window for operators — it observes the unresolved
+ *   population, it does not dispatch it.
+ * - "off": refuse exactly like "enforce"; the issuance-side lazy backfill
+ *   does NOT run, so Dispatch performs no issuance-side write on the row.
+ *   Recovery is then entirely operator-driven (re-ingestion, operator
+ *   requeue, or `POST /api/pr-fix-queue/claimant`). Ingestion-side capture
+ *   — the claimant columns and the provenance they record — keeps running,
+ *   and a negotiated poll still receives the evidence object.
+ *
+ * Unresolved rows are NOT silently stranded: outside "off", the gate first
  * attempts a lazy re-resolution from the authoritative records (live Lease,
  * issue agent/owner labels, PR author) and backfills a resolved claimant
  * before deciding — that lazy pass is the bulk recovery path for rows
@@ -371,9 +382,12 @@ export type PrFixOwnershipRow = {
  * refusal.
  *
  * Fail closed: unresolved ownership ("missing"/"ambiguous"/"legacy") never
- * authorizes an automatic hand-out. The unfiltered operator poll (#1046) is
- * NOT an exemption for ownership — it is still an automatic hand-out, and an
- * operator who means to dispatch an unresolved row stamps it explicitly
+ * authorizes an automatic hand-out, in ANY rollout mode (#1569's rule is
+ * absolute). The mode selects the side effects around the refusal — the
+ * "audit" log marker and the issuance-side lazy backfill that "off"
+ * disables — never the decision itself. The unfiltered operator poll (#1046)
+ * is NOT an exemption for ownership: it is still an automatic hand-out, and
+ * an operator who means to dispatch an unresolved row stamps it explicitly
  * (recovery endpoint), which is the auditable act.
  */
 export function evaluatePrFixHandoutOwnership(
@@ -382,22 +396,20 @@ export function evaluatePrFixHandoutOwnership(
 ): { decision: "eligible" | "refuse"; evidence: PrFixOwnershipEvidence } {
   const evidence = prFixOwnershipEvidence(row);
   if (ownershipAuthorizesHandout(evidence)) return { decision: "eligible", evidence };
-  if (mode === "off") return { decision: "eligible", evidence };
-  if (mode === "audit") {
-    console.info("[next-task-pr-fix] AUDIT: PR-fix hand-out with UNRESOLVED ownership (#1569)", {
-      repoFullName: row.repo,
-      pullRequestNumber: row.pr,
-      generation: row.generation ?? null,
-      ownershipProvenance: evidence.provenance,
-    });
-    return { decision: "eligible", evidence };
-  }
-  console.info("[next-task-pr-fix] refusing PR-fix hand-out with UNRESOLVED ownership (#1569)", {
+  // #1569: NO mode hands an unresolved row out. "audit" keeps its
+  // migration-window observability (a distinguishable log marker), "off"
+  // keeps its no-issuance-write posture — both still refuse.
+  const logFields = {
     repoFullName: row.repo,
     pullRequestNumber: row.pr,
     generation: row.generation ?? null,
     ownershipProvenance: evidence.provenance,
-  });
+  };
+  if (mode === "audit") {
+    console.info("[next-task-pr-fix] AUDIT: refusing PR-fix hand-out with UNRESOLVED ownership (#1569)", logFields);
+  } else {
+    console.info("[next-task-pr-fix] refusing PR-fix hand-out with UNRESOLVED ownership (#1569)", logFields);
+  }
   return { decision: "refuse", evidence };
 }
 
