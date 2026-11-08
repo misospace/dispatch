@@ -4320,6 +4320,9 @@ describe("GET next-task PR-fix ownership evidence (#1569)", () => {
     const writes = handoutWrites();
     expect(writes.filter((args) => args.data?.claimant !== undefined)).toHaveLength(0);
     expect(writes.filter((args) => Array.isArray(args.data?.agentHandouts?.push))).toHaveLength(0);
+    // The refusal lands BEFORE the dispatch stamp: the row is not stamped at
+    // all, so a refused poll leaves no row state behind.
+    expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
   });
 
   it("audit mode refuses an unresolved row — no mode authorizes an automatic hand-out", async () => {
@@ -4377,6 +4380,24 @@ describe("GET next-task PR-fix ownership evidence (#1569)", () => {
     expect(body.type).toBe("followup-pr");
     const backfill = handoutWrites().find((args) => args.data?.claimant !== undefined);
     expect(backfill?.data).toEqual({ claimant: "worker-7", claimantSource: "agent-label" });
+  });
+
+  it("re-decides ownership against the confirmed live row (concurrent ownership change)", async () => {
+    // The queue-read snapshot names a claimant, so the cheap early arm passes.
+    const snapshot = ownershipRow(60, { claimant: "worker-7", claimantSource: "agent-label" });
+    mocks.prFixFindMany.mockResolvedValue([snapshot]);
+    // The confirmed live row does NOT carry one. The authoritative
+    // re-decision runs against the confirmed row, not the snapshot, so the
+    // hand-out is refused.
+    scriptConfirmed(ownershipRow(60, { claimant: null, claimantSource: null }));
+    const body = await (
+      await GET(request("/api/agents/example-agent/next-task?lane=local"), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })
+    ).json();
+    expect(body.type).toBe("idle");
+    // No hand-out append: the row never reaches a receiving consumer.
+    expect(handoutWrites().filter((args) => Array.isArray(args.data?.agentHandouts?.push))).toHaveLength(0);
   });
 
   it("backfills the original claimant from the linked issue's agent label and hands out", async () => {

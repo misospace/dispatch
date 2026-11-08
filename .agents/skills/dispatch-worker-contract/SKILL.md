@@ -117,7 +117,7 @@ A `followup-pr` task carries an `ownership` block **only** when the poll declare
 - `owningLane` is the queue ROW's lane, not the dispatched lane (`prFixItem.fixType` names the dispatched lane).
 - `provenance` records why the value is what it is, including the failure states `missing`, `ambiguous`, and `legacy` (a row predating the contract). `legacy` on a claimant-bearing row still dispatches — read `originalClaimant`, not `provenance`, to decide ownership.
 - A row whose claimant is unresolved is never auto-handed out, in every mode of `DISPATCH_PR_FIX_OWNERSHIP_MODE` (`enforce` is the default). Recovery is re-ingestion, an operator requeue, or `POST /api/pr-fix-queue/claimant` (maintainer tier). The ownership gate applies to every lane, `REBASE` included.
-- A granted poll can receive `originalClaimant: null`. A capability grant is not a promise of a claimant.
+- The ownership block rides on a granted hand-out only. The gate refuses a row with no resolvable claimant in every mode, so a shipped block always names an identity. The queue listing shows the null claimant of a row that still needs recovery. A capability grant is not a promise of a claimant.
 
 Full contract: [docs/pr-fix-ownership-contract.md](../../../docs/pr-fix-ownership-contract.md).
 

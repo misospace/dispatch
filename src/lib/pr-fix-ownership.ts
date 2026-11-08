@@ -34,9 +34,9 @@
  *   Treated exactly like "missing" for authorization.
  *
  * Authorization rule (fail closed): "missing" / "ambiguous" / "legacy"
- * NEVER authorize an automatic hand-out to a declared-lane consumer. The
- * unfiltered operator poll (#1046) stays unrestricted by contract, and
- * recovery is explicit: re-ingestion re-resolves while unresolved, an
+ * NEVER authorize an automatic hand-out, in ANY rollout mode, to a
+ * declared-lane consumer or to the unfiltered operator poll (#1046).
+ * Recovery is explicit: re-ingestion re-resolves while unresolved, an
  * operator requeue re-resolves, or `POST /api/pr-fix-queue/claimant` stamps
  * an identity as "operator".
  *
@@ -45,8 +45,10 @@
  * being granted the `pr-ownership-evidence:1` capability — an un-negotiated
  * peer gets the byte-identical legacy payload (safe mixed-version behavior),
  * while a negotiated peer can REQUIRE ownership evidence before accepting a
- * hand-out and can tell "server too old to send evidence" (capability not
- * granted) from "row has no resolvable claimant" (`originalClaimant: null`).
+ * hand-out. The block rides on a granted hand-out only, and the gate refuses
+ * an unresolved row in every mode, so a shipped block always names an
+ * identity. The queue listing shows a null `originalClaimant` for a row that
+ * still needs recovery.
  */
 
 export const PR_FIX_OWNERSHIP_CONTRACT_VERSION = 1 as const;

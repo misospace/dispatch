@@ -90,10 +90,12 @@ export interface FollowupPrTask {
    * Provenance: captured at ingestion/materialization from a live Lease,
    * a single `agent/*` label, a single `owner/*` label, or (no linked
    * issue) the PR author; an operator stamp overrides on recovery.
-   * `provenance` names which. Missing-value behavior: `originalClaimant`
-   * is null with provenance "missing" | "ambiguous" | "legacy" — such a
-   * row is never auto-handed to a declared-lane consumer, so this field
-   * is null-bearing only on the unfiltered operator path.
+ * `provenance` names which. Missing-value behavior: a row with no
+ * resolvable claimant carries provenance "missing" | "ambiguous" |
+ * "legacy". The ownership gate refuses such a row in every mode. The
+ * block rides on a granted hand-out only, so a shipped task always names
+ * a claimant. The queue listing shows the null claimant of a row that
+ * still needs recovery.
    *
    * Present only when the polling client was granted the
    * `pr-ownership-evidence:1` intake capability (#1532 negotiation);

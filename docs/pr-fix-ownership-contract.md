@@ -99,7 +99,8 @@ Queue listings carry `claimant`, `claimantSource`, and `ownership` additively.
 - `originalClaimant` is the authority. A row that carries a claimant dispatches, whatever its `provenance` says.
 - `provenance: "legacy"` means the row predates this contract (no recorded source). It does not by itself mean "unowned": a claimant-bearing row with no recorded source still reports `legacy` and still dispatches.
 - `missing` and `ambiguous` are the recorded failure states. Both refuse an automatic hand-out in every mode.
-- A negotiated poll can receive `originalClaimant: null`. A capability grant is not a promise of a claimant.
+- The ownership block rides on a granted hand-out only. The gate refuses a row with no resolvable claimant in every mode, so a shipped block always names an identity.
+- The queue listing shows a null `originalClaimant` for a row that still needs recovery. A capability grant is not a promise of a claimant.
 - `owningLane` is the ROW's lane, not the dispatched lane. A `REBASE` hand-out ships `owningLane` from the row (often `NORMAL`) alongside `prFixItem.fixType: "REBASE"`. Bind identity to the row, never to the execution lane.
 
 ## Write rules
