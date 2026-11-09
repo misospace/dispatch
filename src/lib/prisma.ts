@@ -174,6 +174,8 @@ function asPrFixQueueTx(tx: Prisma.TransactionClient): PrFixQueueClient {
     },
     prFixQueueItem: tx.prFixQueueItem,
     prFixHistory: tx.prFixHistory,
+    // #1569: live-lease read for original-claimant resolution.
+    lease: tx.lease,
     // #1419: the dead-owner recovery probes read agent-run liveness off this
     // delegate; without it they fail closed (treat every acked attempt as
     // live) instead of reclaiming blind.
@@ -205,6 +207,8 @@ export function asPrFixQueueClient(client: PrismaClient): PrFixQueueClient {
     issue: client.issue,
     prFixQueueItem: client.prFixQueueItem,
     prFixHistory: client.prFixHistory,
+    // #1569: live-lease read for original-claimant resolution.
+    lease: client.lease,
     agentRun: client.agentRun,
     capacityHandoff: client.capacityHandoff,
     prFixEvidence: client.prFixEvidence,

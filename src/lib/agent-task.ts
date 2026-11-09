@@ -1,5 +1,6 @@
 import type { PrFixType } from "@/types";
 import type { IntakeAck } from "@/lib/rebase-intake";
+import type { PrFixOwnershipEvidence } from "@/lib/pr-fix-ownership";
 
 export interface IssueRef {
   id?: string;
@@ -80,6 +81,28 @@ export interface FollowupPrTask {
   shouldRun: true;
   agentName: string;
   lane?: string;
+  /**
+   * #1569: the versioned OWNING-side evidence — the row's authoritative
+   * owning lane and its ORIGINAL CLAIMANT, separate from `agentName` (the
+   * receiving consumer of THIS hand-out) and from `author` (the PR pusher).
+   * A new hand-out recipient never becomes the claimant.
+   *
+   * Provenance: captured at ingestion/materialization from a live Lease,
+   * a single `agent/*` label, a single `owner/*` label, or (no linked
+   * issue) the PR author. An operator stamp sets provenance "operator"
+   * on an unresolved row and never overrides a recorded claimant.
+ * `provenance` names which. Missing-value behavior: a row with no
+ * resolvable claimant carries provenance "missing" | "ambiguous" |
+ * "legacy". The ownership gate refuses such a row in every mode. The
+ * block rides on a granted hand-out only, so a shipped task always names
+ * a claimant. The queue listing shows the null claimant of a row that
+ * still needs recovery.
+   *
+   * Present only when the polling client was granted the
+   * `pr-ownership-evidence:1` intake capability (#1532 negotiation);
+   * an un-negotiated consumer's task stays byte-identical.
+   */
+  ownership?: PrFixOwnershipEvidence;
   issue?: OptionalIssueRef;
   pullRequest: PullRequestRef;
   prFixItem?: PrFixItemIdentity;
@@ -154,6 +177,8 @@ export function createImplementTask(input: ImplementTaskInput): ImplementTask {
 export interface FollowupPrTaskInput {
   agentName: string;
   lane?: string;
+  /** #1569: versioned owning-side evidence (see `FollowupPrTask.ownership`). */
+  ownership?: PrFixOwnershipEvidence;
   issue?: OptionalIssueRef;
   pullRequest: PullRequestRef;
   prFixItem?: PrFixItemIdentity;
@@ -178,6 +203,7 @@ export function createFollowupPrTask(input: FollowupPrTaskInput): FollowupPrTask
     instructions: input.instructions ?? FOLLOWUP_PR_INSTRUCTIONS,
     stopAfter: input.stopAfter ?? FOLLOWUP_PR_STOP_AFTER,
     forbiddenActions: input.forbiddenActions ? [...input.forbiddenActions] : [...FOLLOWUP_PR_FORBIDDEN],
+    ...(input.ownership ? { ownership: input.ownership } : {}),
     ...(input.intake ? { intake: input.intake } : {}),
   };
 }

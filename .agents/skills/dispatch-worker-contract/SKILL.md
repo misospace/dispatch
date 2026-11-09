@@ -83,7 +83,7 @@ The `next-task` endpoint returns one of three task types:
 
 - `work_scope`: only `rebase-only` exists in contract version 1. A client sends it only together with `work_scope_version`. A repeated scope parameter and a scope value over 64 characters are refused.
 - `work_scope_version`: only `1` exists in contract version 1.
-- `capabilities`: comma-separated `<name>:<version>` tokens. The only known capability is `rebase-executor` version 1. A declaration is proof that the client implements that client-side execution contract. The declaration is bounded at 512 characters and 16 tokens. An empty element in the list is ignored.
+- `capabilities`: comma-separated `<name>:<version>` tokens. The known capabilities are `rebase-executor` version 1 (proof the client executes the mechanical-rebase contract) and `pr-ownership-evidence` version 1 (#1569, requests the versioned `ownership` evidence block on a `followup-pr` task). A declaration is proof that the client implements that client-side execution contract. The declaration is bounded at 512 characters and 16 tokens. An empty element in the list is ignored.
 
 A rejected declaration returns HTTP 400 before any queue read: an unknown `work_scope`, a scope without a version, a version without a scope, an unsupported scope version, a repeated scope parameter, a scope value over the size limit, a malformed capability token, a capability name declared twice, a declaration over the size limit, and a `rebase-only` request without a granted `rebase-executor:1` capability. An unknown capability name or version is not an error. It grants nothing and never broadens the queue.
 
@@ -108,6 +108,18 @@ For `REBASE` the one-attempt bound is enforced server-side, not only in prose (#
 | `REBASE` | Mechanical rebase lane (#1327). Rebase the PR branch onto its base and reconcile conflicts **mechanically only**: lockfiles, version strings, import order, doc indexes, adjacent non-overlapping hunks, and comment-only overlaps where one side is a strict subset. Never edit the same logic on both sides, never merge, never open a PR. Push with `--force-with-lease`, then run the repo's bounded typecheck — an unfixable error in a file this PR touches means the rebase was not mechanical. On **any** semantic conflict, report `outcome: "blocked"` with `blockReason: "human_decision"`, the conflicting files, and why the conflict is not mechanical; do not resolve it yourself. One attempt per dirty episode: do not retry. |
 | `MERGE_CONFLICT` | Pre-#1327 merge-conflict items. Same mechanical walls as `REBASE` — rebase onto the base, reconcile mechanically only, push with `--force-with-lease`, bail to a human on a semantic conflict — but a legacy item's stored reason can be a one-liner, so follow the walls above rather than the item's wording. |
 | `CI_FAILURE`, `REVIEW_FEEDBACK`, `OTHER` | Ordinary requested changes on the PR. |
+
+### Ownership evidence (#1569)
+
+A `followup-pr` task carries an `ownership` block **only** when the poll declared and was granted `pr-ownership-evidence:1`: `{ contract: 1, owningLane, originalClaimant, provenance, prAuthor? }`. An un-negotiated poll receives the byte-identical legacy task.
+
+- `originalClaimant` is the identity that originally owned the work (live Lease → single `agent/*` label → single `owner/*` label → PR author). It is never a hand-out recipient, and a lane re-classification never transfers it.
+- `owningLane` is the queue ROW's lane, not the dispatched lane (`prFixItem.fixType` names the dispatched lane).
+- `provenance` records why the value is what it is, including the failure states `missing`, `ambiguous`, and `legacy` (a row predating the contract). `legacy` on a claimant-bearing row still dispatches — read `originalClaimant`, not `provenance`, to decide ownership.
+- A row whose claimant is unresolved is never auto-handed out, in every mode of `DISPATCH_PR_FIX_OWNERSHIP_MODE` (`enforce` is the default). Recovery is re-ingestion, an operator requeue, or `POST /api/pr-fix-queue/claimant` (maintainer tier). The ownership gate applies to every lane, `REBASE` included.
+- The ownership block rides on a granted hand-out only. The gate refuses a row with no resolvable claimant in every mode, so a shipped block always names an identity. The queue listing shows the null claimant of a row that still needs recovery. A capability grant is not a promise of a claimant.
+
+Full contract: [docs/pr-fix-ownership-contract.md](../../../docs/pr-fix-ownership-contract.md).
 
 ### Report Outcomes
 

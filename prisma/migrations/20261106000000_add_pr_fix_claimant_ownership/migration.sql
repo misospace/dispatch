@@ -1,0 +1,25 @@
+-- #1569: PR-fix ORIGINAL CLAIMANT ownership evidence.
+-- `claimant` records who originally owned the work the PR-fix row covers;
+-- `claimantSource` records WHY that value is what it is ("lease",
+-- "agent-label", "owner-label", "pr-author", "operator", or the failure
+-- states "missing" / "ambiguous"). A per-generation hand-out recipient never
+-- becomes the claimant, and a lane re-classification never transfers it. The
+-- value is captured at ingestion/materialization; every later write
+-- (re-ingestion backfill, issuance backfill, operator requeue, operator
+-- stamp) is pinned on `claimant IS NULL`, so a recorded claimant is never
+-- transferred or cleared.
+-- NULL claimant means unresolved, which the issuance ownership gate refuses
+-- to auto-hand-out (see docs/pr-fix-ownership-contract.md).
+--
+-- Additive only: two nullable columns, no drop, no type change, no backfill
+-- UPDATE here — legacy rows resolve lazily at first contact (re-ingestion,
+-- operator requeue, or POST /api/pr-fix-queue/claimant) so the SQL migration
+-- stays reversible and no ownership is guessed at deploy time.
+--
+-- Plain ADD COLUMN, not IF NOT EXISTS: a pre-existing column of the WRONG
+-- type must fail the deploy loudly, not be silently kept. `IF NOT EXISTS`
+-- would leave a wrongly-typed `claimant` in place and let the deploy report
+-- success — the same convention as the #1542 observe-mode migration.
+-- AlterTable
+ALTER TABLE "PrFixQueueItem" ADD COLUMN "claimant" TEXT;
+ALTER TABLE "PrFixQueueItem" ADD COLUMN "claimantSource" TEXT;

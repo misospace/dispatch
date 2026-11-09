@@ -69,6 +69,23 @@ Incoming feedback is classified as **actionable** or **needs_human**:
 
 Items in the `NEEDS_HUMAN` lane receive `BLOCKED` status and are excluded from the normal agent queue unless `include_blocked=true`.
 
+## Ownership evidence (#1569)
+
+Each queue row records the work's ORIGINAL CLAIMANT (`claimant` + provenance
+`claimantSource`) separately from the PR author (`author`) and from the
+per-generation hand-out recipients (`agentHandouts`). A fresh hand-out
+recipient never becomes the claimant, and a lane re-classification never
+transfers ownership. At issuance the lane gate is bidirectional (normal
+cannot take frontier work; frontier cannot take normal work; an unverifiable
+classification refuses both declared lanes), and a row whose ownership is
+unresolved ("missing", "ambiguous", or legacy) is never auto-handed out in
+any rollout mode — resolution comes from re-ingestion, an operator requeue, or
+`POST /api/pr-fix-queue/claimant`. Rollout mode:
+`DISPATCH_PR_FIX_OWNERSHIP_MODE` (default `enforce`); the mode changes the log
+marker and whether the issuance-side backfill runs, never the refusal. Full
+contract, provenance order, and the capability-gated `ownership` payload on the
+hand-out: [pr-fix-ownership-contract.md](pr-fix-ownership-contract.md).
+
 ## Mechanical rebase lane (#1327)
 
 A PR that goes dirty (GitHub `mergeable_state` = `dirty`, or `mergeable` = `CONFLICTING`) is not handed to the code-fix loop: a fix generation cannot rebase, so the item churned while consuming paid capacity on work a bounded local rebase can do. The queue enqueues an item of type **`REBASE`** instead — one bounded mechanical rebase attempt.

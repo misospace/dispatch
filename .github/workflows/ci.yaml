@@ -162,6 +162,54 @@ jobs:
           npx prisma db execute --file scripts/revert-add-groomer-observe-mode-migration.sql
           npm run db:deploy
           npx prisma db execute --file scripts/verify-add-groomer-observe-mode-migration.sql
+      # The #1569 claimant migration against a COPY OF THE PRODUCTION
+      # SCHEMA: a database that already carries the production schema and
+      # legacy PrFixQueueItem rows, so the migration is exercised the way a
+      # production instance would run it — with real rows in the table, not an
+      # empty database. The verification proves both nullable columns landed,
+      # that the legacy rows survived with their values intact, and that the
+      # migration back-fills nothing: a pre-existing row keeps a NULL
+      # claimant, so no ownership is guessed at deploy time and the PR author
+      # and the per-generation hand-out recipients are never promoted into
+      # the claimant column.
+      #
+      # Scope: the migration touches PrFixQueueItem only, so the structural
+      # comparison covers that table only.
+      - name: Create the production copy for the claimant migration
+        run: echo 'CREATE DATABASE dispatch_production_copy_prfix;' | npx prisma db execute --stdin
+      - name: Verify the claimant migration on a copy of the production schema
+        env:
+          DATABASE_URL: "postgresql://test:test@localhost:5432/dispatch_production_copy_prfix"
+        run: |
+          # Mark the claimant migration as applied WITHOUT running it: the
+          # deploy below then applies every OTHER migration and leaves
+          # PrFixQueueItem in its true pre-migration shape. The migration
+          # itself runs later, for the FIRST time, against the seeded
+          # production-shaped rows. A migration that damaged the table would
+          # otherwise do its damage before the "before" picture was taken.
+          #
+          # This requires the claimant migration to be the LAST migration
+          # that touches PrFixQueueItem: a later migration that reads or
+          # indexes the claimant columns would fail here, because the marker
+          # says the migration ran while its columns do not exist yet. Such a
+          # migration must move this exercise's marker to include it.
+          npx prisma migrate resolve --applied 20261106000000_add_pr_fix_claimant_ownership
+          npm run db:deploy
+          npx prisma db execute --file scripts/seed-production-copy-pr-fix-queue.sql
+          # Record the table's structure BEFORE the migration runs, so the
+          # verification can prove the migration changed nothing beyond
+          # adding its two columns.
+          npx prisma db execute --file scripts/snapshot-pr-fix-queue-item-structure.sql
+          # Remove the migration record so the next deploy runs the migration.
+          npx prisma db execute --file scripts/revert-add-pr-fix-claimant-ownership-migration.sql
+          npm run db:deploy
+          npx prisma db execute --file scripts/verify-add-pr-fix-claimant-ownership-migration.sql
+          # The verification above inspects the two columns the migration adds
+          # and the rows it must not touch. It cannot see a migration that
+          # damaged anything ELSE on the table, so the live table is also
+          # compared against the structure snapshot taken before the
+          # migration ran.
+          npx prisma db execute --file scripts/verify-pr-fix-queue-item-structure.sql
 
   database-integration:
     name: Database integration

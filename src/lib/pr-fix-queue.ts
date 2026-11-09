@@ -16,6 +16,13 @@ import {
 import { parseExternalWaitInput, parseStoredExternalWait, evaluateExternalWaitTrigger, type ExternalWaitContract } from "./pr-fix-external-wait";
 import { evaluateRecovery, recoveryCooldownMs, type RecoveryDecision } from "./pr-fix-recovery";
 import { getConfiguredLanes, laneMatchesConfigured, type LaneConfig } from "./lane-config";
+import {
+  ingestionClaimantPatch,
+  ownershipAuthorizesHandout,
+  prFixOwnershipEvidence,
+  resolveIngestionClaimant,
+  type PrFixOwnershipEvidence,
+} from "./pr-fix-ownership";
 
 export type PrFixQueueClient = {
   issue: {
@@ -94,6 +101,13 @@ findFirst: (args: any) => Promise<any>;
     findFirst: (args: any) => Promise<any>;
     findMany: (args: any) => Promise<any[]>;
     upsert: (args: any) => Promise<any>;
+  };
+  // #1569: LIVE-LEASE read for ORIGINAL CLAIMANT resolution (a live Lease on
+  // the linked issue is the strongest ownership record). Optional like the
+  // other additive delegates: an absent surface resolves the claimant from
+  // labels / the PR author only — it never fabricates a lease holder.
+  lease?: {
+    findFirst: (args: any) => Promise<any>;
   };
   // The parent-classification authority read runs as a MODELED findFirst;
   // `findFirstLocked` (below) is the fence's serialization boundary and is
@@ -304,6 +318,221 @@ export async function withHandoutLaneExclusivityFence<T>(
     );
     return null;
   }
+}
+
+// ─── PR-fix ownership enforcement (#1569) ──────────────────────────────────
+/**
+ * Rollout mode for the #1569 ownership gate at issuance.
+ *
+ * The AUTHORIZATION is mode-independent: a row whose ownership is unresolved
+ * ("missing", "ambiguous", or a legacy row with no recorded claimant) is
+ * REFUSED to every automatic hand-out path (next-task, including unfiltered
+ * and REBASE dispatches) in EVERY mode. The issue's rule is absolute —
+ * missing or ambiguous ownership never authorizes an automatic hand-out — so
+ * no rollout mode may hand an unresolved row out. The mode selects the
+ * side effects around that refusal, never the refusal itself:
+ * - "enforce" (DEFAULT): refuse; the issuance-side lazy backfill runs (a
+ *   resolved claimant is written back, so legacy rows self-heal on first
+ *   contact); the refusal is logged.
+ * - "audit": refuse exactly like "enforce"; the refusal is logged with an
+ *   AUDIT marker so an operator can enumerate the rows that still need a
+ *   claimant. Migration window for operators — it observes the unresolved
+ *   population, it does not dispatch it.
+ * - "off": refuse exactly like "enforce"; the issuance-side lazy backfill
+ *   does NOT run, so Dispatch performs no issuance-side write on the row.
+ *   Recovery is then entirely operator-driven (re-ingestion, operator
+ *   requeue, or `POST /api/pr-fix-queue/claimant`). Ingestion-side capture
+ *   — the claimant columns and the provenance they record — keeps running,
+ *   and a negotiated poll still receives the evidence object.
+ *
+ * Unresolved rows are NOT silently stranded: outside "off", the gate first
+ * attempts a lazy re-resolution from the authoritative records (live Lease,
+ * issue agent/owner labels, PR author) and backfills a resolved claimant
+ * before deciding — that lazy pass is the bulk recovery path for rows
+ * created before this contract. Operator recovery for the rest:
+ * `POST /api/pr-fix-queue/claimant` or an operator requeue (which
+ * re-resolves). Invalid values run "enforce" (fail closed).
+ */
+export type PrFixOwnershipMode = "off" | "audit" | "enforce";
+export function prFixOwnershipMode(env: NodeJS.ProcessEnv = process.env): PrFixOwnershipMode {
+  const raw = (env.DISPATCH_PR_FIX_OWNERSHIP_MODE ?? "").trim().toLowerCase();
+  if (raw === "off" || raw === "audit") return raw;
+  return "enforce";
+}
+
+/** The row fields the ownership gate reads (subset of a queue row). */
+export type PrFixOwnershipRow = {
+  id?: string;
+  repo: string;
+  pr: number;
+  generation?: number;
+  lane?: string | null;
+  issue?: number | null;
+  author?: string | null;
+  claimant?: string | null;
+  claimantSource?: string | null;
+};
+
+/**
+ * The ownership arm of the hand-out gate (#1569). Applies to EVERY
+ * dispatchable candidate — NORMAL, ESCALATED, unfiltered, and REBASE alike:
+ * the REBASE exemption (#1327) exempts the LANE-classification column, never
+ * the ownership evidence. Returns the versioned evidence regardless of
+ * decision so the caller can ship it on a granted hand-out and log it on a
+ * refusal.
+ *
+ * Fail closed: unresolved ownership ("missing"/"ambiguous"/"legacy") never
+ * authorizes an automatic hand-out, in ANY rollout mode (#1569's rule is
+ * absolute). The mode selects the side effects around the refusal — the
+ * "audit" log marker and the issuance-side lazy backfill that "off"
+ * disables — never the decision itself. The unfiltered operator poll (#1046)
+ * is NOT an exemption for ownership: it is still an automatic hand-out, and
+ * an operator who means to dispatch an unresolved row stamps it explicitly
+ * (recovery endpoint), which is the auditable act.
+ */
+export function evaluatePrFixHandoutOwnership(
+  row: PrFixOwnershipRow,
+  mode: PrFixOwnershipMode = prFixOwnershipMode(),
+): { decision: "eligible" | "refuse"; evidence: PrFixOwnershipEvidence } {
+  const evidence = prFixOwnershipEvidence(row);
+  if (ownershipAuthorizesHandout(evidence)) return { decision: "eligible", evidence };
+  // #1569: NO mode hands an unresolved row out. "audit" keeps its
+  // migration-window observability (a distinguishable log marker), "off"
+  // keeps its no-issuance-write posture — both still refuse.
+  const logFields = {
+    repoFullName: row.repo,
+    pullRequestNumber: row.pr,
+    generation: row.generation ?? null,
+    ownershipProvenance: evidence.provenance,
+  };
+  if (mode === "audit") {
+    console.info("[next-task-pr-fix] AUDIT: refusing PR-fix hand-out with UNRESOLVED ownership (#1569)", logFields);
+  } else {
+    console.info("[next-task-pr-fix] refusing PR-fix hand-out with UNRESOLVED ownership (#1569)", logFields);
+  }
+  return { decision: "refuse", evidence };
+}
+
+/**
+ * Lazy claimant resolution at the issuance boundary (#1569): a row whose
+ * claimant is unresolved is re-resolved from the authoritative records
+ * (live Lease / single agent label / single owner label / PR author). A
+ * resolved value is backfilled with a conditional write pinned on
+ * `claimant IS NULL` — it can never overwrite a recorded claimant, and a
+ * concurrent backfill is idempotent (same conditional shape). An
+ * unresolved row records NOTHING here (repeated issuance polls must not
+ * churn writes); the failure state is persisted by ingestion.
+ * Returns the row's effective claimant pair after the attempt (the input
+ * value when one was already recorded, else the freshly resolved one).
+ * When the conditional write loses a concurrent race (a sibling backfill or
+ * the operator stamp persisted first), the persisted claimant is re-read and
+ * echoed — a rejected local resolution is never reported as effective — and
+ * a failed re-read resolves to nothing (fail closed).
+ */
+export async function backfillPrFixClaimant(
+  client: PrFixQueueClient,
+  row: {
+    id: string;
+    repo: string;
+    issue?: number | null;
+    author?: string | null;
+    claimant?: string | null;
+    claimantSource?: string | null;
+  },
+): Promise<{ claimant: string | null; claimantSource: string | null }> {
+  if (typeof row.claimant === "string" && row.claimant.trim() !== "") {
+    // Already recorded: no facts read, no write. The row's OWN provenance is
+    // echoed, so a caller deriving evidence from this return value can never
+    // report a recorded lease/operator/agent claimant as "legacy".
+    return { claimant: row.claimant, claimantSource: row.claimantSource ?? null };
+  }
+  const resolution = await resolveIngestionClaimant(client, row.repo, row.issue ?? null, row.author);
+  if (resolution.state !== "resolved") return { claimant: null, claimantSource: null };
+  try {
+    const { count } = await client.prFixQueueItem.updateMany({
+      where: { id: row.id, claimant: null },
+      data: { claimant: resolution.claimant, claimantSource: resolution.source },
+    });
+    if (count === 1) {
+      console.info(`[pr-fix-queue] backfilled PR-fix claimant ${resolution.claimant} via ${resolution.source} (${row.repo} ${row.id}) (#1569)`);
+      return { claimant: resolution.claimant, claimantSource: resolution.source };
+    }
+    // Lost the write race: a concurrent writer (operator stamp, sibling
+    // backfill) recorded a claimant between this read and the conditional
+    // write. The locally resolved identity was REJECTED — it is not persisted,
+    // so it must never be returned as the row's effective claimant (the caller
+    // would authorize and transport an identity the row does not carry).
+    console.info(`[pr-fix-queue] claimant backfill lost the write race for ${row.repo}/${row.id} (#1569); echoing the persisted claimant`);
+  } catch (error) {
+    // Best-effort: a failed backfill leaves the row unresolved for THIS
+    // poll (the gate refuses); the next poll or ingestion retries.
+    console.warn(
+      `[pr-fix-queue] claimant backfill failed for ${row.repo}/${row.id} (#1569):`,
+      error instanceof Error ? error.message : error,
+    );
+  }
+  // Either the write lost the race or failed outright: the only claimant this
+  // caller may report is one actually persisted on the row. A failed re-read
+  // resolves to nothing — fail closed, the gate refuses an unresolved row.
+  try {
+    const persisted = await client.prFixQueueItem.findUnique({
+      where: { id: row.id },
+      select: { claimant: true, claimantSource: true },
+    });
+    return {
+      claimant: persisted?.claimant ?? null,
+      claimantSource: persisted?.claimantSource ?? null,
+    };
+  } catch (error) {
+    console.warn(
+      `[pr-fix-queue] claimant re-read failed for ${row.repo}/${row.id} (#1569):`,
+      error instanceof Error ? error.message : error,
+    );
+    return { claimant: null, claimantSource: null };
+  }
+}
+
+/**
+ * Operator recovery (#1569): explicitly stamp the ORIGINAL CLAIMANT of a
+ * PR-fix row. This is the auditable act that resolves "missing" and
+ * "ambiguous" rows; provenance becomes "operator" and no ingestion path may
+ * overwrite it. The claimant is a plain identity string (agent name or
+ * login) — Dispatch never maps it to lanes or tiers.
+ *
+ * Preservation rule: an already-recorded claimant is NEVER transferred. The
+ * write is a `claimant IS NULL` conditional update, and the successful stamp
+ * plus its PrFixHistory note commit in ONE transaction — there is no window
+ * where a stamped row exists without its audit row, and a concurrent
+ * resolution can never be clobbered. A stamp that finds an existing
+ * claimant is refused (`reason: "already_set"`), not silently applied.
+ */
+export async function setPrFixClaimant(
+  client: PrFixQueueClient,
+  input: { repo: string; pr: number; claimant: string },
+): Promise<{ updated: boolean; reason?: "not_found" | "already_set" }> {
+  const repo = normalizeQueueRepo(input.repo);
+  const claimant = input.claimant.trim();
+  if (claimant === "") return { updated: false, reason: "not_found" };
+  return client.$transaction(async (tx) => {
+    const existing = await tx.prFixQueueItem.findUnique({
+      where: { repo_pr: { repo, pr: input.pr } },
+      select: { id: true },
+    });
+    if (!existing) return { updated: false, reason: "not_found" } as const;
+    const { count } = await tx.prFixQueueItem.updateMany({
+      where: { id: existing.id, claimant: null },
+      data: { claimant, claimantSource: "operator" },
+    });
+    if (count !== 1) return { updated: false, reason: "already_set" } as const;
+    await tx.prFixHistory.create({
+      data: {
+        itemId: existing.id,
+        action: "mark",
+        note: `#1569 operator claimant stamp: (unset) -> ${claimant} (provenance "operator").`,
+      },
+    });
+    return { updated: true } as const;
+  });
 }
 
 // #1121: upper bound on an already_addressed evidence string, shared by the
@@ -690,14 +919,15 @@ function releaseLaneFromParentClass(
  *   serves every lane (#1046) — never refused, but the correction above is
  *   still applied opportunistically so misclassified rows converge no matter
  *   which consumer observes them first.
- * - UNKNOWN parent (#1503 review): an unverifiable classification must never
- *   authorize the lower/shared lane, so a declared-NORMAL consumer is refused
- *   (transient — the next poll re-reads; no correction CAS, no history row,
- *   because there is nothing verified to correct). An "ESCALATED" consumer
- *   stays eligible — it is authorized for escalation work regardless — and the
- *   unfiltered legacy poll is unrestricted by contract, so an unverified
- *   classification cannot make either more authorized than it already is;
- *   neither gets a correction either. REBASE rows are exempt upstream.
+  * - UNKNOWN parent (#1503 review, widened by #1569): an unverifiable
+  *   classification authorizes NEITHER declared lane — both the
+  *   declared-NORMAL and the declared-ESCALATED consumer are refused
+  *   (transient — the next poll re-reads; no correction CAS, no history row,
+  *   because there is nothing verified to correct). Only the unfiltered
+  *   legacy poll is unrestricted by contract, and it gets no correction
+  *   either. REBASE rows are exempt from this LANE gate upstream — but not
+  *   from the ownership gate (#1569): `evaluatePrFixHandoutOwnership`
+  *   applies to every dispatchable candidate, REBASE included.
  *
  * REBASE rows are the declared mechanical exception (#1327): they are gated
  * by the DISPATCH_REBASE_AGENTS local-only pool, not this lane column, and
@@ -747,11 +977,13 @@ export async function enforcePrFixHandoutLaneExclusivity(
 
 /**
  * The parent-classification verdict shared by the plain gate and the fence's
- * locked re-read (#1503 review): NOT_ESCALATED → eligible; UNKNOWN → refused
- * for the declared-NORMAL consumer only (fail closed, no correction — nothing
- * was verified); ESCALATED → the safe correction CAS + history row, then
- * refuse-for-NORMAL / eligible-otherwise. Kept internal so both authority
- * reads can never drift apart.
+ * locked re-read (#1503 review, symmetric both-directions rule #1569):
+ * NOT_ESCALATED → eligible for NORMAL/unfiltered, REFUSED for a
+ * declared-ESCALATED consumer (frontier cannot take normal work); UNKNOWN →
+ * refused for BOTH declared lanes (fail closed, no correction — nothing was
+ * verified); ESCALATED → the safe correction CAS + history row, then
+ * refuse-for-NORMAL / eligible-for-escalated-and-unfiltered. Kept internal so
+ * both authority reads can never drift apart.
  */
 async function handoutExclusivityFromParentClass(
   client: PrFixQueueClient,
@@ -768,16 +1000,38 @@ async function handoutExclusivityFromParentClass(
 ): Promise<{ decision: "eligible" | "refuse"; correctedLane: boolean }> {
   const escalation = parentClass;
   if (escalation === "NOT_ESCALATED") {
+    // #1569: isolation is BIDIRECTIONAL at issuance. Work that is
+    // authoritatively NORMAL never goes to a declared-escalation consumer
+    // either — the frontier lane exists exclusively for escalation work, and
+    // a shared-queue repair must not be absorbed by the tier reserved for
+    // higher-judgment fixes. A row already STORED ESCALATED is frontier by
+    // its own authority (#1503: a verified row is never demoted by a later
+    // parent read), so it stays eligible for the escalation consumer — the
+    // fence's locked re-read lands here with the row lane, not a fresh one.
+    // (The read filter should have kept a NORMAL row out of the escalation
+    // poll's candidates entirely; reaching here means a reclassification
+    // raced the queue read, or a linked-PR materialization offered NORMAL
+    // work to an escalation poll.)
+    if (requestPrFixLane === "ESCALATED" && candidate.lane !== "ESCALATED") {
+      console.info("[next-task-pr-fix] refusing NORMAL PR-fix work for the escalation lane (#1569)", {
+        repoFullName: candidate.repo,
+        pullRequestNumber: candidate.pr,
+        generation: candidate.generation,
+        escalationLinked: "NOT_ESCALATED",
+        correctedLane: false,
+      });
+      return { decision: "refuse", correctedLane: false };
+    }
     return { decision: "eligible", correctedLane: false };
   }
-  // UNKNOWN parent (#1503 review): fail closed for the declared-NORMAL
-  // consumer only — an unverifiable classification must not authorize the
-  // shared lane. No correction CAS and no history row: nothing was verified,
-  // so there is nothing to correct. Escalation consumers and the #1046
-  // unfiltered poll stay eligible (see docblock).
+  // UNKNOWN parent (#1503 review, widened symmetrically by #1569): an
+  // unverifiable classification must not authorize EITHER declared lane.
+  // No correction CAS and no history row: nothing was verified, so there is
+  // nothing to correct. The #1046 unfiltered poll stays eligible (see
+  // docblock).
   if (escalation === "UNKNOWN") {
-    if (requestPrFixLane === "NORMAL") {
-      console.info("[next-task-pr-fix] refusing PR-fix work with an UNVERIFIABLE escalation classification for the normal lane (#1503)", {
+    if (requestPrFixLane === "NORMAL" || requestPrFixLane === "ESCALATED") {
+      console.info(`[next-task-pr-fix] refusing PR-fix work with an UNVERIFIABLE escalation classification for the declared ${requestPrFixLane} lane (#1503, #1569)`, {
         repoFullName: candidate.repo,
         pullRequestNumber: candidate.pr,
         generation: candidate.generation,
@@ -2319,6 +2573,16 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
   // row's lane would strand it with no eligible worker.
   const escalation =
     type !== "REBASE" && (await linkedIssueEscalationClassified(client, input.repo, input.issue));
+  // #1569: ORIGINAL CLAIMANT resolution runs once per enqueue, alongside the
+  // lane classification: linked issue → live Lease / single `agent/*` label /
+  // single `owner/*` label; no linked issue → PR author login. The value is
+  // WRITTEN AT CREATION and only ever BACKFILLED on an update while the
+  // row's claimant is still NULL — a recorded claimant (any provenance,
+  // "operator" included) is never transferred, refreshed, or cleared by
+  // re-ingestion, so a later owner change or lane flip cannot move existing
+  // PR ownership.
+  const claimantResolution = await resolveIngestionClaimant(client, input.repo, input.issue, input.author);
+  const claimantPatch = ingestionClaimantPatch(claimantResolution);
   // A NORMAL classification may be raised to the exclusive escalation lane by
   // the linked issue; it never lowers ESCALATED, and it never touches a
   // NEEDS_HUMAN human hold (BLOCKED stops dispatch anyway).
@@ -2333,6 +2597,22 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
     // from fresher snapshots, and the post-transaction BLOCKED-surfacing
     // comparison keeps its pre-#1134 meaning.
     previousStatus = existing?.status;
+    // #1569: backfill the ORIGINAL CLAIMANT on an EXISTING row as its own
+    // write, pinned on `claimant IS NULL` — never folded into the decision
+    // payload. The pin is what makes this safe against the recovery paths:
+    // an operator stamp (`POST /api/pr-fix-queue/claimant`) or an
+    // issuance-side backfill committing in this read→write gap wins, and a
+    // re-ingestion can then neither transfer NOR clear a recorded claimant
+    // (a failure-state resolution would otherwise write `claimant: null`
+    // over it). Only a RESOLVED value is ever written here: an unresolved
+    // observation leaves the row's source NULL ("legacy") instead of
+    // churning the row or recording a transient read failure as provenance.
+    if (existing && existing.claimant == null && claimantResolution.state === "resolved") {
+      await tx.prFixQueueItem.updateMany({
+        where: { id: existing.id, claimant: null },
+        data: { claimant: claimantResolution.claimant, claimantSource: claimantResolution.source },
+      });
+    }
     // One wall-clock instant per enqueue decision (#1253): every
     // disposition stamp (`disposedAt`) and reactivation stamp
     // (`recoveryAppliedAt`) this decision writes uses the same `now`, so the
@@ -2893,6 +3173,13 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
         ...(nextStatus === "BLOCKED"
           ? { outcome: "human_decision", ...(input.decision ? { decisionDetail: input.decision } : {}) }
           : {}),
+        // #1569: a brand-new row records its ORIGINAL CLAIMANT (or its
+        // failure state "missing"/"ambiguous") at creation. A FAILED fact read
+        // records nothing: the row stays source-NULL ("legacy", unresolved and
+        // therefore never auto-handed out) and re-resolves on the next
+        // observation, so a transient error is never stored as provenance.
+        // Provenance and missing-value behavior: docs/pr-fix-ownership-contract.md.
+        ...claimantPatch,
         ...metadataPatch(input),
       },
     });
@@ -3070,6 +3357,18 @@ export async function createLinkedPrFixItem(
 ): Promise<{ item: any; created: boolean }> {
   // Same identity fold as enqueuePrFixItem (#1145).
   const input: CreateLinkedPrFixInput = { ...rawInput, repo: normalizeQueueRepo(rawInput.repo) };
+  // #1569: a materialized row records its ORIGINAL CLAIMANT at creation,
+  // resolved from the linked issue's authoritative records (live Lease →
+  // single `agent/*` label → single `owner/*` label). No PR-author input
+  // exists here (the row is minted from health, not a PR event), so an
+  // unresolved issue records its failure state; the issuance-time lazy
+  // backfill and operator recovery resolve it later. Ownership is never
+  // inherited from any consuming poll.
+  const claimantResolution = await resolveIngestionClaimant(client, input.repo, input.issue, null);
+  // #1569: same rule as enqueue — a resolved identity or an honest failure
+  // state is recorded at materialization; a failed fact read records nothing
+  // and the row stays unresolved ("legacy").
+  const claimantPatch = ingestionClaimantPatch(claimantResolution);
   try {
     const item = await client.$transaction(async (tx) => {
       const item = await tx.prFixQueueItem.create({
@@ -3078,6 +3377,7 @@ export async function createLinkedPrFixItem(
           pr: input.pr,
           issue: input.issue,
           lane: input.lane,
+          ...claimantPatch,
           // The caller picks the lane's type (#1327): a conflicted linked PR
           // materializes as REBASE, everything else stays the ordinary fix
           // lane (OTHER).
@@ -4731,6 +5031,15 @@ export function toAgentQueuePrFixItem(item: any) {
     // exposed additively so consumers can distinguish it from headSha.
     attemptHeadSha: item.attemptHeadSha,
     author: item.author,
+    // #1569: ORIGINAL CLAIMANT evidence — the identity that owned the work
+    // at ingestion, its provenance, and the derived versioned evidence
+    // block. Additive for queue consumers (agent queue listings and the
+    // PR-fix queued listing); the hand-out payload ships the same evidence
+    // object only to a poll granted the `pr-ownership-evidence:1`
+    // capability. `author` above stays the distinct PR-pusher identity.
+    claimant: item.claimant ?? null,
+    claimantSource: item.claimantSource ?? null,
+    ownership: prFixOwnershipEvidence(item),
     generation: item.generation,
     // Per-agent hand-out records for the current generation (#1133); the
     // next-task route reads these to skip items this agent already has.
@@ -4801,6 +5110,25 @@ export async function requeuePrFixItem(client: PrFixQueueClient, rawInput: Reque
     // issuance.
     const requeueEscalation = await linkedIssueEscalationClassified(tx, input.repo, existing.issue);
     const requeueLane: PrFixLane = releaseLaneFromParentClass(requeueEscalation, existing.lane);
+    // #1569: requeue recovery for a row whose ORIGINAL CLAIMANT never
+    // resolved — re-resolve from the authoritative records inside the same
+    // transaction. Only computed while the claimant is still NULL; a
+    // recorded claimant is never re-derived, refreshed, or transferred.
+    const requeueClaimantPatch =
+      existing.claimant == null
+        ? await resolveIngestionClaimant(tx, input.repo, existing.issue, existing.author)
+        : null;
+    // #1569: the re-resolved claimant rides its OWN write, pinned on
+    // `claimant IS NULL`, not the requeue payload — so a concurrent operator
+    // stamp or issuance backfill in the gap cannot be overwritten or cleared
+    // here, and only a RESOLVED value is ever recorded (an unresolved
+    // observation leaves the source NULL rather than churning the row).
+    if (requeueClaimantPatch !== null && requeueClaimantPatch.state === "resolved") {
+      await tx.prFixQueueItem.updateMany({
+        where: { id: existing.id, claimant: null },
+        data: { claimant: requeueClaimantPatch.claimant, claimantSource: requeueClaimantPatch.source },
+      });
+    }
     const updated = await tx.prFixQueueItem.update({
       where: { id: existing.id },
       // Requeue hands the PR back to the worker loop as a fresh attempt —
