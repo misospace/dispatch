@@ -36,7 +36,7 @@ Failure states:
 - `missing` — no source resolved.
 - `legacy` — the row predates this contract, so `claimantSource` is NULL. Treated like missing.
 
-A recorded claimant is never overwritten, refreshed, or cleared by re-ingestion. Operator stamps win and are audited in `PrFixHistory`.
+A recorded claimant is never overwritten, refreshed, or cleared by any writer. Every write after row creation is pinned on `claimant IS NULL`. The operator stamp refuses a row that already carries a claimant (`409`), and a successful stamp is audited in `PrFixHistory`.
 
 ## Enforcement at issuance (next-task)
 

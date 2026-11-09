@@ -3,8 +3,11 @@
 -- `claimantSource` records WHY that value is what it is ("lease",
 -- "agent-label", "owner-label", "pr-author", "operator", or the failure
 -- states "missing" / "ambiguous"). A per-generation hand-out recipient never
--- becomes the claimant, and a lane re-classification never transfers it; a
--- recorded claimant is only ever written again by operator recovery.
+-- becomes the claimant, and a lane re-classification never transfers it. The
+-- value is captured at ingestion/materialization; every later write
+-- (re-ingestion backfill, issuance backfill, operator requeue, operator
+-- stamp) is pinned on `claimant IS NULL`, so a recorded claimant is never
+-- transferred or cleared.
 -- NULL claimant means unresolved, which the issuance ownership gate refuses
 -- to auto-hand-out (see docs/pr-fix-ownership-contract.md).
 --

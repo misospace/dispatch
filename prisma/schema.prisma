@@ -417,14 +417,17 @@ model PrFixQueueItem {
   // `author` is the PR author login (who pushed), `agentHandouts` are the
   // RECEIVING consumers per generation (who was handed the repair). A fresh
   // hand-out recipient never becomes the claimant, and a lane re-classification
-  // never moves it: the value is captured at ingestion/materialization and is
-  // only ever written again by an operator (recovery). NULL claimant means
-  // unresolved; `claimantSource` records WHY ("missing": no authoritative
-  // source existed; "ambiguous": sources conflicted; NULL: legacy row from
-  // before the contract, treated as missing). Unresolved ownership never
-  // authorizes an automatic hand-out to a declared-lane consumer; recovery is
-  // re-ingestion while unresolved, an operator requeue, or an explicit stamp
-  // via POST /api/pr-fix-queue/claimant. See docs/pr-fix-ownership-contract.md.
+  // never moves it. The value is captured at ingestion/materialization; every
+  // later write (re-ingestion backfill, issuance backfill, operator requeue,
+  // operator stamp) is pinned on `claimant IS NULL`, so a recorded claimant is
+  // never transferred or cleared and the operator stamp refuses a row that
+  // already carries one. NULL claimant means unresolved; `claimantSource`
+  // records WHY ("missing": no authoritative source existed; "ambiguous":
+  // sources conflicted; NULL: legacy row from before the contract, treated as
+  // missing). Unresolved ownership never authorizes an automatic hand-out to
+  // a declared-lane consumer; recovery is re-ingestion while unresolved, an
+  // operator requeue, or an explicit stamp via POST /api/pr-fix-queue/claimant.
+  // See docs/pr-fix-ownership-contract.md.
   claimant                 String?
   claimantSource           String?
   // CI park-and-resume deferral (misospace/courier#495): server-side state
