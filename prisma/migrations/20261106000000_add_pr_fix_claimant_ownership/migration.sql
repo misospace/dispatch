@@ -15,6 +15,11 @@
 -- UPDATE here — legacy rows resolve lazily at first contact (re-ingestion,
 -- operator requeue, or POST /api/pr-fix-queue/claimant) so the SQL migration
 -- stays reversible and no ownership is guessed at deploy time.
+--
+-- Plain ADD COLUMN, not IF NOT EXISTS: a pre-existing column of the WRONG
+-- type must fail the deploy loudly, not be silently kept. `IF NOT EXISTS`
+-- would leave a wrongly-typed `claimant` in place and let the deploy report
+-- success — the same convention as the #1542 observe-mode migration.
 -- AlterTable
-ALTER TABLE "PrFixQueueItem" ADD COLUMN IF NOT EXISTS "claimant" TEXT;
-ALTER TABLE "PrFixQueueItem" ADD COLUMN IF NOT EXISTS "claimantSource" TEXT;
+ALTER TABLE "PrFixQueueItem" ADD COLUMN "claimant" TEXT;
+ALTER TABLE "PrFixQueueItem" ADD COLUMN "claimantSource" TEXT;
