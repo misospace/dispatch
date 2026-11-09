@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.5.75](https://github.com/misospace/dispatch/compare/v0.5.74...v0.5.75) (2026-11-09)
+
+
+### Features
+
+* **attention:** surface fail-closed invalid_wait parks on every type ([#1548](https://github.com/misospace/dispatch/issues/1548)) ([#1555](https://github.com/misospace/dispatch/issues/1555)) ([5c25aff](https://github.com/misospace/dispatch/commit/5c25aff63aa67e8c7065f5a24d6fb0426bf5b1d9))
+* **deps:** update dependency @vitejs/plugin-react (6.2.1 → 6.3.0) ([#1522](https://github.com/misospace/dispatch/issues/1522)) ([3c80266](https://github.com/misospace/dispatch/commit/3c80266faf2e6254362b71f8fb3d766137a52290))
+* **deps:** update dependency jsdom (30.1.3 → 31.0.0) ([#1552](https://github.com/misospace/dispatch/issues/1552)) ([35403ed](https://github.com/misospace/dispatch/commit/35403ed053fa1b84a852cfa27a84f282ed580d7f))
+* **deps:** update dependency lucide-react (1.68.0 → 1.69.0) ([#1551](https://github.com/misospace/dispatch/issues/1551)) ([59c1697](https://github.com/misospace/dispatch/commit/59c16978b03ba28d742cece0b386cfd091b8233b))
+* **deps:** update dependency lucide-react (1.69.0 → 1.70.0) ([#1564](https://github.com/misospace/dispatch/issues/1564)) ([0b6c0a3](https://github.com/misospace/dispatch/commit/0b6c0a360653254153bc63e98194b2f9b636d14e))
+* **external-work:** persist and submit external contribution requests ([#1537](https://github.com/misospace/dispatch/issues/1537)) ([#1556](https://github.com/misospace/dispatch/issues/1556)) ([0ca8b1f](https://github.com/misospace/dispatch/commit/0ca8b1f6605a74b4844e4669f882f1227433e5c7))
+* **groomer:** add off/observe/auto rollout mode with durable would-act receipts ([#1542](https://github.com/misospace/dispatch/issues/1542)) ([#1550](https://github.com/misospace/dispatch/issues/1550)) ([b17484e](https://github.com/misospace/dispatch/commit/b17484e6f975429795705eebe0c2579268b3df6c))
+* **pr-fix:** replace the lifetime attempt cap with a consecutive-stagnation guard ([#1543](https://github.com/misospace/dispatch/issues/1543)) ([#1547](https://github.com/misospace/dispatch/issues/1547)) ([df38424](https://github.com/misospace/dispatch/commit/df384248684903ee369327837a78778f07173b7b))
+* **ui:** add derived Needs Attention projection ([#1541](https://github.com/misospace/dispatch/issues/1541)) ([#1544](https://github.com/misospace/dispatch/issues/1544)) ([26626dc](https://github.com/misospace/dispatch/commit/26626dcead40c54b5e6ae848723e3471557aa206))
+
+
+### Bug Fixes
+
+* **attention:** gate semantic-conflict on disposition, not conflict type ([#1546](https://github.com/misospace/dispatch/issues/1546)) ([#1549](https://github.com/misospace/dispatch/issues/1549)) ([d941060](https://github.com/misospace/dispatch/commit/d9410600fd8faf0c5518308f3d080e8e7932adfc))
+* **deps:** update dependency astro (7.4.5 → 7.4.6) ([#1554](https://github.com/misospace/dispatch/issues/1554)) ([92bd5ef](https://github.com/misospace/dispatch/commit/92bd5efe7bf31398541b4290334761725eb8b7f7))
+* **deps:** update dependency astro (7.4.6 → 7.4.7) ([#1560](https://github.com/misospace/dispatch/issues/1560)) ([a2ac7ff](https://github.com/misospace/dispatch/commit/a2ac7ff00d6f39f99cbeb21e024a8c16b97f7b9f))
+* **groomer:** derive exploration budget from the model context window, not a 96 KiB cap ([#1559](https://github.com/misospace/dispatch/issues/1559)) ([6995b87](https://github.com/misospace/dispatch/commit/6995b8780f29f325c594a1b4ce7dfd0f00297f7d))
+* **groomer:** surface investigation_incomplete as not-ready, never Needs Info ([#1561](https://github.com/misospace/dispatch/issues/1561)) ([8b5090a](https://github.com/misospace/dispatch/commit/8b5090a48ca22938ec18a3c7234766f1c693a594))
+* **pr-fix:** preserve lane and original claimant ownership ([#1569](https://github.com/misospace/dispatch/issues/1569)) ([#1571](https://github.com/misospace/dispatch/issues/1571)) ([013a178](https://github.com/misospace/dispatch/commit/013a17890e70595a293fcc883959ebde091d38d6))
+* **pr-followup:** reopen settled REBASE rows for still-conflicted PRs ([#1575](https://github.com/misospace/dispatch/issues/1575)) ([#1576](https://github.com/misospace/dispatch/issues/1576)) ([1bdd60f](https://github.com/misospace/dispatch/commit/1bdd60f4d188e9bc4f79d74fdd5c5df51d9b81c0))
+* **queue:** park issues after repeated same-blocker settlements ([#1562](https://github.com/misospace/dispatch/issues/1562)) ([#1568](https://github.com/misospace/dispatch/issues/1568)) ([0e7d05e](https://github.com/misospace/dispatch/commit/0e7d05eb150c0ad2bf7a3b2b893f07d91a0e244b))
+* **security:** disable the X-Powered-By response header in production ([#1567](https://github.com/misospace/dispatch/issues/1567)) ([#1573](https://github.com/misospace/dispatch/issues/1573)) ([8261980](https://github.com/misospace/dispatch/commit/8261980134a3905ec513e40c9162dd1ad059e8e1))
+
+
+### Refactors
+
+* **api:** consolidate webhook auth boilerplate into a shared helper ([#1565](https://github.com/misospace/dispatch/issues/1565)) ([#1570](https://github.com/misospace/dispatch/issues/1570)) ([9472915](https://github.com/misospace/dispatch/commit/9472915e96776b5c82f1bbdcdf83b2c27b2733bb))
+* **api:** finish readJsonObjectBody consolidation in remaining routes ([#1563](https://github.com/misospace/dispatch/issues/1563)) ([b12a427](https://github.com/misospace/dispatch/commit/b12a4278ae4eca33cda7a0f6d406e3648cfac245))
+
 ## [0.5.74](https://github.com/misospace/dispatch/compare/v0.5.73...v0.5.74) (2026-11-04)
 
 
