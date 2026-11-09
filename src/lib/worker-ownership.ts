@@ -62,10 +62,16 @@ export function isOwnershipDisposition(value: unknown): value is OwnershipDispos
 
 // ─── Windows (configuration, not code constants — design §8.3) ──────────────
 
-const MIN_WINDOW_MS = 60_000; // 1 minute
-const MAX_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 hours
+export const MIN_WINDOW_MS = 60_000; // 1 minute
+export const MAX_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 hours
 
-function readWindowEnv(name: string, fallback: number, min: number, max: number): number {
+/**
+ * Shared bounded window/config parser: a finite positive override wins,
+ * otherwise the fallback, always clamped to [min, max]. Used by every
+ * ownership window and every reconcile tuning knob (§8.3: windows are
+ * configuration, not code constants).
+ */
+export function readWindowEnv(name: string, fallback: number, min: number, max: number): number {
   const raw = Number(process.env[name]);
   const value = Number.isFinite(raw) && raw > 0 ? raw : fallback;
   return Math.min(Math.max(value, min), max);

@@ -11,9 +11,9 @@
  * Nothing here talks to GitHub or the database directly; see
  * freshness-invalidation.ts for the bounded pass that feeds these checks.
  */
-import { createHash } from "crypto";
 
 import { dependencyKey, normalizeRepoKey, parseIssueDependencies } from "@/lib/issue-dependencies";
+import { sha256Hex } from "./evidence-snapshot";
 import type { EvidenceSource, GroomingEvidenceSnapshot } from "./evidence-snapshot";
 
 /**
@@ -82,10 +82,6 @@ const WORKER_OWNED_STATUSES = new Set(["status/in-progress", "status/in-review",
 
 export function isFreshnessTrackedStatus(labels: string[]): boolean {
   return !labels.some((label) => WORKER_OWNED_STATUSES.has(label));
-}
-
-function sha256Hex(value: string): string {
-  return createHash("sha256").update(value).digest("hex");
 }
 
 export interface FingerprintableIssue {

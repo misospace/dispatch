@@ -16,6 +16,8 @@
  * response); it is NEVER the storage identity.
  */
 
+import { isUniqueViolation } from "@/lib/prisma-errors";
+
 // ---------------------------------------------------------------------------
 // Vocabularies
 // ---------------------------------------------------------------------------
@@ -499,19 +501,6 @@ export interface RecordExecutionObservationResult {
 
 /** Bounded retry budget for the read/decide/write loop below. */
 const REPORT_MAX_ATTEMPTS = 3;
-
-/**
- * Prisma unique-constraint violation (the real client throws
- * PrismaClientKnownRequestError with `code: "P2002"`; tests may throw a
- * plain object with the same shape).
- */
-function isUniqueViolation(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    (error as { code?: unknown }).code === "P2002"
-  );
-}
 
 /**
  * Apply a validated observation through the injected deps, race-safe.

@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { errorResponse, readJsonObjectBody } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
+import { isForeignKeyViolation } from "@/lib/prisma-errors";
 import { updateIssueLabels } from "@/lib/github";
 import { getLiveIssueLabels } from "@/lib/claim-gate";
 import { buildUnassignedLabels, getAgentLabels, getOwnerLabels } from "@/lib/assignment-conflicts";
@@ -16,21 +17,6 @@ type UnassignPayload = {
   issueNumber: number;
   action: "unassign_agent" | "unassign_owner";
 };
-
-/**
- * #1361: the anchor's guard row REFERENCES the issue, so acquiring the anchor
- * for an unknown issue raises a Prisma foreign-key violation (P2003) before
- * the route's own "issue not found" check can run. The structural check keeps
- * the route free of a direct Prisma error-class import.
- */
-function isForeignKeyViolation(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    (error as { code?: string }).code === "P2003"
-  );
-}
 
 /**
  * POST /api/issues/unassign

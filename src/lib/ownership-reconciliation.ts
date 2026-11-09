@@ -53,8 +53,11 @@ import {
 } from "@/lib/issue-lifecycle";
 import {
   CURRENT_CLAIM_WORK_ORDER_BY,
+  MAX_WINDOW_MS,
+  MIN_WINDOW_MS,
   ownershipActiveWindowMs,
   ownershipLongRunGraceMs,
+  readWindowEnv,
 } from "@/lib/worker-ownership";
 import {
   deriveOwnershipState,
@@ -64,15 +67,6 @@ import {
 } from "@/lib/ownership-state";
 
 // ─── Configuration (§8.3: windows are configuration, not code constants) ─────
-
-const MIN_WINDOW_MS = 60_000;
-const MAX_WINDOW_MS = 24 * 60 * 60 * 1000;
-
-function readWindowEnv(name: string, fallback: number, min: number, max: number): number {
-  const raw = Number(process.env[name]);
-  const value = Number.isFinite(raw) && raw > 0 ? raw : fallback;
-  return Math.min(Math.max(value, min), max);
-}
 
 export type OwnershipReconcileMode = "off" | "audit" | "enforce";
 

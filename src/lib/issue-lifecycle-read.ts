@@ -129,8 +129,10 @@ function stableKey(row: LifecycleEventRecord): string {
 /**
  * Which PR a `pr_merged` row is about: the metadata's number when it carries
  * one, else the `pr-<n>` sourceEventId. Null when neither identifies a PR.
+ * Shared with the work-attempt-chain reader so both agree on a merge's
+ * identity.
  */
-function resolvePrNumber(row: LifecycleEventRecord): number | null {
+export function resolvePrNumber(row: LifecycleEventRecord): number | null {
   const metadata = row.metadata ?? {};
   if (typeof metadata.pullRequestNumber === "number" && Number.isFinite(metadata.pullRequestNumber)) {
     return metadata.pullRequestNumber;
