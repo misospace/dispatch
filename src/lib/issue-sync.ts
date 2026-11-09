@@ -78,11 +78,12 @@ export interface IssueStore {
   createIssue(repositoryId: string, data: SyncedIssueData): Promise<void>;
   /**
    * Delete a cached issue row that GitHub says should not be cached anymore
-   * (#1587). Returns true when the row was deleted; false when it was kept
-   * because dependent work rows exist (the caller logs the retention). Stores
-   * must not delete when any dependent row exists: the schema cascades or
-   * null-outs every Issue foreign key, so an unguarded delete would silently
-   * destroy lease, run, and grooming evidence.
+   * (#1587). Returns true when the row is no longer in the cache (deleted, or
+   * already gone); false when the delete was refused because dependent work
+   * rows exist (the caller logs the retention). Stores must not delete when
+   * any dependent row exists: the schema cascades or null-outs every Issue
+   * foreign key, so an unguarded delete would silently destroy lease, run,
+   * and grooming evidence.
    */
   deleteIssue(id: string): Promise<boolean>;
 }
@@ -568,9 +569,12 @@ export function makePrismaIssueStore(): IssueStore {
         if (dependents.some((count) => count > 0)) return false;
 
         // deleteMany (not delete): a row that vanished concurrently yields 0,
-        // not a P2025 that would take the whole repo's sync down with it.
-        const { count } = await tx.issue.deleteMany({ where: { id } });
-        return count > 0;
+        // not a P2025 that would take the whole repo's sync down with it. A
+        // vanished row already satisfies the goal — the cache no longer holds
+        // it — so it reports pruned, keeping the false path (and its
+        // "dependent rows exist" warning) only for real refusals.
+        await tx.issue.deleteMany({ where: { id } });
+        return true;
       });
     },
     async createIssue(repositoryId: string, data: SyncedIssueData) {

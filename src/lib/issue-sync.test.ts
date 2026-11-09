@@ -886,19 +886,28 @@ describe("makePrismaIssueStore — excluded-reconcile delete (#1587)", () => {
 
     // The lock must be taken: an insert referencing the issue takes a
     // key-share lock on the parent row, and FOR NO KEY UPDATE is what makes
-    // such an insert wait until the check-then-delete decision commits.
+    // such an insert wait until the check-then-delete decision commits. Pin
+    // the mode itself — a weaker lock (FOR SHARE, or dropping NO KEY) would
+    // keep the call count and silently defeat the serialization.
     expect(mocks.executeRaw).toHaveBeenCalledTimes(1);
+    const [lockQuery] = mocks.executeRaw.mock.calls[0] as [TemplateStringsArray, ...unknown[]];
+    const lockSql = lockQuery.join("$1");
+    expect(lockSql).toContain('FROM "Issue"');
+    expect(lockSql).toContain("FOR NO KEY UPDATE");
     countMocks.forEach((count) => {
       expect(count).toHaveBeenCalledWith({ where: { issueId: "zombie-1" } });
     });
     expect(mocks.issueDeleteMany).toHaveBeenCalledWith({ where: { id: "zombie-1" } });
   });
 
-  it("deletes nothing when the row vanished under the check", async () => {
+  it("reports pruned when the row vanished under the check", async () => {
+    // A row that is already gone satisfies the goal (the cache no longer
+    // holds it); false — and its "dependent rows exist" warning — is
+    // reserved for real refusals, so the log never mislabels this race.
     mocks.issueDeleteMany.mockResolvedValue({ count: 0 });
     const store = makePrismaIssueStore();
 
-    await expect(store.deleteIssue("zombie-1")).resolves.toBe(false);
+    await expect(store.deleteIssue("zombie-1")).resolves.toBe(true);
   });
 
   it.each([
