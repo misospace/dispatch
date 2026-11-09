@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { GitHubIssue } from "@/types";
 
 const { mocks } = vi.hoisted(() => ({
@@ -8,6 +8,14 @@ const { mocks } = vi.hoisted(() => ({
     issueFindUnique: vi.fn(),
     issueUpdate: vi.fn(),
     issueCreate: vi.fn(),
+    issueDeleteMany: vi.fn(),
+    transaction: vi.fn(),
+    executeRaw: vi.fn(),
+    agentRunCount: vi.fn(),
+    agentWorkCount: vi.fn(),
+    leaseCount: vi.fn(),
+    groomingRunCount: vi.fn(),
+    groomingApplicationCount: vi.fn(),
     createLifecycleEvent: vi.fn(),
     upsertLifecycleEvent: vi.fn(),
   },
@@ -24,11 +32,20 @@ vi.mock("@/lib/prisma", () => ({
       findUnique: mocks.issueFindUnique,
       update: mocks.issueUpdate,
       create: mocks.issueCreate,
+      deleteMany: mocks.issueDeleteMany,
     },
     issueLifecycleEvent: {
       create: mocks.createLifecycleEvent,
       upsert: mocks.upsertLifecycleEvent,
     },
+    // Interactive transaction client (#1587 prune): the callback receives a
+    // tx object carrying the same mocks the top-level client would use.
+    $transaction: mocks.transaction,
+    agentRun: { count: mocks.agentRunCount },
+    agentWork: { count: mocks.agentWorkCount },
+    lease: { count: mocks.leaseCount },
+    groomingRun: { count: mocks.groomingRunCount },
+    groomingApplication: { count: mocks.groomingApplicationCount },
   },
 }));
 
@@ -159,6 +176,7 @@ describe("syncIssuesForRepos", () => {
       findIssue: vi.fn().mockResolvedValue(null),
       updateIssue: vi.fn().mockResolvedValue(undefined),
       createIssue: vi.fn().mockResolvedValue(undefined),
+      deleteIssue: vi.fn().mockResolvedValue(true),
     };
   });
 
@@ -210,6 +228,7 @@ describe("syncIssuesForRepos", () => {
       findIssue: findMock,
       updateIssue: updateMock,
       createIssue: createMock,
+      deleteIssue: vi.fn().mockResolvedValue(true),
     };
 
     await syncIssuesForRepos(
@@ -234,6 +253,7 @@ describe("syncIssuesForRepos", () => {
       findIssue: vi.fn().mockResolvedValue({ id: "existing-1", labels: ["agent/saffron", "status/in-progress"] }),
       updateIssue: vi.fn().mockResolvedValue(undefined),
       createIssue: vi.fn().mockResolvedValue(undefined),
+      deleteIssue: vi.fn().mockResolvedValue(true),
     };
 
     await syncIssuesForRepos(
@@ -295,6 +315,88 @@ describe("syncIssuesForRepos", () => {
   });
 });
 
+describe("syncIssuesForRepos — excluded-label reconcile at sync (#1587)", () => {
+  let store: IssueStore;
+  let deleteMock: Mock<(id: string) => Promise<boolean>>;
+
+  beforeEach(() => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    deleteMock = vi.fn().mockResolvedValue(true);
+    store = {
+      findIssue: vi.fn().mockResolvedValue(null),
+      updateIssue: vi.fn().mockResolvedValue(undefined),
+      createIssue: vi.fn().mockResolvedValue(undefined),
+      deleteIssue: deleteMock,
+    };
+  });
+
+  const EXCLUDED = ["wontfix"];
+
+  function runSync(ghIssue: GitHubIssue) {
+    return syncIssuesForRepos(
+      [{ id: "repo-1", fullName: "org/repo" }],
+      async () => [ghIssue],
+      store,
+      EXCLUDED,
+    );
+  }
+
+  it("prunes a cached row whose GitHub labels have become excluded", async () => {
+    vi.mocked(store.findIssue).mockResolvedValue({ id: "zombie-1", labels: ["type/bug"] });
+
+    const response = await runSync(githubIssue(7, { labels: [{ name: "wontfix", color: "ffffff" }] }));
+
+    expect(store.deleteIssue).toHaveBeenCalledWith("zombie-1");
+    expect(store.updateIssue).not.toHaveBeenCalled();
+    expect(store.createIssue).not.toHaveBeenCalled();
+    expect(console.log).toHaveBeenCalledWith(expect.stringContaining("pruned cached issue org/repo#7"));
+    // A prune is a removal, not a sync: it never counts toward syncedCount.
+    expect(response.syncedCount).toBe(0);
+  });
+
+  it("skips a new issue with an excluded label — never ingested, then deleted", async () => {
+    // findIssue resolves null: the row was never cached.
+    await runSync(githubIssue(8, { labels: [{ name: "wontfix", color: "ffffff" }] }));
+
+    expect(store.createIssue).not.toHaveBeenCalled();
+    expect(deleteMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps a cached row the store refuses to delete and logs a warning", async () => {
+    vi.mocked(store.findIssue).mockResolvedValue({ id: "zombie-1", labels: ["type/bug"] });
+    deleteMock.mockResolvedValueOnce(false);
+
+    await runSync(githubIssue(7, { labels: [{ name: "wontfix", color: "ffffff" }] }));
+
+    expect(deleteMock).toHaveBeenCalledWith("zombie-1");
+    expect(store.updateIssue).not.toHaveBeenCalled();
+    expect(store.createIssue).not.toHaveBeenCalled();
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("kept cached issue org/repo#7"));
+  });
+
+  it("does not prune on a cache-side match — GitHub labels are authoritative", async () => {
+    // The cached row still carries "wontfix" (prune pending), but GitHub no
+    // longer has it: the issue is back in scope and syncs normally.
+    vi.mocked(store.findIssue).mockResolvedValue({ id: "live-1", labels: ["wontfix"] });
+
+    await runSync(githubIssue(9));
+
+    expect(store.deleteIssue).not.toHaveBeenCalled();
+    expect(store.updateIssue).toHaveBeenCalled();
+  });
+
+  it("leaves non-excluded issues untouched by the prune path", async () => {
+    vi.mocked(store.findIssue).mockResolvedValue(null);
+
+    await runSync(githubIssue(10));
+
+    expect(store.createIssue).toHaveBeenCalledWith("repo-1", expect.objectContaining({ number: 10 }));
+    expect(deleteMock).not.toHaveBeenCalled();
+  });
+});
+
 describe("syncIssuesForRepos native blocked_by persistence", () => {
   let store: IssueStore;
 
@@ -308,6 +410,7 @@ describe("syncIssuesForRepos native blocked_by persistence", () => {
       findIssue: vi.fn().mockResolvedValue(null),
       updateIssue: vi.fn().mockResolvedValue(undefined),
       createIssue: createMock,
+      deleteIssue: vi.fn().mockResolvedValue(true),
     };
 
     await syncIssuesForRepos(
@@ -326,6 +429,7 @@ describe("syncIssuesForRepos native blocked_by persistence", () => {
       findIssue: vi.fn().mockResolvedValue({ id: "existing-2", labels: [] }),
       updateIssue: updateMock,
       createIssue: vi.fn().mockResolvedValue(undefined),
+      deleteIssue: vi.fn().mockResolvedValue(true),
     };
 
     await syncIssuesForRepos(
@@ -345,6 +449,7 @@ describe("syncIssuesForRepos native blocked_by persistence", () => {
       findIssue: vi.fn().mockResolvedValue({ id: "existing-2", labels: [] }),
       updateIssue: updateMock,
       createIssue: vi.fn().mockResolvedValue(undefined),
+      deleteIssue: vi.fn().mockResolvedValue(true),
     };
 
     // A blocker added after creation: the freshly-fetched non-empty set is
@@ -742,6 +847,73 @@ describe("makePrismaIssueStore — lifecycle evidence (#1202)", () => {
     const keys = mocks.upsertLifecycleEvent.mock.calls.map((call: any[]) => call[0].where.dedupeKey);
     expect(keys).toHaveLength(2);
     expect(new Set(keys).size).toBe(1);
+  });
+});
+
+describe("makePrismaIssueStore — excluded-reconcile delete (#1587)", () => {
+  const countMocks = [
+    mocks.agentRunCount,
+    mocks.agentWorkCount,
+    mocks.leaseCount,
+    mocks.groomingRunCount,
+    mocks.groomingApplicationCount,
+  ];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Interactive transaction: the callback runs against a tx client carrying
+    // the same mocks as the top-level client.
+    mocks.transaction.mockImplementation((fn: (tx: any) => unknown) =>
+      fn({
+        $executeRaw: mocks.executeRaw,
+        agentRun: { count: mocks.agentRunCount },
+        agentWork: { count: mocks.agentWorkCount },
+        lease: { count: mocks.leaseCount },
+        groomingRun: { count: mocks.groomingRunCount },
+        groomingApplication: { count: mocks.groomingApplicationCount },
+        issue: { deleteMany: mocks.issueDeleteMany },
+      }),
+    );
+    mocks.executeRaw.mockResolvedValue(0);
+    countMocks.forEach((count) => count.mockResolvedValue(0));
+    mocks.issueDeleteMany.mockResolvedValue({ count: 1 });
+  });
+
+  it("locks the row, checks every dependent model, then deletes", async () => {
+    const store = makePrismaIssueStore();
+
+    await expect(store.deleteIssue("zombie-1")).resolves.toBe(true);
+
+    // The lock must be taken: an insert referencing the issue takes a
+    // key-share lock on the parent row, and FOR NO KEY UPDATE is what makes
+    // such an insert wait until the check-then-delete decision commits.
+    expect(mocks.executeRaw).toHaveBeenCalledTimes(1);
+    countMocks.forEach((count) => {
+      expect(count).toHaveBeenCalledWith({ where: { issueId: "zombie-1" } });
+    });
+    expect(mocks.issueDeleteMany).toHaveBeenCalledWith({ where: { id: "zombie-1" } });
+  });
+
+  it("deletes nothing when the row vanished under the check", async () => {
+    mocks.issueDeleteMany.mockResolvedValue({ count: 0 });
+    const store = makePrismaIssueStore();
+
+    await expect(store.deleteIssue("zombie-1")).resolves.toBe(false);
+  });
+
+  it.each([
+    ["AgentRun", mocks.agentRunCount],
+    ["AgentWork", mocks.agentWorkCount],
+    ["Lease", mocks.leaseCount],
+    ["GroomingRun", mocks.groomingRunCount],
+    ["GroomingApplication", mocks.groomingApplicationCount],
+  ] as const)("refuses the delete when a dependent %s exists", async (_name, count) => {
+    count.mockResolvedValue(1);
+    const store = makePrismaIssueStore();
+
+    await expect(store.deleteIssue("zombie-1")).resolves.toBe(false);
+    // No dependent-work row may cascade or null out: the row is kept whole.
+    expect(mocks.issueDeleteMany).not.toHaveBeenCalled();
   });
 });
 

@@ -76,6 +76,15 @@ export interface IssueStore {
   ): Promise<{ id: string; labels: string[]; state?: string } | null>;
   updateIssue(id: string, data: SyncedIssueData, previous?: IssueSyncSnapshot | null): Promise<void>;
   createIssue(repositoryId: string, data: SyncedIssueData): Promise<void>;
+  /**
+   * Delete a cached issue row that GitHub says should not be cached anymore
+   * (#1587). Returns true when the row was deleted; false when it was kept
+   * because dependent work rows exist (the caller logs the retention). Stores
+   * must not delete when any dependent row exists: the schema cascades or
+   * null-outs every Issue foreign key, so an unguarded delete would silently
+   * destroy lease, run, and grooming evidence.
+   */
+  deleteIssue(id: string): Promise<boolean>;
 }
 
 export interface SyncResult {
@@ -189,7 +198,30 @@ export async function syncIssuesForRepos(
       let repoSyncedCount = 0;
 
       for (const ghIssue of githubIssues) {
+        // Resolve the cached row before the exclusion check (#1587). An issue
+        // that was cached clean and later gains an excluded label on GitHub
+        // used to `continue` here before the cache was consulted, so its row
+        // was never revisited — a permanent zombie that every board/count
+        // query kept seeing. An issue that was never cached is still skipped
+        // outright below (never ingested, then deleted).
+        const existingIssue = await store.findIssue(repo.id, ghIssue.number);
+
         if (isIssueExcludedByLabels(ghIssue.labels.map((l) => l.name), excludedLabels)) {
+          if (existingIssue) {
+            // GitHub is authoritative: the label says this issue is out of
+            // scope for the cache. Prune it, unless real work still hangs off
+            // the row (the store refuses those deletes; keep + warn instead).
+            const pruned = await store.deleteIssue(existingIssue.id);
+            if (pruned) {
+              console.log(
+                `pruned cached issue ${repo.fullName}#${ghIssue.number}: labels now match DISPATCH_EXCLUDED_LABELS`,
+              );
+            } else {
+              console.warn(
+                `kept cached issue ${repo.fullName}#${ghIssue.number}: labels match DISPATCH_EXCLUDED_LABELS but dependent rows exist`,
+              );
+            }
+          }
           continue;
         }
 
@@ -198,8 +230,6 @@ export async function syncIssuesForRepos(
         // Closed ⇒ status/done (deterministic, every sync).
         const statusFix = closedIssueStatusFix(issueData.labels, issueData.state);
         issueData.labels = statusFix.labels;
-
-        const existingIssue = await store.findIssue(repo.id, ghIssue.number);
 
         if (existingIssue) {
           // Preserve agent/* labels from the cached record in case GitHub hasn't
@@ -507,6 +537,41 @@ export function makePrismaIssueStore(): IssueStore {
       }
 
       await prisma.issue.update({ where: { id }, data });
+    },
+    async deleteIssue(id: string): Promise<boolean> {
+      // The row left the repo's write path with this decision; drop the
+      // pending-repo-name entry so it cannot outlive the issue.
+      repoByIssueId.delete(id);
+
+      // #1587 excluded-reconcile delete. Every Issue foreign key cascades or
+      // null-outs (see prisma/migrations), so a bare delete would silently
+      // take leases, agent runs, and grooming history with it. Refuse when
+      // any dependent work row exists.
+      //
+      // The check and the delete share one transaction behind a FOR NO KEY
+      // UPDATE lock on the row: inserting a dependent row (a claim creating
+      // a Lease, a run recording an AgentRun) takes a key-share lock on the
+      // parent row in Postgres, so such an insert waits behind this decision
+      // and can never slip in between the count and the delete. If this
+      // deletes, that insert then fails its foreign key — correct, since the
+      // excluded issue is no longer dispatchable work.
+      return prisma.$transaction(async (tx) => {
+        await tx.$executeRaw`SELECT id FROM "Issue" WHERE id = ${id} FOR NO KEY UPDATE`;
+
+        const dependents = await Promise.all([
+          tx.agentRun.count({ where: { issueId: id } }),
+          tx.agentWork.count({ where: { issueId: id } }),
+          tx.lease.count({ where: { issueId: id } }),
+          tx.groomingRun.count({ where: { issueId: id } }),
+          tx.groomingApplication.count({ where: { issueId: id } }),
+        ]);
+        if (dependents.some((count) => count > 0)) return false;
+
+        // deleteMany (not delete): a row that vanished concurrently yields 0,
+        // not a P2025 that would take the whole repo's sync down with it.
+        const { count } = await tx.issue.deleteMany({ where: { id } });
+        return count > 0;
+      });
     },
     async createIssue(repositoryId: string, data: SyncedIssueData) {
       // Stamp the configured default claimable lane so a freshly-ingested,
