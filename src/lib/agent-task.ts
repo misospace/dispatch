@@ -89,7 +89,8 @@ export interface FollowupPrTask {
    *
    * Provenance: captured at ingestion/materialization from a live Lease,
    * a single `agent/*` label, a single `owner/*` label, or (no linked
-   * issue) the PR author; an operator stamp overrides on recovery.
+   * issue) the PR author. An operator stamp sets provenance "operator"
+   * on an unresolved row and never overrides a recorded claimant.
  * `provenance` names which. Missing-value behavior: a row with no
  * resolvable claimant carries provenance "missing" | "ambiguous" |
  * "legacy". The ownership gate refuses such a row in every mode. The
