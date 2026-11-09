@@ -142,7 +142,7 @@ const MAX_PERSISTED_SOURCES = 60;
 /** Cap on capture-time warnings kept in the persisted summary. */
 const MAX_PERSISTED_WARNINGS = 20;
 
-function sha256Hex(value: string): string {
+export function sha256Hex(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 

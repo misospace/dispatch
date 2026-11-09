@@ -28,6 +28,7 @@ import {
   type DecompositionStateClient,
 } from "@/lib/decomposition";
 import { getBacklogLane } from "@/lib/lane-config";
+import { isUniqueViolation } from "@/lib/prisma-errors";
 import { isAutomationAuthor } from "./context";
 import { neutralizeMentions, sanitizeModelText } from "./sanitize";
 import { inFlightStatus, toGroomerOutput, type ChildBrief, type GroomingPlan, type ReleaseSignal } from "./plan";
@@ -1334,10 +1335,6 @@ export interface ApplicationStoreClient extends DecompositionStateClient {
     create(args: { data: Record<string, unknown> }): Promise<unknown>;
     update(args: { where: { childKey: string }; data: Record<string, unknown> }): Promise<unknown>;
   };
-}
-
-function isUniqueViolation(err: unknown): boolean {
-  return typeof err === "object" && err !== null && (err as { code?: unknown }).code === "P2002";
 }
 
 /**

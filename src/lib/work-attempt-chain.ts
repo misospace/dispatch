@@ -44,6 +44,7 @@
 import { createHash } from "node:crypto";
 import { toIso, toMillis } from "./time-parse";
 
+import { resolvePrNumber } from "./issue-lifecycle-read";
 import type {
   LifecycleEventRecord,
   LifecycleProvenance,
@@ -245,20 +246,6 @@ export interface WorkItemChainInput {
 
 function isBackfilled(metadata: Record<string, unknown> | null): boolean {
   return metadata?.backfilled === true;
-}
-
-/**
- * Which PR a `pr_merged` row is about: the metadata's number when it carries
- * one, else the `pr-<n>` sourceEventId. Mirrors the timeline's resolver so
- * both readers agree on a merge's identity.
- */
-function resolvePrNumber(row: LifecycleEventRecord): number | null {
-  const metadata = row.metadata ?? {};
-  if (typeof metadata.pullRequestNumber === "number" && Number.isFinite(metadata.pullRequestNumber)) {
-    return metadata.pullRequestNumber;
-  }
-  const match = row.sourceEventId?.match(/^pr-(\d+)$/);
-  return match ? Number(match[1]) : null;
 }
 
 function contentKey(value: unknown): string {

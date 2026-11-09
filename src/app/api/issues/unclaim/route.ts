@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { errorResponse, readJsonObjectBody } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
+import { isForeignKeyViolation } from "@/lib/prisma-errors";
 import { getAgentFromLabels, AGENT_PREFIX } from "@/types";
 import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
 import { enforceWorkerAgentScope } from "@/lib/worker-identity";
@@ -44,21 +45,6 @@ const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
  * callback is still running. The budget therefore only has to dominate the
  * region's forge calls — it does not have to fit inside the silence window.
  */
-
-/**
- * #1361: the anchor's guard row REFERENCES the issue, so acquiring the anchor
- * for an unknown issue raises a Prisma foreign-key violation (P2003) before
- * the route's own "issue not found" check can run. The structural check keeps
- * the route free of a direct Prisma error-class import.
- */
-function isForeignKeyViolation(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    (error as { code?: string }).code === "P2003"
-  );
-}
 
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
