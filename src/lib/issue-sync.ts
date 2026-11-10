@@ -157,6 +157,30 @@ export function mergeLabels(ghLabels: string[], existingAgentLabels: string[]): 
 }
 
 /**
+ * GitHub-authoritative issue data for one sync step: closed⇒status/done applied,
+ * and the cached agent/* labels preserved on top when a cached row exists.
+ * Shared by the normal update path and the refused-prune keep path (#1587),
+ * which must persist identical label semantics.
+ */
+function syncedIssueDataFor(
+  ghIssue: GitHubIssue,
+  existingIssue: { labels: string[] } | null,
+): { issueData: SyncedIssueData; statusFix: { added: string[]; removed: string[] } } {
+  const issueData = githubIssueToSyncedIssueData(ghIssue);
+
+  // Closed ⇒ status/done (deterministic, every sync).
+  const statusFix = closedIssueStatusFix(issueData.labels, issueData.state);
+  issueData.labels = statusFix.labels;
+
+  if (existingIssue && existingIssue.labels.length > 0) {
+    // Preserve agent/* labels from the cached record in case GitHub hasn't
+    // propagated a concurrent claim yet (see mergeLabels).
+    issueData.labels = mergeLabels(issueData.labels, existingIssue.labels);
+  }
+  return { issueData, statusFix };
+}
+
+/**
  * Enforce "closed ⇒ status/done" at sync time. A closed GitHub issue should
  * carry status/done regardless of its prior status (backlog/ready/in-progress/
  * in-review, or no status label at all). Applied on every sync so the mapping
@@ -218,6 +242,19 @@ export async function syncIssuesForRepos(
                 `pruned cached issue ${repo.fullName}#${ghIssue.number}: labels now match DISPATCH_EXCLUDED_LABELS`,
               );
             } else {
+              // The store kept the row because dependent work rows exist. The
+              // board/count and agent-queue exclusion filters read the *cached*
+              // labels, so leaving them stale would keep a GitHub-excluded
+              // issue visible and dispatchable indefinitely. Persist the
+              // GitHub-authoritative labels — the excluded label among them —
+              // through the same path a normal sync uses, so every exclusion
+              // consumer sees the kept row as excluded until a later sync can
+              // finally prune it.
+              const { issueData } = syncedIssueDataFor(ghIssue, existingIssue);
+              await store.updateIssue(existingIssue.id, issueData, {
+                labels: existingIssue.labels,
+                state: existingIssue.state ?? null,
+              });
               console.warn(
                 `kept cached issue ${repo.fullName}#${ghIssue.number}: labels match DISPATCH_EXCLUDED_LABELS but dependent rows exist`,
               );
@@ -226,18 +263,9 @@ export async function syncIssuesForRepos(
           continue;
         }
 
-        const issueData = githubIssueToSyncedIssueData(ghIssue);
-
-        // Closed ⇒ status/done (deterministic, every sync).
-        const statusFix = closedIssueStatusFix(issueData.labels, issueData.state);
-        issueData.labels = statusFix.labels;
+        const { issueData, statusFix } = syncedIssueDataFor(ghIssue, existingIssue);
 
         if (existingIssue) {
-          // Preserve agent/* labels from the cached record in case GitHub hasn't
-          // propagated a concurrent claim yet (see mergeLabels).
-          if (existingIssue.labels.length > 0) {
-            issueData.labels = mergeLabels(issueData.labels, existingIssue.labels);
-          }
           await store.updateIssue(existingIssue.id, issueData, {
             labels: existingIssue.labels,
             state: existingIssue.state ?? null,
@@ -549,15 +577,16 @@ export function makePrismaIssueStore(): IssueStore {
       // take leases, agent runs, and grooming history with it. Refuse when
       // any dependent work row exists.
       //
-      // The check and the delete share one transaction behind a FOR NO KEY
-      // UPDATE lock on the row: inserting a dependent row (a claim creating
-      // a Lease, a run recording an AgentRun) takes a key-share lock on the
-      // parent row in Postgres, so such an insert waits behind this decision
-      // and can never slip in between the count and the delete. If this
-      // deletes, that insert then fails its foreign key — correct, since the
-      // excluded issue is no longer dispatchable work.
+      // The check and the delete share one transaction behind a FOR UPDATE
+      // lock on the row: inserting a dependent row (a claim creating a Lease,
+      // a run recording an AgentRun) takes a FOR KEY SHARE lock on the parent
+      // row in Postgres, and FOR KEY SHARE conflicts with FOR UPDATE (it does
+      // NOT conflict with FOR NO KEY UPDATE), so such an insert waits behind
+      // this decision and can never slip in between the count and the delete.
+      // If this deletes, that insert then fails its foreign key — correct,
+      // since the excluded issue is no longer dispatchable work.
       return prisma.$transaction(async (tx) => {
-        await tx.$executeRaw`SELECT id FROM "Issue" WHERE id = ${id} FOR NO KEY UPDATE`;
+        await tx.$executeRaw`SELECT id FROM "Issue" WHERE id = ${id} FOR UPDATE`;
 
         const dependents = await Promise.all([
           tx.agentRun.count({ where: { issueId: id } }),

@@ -364,16 +364,44 @@ describe("syncIssuesForRepos — excluded-label reconcile at sync (#1587)", () =
     expect(deleteMock).not.toHaveBeenCalled();
   });
 
-  it("keeps a cached row the store refuses to delete and logs a warning", async () => {
-    vi.mocked(store.findIssue).mockResolvedValue({ id: "zombie-1", labels: ["type/bug"] });
+  it("keeps a cached row the store refuses to delete, logs a warning, and persists the exclusion into the cached labels", async () => {
+    vi.mocked(store.findIssue).mockResolvedValue({ id: "zombie-1", labels: ["agent/alpha"] });
     deleteMock.mockResolvedValueOnce(false);
 
     await runSync(githubIssue(7, { labels: [{ name: "wontfix", color: "ffffff" }] }));
 
     expect(deleteMock).toHaveBeenCalledWith("zombie-1");
-    expect(store.updateIssue).not.toHaveBeenCalled();
     expect(store.createIssue).not.toHaveBeenCalled();
     expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("kept cached issue org/repo#7"));
+    // The kept row must not stay dispatchable: board and queue exclusion
+    // filters read the *cached* labels, so the refusal persists the
+    // GitHub-authoritative labels — the excluded label among them — while
+    // preserving the cached agent/* labels (the dependent work likely belongs
+    // to a claim).
+    expect(store.updateIssue).toHaveBeenCalledWith(
+      "zombie-1",
+      expect.objectContaining({ labels: ["wontfix", "agent/alpha"] }),
+      { labels: ["agent/alpha"], state: null },
+    );
+  });
+
+  it("persists closed⇒done on a refused prune, without mirroring the relabel to GitHub", async () => {
+    // A refused prune writes the cache only: the branch continues before the
+    // closed⇒done mirror, and a closed excluded issue still lands on
+    // status/done in the cache. The status fix applies to the GitHub labels
+    // BEFORE the cached agent/* labels are merged on top.
+    vi.mocked(store.findIssue).mockResolvedValue({ id: "zombie-1", labels: ["agent/alpha"] });
+    deleteMock.mockResolvedValueOnce(false);
+
+    await runSync(
+      githubIssue(7, { state: "closed", labels: [{ name: "wontfix", color: "ffffff" }] }),
+    );
+
+    expect(store.updateIssue).toHaveBeenCalledWith(
+      "zombie-1",
+      expect.objectContaining({ labels: ["wontfix", "status/done", "agent/alpha"], state: "closed" }),
+      { labels: ["agent/alpha"], state: null },
+    );
   });
 
   it("does not prune on a cache-side match — GitHub labels are authoritative", async () => {
@@ -885,15 +913,19 @@ describe("makePrismaIssueStore — excluded-reconcile delete (#1587)", () => {
     await expect(store.deleteIssue("zombie-1")).resolves.toBe(true);
 
     // The lock must be taken: an insert referencing the issue takes a
-    // key-share lock on the parent row, and FOR NO KEY UPDATE is what makes
-    // such an insert wait until the check-then-delete decision commits. Pin
-    // the mode itself — a weaker lock (FOR SHARE, or dropping NO KEY) would
-    // keep the call count and silently defeat the serialization.
+    // FOR KEY SHARE lock on the parent row, and FOR UPDATE is the mode that
+    // conflicts with it — such an insert waits until the check-then-delete
+    // decision commits. Pin the mode itself: FOR NO KEY UPDATE does NOT
+    // conflict with FOR KEY SHARE (a dependent insert could slip in between
+    // the counts and the delete and be cascade-deleted), and a weaker lock
+    // (FOR SHARE) would keep the call count and silently defeat the
+    // serialization.
     expect(mocks.executeRaw).toHaveBeenCalledTimes(1);
     const [lockQuery] = mocks.executeRaw.mock.calls[0] as [TemplateStringsArray, ...unknown[]];
     const lockSql = lockQuery.join("$1");
     expect(lockSql).toContain('FROM "Issue"');
-    expect(lockSql).toContain("FOR NO KEY UPDATE");
+    expect(lockSql).toContain("FOR UPDATE");
+    expect(lockSql).not.toContain("FOR NO KEY UPDATE");
     countMocks.forEach((count) => {
       expect(count).toHaveBeenCalledWith({ where: { issueId: "zombie-1" } });
     });
