@@ -139,8 +139,12 @@ suite("the #1587 excluded-reconcile prune against a real PostgreSQL", () => {
     // FOR KEY SHARE lock on the Issue row. The gate holds the insert
     // uncommitted while the prune decision starts.
     let releaseGate: () => void = () => {};
+    let signalInserted: () => void = () => {};
     const gate = new Promise<void>((resolve) => {
       releaseGate = resolve;
+    });
+    const inserted = new Promise<void>((resolve) => {
+      signalInserted = resolve;
     });
     const dependentTx = other.$transaction(async (tx) => {
       await tx.lease.create({
@@ -151,6 +155,10 @@ suite("the #1587 excluded-reconcile prune against a real PostgreSQL", () => {
           expiredAt: new Date(Date.now() + 60_000),
         },
       });
+      // The INSERT has executed against Postgres: the FOR KEY SHARE lock on
+      // the parent row is now held uncommitted. Signal before starting the
+      // prune so the prune's lock query cannot win the race.
+      signalInserted();
       await gate;
       // Throw to force the rollback variant of this scenario.
       throw new Error("force-rollback");
@@ -158,6 +166,7 @@ suite("the #1587 excluded-reconcile prune against a real PostgreSQL", () => {
     // Swallow the intentional rollback rejection.
     const dependentSettled = dependentTx.catch((error) => String(error));
 
+    await inserted;
     const deletePromise = store.deleteIssue(issueId);
     let deleteSettled = false;
     void deletePromise.then(
@@ -170,8 +179,9 @@ suite("the #1587 excluded-reconcile prune against a real PostgreSQL", () => {
     );
     // The FOR UPDATE on the parent row conflicts with the held FOR KEY
     // SHARE, so the decision cannot complete while the insert is open.
-    // (With FOR NO KEY UPDATE the counts would have run against the
-    // uncommitted state and the delete would have proceeded.)
+    // (With FOR NO KEY UPDATE the parent lock would not conflict with the
+    // held FOR KEY SHARE, so the decision could complete against the
+    // uncommitted state — the counts see nothing and the delete proceeds.)
     await new Promise((resolve) => setTimeout(resolve, 200));
     expect(deleteSettled).toBe(false);
 
@@ -188,8 +198,12 @@ suite("the #1587 excluded-reconcile prune against a real PostgreSQL", () => {
     const store = makePrismaIssueStore();
 
     let releaseGate: () => void = () => {};
+    let signalInserted: () => void = () => {};
     const gate = new Promise<void>((resolve) => {
       releaseGate = resolve;
+    });
+    const inserted = new Promise<void>((resolve) => {
+      signalInserted = resolve;
     });
     const dependentTx = other.$transaction(async (tx) => {
       await tx.lease.create({
@@ -200,9 +214,11 @@ suite("the #1587 excluded-reconcile prune against a real PostgreSQL", () => {
           expiredAt: new Date(Date.now() + 60_000),
         },
       });
+      signalInserted();
       await gate;
     });
 
+    await inserted;
     const deletePromise = store.deleteIssue(issueId);
     await new Promise((resolve) => setTimeout(resolve, 200));
 
