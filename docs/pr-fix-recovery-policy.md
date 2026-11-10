@@ -46,7 +46,7 @@ after settlement while being strictly newer than anything the worker saw.
 ## Scope
 
 This design covers Dispatch's `PrFixQueueItem` lifecycle as implemented in
-`src/lib/pr-fix-queue.ts`, `src/lib/pr-followup-ingestion.ts`,
+`src/lib/pr-fix-queue/`, `src/lib/pr-followup-ingestion.ts`,
 `src/lib/pr-fix-surfacing.ts`, and the `/api/pr-fix-queue/*`,
 `/api/pr-followup/*`, and `/api/agents/{agentName}/tasks/report` routes. It
 defines evidence identity, freshness, disposition classes, reactivation rules,
@@ -70,7 +70,7 @@ queue API, the `(id, generation)` attempt token, and `tasks/report`.
 
 | Term | Meaning |
 |------|---------|
-| **Evidence identity** | The stable key of an observation, e.g. `review:<repo>#<pr>:<reviewId>`. Replayed webhooks of the same observation share it. Current format: `computeEvidenceKey` in `src/lib/pr-followup-ingestion.ts:255`. |
+| **Evidence identity** | The stable key of an observation, e.g. `review:<repo>#<pr>:<reviewId>`. Replayed webhooks of the same observation share it. Current format: `computeEvidenceKey` in `src/lib/pr-followup-ingestion.ts:270`. |
 | **Evidence version** | The state-bearing fields of an identity (head SHA, review state/`commit_id`, comment resolution/`updated_at`, check `status`/`conclusion`). A new *version* of a known identity is only fresh if its transition is actionable. |
 | **Evidence ledger** | The durable, per-item record of every distinct observation: one row per `(item, identity)` holding the current `version`, the ledger sequence at which the transition was first recorded, and the forge-side event timestamp where one exists. **Proposed.** Re-recording an already-stored `(identity, version)` never creates a transition and never restamps anything. See [Evidence watermark lifetime](#evidence-watermark-lifetime). |
 | **Evidence watermark** | The evidence ledger's recorded `(identity, version)` transitions for the item, relative to which freshness is measured. Today only approximated by `evidenceKeys` (40, FIFO) and `postDispatchEvidenceKeys` (20, priority-eviction), both bounded and lossy; see [Evidence watermark lifetime](#evidence-watermark-lifetime). |
@@ -170,7 +170,7 @@ caches are bounded and lossy:
   `slice(-maxItems)`, `src/lib/pr-fix-queue/shared.ts:68`), and one review contributes
   one key per inline comment, so eviction is routine.
 - **Current:** `postDispatchEvidenceKeys` is a *separate* 20-entry list with
-  priority eviction (`src/lib/pr-fix-queue/lane-admission.ts:201`). Every fresh attempt **clears** it (`src/lib/pr-fix-queue/evidence.ts:45`).
+  priority eviction (`src/lib/pr-fix-queue/evidence.ts:165`). Every fresh attempt **clears** it (`src/lib/pr-fix-queue/enqueue.ts:449`).
 - **Current:** `PrFixHistory` is the immutable audit record.
 
 The design therefore makes a **durable evidence ledger plus a per-attempt
@@ -256,11 +256,11 @@ by fresh evidence depends on **hold class** and **remaining budget**, not on
 **Budget-exhausted** means `stagnationCount >= PR_FIX_MAX_STAGNATION` **or**
 `handoutReclaims >= PR_FIX_MAX_RECLAIMS` (#1543). This matters because
 `PARKED`/`no_progress` is *created by* those caps: six of the seven `PARKED`
-write sites are cap-exhaustion (`src/lib/pr-fix-queue/escalation-lane.ts:190`, `src/lib/pr-fix-queue/inputs.ts:248`, `src/lib/pr-fix-queue/external-wait.ts:91`,
-`src/lib/pr-fix-queue/shared.ts:138`, `src/lib/pr-fix-queue/claim-handout.ts:219`, `src/lib/pr-fix-queue/enqueue.ts:534`). The seventh is the generic `markPrFixItem` `PARKED`
-path (`src/lib/pr-fix-queue/external-wait.ts:13`, `src/lib/pr-fix-queue/external-wait.ts:193`), reachable from the worker-tier
+write sites are cap-exhaustion (`src/lib/pr-fix-queue/enqueue.ts:315`, `src/lib/pr-fix-queue/settlement.ts:298`, `src/lib/pr-fix-queue/settlement.ts:575`,
+`src/lib/pr-fix-queue/settlement.ts:886`, `src/lib/pr-fix-queue/report-resolution.ts:550`, `src/lib/pr-fix-queue/claim-handout.ts:484`). The seventh is the generic `markPrFixItem` `PARKED`
+path (`src/lib/pr-fix-queue/settlement.ts:448`), reachable from the worker-tier
 `POST /api/pr-fix-queue/mark` and from the bare-`blocked` report in
-`resolvePrFixFromAgentReport` (`src/lib/pr-fix-queue/enqueue.ts:471`); it parks without consuming the
+`resolvePrFixFromAgentReport` (`src/lib/pr-fix-queue/report-resolution.ts:444`); it parks without consuming the
 stagnation budget, so it is **budget-available** and reactivatable.
 
 **Proposed:** the item records why it parked (cap-exhausted vs. budget-available
@@ -341,33 +341,33 @@ cooldown is named.
 | 2 | `QUEUED` (dispatched) | new actionable evidence | stays `QUEUED`; recorded in `postDispatchEvidenceKeys` | — | — | — | In-flight worker cannot see it; settlement must reopen (`#1119`). |
 | 3 | `QUEUED` | duplicate / replayed event | no-op | — | — | — | Identity+version already in `L` at or before `W`. |
 | 4 | `QUEUED` | non-actionable/cleared condition | no-op; recorded for audit | — | — | — | Transient `behind`, resolved comment, dismissed review. |
-| 5 | `FIXED` | fresh actionable evidence | `QUEUED` fresh attempt | +1 | +1 | cap → `PARKED` + stale flag (row 9) | Enqueue reopen (`src/lib/pr-fix-queue/inputs.ts:231`). |
-| 6 | `FIXED` | known evidence, head unchanged | `QUEUED` fresh attempt | +1 | +1 | cap → `PARKED` + stale flag (row 9) | `#940`; FIXED tombstone is untrusted (`src/lib/pr-fix-queue/inputs.ts:228`). |
+| 5 | `FIXED` | fresh actionable evidence | `QUEUED` fresh attempt | +1 | +1 | cap → `PARKED` + stale flag (row 9) | Enqueue reopen (`src/lib/pr-fix-queue/enqueue.ts:288`). |
+| 6 | `FIXED` | known evidence, head unchanged | `QUEUED` fresh attempt | +1 | +1 | cap → `PARKED` + stale flag (row 9) | `#940`; FIXED tombstone is untrusted (`src/lib/pr-fix-queue/enqueue.ts:183`). |
 | 7 | **P** `FIXED` | duplicate/repeated text | no-op | — | — | — | Content signature (proposed); today only the same-identity `#25` path no-ops, and never at `FIXED`/unchanged head (row 6 `#940` runs first). |
-| 8 | **P** `PARKED`/`no_progress`, **budget available** | fresh actionable evidence, cooldown elapsed | `QUEUED` fresh attempt; clear `retryAt`/stale flag | +1 | +1 | cap → `PARKED` | **Gap today:** `PARKED` is sticky to enqueue (`src/lib/pr-fix-queue/inputs.ts:207`). |
+| 8 | **P** `PARKED`/`no_progress`, **budget available** | fresh actionable evidence, cooldown elapsed | `QUEUED` fresh attempt; clear `retryAt`/stale flag | +1 | +1 | cap → `PARKED` | **Gap today:** `PARKED` is sticky to enqueue (`src/lib/pr-fix-queue/enqueue.ts:278`). |
 | 9 | **P** `PARKED`/`no_progress`, **budget exhausted** | fresh actionable evidence | stays `PARKED`; set stale-disposition flag; record evidence | — | — | — | Operator requeue resets budget. Prevents livelock. |
 | 10 | `PARKED`/`infra_failure` | PR feedback | stays `PARKED`; recorded; stale flag | — | — | — | Infra recovery is not PR evidence; needs health signal/operator. |
 | 11 | `PARKED`/`security_failure` | PR feedback | stays `PARKED`; recorded | — | — | — | Operator only (fail-closed). |
 | 12 | **P** `WAITING_EXTERNAL` | recorded recovery trigger fires | `QUEUED` recheck; clear `retryAt` | +1 | — | — | Recheck of the dependency; uncharged (matches current cooldown). |
 | 13 | **P** `WAITING_EXTERNAL` | fresh actionable feedback | `QUEUED` fresh attempt; dependency re-checked on run; clear `retryAt` | +1 | +1 | cap | New work independent of the dependency. |
-| 14 | `WAITING_EXTERNAL` | cooldown elapsed, no trigger | `QUEUED` recheck; clear `retryAt` | +1 | — | `PR_FIX_EXTERNAL_WAIT_COOLDOWN_MS` | Current `reactivateDueExternalWaits` (`src/lib/pr-fix-queue/inputs.ts:30`); **uncharged**. |
-| 15 | `WAITING_EXTERNAL` | duplicate mark / late mark | no-op | — | — | — | Idempotent; cannot change generation (`src/lib/pr-fix-queue/external-wait.ts:15`). |
+| 14 | `WAITING_EXTERNAL` | cooldown elapsed, no trigger | `QUEUED` recheck; clear `retryAt` | +1 | — | `PR_FIX_EXTERNAL_WAIT_COOLDOWN_MS` | Current `reactivateDueExternalWaits` (`src/lib/pr-fix-queue/external-wait.ts:52`); **uncharged**. |
+| 15 | `WAITING_EXTERNAL` | duplicate mark / late mark | no-op | — | — | — | Idempotent; cannot change generation (`src/lib/pr-fix-queue/report-resolution.ts:233`). |
 | 16 | `BLOCKED`/`human_decision` | any automatic evidence | stays `BLOCKED`; recorded; stale flag | — | — | — | Human hold; operator requeue/maintainer only. |
 | 17 | **P** any active | maintainer hold set | stays; hold recorded | — | — | — | Explicit hold; evidence cannot override. |
 | 18 | any active | PR merged/closed/archived | `STALE` | — | — | — | Terminal (`src/lib/pr-fix-queue/reconcile.ts:16`, `src/lib/pr-fix-queue/reconcile.ts:97`). |
-| 19 | `STALE`/`IGNORED` | evidence | stays | — | — | — | Maintainer mark to `QUEUED` only (`requeue` rejects `STALE`, `src/lib/pr-fix-queue/claim-handout.ts:597`). |
+| 19 | `STALE`/`IGNORED` | evidence | stays | — | — | — | Maintainer mark to `QUEUED` only (`requeue` rejects `STALE`, `src/lib/pr-fix-queue/requeue.ts:38`). |
 | 20 | any | operator requeue | `QUEUED` fresh attempt; budgets reset | +1 | reset | — | `requeuePrFixItem` (`src/lib/pr-fix-queue/requeue.ts:23`). |
-| 21 | any | maintainer mark `QUEUED` | `QUEUED` fresh attempt | +1 | +1 | — | `markPrFixItem` QUEUED path (`src/lib/pr-fix-queue/external-wait.ts:197`). |
+| 21 | any | maintainer mark `QUEUED` | `QUEUED` fresh attempt | +1 | +1 | — | `markPrFixItem` QUEUED path (`src/lib/pr-fix-queue/settlement.ts:456`). |
 | 22 | dispatched, unacked, stale | reclaim | `QUEUED` fresh generation | +1 | — | `PR_FIX_MAX_RECLAIMS` → `PARKED` | Hand-out never reached a worker (`#1211`). |
 | 23 | dispatched, **acked**, stale | reclaim attempt | never reclaimed unless every acking agent is dead | — | — | `PR_FIX_MAX_RECLAIMS` → `PARKED` | Durable ack is separated from enduring liveness (#1419): an acked generation is recoverable only when its ack is older than `PR_FIX_ACK_LIVENESS_MS` (default 24h) AND the acking agent produced no recent `AgentRun` activity, plus a defensive open-run probe. Any live evidence or probe error fails closed and keeps the protection. A legacy ack without a timestamp is dated by the dispatch stamp, so pre-#1419 stranded rows stay recoverable. |
-| 24 | any | old-worker settle at stale generation | no-op (`skipped`) | — | — | — | Settlement token fencing (`src/lib/pr-fix-queue/enqueue.ts:260`, `src/lib/pr-fix-queue/enqueue.ts:269`). |
+| 24 | any | old-worker settle at stale generation | no-op (`skipped`) | — | — | — | Settlement token fencing (`src/lib/pr-fix-queue/report-resolution.ts:204`). |
 
 Row 12 vs row 14: a wait that ends because its dependency resolved is an
 uncharged recheck (as today); a wait interrupted by *new feedback* opens a
 charged attempt (row 13), consistent with `FIXED` reopening on new evidence.
 
 **The `#940` exception and its precedence over rows 3/7.** Row 6 is the `#940`
-stale-`FIXED` safety net (`src/lib/pr-fix-queue/inputs.ts:228`, `src/lib/pr-fix-queue/evidence.ts:134`): on a `FIXED`
+stale-`FIXED` safety net (`src/lib/pr-fix-queue/enqueue.ts:183`, `src/lib/pr-fix-queue/evidence.ts:144`): on a `FIXED`
 item whose PR head has not moved, re-detecting **even already-known**
 triggering evidence reopens. That is deliberate — `FIXED` asserts the feedback
 was addressed, and the same evidence persisting at an unchanged head
@@ -400,7 +400,7 @@ apply to it. Precedence is explicit:
    `generation` and evidence watermark. It appends the observation, then
    re-derives the transition from the same snapshot the write is pinned on, so
    a concurrent append cannot be silently absorbed or clobbered (the `#1134`
-   pinned loop, `src/lib/pr-fix-queue/evidence.ts:84`).
+   pinned loop, `src/lib/pr-fix-queue/evidence.ts:92`).
 3. The transition follows the state-transition table by hold class and remaining
    budget. Only `FIXED`, budget-available `PARKED`/`no_progress`, and structured
    `WAITING_EXTERNAL` are reactivatable by evidence; `BLOCKED`, fail-closed
@@ -414,7 +414,7 @@ the configured forge capability and applies the **same** transition rules. It
 must be:
 
 - **Bounded** per run (page/cap, like `reclaimStalePrFixHandouts`,
-  `src/lib/pr-fix-queue/escalation-lane.ts:47`), so a backlog never becomes a thundering herd;
+  `src/lib/pr-fix-queue/claim-handout.ts:271`), so a backlog never becomes a thundering herd;
 - **Fair-rotating** — the bounded external-wait trigger pass
   (`reconcileExternalWaitTriggers`) reads waits least-recently-considered first
   and stamps every row it considered in `triggerEvaluatedAt`, so an earlier
@@ -498,7 +498,7 @@ liveness:
 ### Audit trail
 
 Every transition appends an immutable `PrFixHistory` row. **Proposed** fields
-extend the current row (`prisma/schema.prisma:265`) with: from/to `status`,
+extend the current row (`prisma/schema.prisma:491`) with: from/to `status`,
 `generation`, actor class (worker / operator / maintainer / reconciler), and the
 triggering `(identity, version)`. Prior attempts and their reasons are
 preserved; reactivation never erases the record of why the item was parked or
@@ -512,7 +512,7 @@ next reactivation or operator requeue).
 |---------|--------|
 | `POST /api/pr-fix-queue/requeue` | Release `BLOCKED`, `PARKED`, or `FIXED`; fresh generation; reset attempt and reclaim budgets. |
 | Mark to `QUEUED` (maintainer tier) | Release a sticky settlement including `STALE`/`IGNORED`; fresh generation; +1 attempt. |
-| `POST /api/pr-fix-queue/requeue` for `WAITING_EXTERNAL` (**Proposed**) | Explicitly end an external wait early; today `requeue` rejects it (`src/lib/pr-fix-queue/claim-handout.ts:597`). |
+| `POST /api/pr-fix-queue/requeue` for `WAITING_EXTERNAL` (**Proposed**) | Explicitly end an external wait early; today `requeue` rejects it (`src/lib/pr-fix-queue/requeue.ts:38`). |
 | Maintainer hold (**Proposed**) | Explicit hold that evidence cannot override; cleared only by an operator. |
 | `GET /api/audit` / `PrFixHistory` | Inspect why an item is held and what evidence has arrived since. |
 
@@ -555,21 +555,21 @@ Rules:
 - **Settlement authority is the attempt token.** A report settles exactly the
   `(id, generation)` it was issued; a stale generation, mismatched repo/PR, or
   already-settled status yields `action: "skipped"` with no mutation
-  (`resolvePrFixFromAgentReport`, `src/lib/pr-fix-queue/enqueue.ts:207`; fences at `src/lib/pr-fix-queue/enqueue.ts:260`, `src/lib/pr-fix-queue/enqueue.ts:269`). An old
+  (`resolvePrFixFromAgentReport`, `src/lib/pr-fix-queue/report-resolution.ts:136`; fences at `src/lib/pr-fix-queue/report-resolution.ts:192`, `src/lib/pr-fix-queue/report-resolution.ts:204`, `src/lib/pr-fix-queue/report-resolution.ts:251`). An old
   worker can never settle newer feedback.
 - **Commit-time pins.** Settlement, reclaim, and enqueue writes are
   generation-conditional and, where they touch the watermark, pinned on the
   exact snapshot they decided from, so a concurrent re-issue between read and
   write no-ops the loser. **Current exception:** the terminal reap in
-  `reconcileStalePrFixItems` (`src/lib/pr-fix-queue/claim-handout.ts:322`) and `reconcileArchivedRepoPrFixItems`
-  (`src/lib/pr-fix-queue/claim-handout.ts:383`) writes `STALE` by `id` only, with no generation/status predicate, so
+  `reconcileStalePrFixItems` (`src/lib/pr-fix-queue/reconcile.ts:51`) and `reconcileArchivedRepoPrFixItems`
+  (`src/lib/pr-fix-queue/reconcile.ts:119`) writes `STALE` by `id` only, with no generation/status predicate, so
   a concurrent requeue can be clobbered. **Proposed:** make the reaps
   generation-pinned, or scope this invariant to settlement/reclaim/enqueue
   writes and document the reap exception.
 - **Hand-out ownership.** An acked attempt is protected unless every acking
   agent is provably dead (#1419: ack age past `PR_FIX_ACK_LIVENESS_MS` plus no
   recent agent activity); reclamation otherwise targets only unacked stamped
-  hand-outs and counts toward `PR_FIX_MAX_RECLAIMS` (`src/lib/pr-fix-queue/escalation-lane.ts:47`–`src/lib/pr-fix-queue/escalation-lane.ts:301`).
+  hand-outs and counts toward `PR_FIX_MAX_RECLAIMS` (`src/lib/pr-fix-queue/claim-handout.ts:271`–`src/lib/pr-fix-queue/claim-handout.ts:623`).
   Reactivation must not clear a healthy owner's ack or duplicate an active
   hand-out.
 - **Generation bump on every reactivation** is what makes old-worker settling
@@ -581,7 +581,7 @@ Rules:
 |-----------|----------|
 | Unparseable / unknown event kind | Do **not** advance the watermark; record an `unknown_evidence` audit entry; do **not** reopen (fail-closed against churn); bounded reconciliation re-reads authoritative state. |
 | Missing head SHA on a check | Treat as actionable (conservative) but bounded by cooldown and attempt cap; re-fetch on the next pass. |
-| Missing/unknown PR state | Defer; never reopen or reap into a fresh attempt (`report.unknownState`, `src/lib/pr-fix-queue/escalation-lane.ts:126`). |
+| Missing/unknown PR state | Defer; never reopen or reap into a fresh attempt (`report.unknownState`, `src/lib/pr-fix-queue/claim-handout.ts:408`). |
 | Head fetch failure | Defer with an audit note; never silently absorb and never loop unbounded. |
 
 The asymmetry is deliberate: absorbing real evidence is the bug this design
@@ -659,7 +659,7 @@ Item is `QUEUED` and dispatched (generation `g`). A new `CHANGES_REQUESTED`
 review lands before the worker reports. It is recorded in
 `postDispatchEvidenceKeys` bound to `g`. When the worker reports `FIXED`/`no_changes_needed`,
 settlement sees actionable post-dispatch evidence and reopens a fresh attempt
-at `g+1` (`src/lib/pr-fix-queue/external-wait.ts:180`) instead of marking `FIXED`. Current behavior already matches
+at `g+1` (`src/lib/pr-fix-queue/report-resolution.ts:568`) instead of marking `FIXED`. Current behavior already matches
 this case.
 
 **The webhook is lost instead.** Hand-out at 10:00 stamps the attempt
@@ -676,8 +676,8 @@ recover — pinned by negative control 17.
 
 Worker reports `no_changes_needed`; item becomes `FIXED` at head `H`. Later a
 review requests changes on head `H` (same head) or on a newer head. With new
-actionable evidence, enqueue reopens a fresh attempt (`src/lib/pr-fix-queue/inputs.ts:231`). With the same
-evidence and an unchanged head, the `#940` path reopens (`src/lib/pr-fix-queue/inputs.ts:228`) because the
+actionable evidence, enqueue reopens a fresh attempt (`src/lib/pr-fix-queue/enqueue.ts:288`). With the same
+evidence and an unchanged head, the `#940` path reopens (`src/lib/pr-fix-queue/enqueue.ts:183`) because the
 FIXED tombstone is untrusted. **Gap:** if the new feedback is repeated text
 under a new review id, today it reopens; the design suppresses it via content
 signature.
@@ -686,7 +686,7 @@ signature.
 
 Item is `WAITING_EXTERNAL` on `org/repo#123` with `retryAt = +6h`. A
 `CHANGES_REQUESTED` review lands at +1h. **Current:** the item stays
-`WAITING_EXTERNAL` until the cooldown (sticky at `src/lib/pr-fix-queue/inputs.ts:207`), so the new feedback
+`WAITING_EXTERNAL` until the cooldown (sticky at `src/lib/pr-fix-queue/enqueue.ts:278`), so the new feedback
 is stranded. **Proposed:** fresh actionable feedback opens a fresh generation
 immediately (row 13); the worker re-checks the dependency and, if it is still
 unsatisfied, re-parks with a refreshed `recheckAt`. Alternatively, if the
@@ -727,17 +727,17 @@ observation is recorded for audit only.
 
 | Requirement | Current behavior | Gap |
 |-------------|------------------|-----|
-| Fresh evidence by authoritative identity | `evidenceKeys` dedupe by identity only (`src/lib/pr-fix-queue/shared.ts:68`); `postDispatchEvidenceKeys` for the FIXED-settle path (`src/lib/pr-fix-queue/external-wait.ts:174`) | No version/content-signature model; new id ⇒ fresh even for repeated text. |
+| Fresh evidence by authoritative identity | `evidenceKeys` dedupe by identity only (`src/lib/pr-fix-queue/shared.ts:68`); `postDispatchEvidenceKeys` for the FIXED-settle path (`src/lib/pr-fix-queue/settlement.ts:410`) | No version/content-signature model; new id ⇒ fresh even for repeated text. |
 | Already-resolved comments excluded | No resolution/outdated state is read (`src/lib/github-prs.ts`) | **Gap:** needs a new forge read capability. |
-| Watermark sound under bounds | 40-entry FIFO + 20-entry priority caches; per-attempt reset (`src/lib/pr-fix-queue/evidence.ts:45`) | No durable ledger and no per-attempt evidence watermark: evicted keys can read as fresh, and late-discovered events fail any timestamp-vs-disposition comparison. |
+| Watermark sound under bounds | 40-entry FIFO + 20-entry priority caches; per-attempt reset (`src/lib/pr-fix-queue/enqueue.ts:449`) | No durable ledger and no per-attempt evidence watermark: evicted keys can read as fresh, and late-discovered events fail any timestamp-vs-disposition comparison. |
 | Durable baseline for condition kinds | `merge_state`/`merge_conflict` identity derived from the state string; only bounded caches hold observations | No stable per-condition row: an unchanged persistent condition re-read after eviction reads as new, and no single disposition key can preserve it. |
-| Reactivate operational parking | `PARKED` and `WAITING_EXTERNAL` are sticky to enqueue (`src/lib/pr-fix-queue/inputs.ts:207`) | Fresh evidence does not reactivate budget-available `no_progress`; cap-exhausted parks need an explicit operator path + stale flag. |
-| WAITING_EXTERNAL concrete dependency | Free-text note + timer only (`src/lib/pr-fix-queue/settlement.ts:31`, `src/lib/pr-fix-queue/inputs.ts:30`) | No machine-checkable dependency/evidence/recovery trigger; "no patch" can masquerade as an external wait. |
+| Reactivate operational parking | `PARKED` and `WAITING_EXTERNAL` are sticky to enqueue (`src/lib/pr-fix-queue/enqueue.ts:278`) | Fresh evidence does not reactivate budget-available `no_progress`; cap-exhausted parks need an explicit operator path + stale flag. |
+| WAITING_EXTERNAL concrete dependency | Free-text note + timer only (`src/lib/pr-fix-queue/settlement.ts:31`, `src/lib/pr-fix-queue/external-wait.ts:52`) | No machine-checkable dependency/evidence/recovery trigger; "no patch" can masquerade as an external wait. |
 | Event-driven invalidation of a wait | Cooldown only | No recovery-trigger or fresh-feedback invalidation. |
-| Preserve human decisions | `BLOCKED` sticky; worker settlements pinned (`src/lib/pr-fix-queue/external-wait.ts:51`) | No explicit maintainer hold distinct from `BLOCKED`; no stale-disposition flag when evidence arrives. |
-| Settlement fencing | Attempt token + generation pins + ack/reclaim (`src/lib/pr-fix-queue/enqueue.ts:207`, `src/lib/pr-fix-queue/escalation-lane.ts:47`) | Reap writes are not generation-conditional (`src/lib/pr-fix-queue/claim-handout.ts:322`, `src/lib/pr-fix-queue/claim-handout.ts:383`). |
+| Preserve human decisions | `BLOCKED` sticky; worker settlements pinned (`src/lib/pr-fix-queue/settlement.ts:238`) | No explicit maintainer hold distinct from `BLOCKED`; no stale-disposition flag when evidence arrives. |
+| Settlement fencing | Attempt token + generation pins + ack/reclaim (`src/lib/pr-fix-queue/report-resolution.ts:136`, `src/lib/pr-fix-queue/claim-handout.ts:271`) | Reap writes are not generation-conditional (`src/lib/pr-fix-queue/reconcile.ts:51`, `src/lib/pr-fix-queue/reconcile.ts:119`). |
 | Bounded periodic reconciliation | `pr-followup` sync + `reconcile` reap closed/archived | Reconciliation reaps terminal PRs but does not apply the freshness transition table to active items. |
-| Unknown evidence | Split: unknown event kinds non-actionable; unknown head actionable (`src/lib/pr-fix-queue/handout-ownership.ts:98`) | No single documented policy; no audit entry. |
+| Unknown evidence | Split: unknown event kinds non-actionable; unknown head actionable (`src/lib/pr-fix-queue/evidence.ts:242`) | No single documented policy; no audit entry. |
 
 ## Implementation outline (for the follow-up, not this issue)
 
