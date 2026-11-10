@@ -9,7 +9,9 @@ const { mocks } = vi.hoisted(() => ({
     fetchIssues: vi.fn(),
     issueAggregate: vi.fn(),
     issueFindUnique: vi.fn(),
+    issueFindMany: vi.fn().mockResolvedValue([]),
     issueUpdate: vi.fn(),
+    issueUpdateMany: vi.fn().mockResolvedValue({ count: 0 }),
     issueCreate: vi.fn(),
     issueDeleteMany: vi.fn(),
     transaction: vi.fn(),
@@ -29,6 +31,7 @@ const { mocks } = vi.hoisted(() => ({
     blockedExternalParkCount: vi.fn(),
     issueLifecycleEventCount: vi.fn(),
     issueLaneCount: vi.fn(),
+    issueLaneCreate: vi.fn(),
     auditLogCreate: vi.fn(),
     txIssueFindUnique: vi.fn(),
     createLifecycleEvent: vi.fn(),
@@ -45,9 +48,15 @@ vi.mock("@/lib/prisma", () => ({
     issue: {
       aggregate: mocks.issueAggregate,
       findUnique: mocks.issueFindUnique,
+      findMany: mocks.issueFindMany,
       update: mocks.issueUpdate,
+      updateMany: mocks.issueUpdateMany,
       create: mocks.issueCreate,
       deleteMany: mocks.issueDeleteMany,
+    },
+    issueLane: {
+      create: mocks.issueLaneCreate,
+      count: mocks.issueLaneCount,
     },
     issueLifecycleEvent: {
       create: mocks.createLifecycleEvent,
@@ -70,7 +79,6 @@ vi.mock("@/lib/prisma", () => ({
     groomingChildClaim: { count: mocks.groomingChildClaimCount },
     noPrConclusion: { count: mocks.noPrConclusionCount },
     blockedExternalPark: { count: mocks.blockedExternalParkCount },
-    issueLane: { count: mocks.issueLaneCount },
     auditLog: { create: mocks.auditLogCreate },
   },
 }));
@@ -85,6 +93,7 @@ import {
   fetchAllStateIssues,
   makePrismaIssueStore,
   makePrismaReconcileIssueStore,
+  sweepRetiredLanes,
   defaultCurrentLane,
   currentLaneForLabels,
   SYNC_OVERLAP_BUFFER_MS,
@@ -1331,5 +1340,324 @@ describe("makePrismaReconcileIssueStore — lifecycle evidence (#1202)", () => {
 
     expect(mocks.upsertLifecycleEvent).not.toHaveBeenCalled();
     expect(mocks.issueUpdate).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("sweepRetiredLanes (dispatch#1589)", () => {
+  interface SweepCandidate {
+    id: string;
+    number: number;
+    currentLane?: string | null; // what the transaction's fresh read sees
+    groomingSummary?: string | null;
+  }
+
+  function stubSweepQueries(laneValues: Array<string | null>, candidates: SweepCandidate[] = []) {
+    mocks.issueFindMany.mockImplementation((args: any) =>
+      Promise.resolve(
+        args?.distinct
+          ? laneValues.map((currentLane) => ({ currentLane }))
+          : candidates.map((c) => ({ id: c.id, number: c.number, repository: { fullName: "org/repo" } })),
+      ),
+    );
+    mocks.issueFindUnique.mockImplementation((args: any) => {
+      const match = candidates.find((c) => c.id === args?.where?.id);
+      return Promise.resolve(
+        match
+          ? {
+              currentLane: match.currentLane === undefined ? "legacy-queue" : match.currentLane,
+              groomingSummary: match.groomingSummary ?? null,
+            }
+          : null,
+      );
+    });
+  }
+
+  function runTransaction(fn: (tx: unknown) => Promise<unknown>) {
+    return fn({
+      issue: { findUnique: mocks.issueFindUnique, updateMany: mocks.issueUpdateMany },
+      issueLane: { create: mocks.issueLaneCreate },
+    });
+  }
+
+  beforeEach(() => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    setLaneConfig({
+      lanes: [
+        { id: "local", title: "Local", claimable: true, role: "default" },
+        { id: "frontier", title: "Frontier", claimable: true, role: "escalation" },
+        { id: "backlog", title: "Backlog", claimable: false },
+      ],
+      laneAliases: { normal: "local", escalated: "frontier" },
+    });
+    mocks.issueFindMany.mockReset().mockResolvedValue([]);
+    mocks.issueUpdateMany.mockReset().mockResolvedValue({ count: 1 });
+    mocks.issueLaneCreate.mockReset().mockResolvedValue({ id: "lane-1" });
+    mocks.issueFindUnique.mockReset();
+    mocks.transaction.mockReset().mockImplementation(runTransaction);
+  });
+
+  afterEach(() => {
+    resetLaneConfig();
+    vi.restoreAllMocks();
+    // Restore the module-level defaults the other describes rely on.
+    mocks.issueFindMany.mockReset().mockResolvedValue([]);
+    mocks.issueUpdateMany.mockReset().mockResolvedValue({ count: 0 });
+    mocks.issueFindUnique.mockReset();
+    mocks.transaction.mockReset();
+  });
+
+  it("sweeps an issue with a retired lane id to the backlog lane with provenance", async () => {
+    stubSweepQueries(["legacy-queue"], [{ id: "issue-1", number: 42 }]);
+
+    const swept = await sweepRetiredLanes(["repo-1"]);
+
+    expect(swept).toBe(1);
+    expect(mocks.issueFindMany).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ where: { repositoryId: { in: ["repo-1"] }, currentLane: "legacy-queue" } }),
+    );
+    expect(mocks.issueUpdateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          id: "issue-1",
+          currentLane: "legacy-queue",
+          groomingSummary: { equals: null },
+        },
+        data: expect.objectContaining({
+          currentLane: "backlog",
+          groomingSummary: expect.stringContaining('retired lane "legacy-queue"'),
+        }),
+      }),
+    );
+    expect(mocks.issueLaneCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          issueId: "issue-1",
+          lane: "backlog",
+          model: "lane-sweep",
+          reason: expect.stringContaining("legacy-queue"),
+        }),
+      }),
+    );
+  });
+
+  it("appends the sweep note without dropping an existing grooming summary", async () => {
+    stubSweepQueries(["legacy-queue"], [
+      { id: "issue-1", number: 42, groomingSummary: "operator note: hold for the release cut" },
+    ]);
+
+    const swept = await sweepRetiredLanes(["repo-1"]);
+
+    expect(swept).toBe(1);
+    const summary = mocks.issueUpdateMany.mock.calls[0][0].data.groomingSummary;
+    expect(summary.startsWith("operator note: hold for the release cut")).toBe(true);
+    expect(summary).toContain("Lane sweep");
+  });
+
+  it("leaves an issue with an aliased lane id untouched — aliases never rewrite issue data", async () => {
+    stubSweepQueries(["normal", "escalated"], []);
+
+    const swept = await sweepRetiredLanes(["repo-1"]);
+
+    expect(swept).toBe(0);
+    expect(mocks.issueUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.issueLaneCreate).not.toHaveBeenCalled();
+  });
+
+  it("leaves issues on valid configured lanes untouched, and tolerates a null lane value", async () => {
+    stubSweepQueries(["local", "frontier", "backlog", null], []);
+
+    const swept = await sweepRetiredLanes(["repo-1"]);
+
+    expect(swept).toBe(0);
+    expect(mocks.issueUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.issueLaneCreate).not.toHaveBeenCalled();
+  });
+
+  it("skips a row whose lane was re-set between the candidate query and the transaction", async () => {
+    // The distinct pass saw the retired id; the fresh read inside the
+    // transaction sees a groomer/lane-API re-lane that landed in between.
+    stubSweepQueries(["legacy-queue"], [{ id: "issue-1", number: 42, currentLane: "local" }]);
+
+    const swept = await sweepRetiredLanes(["repo-1"]);
+
+    expect(swept).toBe(0);
+    expect(mocks.issueUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.issueLaneCreate).not.toHaveBeenCalled();
+  });
+
+  it("skips a row whose write guard misses, without a history row", async () => {
+    stubSweepQueries(["legacy-queue"], [{ id: "issue-1", number: 42 }]);
+    mocks.issueUpdateMany.mockResolvedValue({ count: 0 }); // the guard missed
+
+    const swept = await sweepRetiredLanes(["repo-1"]);
+
+    expect(swept).toBe(0);
+    expect(mocks.issueLaneCreate).not.toHaveBeenCalled();
+  });
+
+  it("pins the freshly-read summary in the write guard so a concurrent summary-only groom wins", async () => {
+    // The sweep reads "pre-groom summary"; a concurrent manual groom then
+    // refreshes the summary WITHOUT changing the lane. The conditional write
+    // must carry the read value in its WHERE clause so the concurrent write
+    // wins and the sweep defers to the next sync pass.
+    stubSweepQueries(["legacy-queue"], [
+      { id: "issue-1", number: 42, groomingSummary: "pre-groom summary" },
+    ]);
+    mocks.issueUpdateMany.mockImplementation((args: any) =>
+      Promise.resolve(args?.where?.groomingSummary?.equals === "pre-groom summary" ? { count: 0 } : { count: 1 }),
+    );
+
+    const swept = await sweepRetiredLanes(["repo-1"]);
+
+    expect(swept).toBe(0);
+    expect(mocks.issueUpdateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          id: "issue-1",
+          currentLane: "legacy-queue",
+          groomingSummary: { equals: "pre-groom summary" },
+        }),
+      }),
+    );
+    expect(mocks.issueLaneCreate).not.toHaveBeenCalled();
+  });
+
+  it("skips a row whose summary was concurrently set from null — the IS NULL guard misses", async () => {
+    // The sweep read a null summary (equals: null → IS NULL); a concurrent
+    // groom set a summary without changing the lane, so the guard must miss.
+    stubSweepQueries(["legacy-queue"], [{ id: "issue-1", number: 42 }]);
+    mocks.issueUpdateMany.mockImplementation((args: any) =>
+      Promise.resolve(args?.where?.groomingSummary?.equals === null ? { count: 0 } : { count: 1 }),
+    );
+
+    const swept = await sweepRetiredLanes(["repo-1"]);
+
+    expect(swept).toBe(0);
+    expect(mocks.issueUpdateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          groomingSummary: { equals: null },
+        }),
+      }),
+    );
+    expect(mocks.issueLaneCreate).not.toHaveBeenCalled();
+  });
+
+  it("appends onto a summary that survived the guarded write — the CAS matches the row it read", async () => {
+    stubSweepQueries(["legacy-queue"], [
+      { id: "issue-1", number: 42, groomingSummary: "operator note" },
+    ]);
+
+    const swept = await sweepRetiredLanes(["repo-1"]);
+
+    expect(swept).toBe(1);
+    expect(mocks.issueUpdateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          groomingSummary: { equals: "operator note" },
+        }),
+        data: expect.objectContaining({
+          groomingSummary: expect.stringContaining("operator note"),
+        }),
+      }),
+    );
+  });
+
+  it("rolls back a re-lane whose history row write fails — no lane change without provenance", async () => {
+    stubSweepQueries(["legacy-queue"], [{ id: "issue-1", number: 42 }]);
+    mocks.issueLaneCreate.mockRejectedValue(new Error("db blip"));
+
+    const swept = await sweepRetiredLanes(["repo-1"]);
+
+    // The mock transaction runs the writes in order; a history-write failure
+    // throws out of the transaction, so the sweep reports the row un-swept
+    // (a real transaction would roll the lane update back the same way).
+    expect(swept).toBe(0);
+    expect(mocks.issueLaneCreate).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps sweeping other issues when one transaction fails", async () => {
+    stubSweepQueries(["legacy-queue"], [
+      { id: "issue-a", number: 1 },
+      { id: "issue-b", number: 2 },
+    ]);
+    mocks.issueUpdateMany.mockImplementation((args: any) =>
+      args.where.id === "issue-a"
+        ? Promise.reject(new Error("db blip"))
+        : Promise.resolve({ count: 1 }),
+    );
+
+    const swept = await sweepRetiredLanes(["repo-1"]);
+
+    expect(swept).toBe(1);
+    expect(mocks.issueLaneCreate).toHaveBeenCalledTimes(1);
+    expect(mocks.issueLaneCreate.mock.calls[0][0].data.issueId).toBe("issue-b");
+  });
+
+  it("does nothing when no non-claimable lane is configured (fail-safe, no query)", async () => {
+    setLaneConfig({ lanes: [{ id: "work", title: "Work", claimable: true, role: "default" }] });
+
+    const swept = await sweepRetiredLanes(["repo-1"]);
+
+    expect(swept).toBe(0);
+    expect(mocks.issueFindMany).not.toHaveBeenCalled();
+  });
+
+  it("does nothing when no repository ids are given", async () => {
+    const swept = await sweepRetiredLanes([]);
+    expect(swept).toBe(0);
+    expect(mocks.issueFindMany).not.toHaveBeenCalled();
+  });
+
+  it("runs automatically as part of syncIssuesForRepos, scoped to the synced repos", async () => {
+    stubSweepQueries(["legacy-queue"], [{ id: "issue-1", number: 42 }]);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const store: IssueStore = {
+      findIssue: vi.fn().mockResolvedValue(null),
+      updateIssue: vi.fn().mockResolvedValue(undefined),
+      createIssue: vi.fn().mockResolvedValue(undefined),
+      deleteIssue: vi.fn().mockResolvedValue(false),
+    };
+
+    const response = await syncIssuesForRepos(
+      [{ id: "repo-1", fullName: "org/repo" }],
+      async () => [githubIssue(1)],
+      store,
+    );
+
+    expect(response.success).toBe(true);
+    expect(mocks.issueFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        distinct: ["currentLane"],
+        where: { repositoryId: { in: ["repo-1"] }, currentLane: { not: null } },
+      }),
+    );
+    expect(mocks.issueUpdateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ currentLane: "backlog" }),
+      }),
+    );
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("Lane sweep re-laned 1"));
+  });
+
+  it("a failing sweep does not fail the sync", async () => {
+    mocks.issueFindMany.mockRejectedValue(new Error("db down"));
+    const store: IssueStore = {
+      findIssue: vi.fn().mockResolvedValue(null),
+      updateIssue: vi.fn().mockResolvedValue(undefined),
+      createIssue: vi.fn().mockResolvedValue(undefined),
+      deleteIssue: vi.fn().mockResolvedValue(false),
+    };
+
+    const response = await syncIssuesForRepos(
+      [{ id: "repo-1", fullName: "org/repo" }],
+      async () => [githubIssue(1)],
+      store,
+    );
+
+    expect(response.success).toBe(true);
+    expect(response.syncedCount).toBe(1);
+    expect(mocks.issueUpdateMany).not.toHaveBeenCalled();
   });
 });
