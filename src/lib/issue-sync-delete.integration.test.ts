@@ -11,10 +11,14 @@
  * Scenarios:
  * 1. An unguarded cached issue is pruned end-to-end (the lock query executes).
  * 2. An issue with a dependent work row is refused, row kept whole.
- * 3. A concurrent uncommitted dependent insert holds `FOR KEY SHARE` on the
- *    parent row while the prune decision runs; on commit the counts see it
- *    and the delete is refused — a landed dependent row is never
- *    cascade-deleted. On rollback the prune completes.
+ * 3. A concurrent dependent insert holds `FOR KEY SHARE` on the parent row
+ *    while the prune decision starts, so the decision cannot even reach its
+ *    counts; on rollback the counts see nothing and the prune completes.
+ * 4. A dependent insert that COMMITS while the prune is waiting is seen by
+ *    the counts, and the prune refuses instead of cascade-deleting it. This
+ *    is the scenario that discriminates the lock mode: with the weaker
+ *    `FOR NO KEY UPDATE` the counts run before the commit, see nothing, and
+ *    the delete destroys the just-committed dependent work.
  *
  * Opt-in via RUN_DB_INTEGRATION=1, NOT merely DATABASE_URL: that variable
  * is set workflow-wide in ci.yaml, so gating on it alone would make this
@@ -131,7 +135,7 @@ suite("the #1587 excluded-reconcile prune against a real PostgreSQL", () => {
     await expect(db.lease.count({ where: { issueId } })).resolves.toBe(1);
   });
 
-  it("a dependent insert holding FOR KEY SHARE blocks the decision: commit is refused, rollback prunes", async () => {
+  it("a dependent insert holding FOR KEY SHARE blocks the decision: a rolled-back insert lets the prune complete", async () => {
     await seedIssue();
     const store = makePrismaIssueStore();
 
@@ -167,30 +171,42 @@ suite("the #1587 excluded-reconcile prune against a real PostgreSQL", () => {
     const dependentSettled = dependentTx.catch((error) => String(error));
 
     await inserted;
-    const deletePromise = store.deleteIssue(issueId);
-    let deleteSettled = false;
-    void deletePromise.then(
-      () => {
-        deleteSettled = true;
-      },
-      () => {
-        deleteSettled = true;
-      },
-    );
-    // The FOR UPDATE on the parent row conflicts with the held FOR KEY
-    // SHARE, so the decision cannot complete while the insert is open.
-    // (With FOR NO KEY UPDATE the parent lock would not conflict with the
-    // held FOR KEY SHARE, so the decision could complete against the
-    // uncommitted state — the counts see nothing and the delete proceeds.)
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    expect(deleteSettled).toBe(false);
+    let deletePromise: Promise<boolean> | undefined;
+    try {
+      deletePromise = store.deleteIssue(issueId);
+      let deleteSettled = false;
+      void deletePromise.then(
+        () => {
+          deleteSettled = true;
+        },
+        () => {
+          deleteSettled = true;
+        },
+      );
+      // The FOR UPDATE on the parent row conflicts with the held FOR KEY
+      // SHARE, so the decision cannot even reach its dependent-row counts
+      // while the insert is open. (With FOR NO KEY UPDATE the lock statement
+      // itself would NOT conflict: the counts would run against the
+      // uncommitted state and see nothing. The delete's own row lock would
+      // still block here, so this scenario passes under either lock mode —
+      // the committed-insert scenario below is the one that discriminates.)
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(deleteSettled).toBe(false);
 
-    // Rollback: the KEY SHARE releases, the counts find nothing, the prune
-    // completes.
-    releaseGate();
-    await expect(deletePromise).resolves.toBe(true);
-    expect(await dependentSettled).toContain("force-rollback");
-    await expect(db.issue.findUnique({ where: { id: issueId } })).resolves.toBeNull();
+      // Rollback: the KEY SHARE releases, the counts find nothing, the prune
+      // completes.
+      releaseGate();
+      await expect(deletePromise).resolves.toBe(true);
+      expect(await dependentSettled).toContain("force-rollback");
+      await expect(db.issue.findUnique({ where: { id: issueId } })).resolves.toBeNull();
+    } finally {
+      // Never leave the dependent transaction open: while it is open it holds
+      // FOR KEY SHARE on the parent row, so the afterEach cleanup (which
+      // deletes the issue) would block forever instead of reporting the
+      // failure that got us here.
+      releaseGate();
+      await deletePromise?.catch(() => {});
+    }
   });
 
   it("a committed dependent insert is never cascade-deleted by the prune", async () => {
@@ -223,19 +239,27 @@ suite("the #1587 excluded-reconcile prune against a real PostgreSQL", () => {
     });
 
     await inserted;
-    const deletePromise = store.deleteIssue(issueId);
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    let deletePromise: Promise<boolean> | undefined;
+    try {
+      deletePromise = store.deleteIssue(issueId);
+      await new Promise((resolve) => setTimeout(resolve, 200));
 
-    // Commit: the KEY SHARE releases and the lease row becomes visible. The
-    // prune decision — blocked on the parent lock the whole time — then runs
-    // its counts, sees the dependent row, and refuses. The regression this
-    // pins: a weaker lock (FOR NO KEY UPDATE) let the counts run first
-    // against the uncommitted state, the delete then destroyed the just-
-    // committed dependent work.
-    releaseGate();
-    await expect(dependentTx).resolves.toBe("committed");
-    await expect(deletePromise).resolves.toBe(false);
-    await expect(db.issue.findUnique({ where: { id: issueId } })).resolves.not.toBeNull();
-    await expect(db.lease.count({ where: { issueId } })).resolves.toBe(1);
+      // Commit: the KEY SHARE releases and the lease row becomes visible. The
+      // prune decision — blocked on the parent lock the whole time — then runs
+      // its counts, sees the dependent row, and refuses. The regression this
+      // pins: a weaker lock (FOR NO KEY UPDATE) let the counts run first
+      // against the uncommitted state, the delete then destroyed the just-
+      // committed dependent work.
+      releaseGate();
+      await expect(dependentTx).resolves.toBe("committed");
+      await expect(deletePromise).resolves.toBe(false);
+      await expect(db.issue.findUnique({ where: { id: issueId } })).resolves.not.toBeNull();
+      await expect(db.lease.count({ where: { issueId } })).resolves.toBe(1);
+    } finally {
+      // Same reason as the rollback scenario: an open dependent transaction
+      // holds FOR KEY SHARE on the parent row and would hang the cleanup.
+      releaseGate();
+      await deletePromise?.catch(() => {});
+    }
   });
 });
