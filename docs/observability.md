@@ -259,9 +259,9 @@ budget (`stagnationCount`) is bounded by `PR_FIX_MAX_STAGNATION` default 5
 (#1543). Queue and history expose both counters, so an operator can tell a
 long-but-healthy loop (head advancing, `stagnationCount` 0) from a stuck one.
 Hand-out timeout `PR_FIX_HANDOUT_TIMEOUT_MS` default 30 min; reclaim cap
-`PR_FIX_MAX_RECLAIMS` default 3 (`src/lib/pr-fix-queue.ts:579-597`). Past the cap the
+`PR_FIX_MAX_RECLAIMS` default 3 (`src/lib/pr-fix-queue/shared.ts:103-123`). Past the cap the
 item is **PARKED + `no_progress`** — bounded exhaustion, never a human decision
-(`src/lib/pr-fix-queue.ts:937-1010`). The `pr-fix-sweep` scheduler job is
+(`src/lib/pr-fix-queue/claim-handout.ts:271-560`). The `pr-fix-sweep` scheduler job is
 default-disabled, so reclaim may be absent in a default deployment, and the
 overdue signal can rise without an automated sweeper to drain it — see A7.
 

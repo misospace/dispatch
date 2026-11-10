@@ -28,7 +28,7 @@
  *   evidence. Operator only.
  * - row 12 — WAITING_EXTERNAL with a recorded recovery trigger is NOT
  *   decided here: trigger-fired rechecks are uncharged and live in
- *   `reconcileExternalWaitTriggers` (pr-fix-queue.ts). This module only
+ *   `reconcileExternalWaitTriggers` (pr-fix-queue/external-wait.ts). This module only
  *   handles row 13.
  * - row 13 — WAITING_EXTERNAL (structured contract): reactivates on fresh
  *   actionable feedback, charged, independent of any cooldown — fresh

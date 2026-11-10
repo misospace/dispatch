@@ -21,7 +21,7 @@
  *   replay never mints a transition at all.
  *
  * Everything here is pure (no Prisma, no network): the durable ledger rows and
- * the watermark stamp live in `pr-fix-queue.ts` / the next-task hand-out, and
+ * the watermark stamp live in `pr-fix-queue/` / the next-task hand-out, and
  * the reactivation policy that consumes `evaluateEvidenceFreshness` lands in
  * the follow-up (#1253). Do not import forge-specific code from here.
  */
