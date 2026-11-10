@@ -80,11 +80,16 @@ export interface IssueStore {
   /**
    * Delete a cached issue row that GitHub says should not be cached anymore
    * (#1587). Returns true when the row is no longer in the cache (deleted, or
-   * already gone); false when the delete was refused because dependent work
-   * rows exist (the caller logs the retention). Stores must not delete when
-   * any dependent row exists: the schema cascades or null-outs every Issue
-   * foreign key, so an unguarded delete would silently destroy lease, run,
-   * and grooming evidence.
+   * already gone); false when the delete was refused because a dependent row
+   * holds live state (the caller logs the retention).
+   *
+   * A store must refuse whenever any Issue relation that holds work,
+   * coordination, or policy state has a row: the schema cascades those, so an
+   * unguarded delete would silently destroy leases, runs, grooming history,
+   * in-flight fences, and pending reconciliation intents. Only the row's own
+   * derived history (lifecycle events, lane classifications) goes with the
+   * row, and that removal must be recorded. See
+   * makePrismaIssueStore.deleteIssue for the exact set.
    */
   deleteIssue(id: string): Promise<boolean>;
 }
@@ -589,10 +594,34 @@ export function makePrismaIssueStore(): IssueStore {
       await prisma.issue.update({ where: { id }, data });
     },
     async deleteIssue(id: string): Promise<boolean> {
-      // #1587 excluded-reconcile delete. Every Issue foreign key cascades or
-      // null-outs (see prisma/migrations), so a bare delete would silently
-      // take leases, agent runs, and grooming history with it. Refuse when
-      // any dependent work row exists.
+      // #1587 excluded-reconcile delete. The Issue row is the cache's
+      // projection of one GitHub issue, and the rows that hang off it fall
+      // into three kinds. The delete treats them differently.
+      //
+      // 1. LIVE STATE — refused. Every Issue relation that holds work,
+      //    coordination, or policy state is counted first. A row in any of
+      //    them means the issue is not a bare cache row, so the prune is
+      //    refused and the sync keeps it (with the excluded label persisted,
+      //    so it stays invisible and undispatchable). The schema cascades
+      //    these, so an unguarded delete would silently destroy real work:
+      //    agent runs and agent work, leases, grooming runs and
+      //    applications, the in-flight mutation guard, a pending groomer
+      //    reply, handoff settlements, the ownership reconciler's release
+      //    intents and candidates, a decomposed parent's child claims, and
+      //    the no-PR / blocked-external parks.
+      // 2. DERIVED HISTORY — goes with the row, and is recorded.
+      //    IssueLifecycleEvent (the transitions observed for this row) and
+      //    IssueLane (Dispatch's classification of it) describe the cache row
+      //    itself, not work that outlives it, so they are removed with it.
+      //    Guarding them would make the prune unreachable for exactly the
+      //    population it exists to remove: every groomed issue carries an
+      //    IssueLane row, and #1586's stranded rows were all groomed
+      //    normal-lane rows. The prune counts them and records what it
+      //    removed in an AuditLog row, which survives the delete (its issue
+      //    link is nullable), so the loss is recorded rather than silent.
+      // 3. NULLABLE LINKS — survive. AuditLog and CapacityHandoff reference
+      //    the issue through a nullable foreign key: their rows stay and the
+      //    link is cleared (ON DELETE SET NULL).
       //
       // The check and the delete share one transaction behind a FOR UPDATE
       // lock on the row: inserting a dependent row (a claim creating a Lease,
@@ -608,21 +637,78 @@ export function makePrismaIssueStore(): IssueStore {
         async (tx) => {
           await tx.$queryRaw`SELECT id FROM "Issue" WHERE id = ${id} FOR UPDATE`;
 
+          // The row itself, read under the lock this transaction already
+          // holds: the audit record needs its number, its repository, and the
+          // labels the cache carried.
+          const row = await tx.issue.findUnique({
+            where: { id },
+            select: { number: true, labels: true, repository: { select: { fullName: true } } },
+          });
+          // The row is already gone — it was deleted while this transaction
+          // waited for the lock. The cache no longer holds it, which is the
+          // goal, so the prune reports success and records nothing.
+          if (!row) return true;
+
           const dependents = await Promise.all([
+            // Work in flight, or already recorded, for this issue.
             tx.agentRun.count({ where: { issueId: id } }),
             tx.agentWork.count({ where: { issueId: id } }),
             tx.lease.count({ where: { issueId: id } }),
             tx.groomingRun.count({ where: { issueId: id } }),
             tx.groomingApplication.count({ where: { issueId: id } }),
+            // Coordination state: the in-flight fenced write, a pending
+            // groomer reply, a durable handoff settlement, the ownership
+            // reconciler's pending release intent and candidate, and the
+            // child claims a decomposed parent holds.
+            tx.issueMutationGuard.count({ where: { issueId: id } }),
+            tx.groomerPendingReply.count({ where: { issueId: id } }),
+            tx.issueHandoffSettlement.count({ where: { issueId: id } }),
+            tx.ownershipReleaseIntent.count({ where: { issueId: id } }),
+            tx.ownershipReconcileCandidate.count({ where: { issueId: id } }),
+            tx.groomingChildClaim.count({ where: { parentIssueId: id } }),
+            // Policy parks: a terminal no-PR conclusion and a
+            // blocked-external park.
+            tx.noPrConclusion.count({ where: { issueId: id } }),
+            tx.blockedExternalPark.count({ where: { issueId: id } }),
           ]);
           if (dependents.some((count) => count > 0)) return false;
+
+          const [lifecycleEvents, laneClassifications] = await Promise.all([
+            tx.issueLifecycleEvent.count({ where: { issueId: id } }),
+            tx.issueLane.count({ where: { issueId: id } }),
+          ]);
 
           // deleteMany (not delete): a row that vanished concurrently yields 0,
           // not a P2025 that would take the whole repo's sync down with it. A
           // vanished row already satisfies the goal — the cache no longer holds
           // it — so it reports pruned, keeping the false path (and its
           // "dependent rows exist" warning) only for real refusals.
-          await tx.issue.deleteMany({ where: { id } });
+          const deleted = await tx.issue.deleteMany({ where: { id } });
+          if (deleted.count === 0) return true;
+
+          // The durable record of the prune, written after the delete so it
+          // only records a prune that actually happened. issueId stays null on
+          // purpose: the row this entry describes is deleted in this same
+          // transaction, so a link to it could not survive it. The
+          // repository, the issue number, and the id in the notes identify
+          // what was pruned.
+          await tx.auditLog.create({
+            data: {
+              actor: "sync",
+              action: "prune_excluded_issue",
+              repoFullName: row.repository.fullName,
+              issueNumber: row.number,
+              issueId: null,
+              beforeLabels: row.labels,
+              afterLabels: [],
+              success: true,
+              notes:
+                `pruned cached issue ${row.repository.fullName}#${row.number} (${id}): ` +
+                `GitHub labels match DISPATCH_EXCLUDED_LABELS; removed ` +
+                `${lifecycleEvents} lifecycle event(s) and ${laneClassifications} ` +
+                `lane classification(s) with it`,
+            },
+          });
           return true;
         },
         // READ COMMITTED, pinned. The dependent-row counts must see a row

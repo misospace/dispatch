@@ -19,6 +19,12 @@
  *    is the scenario that discriminates the lock mode: with the weaker
  *    `FOR NO KEY UPDATE` the counts run before the commit, see nothing, and
  *    the delete destroys the just-committed dependent work.
+ * 5. An issue that holds COORDINATION state (the in-flight mutation guard)
+ *    is refused too — the guard is not a work model, but it is state that
+ *    would be cascade-deleted with the row.
+ * 6. The prune removes the row's own derived history (lifecycle events, lane
+ *    classifications) and records that removal in an audit row that survives
+ *    the delete.
  *
  * Opt-in via RUN_DB_INTEGRATION=1, NOT merely DATABASE_URL: that variable
  * is set workflow-wide in ci.yaml, so gating on it alone would make this
@@ -55,6 +61,7 @@ suite("the #1587 excluded-reconcile prune against a real PostgreSQL", () => {
   let other: PrismaClient;
   let issueId: string = UNSET_ISSUE_ID;
   let repoId: string = UNSET_ISSUE_ID;
+  let repoFullName: string = UNSET_ISSUE_ID;
 
   beforeAll(async () => {
     db = new PrismaClient({ adapter: new PrismaPg({ connectionString: url as string }) });
@@ -78,6 +85,11 @@ suite("the #1587 excluded-reconcile prune against a real PostgreSQL", () => {
       await db.groomingApplication.deleteMany({ where: { issueId } });
       await db.issue.deleteMany({ where: { id: issueId } });
     }
+    if (repoFullName !== UNSET_ISSUE_ID) {
+      // The prune's audit row carries a NULL issue link (the row it describes
+      // is gone), so it is not reachable by an issue-scoped delete.
+      await db.auditLog.deleteMany({ where: { repoFullName } });
+    }
     if (repoId !== UNSET_ISSUE_ID) {
       await db.repository.deleteMany({ where: { id: repoId } });
     }
@@ -92,6 +104,7 @@ suite("the #1587 excluded-reconcile prune against a real PostgreSQL", () => {
       },
     });
     repoId = repo.id;
+    repoFullName = repo.fullName;
     const issue = await db.issue.create({
       data: {
         number: 1,
@@ -133,6 +146,70 @@ suite("the #1587 excluded-reconcile prune against a real PostgreSQL", () => {
     await expect(store.deleteIssue(issueId)).resolves.toBe(false);
     await expect(db.issue.findUnique({ where: { id: issueId } })).resolves.not.toBeNull();
     await expect(db.lease.count({ where: { issueId } })).resolves.toBe(1);
+  });
+
+  it("refuses the prune when the issue holds coordination state, keeping the row and the guard whole", async () => {
+    await seedIssue();
+    // The in-flight mutation guard is coordination state, not a work model:
+    // it is the fence a concurrent writer holds on this row. It cascades with
+    // the row, so the prune must refuse while it exists.
+    await db.issueMutationGuard.create({
+      data: {
+        issueId,
+        operation: "status_set",
+        ownerToken: `integration-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      },
+    });
+    const store = makePrismaIssueStore();
+
+    await expect(store.deleteIssue(issueId)).resolves.toBe(false);
+    await expect(db.issue.findUnique({ where: { id: issueId } })).resolves.not.toBeNull();
+    await expect(db.issueMutationGuard.count({ where: { issueId } })).resolves.toBe(1);
+  });
+
+  it("removes the row's derived history and records the prune in an audit row that survives the delete", async () => {
+    await seedIssue();
+    await db.issueLifecycleEvent.create({
+      data: {
+        issueId,
+        repoFullName,
+        issueNumber: 1,
+        kind: "status_changed",
+        source: "sync",
+        actor: "github",
+        fromStatus: "status/backlog",
+        toStatus: "status/ready",
+        occurredAt: new Date(),
+      },
+    });
+    await db.issueLane.create({
+      data: {
+        issueId,
+        lane: "normal",
+        confidence: "high",
+      },
+    });
+    const store = makePrismaIssueStore();
+
+    await expect(store.deleteIssue(issueId)).resolves.toBe(true);
+
+    // The row and its own derived history are gone.
+    await expect(db.issue.findUnique({ where: { id: issueId } })).resolves.toBeNull();
+    await expect(db.issueLifecycleEvent.count({ where: { issueId } })).resolves.toBe(0);
+    await expect(db.issueLane.count({ where: { issueId } })).resolves.toBe(0);
+
+    // The loss is recorded: the audit row survives the delete (its issue link
+    // is nullable) and names what went with the row.
+    const audit = await db.auditLog.findFirst({
+      where: { action: "prune_excluded_issue", repoFullName },
+      orderBy: { createdAt: "desc" },
+    });
+    expect(audit).not.toBeNull();
+    expect(audit?.issueId).toBeNull();
+    expect(audit?.issueNumber).toBe(1);
+    expect(audit?.success).toBe(true);
+    expect(audit?.notes).toContain("1 lifecycle event(s)");
+    expect(audit?.notes).toContain("1 lane classification(s)");
   });
 
   it("a dependent insert holding FOR KEY SHARE blocks the decision: a rolled-back insert lets the prune complete", async () => {

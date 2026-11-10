@@ -17,6 +17,18 @@ const { mocks } = vi.hoisted(() => ({
     leaseCount: vi.fn(),
     groomingRunCount: vi.fn(),
     groomingApplicationCount: vi.fn(),
+    issueMutationGuardCount: vi.fn(),
+    groomerPendingReplyCount: vi.fn(),
+    issueHandoffSettlementCount: vi.fn(),
+    ownershipReleaseIntentCount: vi.fn(),
+    ownershipReconcileCandidateCount: vi.fn(),
+    groomingChildClaimCount: vi.fn(),
+    noPrConclusionCount: vi.fn(),
+    blockedExternalParkCount: vi.fn(),
+    issueLifecycleEventCount: vi.fn(),
+    issueLaneCount: vi.fn(),
+    auditLogCreate: vi.fn(),
+    txIssueFindUnique: vi.fn(),
     createLifecycleEvent: vi.fn(),
     upsertLifecycleEvent: vi.fn(),
   },
@@ -38,6 +50,7 @@ vi.mock("@/lib/prisma", () => ({
     issueLifecycleEvent: {
       create: mocks.createLifecycleEvent,
       upsert: mocks.upsertLifecycleEvent,
+      count: mocks.issueLifecycleEventCount,
     },
     // Interactive transaction client (#1587 prune): the callback receives a
     // tx object carrying the same mocks the top-level client would use.
@@ -47,6 +60,16 @@ vi.mock("@/lib/prisma", () => ({
     lease: { count: mocks.leaseCount },
     groomingRun: { count: mocks.groomingRunCount },
     groomingApplication: { count: mocks.groomingApplicationCount },
+    issueMutationGuard: { count: mocks.issueMutationGuardCount },
+    groomerPendingReply: { count: mocks.groomerPendingReplyCount },
+    issueHandoffSettlement: { count: mocks.issueHandoffSettlementCount },
+    ownershipReleaseIntent: { count: mocks.ownershipReleaseIntentCount },
+    ownershipReconcileCandidate: { count: mocks.ownershipReconcileCandidateCount },
+    groomingChildClaim: { count: mocks.groomingChildClaimCount },
+    noPrConclusion: { count: mocks.noPrConclusionCount },
+    blockedExternalPark: { count: mocks.blockedExternalParkCount },
+    issueLane: { count: mocks.issueLaneCount },
+    auditLog: { create: mocks.auditLogCreate },
   },
 }));
 
@@ -924,13 +947,30 @@ describe("makePrismaIssueStore — lifecycle evidence (#1202)", () => {
 });
 
 describe("makePrismaIssueStore — excluded-reconcile delete (#1587)", () => {
-  const countMocks = [
-    mocks.agentRunCount,
-    mocks.agentWorkCount,
-    mocks.leaseCount,
-    mocks.groomingRunCount,
-    mocks.groomingApplicationCount,
-  ];
+  // Every Issue relation that holds live state (work, coordination, policy).
+  // A row in any of them refuses the prune: the schema cascades those, so an
+  // unguarded delete would destroy real work. The pair with the derived
+  // history below is the only thing the prune may take with the row.
+  const dependentCounts = [
+    ["AgentRun", mocks.agentRunCount, "issueId"],
+    ["AgentWork", mocks.agentWorkCount, "issueId"],
+    ["Lease", mocks.leaseCount, "issueId"],
+    ["GroomingRun", mocks.groomingRunCount, "issueId"],
+    ["GroomingApplication", mocks.groomingApplicationCount, "issueId"],
+    ["IssueMutationGuard", mocks.issueMutationGuardCount, "issueId"],
+    ["GroomerPendingReply", mocks.groomerPendingReplyCount, "issueId"],
+    ["IssueHandoffSettlement", mocks.issueHandoffSettlementCount, "issueId"],
+    ["OwnershipReleaseIntent", mocks.ownershipReleaseIntentCount, "issueId"],
+    ["OwnershipReconcileCandidate", mocks.ownershipReconcileCandidateCount, "issueId"],
+    ["GroomingChildClaim", mocks.groomingChildClaimCount, "parentIssueId"],
+    ["NoPrConclusion", mocks.noPrConclusionCount, "issueId"],
+    ["BlockedExternalPark", mocks.blockedExternalParkCount, "issueId"],
+  ] as const;
+  // The row's own derived history: removed with it, counted and recorded.
+  const derivedCounts = [
+    ["IssueLifecycleEvent", mocks.issueLifecycleEventCount],
+    ["IssueLane", mocks.issueLaneCount],
+  ] as const;
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -944,11 +984,29 @@ describe("makePrismaIssueStore — excluded-reconcile delete (#1587)", () => {
         lease: { count: mocks.leaseCount },
         groomingRun: { count: mocks.groomingRunCount },
         groomingApplication: { count: mocks.groomingApplicationCount },
-        issue: { deleteMany: mocks.issueDeleteMany },
+        issueMutationGuard: { count: mocks.issueMutationGuardCount },
+        groomerPendingReply: { count: mocks.groomerPendingReplyCount },
+        issueHandoffSettlement: { count: mocks.issueHandoffSettlementCount },
+        ownershipReleaseIntent: { count: mocks.ownershipReleaseIntentCount },
+        ownershipReconcileCandidate: { count: mocks.ownershipReconcileCandidateCount },
+        groomingChildClaim: { count: mocks.groomingChildClaimCount },
+        noPrConclusion: { count: mocks.noPrConclusionCount },
+        blockedExternalPark: { count: mocks.blockedExternalParkCount },
+        issueLifecycleEvent: { count: mocks.issueLifecycleEventCount },
+        issueLane: { count: mocks.issueLaneCount },
+        auditLog: { create: mocks.auditLogCreate },
+        issue: { findUnique: mocks.txIssueFindUnique, deleteMany: mocks.issueDeleteMany },
       }),
     );
     mocks.queryRaw.mockResolvedValue([]);
-    countMocks.forEach((count) => count.mockResolvedValue(0));
+    dependentCounts.forEach(([, count]) => count.mockResolvedValue(0));
+    derivedCounts.forEach(([, count]) => count.mockResolvedValue(0));
+    mocks.txIssueFindUnique.mockResolvedValue({
+      number: 42,
+      labels: ["wontfix"],
+      repository: { fullName: "org/repo" },
+    });
+    mocks.auditLogCreate.mockResolvedValue({ id: "audit-1" });
     mocks.issueDeleteMany.mockResolvedValue({ count: 1 });
   });
 
@@ -973,8 +1031,10 @@ describe("makePrismaIssueStore — excluded-reconcile delete (#1587)", () => {
     expect(lockSql).toContain('FROM "Issue"');
     expect(lockSql).toContain("FOR UPDATE");
     expect(lockSql).not.toContain("FOR NO KEY UPDATE");
-    countMocks.forEach((count) => {
-      expect(count).toHaveBeenCalledWith({ where: { issueId: "zombie-1" } });
+    // Every relation that holds live state is counted, under its own foreign
+    // key name. A relation left out of this list cascades silently.
+    dependentCounts.forEach(([, count, field]) => {
+      expect(count).toHaveBeenCalledWith({ where: { [field]: "zombie-1" } });
     });
     expect(mocks.issueDeleteMany).toHaveBeenCalledWith({ where: { id: "zombie-1" } });
   });
@@ -1002,20 +1062,59 @@ describe("makePrismaIssueStore — excluded-reconcile delete (#1587)", () => {
     const store = makePrismaIssueStore();
 
     await expect(store.deleteIssue("zombie-1")).resolves.toBe(true);
+    // Nothing was removed, so nothing is recorded.
+    expect(mocks.auditLogCreate).not.toHaveBeenCalled();
   });
 
-  it.each([
-    ["AgentRun", mocks.agentRunCount],
-    ["AgentWork", mocks.agentWorkCount],
-    ["Lease", mocks.leaseCount],
-    ["GroomingRun", mocks.groomingRunCount],
-    ["GroomingApplication", mocks.groomingApplicationCount],
-  ] as const)("refuses the delete when a dependent %s exists", async (_name, count) => {
-    count.mockResolvedValue(1);
+  it.each(dependentCounts)(
+    "refuses the delete when a dependent %s exists",
+    async (_name, count) => {
+      count.mockResolvedValue(1);
+      const store = makePrismaIssueStore();
+
+      await expect(store.deleteIssue("zombie-1")).resolves.toBe(false);
+      // No dependent row may cascade or null out: the row is kept whole.
+      expect(mocks.issueDeleteMany).not.toHaveBeenCalled();
+      // A refused prune removes nothing, so it records nothing.
+      expect(mocks.auditLogCreate).not.toHaveBeenCalled();
+    },
+  );
+
+  it("records the prune in an audit row, and counts the derived history that goes with it", async () => {
+    // The prune removes the row's own derived history (lifecycle events, lane
+    // classifications). That loss must be recorded, not silent: the audit row
+    // survives the delete because its issue link is nullable.
+    mocks.issueLifecycleEventCount.mockResolvedValue(3);
+    mocks.issueLaneCount.mockResolvedValue(1);
     const store = makePrismaIssueStore();
 
-    await expect(store.deleteIssue("zombie-1")).resolves.toBe(false);
-    // No dependent-work row may cascade or null out: the row is kept whole.
+    await expect(store.deleteIssue("zombie-1")).resolves.toBe(true);
+
+    expect(mocks.auditLogCreate).toHaveBeenCalledTimes(1);
+    const audit = mocks.auditLogCreate.mock.calls[0][0].data;
+    expect(audit.action).toBe("prune_excluded_issue");
+    expect(audit.actor).toBe("sync");
+    expect(audit.repoFullName).toBe("org/repo");
+    expect(audit.issueNumber).toBe(42);
+    // The row this entry describes is deleted in the same transaction, so the
+    // link cannot be kept.
+    expect(audit.issueId).toBeNull();
+    expect(audit.beforeLabels).toEqual(["wontfix"]);
+    expect(audit.success).toBe(true);
+    expect(audit.notes).toContain("org/repo#42");
+    expect(audit.notes).toContain("3 lifecycle event(s)");
+    expect(audit.notes).toContain("1 lane classification(s)");
+  });
+
+  it("writes no audit row when the row is already gone", async () => {
+    // The row vanished while the transaction waited for the lock: the goal is
+    // already met, and nothing was removed, so nothing is recorded.
+    mocks.txIssueFindUnique.mockResolvedValue(null);
+    const store = makePrismaIssueStore();
+
+    await expect(store.deleteIssue("zombie-1")).resolves.toBe(true);
+
+    expect(mocks.auditLogCreate).not.toHaveBeenCalled();
     expect(mocks.issueDeleteMany).not.toHaveBeenCalled();
   });
 
