@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import { appendIssueWhere, buildExcludedLabelWhere } from "@/lib/issue-filters";
+import { parseExcludedLabels } from "@/lib/config";
 
 /** Statuses this endpoint will list. Kept narrow: it exists to find claimed work,
  *  not as a general issue query. */
@@ -33,12 +35,21 @@ export async function GET(request: Request) {
   }
 
   try {
+    // #1610: an issue whose cached labels match DISPATCH_EXCLUDED_LABELS is an
+    // operator visibility opt-out, but the sync prune (#1594) keeps the row
+    // cached when dependent work blocks deletion — without this filter such a
+    // row is listed as claimed work. Same shared filter the issues list and
+    // board apply; the excluded set comes from parseExcludedLabels, so there
+    // is no second definition of it.
+    const where: Record<string, unknown> = {
+      repository: { enabled: true },
+      state: "open",
+      labels: { hasEvery: [`status/${status}`, `agent/${agentName}`] },
+    };
+    appendIssueWhere(where, buildExcludedLabelWhere(parseExcludedLabels(process.env.DISPATCH_EXCLUDED_LABELS)));
+
     const issues = await prisma.issue.findMany({
-      where: {
-        repository: { enabled: true },
-        state: "open",
-        labels: { hasEvery: [`status/${status}`, `agent/${agentName}`] },
-      },
+      where,
       include: { repository: true },
       orderBy: { updatedAt: "desc" },
     });

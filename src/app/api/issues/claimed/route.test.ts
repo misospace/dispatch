@@ -83,6 +83,32 @@ describe("GET /api/issues/claimed", () => {
     });
   });
 
+  // #1610: an excluded row can stay cached when dependent work blocks the
+  // sync prune (#1594), and it must not be listed as claimed work.
+  it("applies the DISPATCH_EXCLUDED_LABELS filter to the query (#1610)", async () => {
+    process.env.DISPATCH_EXCLUDED_LABELS = "wontfix, hold";
+    try {
+      await makeRequest("http://localhost/api/issues/claimed?agentName=opencode");
+
+      const call = mocks.findManyIssues.mock.calls[0][0];
+      expect(call.where).toEqual({
+        repository: { enabled: true },
+        state: "open",
+        labels: { hasEvery: ["status/in-progress", "agent/opencode"] },
+        AND: [{ NOT: { labels: { hasSome: ["wontfix", "hold"] } } }],
+      });
+    } finally {
+      delete process.env.DISPATCH_EXCLUDED_LABELS;
+    }
+  });
+
+  it("adds no excluded-label clause when DISPATCH_EXCLUDED_LABELS is unset (#1610)", async () => {
+    await makeRequest("http://localhost/api/issues/claimed?agentName=opencode");
+
+    const call = mocks.findManyIssues.mock.calls[0][0];
+    expect(call.where.AND).toBeUndefined();
+  });
+
   // The stuck-claim shape: still holding its agent label while back at
   // status/ready, invisible to every reaper because this endpoint only ever
   // returned in-progress. Two p0s sat like that for 20 days.
