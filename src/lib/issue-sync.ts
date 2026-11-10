@@ -84,12 +84,12 @@ export interface IssueStore {
    * holds live state (the caller logs the retention).
    *
    * A store must refuse whenever any Issue relation that holds work,
-   * coordination, or policy state has a row: the schema cascades those, so an
-   * unguarded delete would silently destroy leases, runs, grooming history,
-   * in-flight fences, and pending reconciliation intents. Only the row's own
-   * derived history (lifecycle events, lane classifications) goes with the
-   * row, and that removal must be recorded. See
-   * makePrismaIssueStore.deleteIssue for the exact set.
+   * coordination, or policy state has a row: the schema cascades or nulls out
+   * those, so an unguarded delete would silently destroy leases, runs,
+   * grooming history, in-flight fences, and pending reconciliation intents.
+   * Only the row's own derived history (lifecycle events, lane
+   * classifications) goes with the row, and that removal must be recorded.
+   * See makePrismaIssueStore.deleteIssue for the exact set.
    */
   deleteIssue(id: string): Promise<boolean>;
 }
@@ -602,9 +602,10 @@ export function makePrismaIssueStore(): IssueStore {
       //    coordination, or policy state is counted first. A row in any of
       //    them means the issue is not a bare cache row, so the prune is
       //    refused and the sync keeps it (with the excluded label persisted,
-      //    so it stays invisible and undispatchable). The schema cascades
-      //    these, so an unguarded delete would silently destroy real work:
-      //    agent runs and agent work, leases, grooming runs and
+      //    so it stays invisible and undispatchable). The schema cascades or
+      //    nulls out these, so an unguarded delete would silently destroy
+      //    real work — or strip the link that says which issue the work
+      //    belongs to: agent runs and agent work, leases, grooming runs and
       //    applications, the in-flight mutation guard, a pending groomer
       //    reply, handoff settlements, the ownership reconciler's release
       //    intents and candidates, a decomposed parent's child claims, and
@@ -613,15 +614,17 @@ export function makePrismaIssueStore(): IssueStore {
       //    IssueLifecycleEvent (the transitions observed for this row) and
       //    IssueLane (Dispatch's classification of it) describe the cache row
       //    itself, not work that outlives it, so they are removed with it.
-      //    Guarding them would make the prune unreachable for exactly the
-      //    population it exists to remove: every groomed issue carries an
-      //    IssueLane row, and #1586's stranded rows were all groomed
-      //    normal-lane rows. The prune counts them and records what it
-      //    removed in an AuditLog row, which survives the delete (its issue
-      //    link is nullable), so the loss is recorded rather than silent.
-      // 3. NULLABLE LINKS — survive. AuditLog and CapacityHandoff reference
-      //    the issue through a nullable foreign key: their rows stay and the
-      //    link is cleared (ON DELETE SET NULL).
+      //    Guarding them would block the prune for much of the population it
+      //    exists to clear: a lane classification writes an IssueLane row on
+      //    its own (POST /api/issues/[issueId]/lane), so an issue that was
+      //    classified and later gained an excluded label would keep its row
+      //    forever. The prune counts them and records what it removed in an
+      //    AuditLog row, which survives the delete (its issue link is
+      //    nullable), so the loss is recorded rather than silent.
+      // 3. NULLABLE LINKS — survive. AuditLog references the issue through a
+      //    nullable foreign key (ON DELETE SET NULL), so its rows stay and
+      //    the link is cleared. CapacityHandoff stores the issue id as a
+      //    plain column with no foreign key, so its rows survive too.
       //
       // The check and the delete share one transaction behind a FOR UPDATE
       // lock on the row: inserting a dependent row (a claim creating a Lease,

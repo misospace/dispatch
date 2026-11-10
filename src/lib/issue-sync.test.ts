@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { Prisma } from "@prisma/client";
+import { readFileSync } from "fs";
+import { join } from "path";
 import { GitHubIssue } from "@/types";
 
 const { mocks } = vi.hoisted(() => ({
@@ -88,6 +90,8 @@ import {
   SYNC_OVERLAP_BUFFER_MS,
 } from "./issue-sync";
 import { setLaneConfig, resetLaneConfig } from "@/lib/lane-config";
+
+const REPO_ROOT = join(__dirname, "..", "..");
 
 function githubIssue(number: number, overrides?: Partial<GitHubIssue>): GitHubIssue {
   return {
@@ -1104,6 +1108,54 @@ describe("makePrismaIssueStore — excluded-reconcile delete (#1587)", () => {
     expect(audit.notes).toContain("org/repo#42");
     expect(audit.notes).toContain("3 lifecycle event(s)");
     expect(audit.notes).toContain("1 lane classification(s)");
+    // The counts are read for THIS row.
+    expect(mocks.issueLifecycleEventCount).toHaveBeenCalledWith({ where: { issueId: "zombie-1" } });
+    expect(mocks.issueLaneCount).toHaveBeenCalledWith({ where: { issueId: "zombie-1" } });
+  });
+
+  it("classifies every relation the Issue model has", () => {
+    // The guard list is hand-maintained, so a relation added to the schema
+    // later would be cascade-deleted without anyone noticing. This test reads
+    // the schema and fails until every Issue relation is classified: guarded
+    // (a dependent row refuses the prune), derived history (removed with the
+    // row and recorded), or surviving (a nullable link that is only cleared).
+    const schema = readFileSync(join(REPO_ROOT, "prisma", "schema.prisma"), "utf-8");
+    const modelBlock = schema.slice(schema.indexOf("model Issue {"));
+    const body = modelBlock.slice(0, modelBlock.indexOf("\n}"));
+    const scalarTypes = new Set([
+      "String",
+      "Boolean",
+      "Int",
+      "Float",
+      "BigInt",
+      "Decimal",
+      "DateTime",
+      "Json",
+      "Bytes",
+    ]);
+    const relations = [...body.matchAll(/^\s+(\w+)\s+([A-Z]\w+)(\[\]|\?)?\s*$/gm)]
+      .map((match) => ({ field: match[1], model: match[2] }))
+      .filter((relation) => !scalarTypes.has(relation.model));
+
+    expect(relations.length).toBeGreaterThan(0);
+
+    const guarded = new Set<string>(dependentCounts.map(([model]) => model));
+    const derived = new Set(["IssueLifecycleEvent", "IssueLane"]);
+    const surviving = new Set(["AuditLog"]);
+    for (const relation of relations) {
+      expect(
+        guarded.has(relation.model) || derived.has(relation.model) || surviving.has(relation.model),
+        `Issue relation "${relation.field}" (${relation.model}) is not classified for the #1587 prune`,
+      ).toBe(true);
+    }
+    // And the guard list must not name a model the schema no longer has: a
+    // stale entry would count a table that no longer exists.
+    for (const [model] of dependentCounts) {
+      expect(
+        relations.some((relation) => relation.model === model),
+        `the prune guard names ${model}, which the Issue model no longer relates to`,
+      ).toBe(true);
+    }
   });
 
   it("writes no audit row when the row is already gone", async () => {

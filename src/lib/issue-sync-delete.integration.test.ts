@@ -167,6 +167,25 @@ suite("the #1587 excluded-reconcile prune against a real PostgreSQL", () => {
     await expect(db.issueMutationGuard.count({ where: { issueId } })).resolves.toBe(1);
   });
 
+  it("refuses the prune when the issue holds a policy park, keeping the row and the park whole", async () => {
+    await seedIssue();
+    // A terminal no-PR conclusion is a park on the issue: it is policy state
+    // that the schema cascades, so the prune must refuse while it exists.
+    await db.noPrConclusion.create({
+      data: {
+        issueId,
+        agentName: "worker",
+        outcome: "no_changes_needed",
+        contentFingerprint: `integration-fingerprint-${Date.now()}`,
+      },
+    });
+    const store = makePrismaIssueStore();
+
+    await expect(store.deleteIssue(issueId)).resolves.toBe(false);
+    await expect(db.issue.findUnique({ where: { id: issueId } })).resolves.not.toBeNull();
+    await expect(db.noPrConclusion.count({ where: { issueId } })).resolves.toBe(1);
+  });
+
   it("removes the row's derived history and records the prune in an audit row that survives the delete", async () => {
     await seedIssue();
     await db.issueLifecycleEvent.create({
