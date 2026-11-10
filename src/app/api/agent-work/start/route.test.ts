@@ -16,10 +16,15 @@ const mockTransaction = vi.fn((fn: (tx: any) => Promise<any>) => fn({
   agentWorkHistory: mockAgentWorkHistory,
 }));
 
+const { mockIssueFindUnique } = vi.hoisted(() => ({ mockIssueFindUnique: vi.fn() }));
+
 vi.mock("@/lib/prisma", () => ({
   prisma: {
     auditLog: {
       create: vi.fn(async () => ({ id: "audit-1" })),
+    },
+    issue: {
+      findUnique: mockIssueFindUnique,
     },
   },
   asAgentWorkClient: (client: any) => ({
@@ -175,6 +180,54 @@ describe("POST /api/agent-work/start", () => {
     expect(res.status).toBe(400);
     const body = await res.json();
     expect(body.error).toBe("Missing required field: agentName (string)");
+  });
+
+  // #1605: the queue never offers an excluded issue and the claim refuses it
+  // by id; start is the last door where an AgentWork row could still attach.
+  it("refuses an issue whose cached labels match DISPATCH_EXCLUDED_LABELS", async () => {
+    process.env.DISPATCH_EXCLUDED_LABELS = "wontfix, hold";
+    try {
+      mockIssueFindUnique.mockResolvedValue({ id: "issue-abc", labels: ["wontfix"] });
+      const res = await makeStartRequest({ agentName: "test-agent", issueId: "issue-abc" });
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toContain("DISPATCH_EXCLUDED_LABELS");
+      expect(mockAgentWork.create).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.DISPATCH_EXCLUDED_LABELS;
+    }
+  });
+
+  it("starts work when the cached labels do not match the excluded set", async () => {
+    process.env.DISPATCH_EXCLUDED_LABELS = "wontfix";
+    try {
+      mockIssueFindUnique.mockResolvedValue({ id: "issue-abc", labels: ["bug", "status/ready"] });
+      const res = await makeStartRequest({ agentName: "test-agent", issueId: "issue-abc" });
+      expect(res.status).toBe(201);
+      expect(mockAgentWork.create).toHaveBeenCalled();
+    } finally {
+      delete process.env.DISPATCH_EXCLUDED_LABELS;
+    }
+  });
+
+  it("does not refuse an issueId missing from the cache — the request proceeds as before", async () => {
+    process.env.DISPATCH_EXCLUDED_LABELS = "wontfix";
+    try {
+      mockIssueFindUnique.mockResolvedValue(null);
+      const res = await makeStartRequest({ agentName: "test-agent", issueId: "issue-missing" });
+      // The gate adds no refusal; what startAgentWork then does with an
+      // uncached issueId (a real DB has an AgentWork.issueId → Issue FK) is
+      // pre-existing behavior outside this gate, not asserted here.
+      expect(res.status).not.toBe(400);
+      expect(mockAgentWork.create).toHaveBeenCalled();
+    } finally {
+      delete process.env.DISPATCH_EXCLUDED_LABELS;
+    }
+  });
+
+  it("reads no issue row when DISPATCH_EXCLUDED_LABELS is unset", async () => {
+    const res = await makeStartRequest({ agentName: "test-agent", issueId: "issue-abc" });
+    expect(res.status).toBe(201);
+    expect(mockIssueFindUnique).not.toHaveBeenCalled();
   });
 });
 
