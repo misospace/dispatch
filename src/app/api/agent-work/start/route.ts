@@ -5,6 +5,8 @@ import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { enforceWorkerAgentScope } from "@/lib/worker-identity";
 import { parseStartAgentWorkInput, startAgentWork } from "@/lib/agent-work";
 import { enforceRateLimit } from "@/lib/rate-limit";
+import { isIssueExcludedByLabels } from "@/lib/issue-filters";
+import { parseExcludedLabels } from "@/lib/config";
 
 const RATE_LIMIT = { limit: 30, windowMs: 10_000 } as const;
 
@@ -41,6 +43,9 @@ const RATE_LIMIT = { limit: 30, windowMs: 10_000 } as const;
  * 400 Bad Request — Validation error
  * { "error": "Missing required field: agentName (string)" }
  *
+ * 400 Bad Request — the issue's cached labels match DISPATCH_EXCLUDED_LABELS (#1605)
+ * { "error": "Issue labels match DISPATCH_EXCLUDED_LABELS; agent work cannot start on an excluded issue" }
+ *
  * 401 Unauthorized — Invalid or missing bearer token
  * { "error": "Unauthorized" }
  *
@@ -67,6 +72,28 @@ export async function POST(request: Request) {
     // an unbound legacy worker token is refused here.
     const scopeError = await enforceWorkerAgentScope(auth, parsed.agentName);
     if (scopeError) return scopeError;
+
+    // #1605: the excluded set is an operator visibility opt-out — the queue
+    // never offers such an issue and the claim path refuses it by id (#1604).
+    // Start is the last door: without this gate an AgentWork row still attaches
+    // to an excluded issue and checkpoint/finish reports accumulate on it.
+    // Same cached labels and same predicate as the claim gate and the sync
+    // prune — no second definition of the excluded set. An issueId missing
+    // from the cache has no cached labels to match, so start behaves as
+    // before. With the set unset the gate costs no database read.
+    const excludedLabels = parseExcludedLabels(process.env.DISPATCH_EXCLUDED_LABELS);
+    if (parsed.issueId && excludedLabels.length > 0) {
+      const issue = await prisma.issue.findUnique({
+        where: { id: parsed.issueId },
+        select: { labels: true },
+      });
+      if (issue && isIssueExcludedByLabels(issue.labels, excludedLabels)) {
+        return errorResponse(
+          "Issue labels match DISPATCH_EXCLUDED_LABELS; agent work cannot start on an excluded issue",
+          400,
+        );
+      }
+    }
 
     const work = await startAgentWork(asAgentWorkClient(prisma), parsed);
 
