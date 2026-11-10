@@ -593,12 +593,30 @@ export function IssueCard({ issue, lanes, isDragging, onIssueUpdate }: IssueCard
       <CardContent className="p-3 pt-0">
         <p className="text-sm font-medium line-clamp-2">{issue.title}</p>
         <div className="flex flex-wrap gap-1 mt-2">
-          <span
-            className="px-1.5 py-0.5 text-xs rounded"
-            style={{ backgroundColor: `#${statusColor}20`, color: `#${statusColor}` }}
-          >
-            {issue.labels.find((l) => l.startsWith("status/"))?.replace("status/", "") || "backlog"}
-          </span>
+          {(() => {
+            const statusText = issue.labels.find((l) => l.startsWith("status/"))?.replace("status/", "") || "backlog";
+            // #1590: nothing in a nonexistent lane is blocked on anything — an
+            // un-routable issue displays its own state instead of "blocked".
+            if (issue.unroutableLane && statusText === "blocked") {
+              return (
+                <span
+                  className="px-1.5 py-0.5 text-xs rounded bg-amber-100 text-amber-700"
+                  data-testid="unroutable-status"
+                  title={`Un-routable lane: ${issue.unroutableLane.rawId} (not in the configured lane set)`}
+                >
+                  un-routable
+                </span>
+              );
+            }
+            return (
+              <span
+                className="px-1.5 py-0.5 text-xs rounded"
+                style={{ backgroundColor: `#${statusColor}20`, color: `#${statusColor}` }}
+              >
+                {statusText}
+              </span>
+            );
+          })()}
           {agentLabel && (
             <span className="px-1.5 py-0.5 text-xs rounded bg-purple-100 text-purple-700">
               {agentLabel.replace(AGENT_PREFIX, "")}
@@ -614,7 +632,15 @@ export function IssueCard({ issue, lanes, isDragging, onIssueUpdate }: IssueCard
               {priorityLabel.replace("priority/", "p")}
             </span>
           )}
-          {issue.currentLane && lanes && (() => {
+          {issue.currentLane && issue.unroutableLane ? (
+            <span
+              className="px-1.5 py-0.5 text-xs rounded bg-amber-100 text-amber-700"
+              data-testid="unroutable-lane-badge"
+              title={`Un-routable lane: ${issue.unroutableLane.rawId} (not in the configured lane set)`}
+            >
+              Un-routable: {issue.unroutableLane.rawId}
+            </span>
+          ) : issue.currentLane && lanes ? (() => {
             const laneConfig = lanes.find((l) => l.id === issue.currentLane);
             if (laneConfig) {
               const rawColor = laneConfig.color ?? "#6b7280";
@@ -642,7 +668,7 @@ export function IssueCard({ issue, lanes, isDragging, onIssueUpdate }: IssueCard
                 Unknown: {issue.currentLane}
               </span>
             );
-          })()}
+          })() : null}
           {issue.linkedPrNeedsFollowup && (
             <a
               href={issue.linkedPrUrl ?? issue.url}

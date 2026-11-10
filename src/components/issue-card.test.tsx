@@ -363,3 +363,40 @@ describe("IssueCard superseded grooming reasons (#1453)", () => {
     expect(screen.getByText("Blocked by open bar/repo#20")).toBeInTheDocument();
   });
 });
+
+describe("IssueCard un-routable lane display (#1590)", () => {
+  it("renders the un-routable lane badge for an annotated unknown lane id", () => {
+    const issue = makeIssue({ currentLane: "normal", unroutableLane: { rawId: "normal" } });
+
+    render(React.createElement(IssueCard, { issue }));
+
+    const badge = screen.getByTestId("unroutable-lane-badge");
+    expect(badge).toHaveTextContent("Un-routable: normal");
+    expect(badge).toHaveAttribute("title", "Un-routable lane: normal (not in the configured lane set)");
+  });
+
+  it("shows un-routable instead of blocked for an un-routable issue", () => {
+    const issue = makeIssue({
+      labels: ["status/blocked"],
+      currentLane: "normal",
+      unroutableLane: { rawId: "normal" },
+    });
+
+    render(React.createElement(IssueCard, { issue }));
+
+    expect(screen.getByTestId("unroutable-status")).toHaveTextContent("un-routable");
+    expect(screen.queryByText("blocked")).not.toBeInTheDocument();
+  });
+
+  it("keeps showing blocked for a dependency-blocked issue on a configured lane", () => {
+    const lanes = [{ id: "local", title: "Local", claimable: true, color: "#3b82f6" }];
+    const issue = makeIssue({ labels: ["status/blocked"], currentLane: "local" });
+
+    render(React.createElement(IssueCard, { issue, lanes }));
+
+    expect(screen.queryByTestId("unroutable-status")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("unroutable-lane-badge")).not.toBeInTheDocument();
+    expect(screen.getByText("blocked")).toBeInTheDocument();
+    expect(screen.getByText("Local")).toBeInTheDocument();
+  });
+});

@@ -2,10 +2,10 @@
 
 import { useDroppable } from "@dnd-kit/core";
 import { cn } from "@/lib/utils";
-import { StatusLabel } from "@/types";
 
 interface KanbanColumnProps {
-  id: StatusLabel;
+  /** A BOARD_COLUMNS status id, or the display-only "un-routable" bucket (#1590). */
+  id: string;
   title: string;
   count: number;
   children: React.ReactNode;
