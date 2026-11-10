@@ -4,7 +4,7 @@ import { isIssueExcludedByLabels } from "@/lib/issue-filters";
 import { isEscalationLabel } from "@/lib/issue-lane";
 import { prisma } from "@/lib/prisma";
 import { fetchIssues } from "@/lib/github";
-import { getEscalationLane, assertValidLaneForWrite, defaultCurrentLane } from "@/lib/lane-config";
+import { getEscalationLane, assertValidLaneForWrite, defaultCurrentLane, getBacklogLane, getUnconfiguredLaneInfo } from "@/lib/lane-config";
 import { recordSyncedIssueEvents } from "@/lib/issue-lifecycle";
 
 export interface SyncRepo {
@@ -321,6 +321,22 @@ export async function syncIssuesForRepos(
       console.error(`Issue sync failed for ${repo.fullName}:`, error);
       results.push({ repo: repo.fullName, synced: 0, error: message });
     }
+  }
+
+  // Sync-time lane sweep (#1589): after every pass over these repos, re-lane
+  // cached issues whose currentLane names a retired lane to the backlog lane.
+  // Called here — the one path all three sync entry points (manual, scheduled,
+  // heartbeat) drive — so they cannot drift. Best-effort: a sweep failure is
+  // logged and must not fail a sync whose cache writes already landed.
+  try {
+    const swept = await sweepRetiredLanes(repos.map((repo) => repo.id));
+    if (swept > 0) {
+      console.log(
+        `[issue-sync] Lane sweep re-laned ${swept} issue(s) with retired lane ids to the backlog lane`,
+      );
+    }
+  } catch (error) {
+    console.error("Lane sweep failed:", error);
   }
 
   return {
@@ -747,6 +763,115 @@ export function makePrismaIssueStore(): IssueStore {
       });
     },
   };
+}
+
+/**
+ * Sync-time lane sweep (#1589).
+ *
+ * An issue whose `currentLane` holds a lane id that is neither configured nor
+ * aliased (a retired lane) is invisible to groomer selection and to claim
+ * polls, and no other path ever corrects it — the row persists in the cache
+ * forever. After each sync pass, re-lane those rows to the configured
+ * non-claimable backlog lane: the selector treats the backlog lane as needing
+ * classification, so the groomer re-lanes the issue with current lane
+ * semantics. Backlog is the only safe target — it is never claimable, so a
+ * swept issue cannot be grabbed mid-flight by a poll for the retired id.
+ *
+ * Aliased lane ids are deliberately left alone: aliases are a read-time
+ * resolution mechanism that never rewrites issue data (see lane-config).
+ *
+ * Provenance rides with every write, matching the lane route's transactional
+ * pattern: the re-lane, the note appended to `groomingSummary`, and the
+ * IssueLane history row commit together — a failed history write rolls the
+ * re-lane back rather than committing a lane change without provenance, and
+ * the next sync retries. `model: "lane-sweep"` distinguishes sweep rows from
+ * model/heuristic classifications.
+ *
+ * Each issue commits in its own interactive transaction that re-reads the
+ * row under write contention and re-checks `currentLane` and the freshly-read
+ * `groomingSummary` in the update's WHERE clause: a groomer, reconcile, or
+ * lane-API write landing between the sweep's candidate query and this
+ * transaction — a lane change, or a summary-only refresh that leaves the
+ * retired lane untouched — makes the conditional write miss, and the sweep
+ * skips the row and retries on the next sync pass. The concurrent writer's
+ * value always wins over the sweep's stale read. One residual window is
+ * accepted: a groom that blocks on the sweep's row lock and re-writes the
+ * summary after the sweep's update lands replaces the note (its own
+ * last-writer semantics; the re-lane survives and the IssueLane history row
+ * keeps the provenance).
+ *
+ * Returns the number of issues re-laned. A failure on one issue is logged and
+ * does not abort the sweep or the sync that hosts it. Closed swept rows are
+ * inert — grooming selects open issues only — but they are still swept, so no
+ * cache row anywhere outlives the sync with a retired lane id.
+ */
+export async function sweepRetiredLanes(repositoryIds: string[]): Promise<number> {
+  if (repositoryIds.length === 0) return 0;
+  const backlog = getBacklogLane();
+  if (!backlog) return 0; // No non-claimable lane configured — nothing safe to re-lane to.
+
+  // One distinct query first: lane values in the cache are few, so in the
+  // common (no retired lanes) case the sweep costs exactly this query.
+  const laneValues = await prisma.issue.findMany({
+    where: { repositoryId: { in: repositoryIds }, currentLane: { not: null } },
+    select: { currentLane: true },
+    distinct: ["currentLane"],
+  });
+
+  let swept = 0;
+  for (const { currentLane } of laneValues) {
+    const info = getUnconfiguredLaneInfo(currentLane);
+    if (!info || info.isAliased) continue; // configured, aliased, or unset — not the sweep's business
+
+    const note = `Lane sweep: retired lane "${info.rawId}" is not in the configured lane set; re-laned to backlog lane "${backlog.id}" for re-grooming.`;
+    const candidates = await prisma.issue.findMany({
+      where: { repositoryId: { in: repositoryIds }, currentLane: info.rawId },
+      select: { id: true, number: true, repository: { select: { fullName: true } } },
+    });
+
+    for (const issue of candidates) {
+      try {
+        const didSweep = await prisma.$transaction(async (tx) => {
+          const fresh = await tx.issue.findUnique({
+            where: { id: issue.id },
+            select: { currentLane: true, groomingSummary: true },
+          });
+          if (!fresh || fresh.currentLane !== info.rawId) return false;
+          const summary = await tx.issue.updateMany({
+            where: {
+              id: issue.id,
+              currentLane: info.rawId,
+              // CAS on the summary this transaction read: a concurrent write
+              // that refreshed groomingSummary without touching the lane must
+              // win, so this write misses and the sweep retries next pass.
+              groomingSummary: { equals: fresh.groomingSummary },
+            },
+            data: {
+              currentLane: backlog.id,
+              groomingSummary: fresh.groomingSummary?.trim()
+                ? `${fresh.groomingSummary.trim()}\n${note}`
+                : note,
+            },
+          });
+          if (summary.count === 0) return false; // lane re-set concurrently — keep the fresher value
+          await tx.issueLane.create({
+            data: {
+              issueId: issue.id,
+              lane: backlog.id,
+              confidence: "high",
+              reason: note,
+              model: "lane-sweep",
+            },
+          });
+          return true;
+        });
+        if (didSweep) swept++;
+      } catch (error) {
+        console.error(`Lane sweep failed for ${issue.repository.fullName}#${issue.number}:`, error);
+      }
+    }
+  }
+  return swept;
 }
 
 /**
