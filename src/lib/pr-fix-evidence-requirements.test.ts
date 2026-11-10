@@ -20,7 +20,7 @@
 
 import { describe, expect, it } from "vitest";
 import { existsSync, readdirSync, readFileSync } from "fs";
-import { join, relative } from "path";
+import { join, relative, sep } from "path";
 
 const SRC_DIR = join(__dirname, "..");
 const REPO_ROOT = join(__dirname, "..", "..");
@@ -83,7 +83,13 @@ describe("external-wait contract enforcement (#1250)", () => {
   // WAITING_EXTERNAL, so the external-wait contract is validated exactly once.
   // A second writer could park a malformed `externalWait` as a valid wait
   // without ever meeting `parseExternalWaitInput`.
-const writer = join(SRC_DIR, "lib", "pr-fix-queue.ts");
+  // Since #1592 the queue is a directory module (`src/lib/pr-fix-queue/`,
+  // re-export barrel `pr-fix-queue.ts`); the single-writer surface is that
+  // whole module — the writer itself lives in `pr-fix-queue/settlement.ts`,
+  // and the other submodules only read the status or write history rows.
+  const WRITER_DIR = join(SRC_DIR, "lib", "pr-fix-queue");
+  const isWriterFile = (file: string): boolean =>
+    file === join(SRC_DIR, "lib", "pr-fix-queue.ts") || file.startsWith(`${WRITER_DIR}${sep}`);
   // A status ASSIGNMENT to this value, in any form a writer can use: an
   // object-literal property (`status: "WAITING_EXTERNAL"`,
   // `status: PrFixStatus.WAITING_EXTERNAL`) or a direct assignment
@@ -101,10 +107,10 @@ const writer = join(SRC_DIR, "lib", "pr-fix-queue.ts");
   );
 
   it("WAITING_EXTERNAL has a single status writer (#1276 review)", () => {
-    const outside = assignments.filter((hit) => hit.file !== writer);
+    const outside = assignments.filter((hit) => !isWriterFile(hit.file));
     expect(
       outside.map((hit) => `${relative(REPO_ROOT, hit.file)}:${hit.line} → ${hit.text}`).join("\n"),
-      "Only src/lib/pr-fix-queue.ts may assign `status: \"WAITING_EXTERNAL\"` — every other writer could park an unvalidated external-wait contract. Route WAITING_EXTERNAL marks through markPrFixItem instead.",
+      "Only the src/lib/pr-fix-queue module may assign `status: \"WAITING_EXTERNAL\"` — every other writer could park an unvalidated external-wait contract. Route WAITING_EXTERNAL marks through markPrFixItem instead.",
     ).toBe("");
   });
 
@@ -112,12 +118,12 @@ const writer = join(SRC_DIR, "lib", "pr-fix-queue.ts");
   // the writer must still be the module that turns a request into this status,
   // which means it gates the status AND validates the contract on that gate.
   it("the single-writer scan is not vacuous (the writer still gates this status)", () => {
-    const content = readFileSync(writer, "utf-8");
+    const content = readFileSync(join(WRITER_DIR, "settlement.ts"), "utf-8");
     const gated = /nextStatus\s*===\s*["']WAITING_EXTERNAL["']/.test(content);
     const validated = content.includes("parseExternalWaitInput(");
     expect(
       gated && validated,
-      `src/lib/pr-fix-queue.ts no longer gates WAITING_EXTERNAL via nextStatus and validates it with parseExternalWaitInput (gated=${gated}, validated=${validated}); update this guard and the anchor comment on the markPrFixItem writer.\nAssignments found:\n${located(assignments)}`,
+      `src/lib/pr-fix-queue/settlement.ts no longer gates WAITING_EXTERNAL via nextStatus and validates it with parseExternalWaitInput (gated=${gated}, validated=${validated}); update this guard and the anchor comment on the markPrFixItem writer.\nAssignments found:\n${located(assignments)}`,
     ).toBe(true);
   });
 });
@@ -127,9 +133,15 @@ describe("no credential is logged, echoed, or persisted by the evidence ledger (
   // `src/lib/github-prs-review-threads.ts`; that module never existed — the
   // review-thread read (`fetchPullRequestReviewThreadStates`) lives in
   // `src/lib/github-prs.ts`, so that is what is scanned here (#1276 review).
+  // Since #1592 the queue is a directory module; scan every submodule
+  // (recursively, so future nested modules stay covered) plus the re-export
+  // barrel so the moved code keeps credential coverage.
+  const prFixQueueDir = join(SRC_DIR, "lib", "pr-fix-queue");
+  const prFixQueueModules = productionSources(prFixQueueDir);
   const MODULES = [
     join(SRC_DIR, "lib", "pr-fix-evidence.ts"),
     join(SRC_DIR, "lib", "pr-fix-queue.ts"),
+    ...prFixQueueModules,
     join(SRC_DIR, "lib", "pr-followup-ingestion.ts"),
     join(SRC_DIR, "lib", "github-prs.ts"),
   ];
