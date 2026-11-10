@@ -1,3 +1,10 @@
+// Pin test mode before any imports: Vite's resolve conditions read the ambient
+// NODE_ENV at config load, and the `define` below only rewrites module source.
+// An ambient NODE_ENV=production (build shell, wrapper, IDE runner) resolves the
+// production react-dom build, which has no React.act and fails component tests
+// with "React.act is not a function" (#1591).
+process.env.NODE_ENV = "test";
+
 import { defineConfig, configDefaults } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import path from "path";
