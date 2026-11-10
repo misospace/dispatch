@@ -14,6 +14,8 @@ const { mocks, prismaMocks, githubMocks, configMocks, reconciliationMocks } = vi
   prismaMocks: {
     issueFindMany: vi.fn((_args?: unknown) => Promise.resolve([] as any)),
     issueUpdate: vi.fn(() => Promise.resolve({} as any)),
+    issueLaneCreate: vi.fn((_args: { data: any }) => Promise.resolve({} as any)),
+    transaction: vi.fn(async (ops: unknown[]) => Promise.all(ops as Promise<unknown>[])),
     auditLogCreate: vi.fn(() => Promise.resolve({} as any)),
     prFixQueueItemFindMany: vi.fn(() => Promise.resolve([] as any)),
     lifecycleRows: [] as Array<Record<string, any>>,
@@ -35,7 +37,9 @@ const { mocks, prismaMocks, githubMocks, configMocks, reconciliationMocks } = vi
 vi.mock("@/lib/prisma", () => ({
   prisma: {
     auditLog: { findMany: mocks.auditLogFindMany, create: prismaMocks.auditLogCreate },
-    issue: { findMany: prismaMocks.issueFindMany, update: prismaMocks.issueUpdate },
+        issue: { findMany: prismaMocks.issueFindMany, update: prismaMocks.issueUpdate },
+        issueLane: { create: prismaMocks.issueLaneCreate },
+        $transaction: prismaMocks.transaction,
     prFixQueueItem: { findMany: prismaMocks.prFixQueueItemFindMany },
     issueLifecycleEvent: {
       create: vi.fn(async ({ data }: any) => {
@@ -77,6 +81,7 @@ vi.mock("@/lib/issue-reconciliation", async (importOriginal) => ({
 
 import { GET, POST } from "./route";
 import { resetAuthCaches } from "@/lib/auth";
+import { resetRateLimits } from "@/lib/rate-limit";
 
 function request(urlString: string, includeAuth = true) {
   return authedRequest(urlString, { includeAuth });
@@ -806,5 +811,131 @@ describe("POST — merge evidence after close (#1203)", () => {
       issueNumber: 42,
       metadata: { pullRequestNumber: 7, linkSource: "body-keyword" },
     });
+  });
+});
+
+describe("POST — lane history rows (#1598)", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    // Reset process-global per-actor rate-limit windows per test (see claim suite).
+    resetRateLimits();
+    vi.clearAllMocks();
+    mocks.acquireLock.mockResolvedValue({ locked: true, runId: "test-run" });
+    mocks.releaseLock.mockResolvedValue(undefined);
+    configMocks.getSyncRepos.mockResolvedValue([{ id: "repo-1", fullName: "org/repo" }]);
+    reconciliationMocks.executeActions.mockResolvedValue([]);
+    githubMocks.fetchPullRequests.mockResolvedValue([]);
+    githubMocks.fetchClosedPullRequests.mockResolvedValue([]);
+  });
+
+  function mockIssueRow(overrides: Record<string, unknown>) {
+    const row = { id: "issue-5", number: 5, repositoryId: "repo-1", linkedPrNumber: null, ...overrides };
+    prismaMocks.issueFindMany.mockImplementation(async ({ where }: any) =>
+      [row].filter(
+        (r: { number: number; repositoryId: string }) =>
+          where.number.in.includes(r.number) && r.repositoryId === where.repositoryId,
+      ),
+    );
+    return row;
+  }
+
+  it("creates an IssueLane history row alongside the first-time currentLane write", async () => {
+    const { classifyLaneByHeuristics } = await import("@/lib/issue-reconciliation");
+    mockIssueRow({ currentLane: null });
+    githubMocks.fetchIssues.mockResolvedValue([
+      { number: 5, title: "Add dark mode toggle", body: null, state: "open", labels: [{ name: "enhancement" }] },
+    ]);
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.lanesClassified).toBe(1);
+    const expected = classifyLaneByHeuristics("Add dark mode toggle", null, ["enhancement"]);
+    expect(prismaMocks.issueLaneCreate).toHaveBeenCalledTimes(1);
+    expect(prismaMocks.issueLaneCreate).toHaveBeenCalledWith({
+      data: {
+        issueId: "issue-5",
+        lane: expected.lane,
+        confidence: expected.confidence,
+        reason: expected.reason,
+        model: "heuristic",
+      },
+    });
+    // History row and column write share one transaction.
+    expect(prismaMocks.transaction).toHaveBeenCalledTimes(1);
+    expect(prismaMocks.transaction.mock.calls[0][0]).toHaveLength(2);
+    expect(prismaMocks.issueUpdate).toHaveBeenCalledWith({
+      where: { repositoryId_number: { repositoryId: "repo-1", number: 5 } },
+      data: { currentLane: expected.lane },
+    });
+  });
+
+  it("creates an IssueLane history row for stale-backlog reclassification", async () => {
+    const { classifyLaneByHeuristics } = await import("@/lib/issue-reconciliation");
+    mockIssueRow({ currentLane: "backlog" });
+    githubMocks.fetchIssues.mockResolvedValue([
+      { number: 5, title: "Add dark mode toggle", body: null, state: "open", labels: [{ name: "status/ready" }, { name: "enhancement" }] },
+    ]);
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.lanesClassified).toBe(1);
+    const expected = classifyLaneByHeuristics("Add dark mode toggle", null, ["status/ready", "enhancement"]);
+    expect(prismaMocks.issueLaneCreate).toHaveBeenCalledTimes(1);
+    expect(prismaMocks.issueLaneCreate).toHaveBeenCalledWith({
+      data: {
+        issueId: "issue-5",
+        lane: "local",
+        confidence: expected.confidence,
+        reason: expected.reason,
+        model: "reconcile",
+      },
+    });
+    expect(prismaMocks.issueUpdate).toHaveBeenCalledWith({
+      where: { repositoryId_number: { repositoryId: "repo-1", number: 5 } },
+      data: { currentLane: "local" },
+    });
+  });
+
+  it("records the stale-backlog fallback when the classifier itself still says backlog", async () => {
+    // A placeholder issue reclassifies away from the backlog lane even though
+    // the heuristic classifier still lands on backlog; the history row must
+    // name the lane actually written and note the fallback.
+    mockIssueRow({ currentLane: "backlog" });
+    githubMocks.fetchIssues.mockResolvedValue([
+      { number: 5, title: "New feature TBD", body: "This is a placeholder. More details needed.", state: "open", labels: [{ name: "status/ready" }] },
+    ]);
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+
+    expect(res.status).toBe(200);
+    expect(prismaMocks.issueLaneCreate).toHaveBeenCalledTimes(1);
+    const data = prismaMocks.issueLaneCreate.mock.calls[0][0].data;
+    expect(data.model).toBe("reconcile");
+    expect(data.lane).not.toBe("backlog");
+    expect(data.reason).toContain("default claimable lane");
+    expect(prismaMocks.issueUpdate).toHaveBeenCalledWith({
+      where: { repositoryId_number: { repositoryId: "repo-1", number: 5 } },
+      data: { currentLane: data.lane },
+    });
+  });
+
+  it("writes no lane history row when the lane is already set and not backlog", async () => {
+    mockIssueRow({ currentLane: "normal" });
+    githubMocks.fetchIssues.mockResolvedValue([
+      { number: 5, title: "Open issue", body: null, state: "open", labels: [] },
+    ]);
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.lanesClassified).toBe(0);
+    expect(prismaMocks.issueLaneCreate).not.toHaveBeenCalled();
+    expect(prismaMocks.transaction).not.toHaveBeenCalled();
   });
 });
