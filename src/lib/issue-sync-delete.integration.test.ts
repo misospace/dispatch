@@ -216,6 +216,10 @@ suite("the #1587 excluded-reconcile prune against a real PostgreSQL", () => {
       });
       signalInserted();
       await gate;
+      // The callback's return value is the transaction's resolved value: a
+      // sentinel proves the transaction COMMITTED (a rollback rejects
+      // instead), which is the precondition this scenario turns on.
+      return "committed" as const;
     });
 
     await inserted;
@@ -229,7 +233,7 @@ suite("the #1587 excluded-reconcile prune against a real PostgreSQL", () => {
     // against the uncommitted state, the delete then destroyed the just-
     // committed dependent work.
     releaseGate();
-    await expect(dependentTx).resolves.toBeDefined();
+    await expect(dependentTx).resolves.toBe("committed");
     await expect(deletePromise).resolves.toBe(false);
     await expect(db.issue.findUnique({ where: { id: issueId } })).resolves.not.toBeNull();
     await expect(db.lease.count({ where: { issueId } })).resolves.toBe(1);
