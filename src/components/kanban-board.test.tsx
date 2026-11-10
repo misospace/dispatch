@@ -347,3 +347,103 @@ describe("KanbanBoard horizontal scroll layout", () => {
     expect(sections).toHaveLength(6);
   });
 });
+describe("KanbanBoard un-routable lane display (#1590)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("surfaces un-routable lane issues in a distinct column, excluded from Blocked", () => {
+    render(
+      <KanbanBoard
+        initialIssues={[
+          issue({
+            id: "stranded",
+            title: "Stranded issue",
+            labels: ["status/blocked"],
+            currentLane: "normal",
+            unroutableLane: { rawId: "normal" },
+          }),
+          issue({ id: "real-blocked", title: "Real blocked issue", labels: ["status/blocked"], currentLane: "local" }),
+        ]}
+      />,
+    );
+
+    const unroutable = screen.getByRole("region", { name: "Un-routable" });
+    expect(unroutable).toHaveTextContent("Stranded issue");
+    expect(unroutable).not.toHaveTextContent("Real blocked issue");
+
+    const blocked = screen.getByRole("region", { name: "Blocked" });
+    expect(blocked).toHaveTextContent("Real blocked issue");
+    expect(blocked).not.toHaveTextContent("Stranded issue");
+
+    expect(screen.getByTestId("unroutable-count")).toHaveTextContent("1 un-routable");
+  });
+
+  it("renders no un-routable column or count when every lane is routable", () => {
+    render(<KanbanBoard initialIssues={[issue()]} />);
+
+    expect(screen.queryByRole("region", { name: "Un-routable" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("unroutable-count")).not.toBeInTheDocument();
+    const sections = document.querySelectorAll("section[aria-label]");
+    expect(sections).toHaveLength(BOARD_COLUMNS.length);
+  });
+});
+
+describe("KanbanBoard un-routable column interaction (#1590)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    window.history.replaceState(null, "", "/board");
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("treats drops onto the un-routable bucket as a no-op and widens the grid", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <KanbanBoard
+        initialIssues={[
+          issue({
+            id: "stranded-1",
+            title: "Stranded one",
+            labels: ["status/blocked"],
+            currentLane: "normal",
+            unroutableLane: { rawId: "normal" },
+          }),
+          issue({
+            id: "stranded-2",
+            title: "Stranded two",
+            labels: ["status/ready"],
+            currentLane: "normal",
+            unroutableLane: { rawId: "normal" },
+          }),
+        ]}
+      />,
+    );
+
+    expect(document.querySelector("div.grid")?.className).toContain("xl:grid-cols-7");
+
+    await act(async () => {
+      await dnd.latestProps?.onDragEnd({
+        active: { id: "stranded-1" },
+        over: { id: "un-routable" },
+      });
+    });
+    await act(async () => {
+      await dnd.latestProps?.onDragEnd({
+        active: { id: "stranded-1" },
+        over: { id: "stranded-2" },
+      });
+    });
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});

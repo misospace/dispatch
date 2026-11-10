@@ -288,7 +288,9 @@ describe("GET /api/issues — visible issue filtering", () => {
     const body = await res.json();
 
     expect(res.status).toBe(200);
-    expect(body).toEqual(expectedIssues.map((issue) => ({ ...issue, dependencyBlockReason: null })));
+    expect(body).toEqual(
+      expectedIssues.map((issue) => ({ ...issue, dependencyBlockReason: null, unroutableLane: null })),
+    );
   });
 
   it("returns 500 on database error", async () => {

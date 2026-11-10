@@ -43,6 +43,13 @@ export interface Issue {
   updatedAt: Date;
   closedAt: Date | null;
   currentLane?: string | null;
+  /**
+   * Display-only annotation (#1590): the raw `currentLane` id when it is
+   * neither a configured lane nor alias-resolvable — the issue is un-routable.
+   * Computed at query time by `withUnroutableLaneAnnotations`; never persisted
+   * and does not change the issue's actual lane or status labels.
+   */
+  unroutableLane?: { rawId: string } | null;
   repository: {
     fullName: string;
   };

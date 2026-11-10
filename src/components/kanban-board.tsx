@@ -37,9 +37,16 @@ const XL_GRID_COLS: Record<number, string> = {
 
 const BOARD_GRID_COLUMNS = XL_GRID_COLS[BOARD_COLUMNS.length] ?? "xl:grid-cols-6";
 
-import { getIssuesByStatus, getIssueStatus } from "@/lib/kanban";
+import { getIssuesByStatus, getIssueStatus, getUnroutableLaneIssues, excludeUnroutableLaneIssues } from "@/lib/kanban";
 import type { LaneConfig } from "@/lib/lane-config";
 import { authedFetch } from "@/lib/client-auth";
+
+/**
+ * Display-only bucket (#1590) for issues whose currentLane is not in the
+ * configured lane set. Not a BOARD_COLUMNS entry: dropping onto it is a no-op
+ * and these issues keep their real status labels.
+ */
+const UNROUTABLE_COLUMN: { id: string; title: string } = { id: "un-routable", title: "Un-routable" };
 
 const AUTO_REFRESH_INTERVAL_MS = 30_000; // 30 seconds
 // 10s debounce balances responsiveness with rate-limiting: long enough to batch
@@ -69,6 +76,13 @@ export const KanbanBoard = forwardRef<KanbanBoardRef, KanbanBoardProps>(function
   const [lastRefreshedAt, setLastRefreshedAt] = useState<Date | null>(null);
   const pendingSyncReposRef = useRef<Set<string>>(new Set());
   const syncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // #1590: un-routable issues are surfaced as their own display state instead
+  // of being counted under Blocked.
+  const unroutableIssues = getUnroutableLaneIssues(issues);
+  const routableIssues = excludeUnroutableLaneIssues(issues);
+  const showUnroutableColumn = unroutableIssues.length > 0;
+  const boardGridColumns = XL_GRID_COLS[BOARD_COLUMNS.length + (showUnroutableColumn ? 1 : 0)] ?? BOARD_GRID_COLUMNS;
 
   // Store latest issues in a ref for doRefresh to always use current state
   const issuesRef = useRef(issues);
@@ -200,6 +214,12 @@ export const KanbanBoard = forwardRef<KanbanBoardRef, KanbanBoardProps>(function
 
     const overColumn = BOARD_COLUMNS.find((c) => c.id === overId);
     if (!overColumn) {
+      // Dropping onto the display-only un-routable bucket (or any card inside
+      // it) is a no-op: the bucket is heterogeneous and these issues keep
+      // their real status labels (#1590).
+      if (overId === UNROUTABLE_COLUMN.id) return;
+      if (getUnroutableLaneIssues(issuesRef.current).some((i) => i.id === overId)) return;
+
       const overIssue = issuesRef.current.find((i) => i.id === overId);
       if (!overIssue) return;
 
@@ -259,11 +279,18 @@ export const KanbanBoard = forwardRef<KanbanBoardRef, KanbanBoardProps>(function
   return (
     <div className="space-y-4">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <div className="text-sm text-muted-foreground">
-          {lastRefreshedAt ? `Last refreshed ${lastRefreshedAt.toLocaleTimeString([], {
-            hour: "numeric",
-            minute: "2-digit",
-          })}` : "Last refreshed after page load"}
+        <div className="text-sm text-muted-foreground flex items-center gap-3">
+          <span>
+            {lastRefreshedAt ? `Last refreshed ${lastRefreshedAt.toLocaleTimeString([], {
+              hour: "numeric",
+              minute: "2-digit",
+            })}` : "Last refreshed after page load"}
+          </span>
+          {showUnroutableColumn && (
+            <span data-testid="unroutable-count" className="text-amber-700">
+              {unroutableIssues.length} un-routable
+            </span>
+          )}
         </div>
         <Button onClick={() => void doRefresh()} disabled={refreshing}>
           {refreshing ? "Refreshing..." : "Refresh board"}
@@ -321,10 +348,10 @@ export const KanbanBoard = forwardRef<KanbanBoardRef, KanbanBoardProps>(function
             for viewports too narrow for the tracks to hold their min width. */}
         <div className="overflow-x-auto pb-2">
           <div
-            className={cn("grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4", BOARD_GRID_COLUMNS)}
+            className={cn("grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4", boardGridColumns)}
           >
             {BOARD_COLUMNS.map((column) => {
-              const columnIssues = getIssuesByStatus(issues, column.id);
+              const columnIssues = getIssuesByStatus(routableIssues, column.id);
               return (
                 <KanbanColumn
                   key={column.id}
@@ -350,6 +377,29 @@ export const KanbanBoard = forwardRef<KanbanBoardRef, KanbanBoardProps>(function
                 </KanbanColumn>
               );
             })}
+            {showUnroutableColumn && (
+              <KanbanColumn
+                id={UNROUTABLE_COLUMN.id}
+                title={UNROUTABLE_COLUMN.title}
+                count={unroutableIssues.length}
+              >
+                <SortableContext
+                  items={unroutableIssues.map((i) => i.id)}
+                  strategy={verticalListSortingStrategy}
+                >
+                  <div className="space-y-2">
+                    {unroutableIssues.map((issue) => (
+                      <IssueCard
+                        key={issue.id}
+                        issue={issue}
+                        lanes={lanes}
+                        onIssueUpdate={() => doRefresh()}
+                      />
+                    ))}
+                  </div>
+                </SortableContext>
+              </KanbanColumn>
+            )}
           </div>
         </div>
         <DragOverlay>
