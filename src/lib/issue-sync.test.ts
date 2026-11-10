@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
+import { Prisma } from "@prisma/client";
 import { GitHubIssue } from "@/types";
 
 const { mocks } = vi.hoisted(() => ({
@@ -413,6 +414,50 @@ describe("syncIssuesForRepos — excluded-label reconcile at sync (#1587)", () =
 
     expect(store.deleteIssue).not.toHaveBeenCalled();
     expect(store.updateIssue).toHaveBeenCalled();
+  });
+
+  it("keeps the row and persists the exclusion labels when the prune itself fails, and keeps syncing the repo", async () => {
+    // The prune is the first BLOCKING write in the sync path: it waits on the
+    // row lock, so it can fail where the other writes cannot (a lock wait
+    // that outran the transaction timeout). One issue's failure must not skip
+    // the rest of the repo's sync, and the kept row must not keep its stale
+    // labels — the cached labels are what the board/queue exclusion filters
+    // read. So the failure falls through to the keep path.
+    vi.mocked(store.findIssue)
+      .mockResolvedValueOnce({ id: "zombie-1", labels: ["agent/alpha"] })
+      .mockResolvedValueOnce(null);
+    deleteMock.mockRejectedValueOnce(new Error("Transaction API error: transaction expired"));
+
+    const response = await syncIssuesForRepos(
+      [{ id: "repo-1", fullName: "org/repo" }],
+      async () => [
+        githubIssue(7, { labels: [{ name: "wontfix", color: "ffffff" }] }),
+        githubIssue(8),
+      ],
+      store,
+      EXCLUDED,
+    );
+
+    // The repo's sync continues: the next issue is ingested.
+    expect(response.syncedCount).toBe(1);
+    expect(response.results).toEqual([{ repo: "org/repo", synced: 1, error: null }]);
+    expect(store.createIssue).toHaveBeenCalledWith("repo-1", expect.objectContaining({ number: 8 }));
+    // The kept row carries the excluded label, so it stays out of the board
+    // and queue paths until a later sync can prune it.
+    expect(store.updateIssue).toHaveBeenCalledWith(
+      "zombie-1",
+      expect.objectContaining({ labels: ["wontfix", "agent/alpha"] }),
+      { labels: ["agent/alpha"], state: null },
+    );
+    expect(console.error).toHaveBeenCalledWith(
+      expect.stringContaining("prune failed for cached issue org/repo#7"),
+      expect.any(Error),
+    );
+    // The warning says the prune FAILED — not that dependent rows exist,
+    // which would be a false statement about why the row was kept.
+    expect(console.warn).toHaveBeenCalledWith(
+      expect.stringContaining("kept cached issue org/repo#7: prune failed"),
+    );
   });
 
   it("leaves non-excluded issues untouched by the prune path", async () => {
@@ -932,6 +977,21 @@ describe("makePrismaIssueStore — excluded-reconcile delete (#1587)", () => {
       expect(count).toHaveBeenCalledWith({ where: { issueId: "zombie-1" } });
     });
     expect(mocks.issueDeleteMany).toHaveBeenCalledWith({ where: { id: "zombie-1" } });
+  });
+
+  it("runs the decision under READ COMMITTED so the counts see a row committed after it started", async () => {
+    // The dependent-row counts must read the CURRENT state: under a stronger
+    // isolation level (REPEATABLE READ / SERIALIZABLE) they would read this
+    // transaction's original snapshot, miss a dependent row that committed
+    // while the decision was running, and the delete would destroy it. The
+    // level is pinned so the guarantee does not depend on the server default.
+    const store = makePrismaIssueStore();
+
+    await expect(store.deleteIssue("zombie-1")).resolves.toBe(true);
+
+    expect(mocks.transaction).toHaveBeenCalledWith(expect.any(Function), {
+      isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
+    });
   });
 
   it("reports pruned when the row vanished under the check", async () => {

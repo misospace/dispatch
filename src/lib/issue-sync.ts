@@ -1,4 +1,5 @@
 import { ACTIVE_STATUS_LABELS, GitHubIssue } from "@/types";
+import { Prisma } from "@prisma/client";
 import { isIssueExcludedByLabels } from "@/lib/issue-filters";
 import { isEscalationLabel } from "@/lib/issue-lane";
 import { prisma } from "@/lib/prisma";
@@ -236,27 +237,47 @@ export async function syncIssuesForRepos(
             // GitHub is authoritative: the label says this issue is out of
             // scope for the cache. Prune it, unless real work still hangs off
             // the row (the store refuses those deletes; keep + warn instead).
-            const pruned = await store.deleteIssue(existingIssue.id);
+            let pruned = false;
+            let pruneFailed = false;
+            try {
+              pruned = await store.deleteIssue(existingIssue.id);
+            } catch (error) {
+              // The prune did not complete — a lock wait that outran the
+              // transaction timeout, a transient database error. Two rules hold
+              // here. One issue's failure must not skip the rest of the repo's
+              // sync (the per-repo catch would abort every later issue). And
+              // the kept row must not keep its stale labels, because the
+              // cached labels are what the board/queue exclusion filters read.
+              // So the failure falls through to the keep path, which persists
+              // the excluded label on the row.
+              pruneFailed = true;
+              console.error(
+                `prune failed for cached issue ${repo.fullName}#${ghIssue.number}:`,
+                error,
+              );
+            }
             if (pruned) {
               console.log(
                 `pruned cached issue ${repo.fullName}#${ghIssue.number}: labels now match DISPATCH_EXCLUDED_LABELS`,
               );
             } else {
-              // The store kept the row because dependent work rows exist. The
-              // board/count and agent-queue exclusion filters read the *cached*
-              // labels, so leaving them stale would keep a GitHub-excluded
-              // issue visible and dispatchable indefinitely. Persist the
-              // GitHub-authoritative labels — the excluded label among them —
-              // through the same path a normal sync uses, so every exclusion
-              // consumer sees the kept row as excluded until a later sync can
-              // finally prune it.
+              // The store kept the row because dependent work rows exist (or
+              // the prune failed). The board/count and agent-queue exclusion
+              // filters read the *cached* labels, so leaving them stale would
+              // keep a GitHub-excluded issue visible and dispatchable
+              // indefinitely. Persist the GitHub-authoritative labels — the
+              // excluded label among them — through the same path a normal
+              // sync uses, so every exclusion consumer sees the kept row as
+              // excluded until a later sync can finally prune it.
               const { issueData } = syncedIssueDataFor(ghIssue, existingIssue);
               await store.updateIssue(existingIssue.id, issueData, {
                 labels: existingIssue.labels,
                 state: existingIssue.state ?? null,
               });
               console.warn(
-                `kept cached issue ${repo.fullName}#${ghIssue.number}: labels match DISPATCH_EXCLUDED_LABELS but dependent rows exist`,
+                pruneFailed
+                  ? `kept cached issue ${repo.fullName}#${ghIssue.number}: prune failed, labels match DISPATCH_EXCLUDED_LABELS`
+                  : `kept cached issue ${repo.fullName}#${ghIssue.number}: labels match DISPATCH_EXCLUDED_LABELS but dependent rows exist`,
               );
             }
           }
@@ -583,26 +604,38 @@ export function makePrismaIssueStore(): IssueStore {
       // since the excluded issue is no longer dispatchable work.
       // Row-returning SELECT goes through $queryRaw ($executeRaw is for
       // statements that change rows and cannot return a result set).
-      const pruned = await prisma.$transaction(async (tx) => {
-        await tx.$queryRaw`SELECT id FROM "Issue" WHERE id = ${id} FOR UPDATE`;
+      const pruned = await prisma.$transaction(
+        async (tx) => {
+          await tx.$queryRaw`SELECT id FROM "Issue" WHERE id = ${id} FOR UPDATE`;
 
-        const dependents = await Promise.all([
-          tx.agentRun.count({ where: { issueId: id } }),
-          tx.agentWork.count({ where: { issueId: id } }),
-          tx.lease.count({ where: { issueId: id } }),
-          tx.groomingRun.count({ where: { issueId: id } }),
-          tx.groomingApplication.count({ where: { issueId: id } }),
-        ]);
-        if (dependents.some((count) => count > 0)) return false;
+          const dependents = await Promise.all([
+            tx.agentRun.count({ where: { issueId: id } }),
+            tx.agentWork.count({ where: { issueId: id } }),
+            tx.lease.count({ where: { issueId: id } }),
+            tx.groomingRun.count({ where: { issueId: id } }),
+            tx.groomingApplication.count({ where: { issueId: id } }),
+          ]);
+          if (dependents.some((count) => count > 0)) return false;
 
-        // deleteMany (not delete): a row that vanished concurrently yields 0,
-        // not a P2025 that would take the whole repo's sync down with it. A
-        // vanished row already satisfies the goal — the cache no longer holds
-        // it — so it reports pruned, keeping the false path (and its
-        // "dependent rows exist" warning) only for real refusals.
-        await tx.issue.deleteMany({ where: { id } });
-        return true;
-      });
+          // deleteMany (not delete): a row that vanished concurrently yields 0,
+          // not a P2025 that would take the whole repo's sync down with it. A
+          // vanished row already satisfies the goal — the cache no longer holds
+          // it — so it reports pruned, keeping the false path (and its
+          // "dependent rows exist" warning) only for real refusals.
+          await tx.issue.deleteMany({ where: { id } });
+          return true;
+        },
+        // READ COMMITTED, pinned. The dependent-row counts must see a row
+        // committed AFTER this transaction started — that is what turns the
+        // concurrent insert into a refusal instead of a cascade-delete. Under
+        // READ COMMITTED every statement takes a fresh snapshot, so the counts
+        // read the committed state; under a stronger level (REPEATABLE READ /
+        // SERIALIZABLE) the counts would read this transaction's original
+        // snapshot, miss the dependent row, and the delete would destroy work
+        // that committed while the decision was running. Pinning the level
+        // makes the guarantee independent of the server default.
+        { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted },
+      );
       // The pending-repo-name entry is dropped only once the issue itself is
       // gone. On a refusal the sync core persists the GitHub-authoritative
       // labels via updateIssue, which needs this entry to record the
