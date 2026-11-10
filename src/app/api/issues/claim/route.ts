@@ -16,6 +16,8 @@ import { withIssueMutationGuard } from "@/lib/issue-mutation-guard";
 import { supersedeOwnershipReleaseIntent } from "@/lib/ownership-reconciliation";
 import { clearNoPrConclusionPark, getLiveNoPrConclusion, getNoPrConclusionMode } from "@/lib/no-pr-conclusion";
 import { clearBlockedExternalPark, getBlockedExternalParkMode, getLiveBlockedExternalPark } from "@/lib/blocked-external-park";
+import { isIssueExcludedByLabels } from "@/lib/issue-filters";
+import { parseExcludedLabels } from "@/lib/config";
 
 const IN_PROGRESS_STATUS = "status/in-progress";
 const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
@@ -125,6 +127,17 @@ export async function POST(request: Request) {
     // Refuse closed issues (cached state is fine for this check)
     if (issue.state === "closed") {
       return errorResponse("Cannot claim a closed issue", 400);
+    }
+
+    // #1604: every reader hides issues whose cached labels match
+    // DISPATCH_EXCLUDED_LABELS; a claim by issue id is the last door. The
+    // sync keeps such a row while dependent work blocks its prune, so the
+    // claim itself must refuse it, with the same predicate the sync prune
+    // and the queue filter use. Force does not exempt it: the excluded set
+    // is an operator visibility opt-out, not a claim conflict to override —
+    // work the issue after removing it from the set, like the readers do.
+    if (isIssueExcludedByLabels(issue.labels, parseExcludedLabels(process.env.DISPATCH_EXCLUDED_LABELS))) {
+      return errorResponse("Issue labels match DISPATCH_EXCLUDED_LABELS; the issue is not claimable", 400);
     }
 
     // #1506: a live terminal no-PR conclusion is the durable stop against

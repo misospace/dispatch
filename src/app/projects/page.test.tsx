@@ -46,6 +46,7 @@ vi.mock("@/components/ui/badge", () => ({
 }));
 
 import ProjectsPage from "./page";
+import { buildExcludedLabelWhere } from "@/lib/issue-filters";
 
 function mockIssue(overrides: Record<string, unknown> = {}): unknown {
   return {
@@ -239,6 +240,42 @@ describe("ProjectsPage empty state", () => {
 
     const allText = extractAllText(page);
     expect(allText).toContain("No issues have been synced yet");
+  });
+});
+
+describe("ProjectsPage excluded-label filter (#1604)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    delete process.env.DISPATCH_EXCLUDED_LABELS;
+    mocks.findManyIssues.mockResolvedValue([]);
+  });
+
+  it("filters labels matching DISPATCH_EXCLUDED_LABELS out of the query", async () => {
+    process.env.DISPATCH_EXCLUDED_LABELS = "wontfix\nduplicate";
+
+    await ProjectsPage({ searchParams: Promise.resolve({}) });
+
+    const call = mocks.findManyIssues.mock.calls[0][0];
+    expect(call.where.AND).toEqual(
+      expect.arrayContaining([buildExcludedLabelWhere(["wontfix", "duplicate"])]),
+    );
+  });
+
+  it("adds no excluded-label clause when DISPATCH_EXCLUDED_LABELS is unset", async () => {
+    await ProjectsPage({ searchParams: Promise.resolve({}) });
+
+    const call = mocks.findManyIssues.mock.calls[0][0];
+    const andClauses: unknown[] = Array.isArray(call.where.AND)
+      ? call.where.AND
+      : call.where.AND
+        ? [call.where.AND]
+        : [];
+    // The Renovate exclusion nests under NOT.OR; only the excluded-label
+    // filter puts labels.hasSome inside a NOT clause.
+    const labelExclusions = andClauses.filter(
+      (clause) => (clause as { NOT?: { labels?: { hasSome?: unknown } } }).NOT?.labels?.hasSome,
+    );
+    expect(labelExclusions).toHaveLength(0);
   });
 });
 

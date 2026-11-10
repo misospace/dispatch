@@ -3,7 +3,8 @@ import { handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { parseListLimit } from "@/lib/query-limit";
-import { appendIssueWhere, applyRenovateIssueExclusion, buildNoStatusWhere } from "@/lib/issue-filters";
+import { appendIssueWhere, applyRenovateIssueExclusion, buildExcludedLabelWhere, buildNoStatusWhere } from "@/lib/issue-filters";
+import { parseExcludedLabels } from "@/lib/config";
 
 /**
  * GET /api/issues/untriaged
@@ -68,6 +69,11 @@ export async function GET(request: Request) {
     if (excludeRenovate) {
       applyRenovateIssueExclusion(where);
     }
+
+    // #1604: an operator-excluded label keeps an issue out of every reader,
+    // not just the board — the sync prune that would have deleted the row is
+    // blocked while dependent work exists, so the filter has to live here too.
+    appendIssueWhere(where, buildExcludedLabelWhere(parseExcludedLabels(process.env.DISPATCH_EXCLUDED_LABELS)));
 
     const issues: UntriagedIssue[] = await prisma.issue.findMany({
       where,

@@ -36,7 +36,7 @@ vi.mock("@/types", () => ({
 
 import { GET } from "./route";
 import { resetAuthCaches } from "@/lib/auth";
-import { buildRenovateIssueExclusionWhere } from "@/lib/issue-filters";
+import { buildExcludedLabelWhere, buildRenovateIssueExclusionWhere } from "@/lib/issue-filters";
 
 function request(urlString: string, includeAuth = true) {
   return authedRequest(urlString, { includeAuth });
@@ -70,21 +70,23 @@ function makeIssue(number: number, overrides: Partial<FakeIssue> = {}): FakeIssu
 }
 
 /**
- * Status labels the query excludes, read back out of the route's own `where`
- * clause. Returns null when the route stops asking for the exclusion at all —
- * the fake then stops hiding status-labelled rows, so the behavioural
- * assertion fails instead of silently passing.
+ * Label sets the query excludes, read back out of the route's own `where`
+ * clause — both the `status/*` exclusion and the #1604 excluded-label
+ * exclusion are `NOT { labels: { hasSome } }` AND clauses. Returns the
+ * empty list when the route stops asking for any exclusion at all — the
+ * fake then stops hiding the matching rows, so the behavioural assertion
+ * fails instead of silently passing.
  */
-function excludedStatusLabels(where: Record<string, unknown> | undefined): string[] | null {
+function excludedLabelSets(where: Record<string, unknown> | undefined): string[][] {
   const and = where?.AND;
   const clauses: unknown[] = Array.isArray(and) ? and : and ? [and] : [];
 
+  const sets: string[][] = [];
   for (const clause of clauses) {
-    const not = (clause as { NOT?: { labels?: { hasSome?: unknown } } }).NOT;
-    const hasSome = not?.labels?.hasSome;
-    if (Array.isArray(hasSome)) return hasSome as string[];
+    const hasSome = (clause as { NOT?: { labels?: { hasSome?: unknown } } }).NOT?.labels?.hasSome;
+    if (Array.isArray(hasSome)) sets.push(hasSome as string[]);
   }
-  return null;
+  return sets;
 }
 
 /**
@@ -98,10 +100,10 @@ function fakeIssueFindMany(rows: FakeIssue[]) {
     async (args: { where?: Record<string, unknown>; take?: number }) => {
       const where = args.where ?? {};
       const repository = where.repository as { fullName?: string } | undefined;
-      const statusLabels = excludedStatusLabels(where);
+      const excludedSets = excludedLabelSets(where);
 
       let result = rows.filter(
-        (row) => !statusLabels || !row.labels.some((label) => statusLabels.includes(label)),
+        (row) => !excludedSets.some((set) => row.labels.some((label) => set.includes(label))),
       );
       if (repository?.fullName) {
         result = result.filter((row) => row.repository.fullName === repository.fullName);
@@ -117,6 +119,7 @@ function fakeIssueFindMany(rows: FakeIssue[]) {
 describe("GET /api/issues/untriaged", () => {
   beforeEach(() => {
     delete process.env.DISPATCH_AUTH_MODE;
+    delete process.env.DISPATCH_EXCLUDED_LABELS;
     resetAuthCaches();
     vi.clearAllMocks();
     mocks.issueFindMany.mockResolvedValue([]);
@@ -298,6 +301,37 @@ describe("GET /api/issues/untriaged", () => {
     expect(call.where.AND).toEqual(
       expect.arrayContaining([{ NOT: { labels: { hasSome: STATUS_LABELS } } }]),
     );
+  });
+
+  it("excludes issues whose labels match DISPATCH_EXCLUDED_LABELS (#1604)", async () => {
+    process.env.DISPATCH_EXCLUDED_LABELS = "wontfix, hold";
+    fakeIssueFindMany([
+      makeIssue(1, { title: "Won't do", labels: ["wontfix"] }),
+      makeIssue(2, { title: "Untriaged issue", labels: ["enhancement"] }),
+    ]);
+
+    const res = await GET(request("http://localhost/api/issues/untriaged"));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toHaveLength(1);
+    expect(body[0].number).toBe(2);
+
+    // Exclusion is a query predicate, so `take` stays exact.
+    const call = mocks.issueFindMany.mock.calls[0][0];
+    expect(call.where.AND).toEqual(
+      expect.arrayContaining([buildExcludedLabelWhere(["wontfix", "hold"])]),
+    );
+  });
+
+  it("adds no excluded-label clause when DISPATCH_EXCLUDED_LABELS is unset", async () => {
+    fakeIssueFindMany([makeIssue(1, { labels: ["enhancement"] })]);
+
+    await GET(request("http://localhost/api/issues/untriaged"));
+
+    const call = mocks.issueFindMany.mock.calls[0][0];
+    // Only the `status/*` exclusion carries a label-hasSome NOT clause.
+    expect(excludedLabelSets(call.where)).toHaveLength(1);
   });
 
   it("returns 500 on database error", async () => {
