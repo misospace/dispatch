@@ -4,7 +4,7 @@ import { isIssueExcludedByLabels } from "@/lib/issue-filters";
 import { isEscalationLabel } from "@/lib/issue-lane";
 import { prisma } from "@/lib/prisma";
 import { fetchIssues } from "@/lib/github";
-import { getDefaultClaimableLane, getEscalationLane } from "@/lib/lane-config";
+import { getEscalationLane, assertValidLaneForWrite, defaultCurrentLane } from "@/lib/lane-config";
 import { recordSyncedIssueEvents } from "@/lib/issue-lifecycle";
 
 export interface SyncRepo {
@@ -13,14 +13,14 @@ export interface SyncRepo {
 }
 
 /**
- * The lane a newly-ingested issue should start on: the deployment's configured
- * default claimable lane, or null when no claimable lane is configured. Used at
- * every issue-create site so an ungroomed issue is grabbable on a real lane
- * rather than the removed hardcoded "normal" column default (dispatch#964).
+ * The lane a newly-ingested issue should start on.
+ *
+ * The implementation lives in `@/lib/lane-config` (dispatch#1588), next to the
+ * lane configuration, so a write site reads the default lane from there and
+ * validates it against the configured lane set at the point of persistence.
+ * This re-export keeps the existing importers working.
  */
-export function defaultCurrentLane(): string | null {
-  return getDefaultClaimableLane()?.id ?? null;
-}
+export { defaultCurrentLane };
 
 /**
  * The lane a freshly-ingested issue should start on based on its labels.
@@ -743,7 +743,7 @@ export function makePrismaIssueStore(): IssueStore {
       // baked in. Escalation-labeled issues (e.g. scan/CVE CI failures) are
       // routed straight to the escalation/frontier lane (#988).
       await prisma.issue.create({
-        data: { ...data, repositoryId, currentLane: currentLaneForLabels(data.labels) },
+        data: { ...data, repositoryId, currentLane: assertValidLaneForWrite(currentLaneForLabels(data.labels)) },
       });
     },
   };

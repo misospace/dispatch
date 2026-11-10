@@ -3,6 +3,7 @@ import { errorResponse, readJsonObjectBody } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { parseLaneClassification, classifyLaneByHeuristics, validateLaneRecord } from "@/lib/issue-lane";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
+import { assertValidLaneForWrite } from "@/lib/lane-config";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
 interface LaneRequestBody {
@@ -66,7 +67,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ is
         }),
         prisma.issue.update({
           where: { id: issueId },
-          data: { currentLane: laneData.lane },
+          data: { currentLane: assertValidLaneForWrite(laneData.lane) },
         }),
       ]);
 
@@ -110,7 +111,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ is
       }),
       prisma.issue.update({
         where: { id: issueId },
-        data: { currentLane: classification.lane },
+        data: { currentLane: assertValidLaneForWrite(classification.lane) },
       }),
     ]);
 

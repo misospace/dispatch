@@ -172,6 +172,46 @@ describe("createGroomingRunRecord", () => {
       }),
     );
   });
+
+  it("honors an explicit laneAfter, including an explicit null, instead of mirroring", async () => {
+    const base = {
+      issueId: "issue-42",
+      repoId: "repo-1",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      issueUrl: "https://github.com/org/repo/issues/42",
+      dryRun: false,
+      labelsBefore: [],
+      laneBefore: "retired-lane",
+      model: null,
+      provider: null,
+      timeoutMs: null,
+      maxContextBytes: null,
+    };
+
+    // An explicit null means "no lane set" and must not fall back to the
+    // laneBefore mirror: a caller refusing to seed an un-clampable id relies
+    // on this (#1588).
+    await createGroomingRunRecord(mockPrisma, { ...base, laneAfter: null });
+    expect(mocks.create).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          laneBefore: "retired-lane",
+          laneAfter: null,
+        }),
+      }),
+    );
+
+    await createGroomingRunRecord(mockPrisma, { ...base, laneAfter: "local" });
+    expect(mocks.create).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          laneBefore: "retired-lane",
+          laneAfter: "local",
+        }),
+      }),
+    );
+  });
 });
 
 describe("updateGroomingRunRecord", () => {

@@ -81,6 +81,7 @@ vi.mock("@/lib/issue-sync", () => ({
 
 import { POST } from "./route";
 import { getSyncRepos } from "@/lib/config";
+import { getLaneIds } from "@/lib/lane-config";
 
 function makeRequest(body?: Record<string, unknown>, includeAuth = true) {
   return authedRequest("http://localhost/api/issues/refresh", {
@@ -176,5 +177,17 @@ describe("POST /api/issues/refresh — business logic", () => {
         }),
       }),
     );
+  });
+
+  it("creates a new issue on the configured default lane", async () => {
+    mocks.findUnique.mockResolvedValueOnce(null);
+    const res = await POST(makeRequest({ repoFullName: "org/repo", issueNumber: 98 }));
+    expect(res.status).toBe(200);
+    // The create site persists a configured lane id, not the lane the
+    // issue-sync mock returns (#1588): the write-time clamp validates the id
+    // it is about to persist against the lane configuration.
+    const persistedLane = mocks.create.mock.calls[0]?.[0]?.data?.currentLane;
+    expect(getLaneIds()).toContain(persistedLane);
+    expect(persistedLane).not.toBe("default");
   });
 });

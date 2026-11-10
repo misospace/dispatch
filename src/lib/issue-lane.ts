@@ -1,5 +1,5 @@
 import { VALID_CONFIDENCE } from "@/types";
-import { classifyLaneFromSignals, isValidLane as isValidLaneConfig, LaneSignals } from "@/lib/lane-config";
+import { classifyLaneFromSignals, isValidLane as isValidLaneConfig, resolveLaneId, LaneSignals } from "@/lib/lane-config";
 
 /**
  * A lane classification result for an issue.
@@ -18,9 +18,21 @@ export interface LaneClassification {
 /**
  * Validate a lane value against configured lanes.
  * Delegates to lane-config which respects custom lane configuration.
+ * Strictly configured-only: alias resolution happens in the payload
+ * validators below, so a validated record always carries a configured id.
  */
 export function isValidLane(lane: unknown): lane is string {
   return typeof lane === "string" && isValidLaneConfig(lane);
+}
+
+/**
+ * Resolve an alias source id to its configured target before validation
+ * (dispatch#1588): an alias-resolvable classification must succeed and
+ * persist the resolved configured id. Unknown ids come back unchanged and
+ * stay rejected by the configured-lane check.
+ */
+function resolveLaneForValidation(lane: unknown): unknown {
+  return typeof lane === "string" ? resolveLaneId(lane) : lane;
 }
 
 /**
@@ -38,7 +50,7 @@ export function parseLaneClassification(data: unknown): LaneClassification | nul
   if (typeof data !== "object" || data === null) return null;
 
   const obj = data as Record<string, unknown>;
-  const lane = obj.lane;
+  const lane = resolveLaneForValidation(obj.lane);
   const confidence = obj.confidence;
   const reason = obj.reason;
 
@@ -67,11 +79,11 @@ export function validateLaneRecord(data: unknown): {
   }
 
   const obj = data as Record<string, unknown>;
-  const lane = obj.lane;
+  const lane = resolveLaneForValidation(obj.lane);
   const confidence = obj.confidence;
 
   if (!isValidLane(lane)) {
-    return { valid: false, error: `invalid lane: ${String(lane)}` };
+    return { valid: false, error: `invalid lane: ${String(obj.lane)}` };
   }
   if (!isValidConfidence(confidence)) {
     return { valid: false, error: `invalid confidence: ${String(confidence)}` };

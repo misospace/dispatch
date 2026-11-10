@@ -1,6 +1,7 @@
 import { prisma } from "@/lib/prisma";
 import { addIssueComment, addIssueLabel, closeIssue, createIssue, updateIssueLabels, updateIssueTitleAndBody } from "@/lib/github";
 import { fetchCollaboratorPermission } from "@/lib/github-issues";
+import { assertValidLaneForWrite } from "@/lib/lane-config";
 import { findActiveLeasesForIssue, IssueMutationBusyError, releaseLeaseIfUnchanged, upsertLease } from "@/lib/lease";
 import { acquireGroomerLock, heartbeatGroomerLock, HEARTBEAT_MS, releaseGroomerLock } from "./groomer-lock";
 import { selectGroomingCandidate } from "./selector";
@@ -272,6 +273,7 @@ async function executeGroomerRun(
     mode,
     labelsBefore: candidate.labels,
     laneBefore: candidate.currentLane,
+    laneAfter: provisionalLaneStampOf(candidate.currentLane),
     model: config.model ?? null,
     provider: config.llmBaseUrl ? new URL(config.llmBaseUrl).host : null,
     timeoutMs: config.timeoutMs ?? null,
@@ -328,6 +330,14 @@ async function executeGroomerRun(
       }
       return null;
     }
+    // Fail fast at selection cost (#1588): an in-flight candidate whose row
+    // carries a retired lane id can never produce a valid lane stamp — the
+    // planned-stage clamp refuses the same id after the full evidence
+    // collection and model call. Refuse here, after the lease-contention
+    // defer so a worker-held issue still defers exactly as before, so the
+    // run fails and backs off without burning an LLM assessment on every
+    // backoff cycle.
+    if (inFlightStatus(candidate.labels)) assertValidLaneForWrite(candidate.currentLane);
     if (!observe) {
       // Observe (#1542) is read-only over Dispatch queue state: `upsertLease`
       // mints or renews the hosted-groomer lease row, so lease acquisition
@@ -835,7 +845,15 @@ async function executeGroomerRun(
       labelsToAdd: inFlight ? [] : output.labelsToAdd,
       labelsToRemove: inFlight ? [] : output.labelsToRemove,
       labelsAfter: newLabels,
-      laneAfter: inFlight ? candidate.currentLane : output.lane.id,
+      // Fail-closed lane stamp (#1588): an unknown lane id is never recorded.
+      // For an in-flight candidate the stamp mirrors the lane the row carries
+      // — the selector fills a missing lane with the configured backlog lane
+      // or leaves it null, never a fabricated id — so a row that still holds
+      // a retired lane id fails the run (and backs off) instead of recording
+      // an invalid lane. A non-in-flight run stamps the newly assigned
+      // configured lane and rewrites Issue.currentLane with it, which repairs
+      // such a row.
+      laneAfter: assertValidLaneForWrite(inFlight ? candidate.currentLane : output.lane.id),
       mutationPlan,
       commentBodyPreview: inFlight ? null : (diff.comment?.slice(0, 500) ?? null),
     });
@@ -1376,7 +1394,7 @@ async function executeGroomerRun(
     const issueData: Record<string, unknown> = {
       groomedAt: new Date(),
       groomedBy: "hosted-groomer",
-      currentLane: output.lane.id,
+      currentLane: assertValidLaneForWrite(output.lane.id),
       groomingRetryAfter: null,
     };
     if (output.summary) issueData.groomingSummary = output.summary;
@@ -1676,6 +1694,26 @@ function candidateSourceOf(candidate: { selectionReason?: string }): string {
       return candidate.selectionReason;
     default:
       return "selector";
+  }
+}
+
+/**
+ * Provisional `laneAfter` seed for the GroomingRun row created before any
+ * stage runs (#1588). Seed only what the write-time clamp itself would
+ * accept — a configured id, or an alias resolved to its configured id — and
+ * null when the candidate's row carries an id the lane config does not
+ * recognize. A run that later refuses that id (the in-flight fail-fast or the
+ * planned-stage clamp) then never leaves an unknown lane id persisted as a
+ * lane stamp on the failed run's row. `laneBefore` still records the raw
+ * prior id on purpose: it records prior state, not a new assignment.
+ */
+function provisionalLaneStampOf(laneId: string | null): string | null {
+  if (!laneId) return null;
+  try {
+    const clamped = assertValidLaneForWrite(laneId);
+    return typeof clamped === "string" ? clamped : null;
+  } catch {
+    return null;
   }
 }
 
