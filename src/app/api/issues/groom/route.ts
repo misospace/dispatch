@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { errorResponse, readJsonObjectBody } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
-import { getEscalationLane, getDefaultClaimableLane, isClaimableLane } from "@/lib/lane-config";
+import { getEscalationLane, getDefaultClaimableLane, isClaimableLane, assertValidLaneForWrite } from "@/lib/lane-config";
 import { resolveActor } from "@/lib/resolve-actor";
 import { transitionIssueStatus } from "@/lib/issue-status";
 import { recordStatusTransition } from "@/lib/issue-lifecycle";
@@ -134,28 +134,31 @@ export async function POST(request: Request) {
 
       switch (action) {
         case "promote_to_ready": {
-          // Remove ALL existing status labels (not just the first) and add
-          // status/ready via the shared status-swap helper — keeps GitHub
-          // and the Prisma cache from diverging when an issue carries more
-          // than one status label.
-          afterLabels = await transitionIssueStatus(effectiveRepo, effectiveNumber, issue.labels, "status/ready");
-          groomingData.nextGroomingAction = null;
-
           // A ready issue must carry a claimable lane, otherwise every
           // lane-filtered agent queue (the bridge claims via ?lane=<id>)
           // excludes it and it can never be picked up. Preserve an existing
           // claimable lane (e.g. previously escalated to frontier); only
           // (re)assign the default claimable lane when the issue has no lane
           // or is stuck in the non-claimable backlog lane.
+          //
+          // The lane is resolved before the GitHub status write, so a lane id
+          // the deployment does not configure fails the request before
+          // anything is changed (dispatch#1588).
           if (!issue.currentLane || !isClaimableLane(issue.currentLane)) {
-            groomingData.currentLane = getDefaultClaimableLane()?.id ?? "default";
+            groomingData.currentLane = assertValidLaneForWrite(getDefaultClaimableLane()?.id ?? "default");
           }
+          // Remove ALL existing status labels (not just the first) and add
+          // status/ready via the shared status-swap helper — keeps GitHub
+          // and the Prisma cache from diverging when an issue carries more
+          // than one status label.
+          afterLabels = await transitionIssueStatus(effectiveRepo, effectiveNumber, issue.labels, "status/ready");
+          groomingData.nextGroomingAction = null;
           break;
         }
 
         case "escalate": {
           const escalationLane = getEscalationLane();
-          groomingData.currentLane = escalationLane?.id ?? "default";
+          groomingData.currentLane = assertValidLaneForWrite(escalationLane?.id ?? "default");
           groomingData.nextGroomingAction = "Implement or decompose into actionable sub-tasks";
           break;
         }

@@ -141,6 +141,7 @@ import {
   UNVERIFIABLE_RETRY_BACKOFF_MINUTES,
 } from "./run";
 import { IssueMutationBusyError } from "@/lib/lease";
+import { setLaneConfig } from "@/lib/lane-config";
 import { computeGroomingIssueFingerprint } from "./freshness";
 
 const mockCandidate: GroomingCandidate = {
@@ -5117,6 +5118,165 @@ Investigate session handling in auth module.`;
         applyOutcome: "unverifiable",
         observeDisposition: "assessment_unavailable",
       });
+    });
+  });
+  describe("write-time lane clamp (dispatch#1588)", () => {
+    it("refuses the laneAfter stamp when the stored lane is unknown and not aliased", async () => {
+      const claimed = {
+        ...mockCandidate,
+        labels: ["status/in-progress", "agent/alpha"],
+        currentLane: "prehistoric-lane",
+      };
+      mocks.selectGroomingCandidate.mockResolvedValue(claimed);
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("blocked", { mutations: { labelsToAdd: ["priority/p2"], githubComment: "Parking this." } }),
+      );
+
+      await expect(runHostedGroomer()).rejects.toThrow(/unknown lane id "prehistoric-lane"/);
+
+      // The creation-time row is seeded before the fail-fast throw, so its
+      // provisional lane stamp must never carry the unknown id: laneAfter is
+      // seeded null while laneBefore records the raw prior id as history.
+      expect(mocks.prisma.groomingRun.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            laneBefore: "prehistoric-lane",
+            laneAfter: null,
+          }),
+        }),
+      );
+
+      // Nothing is applied to the issue or GitHub: the run is failed, not applied.
+      expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+      expect(mocks.addIssueComment).not.toHaveBeenCalled();
+      // The failed-run backoff stamp may be written, but never a lane.
+      expect(mocks.prisma.issue.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ currentLane: expect.anything() }) }),
+      );
+      expect(mocks.prisma.groomingRun.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            status: "failed",
+            errorMessage: expect.stringContaining('unknown lane id "prehistoric-lane"'),
+          }),
+        }),
+      );
+    });
+
+    it("resolves an aliased stored lane at the laneAfter stamp instead of failing", async () => {
+      const claimed = {
+        ...mockCandidate,
+        labels: ["status/in-progress", "agent/alpha"],
+        currentLane: "normal", // alias → local in the test lane config
+      };
+      mocks.selectGroomingCandidate.mockResolvedValue(claimed);
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("blocked", { mutations: { labelsToAdd: ["priority/p2"], githubComment: "Parking this." } }),
+      );
+
+      const result = await runHostedGroomer();
+      expect(result).not.toBeNull();
+      // The provisional seed already stores the resolved id, not the alias.
+      expect(mocks.prisma.groomingRun.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            laneBefore: "normal",
+            laneAfter: "local",
+          }),
+        }),
+      );
+      const plannedCall = mocks.prisma.groomingRun.update.mock.calls.find(
+        (call) => call[0]?.data?.stage === "planned",
+      );
+      expect(plannedCall![0].data).toMatchObject({ laneAfter: "local" });
+      // The Issue row itself is never rewritten by the groomer for in-flight work.
+      expect(mocks.prisma.issue.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ currentLane: expect.anything() }) }),
+      );
+    });
+
+    it("does not fail an in-flight candidate when the deployment has no backlog lane", async () => {
+      // A deployment can configure claimable lanes only. The selector then
+      // leaves a missing lane as null (it never fabricates the legacy
+      // "backlog" id), and the clamp passes null through.
+      setLaneConfig({
+        lanes: [
+          { id: "local", title: "Local", claimable: true, role: "default" },
+          { id: "frontier", title: "Frontier", claimable: true, role: "escalation" },
+        ],
+        laneAliases: { normal: "local", escalated: "frontier" },
+      });
+      const claimed = {
+        ...mockCandidate,
+        labels: ["status/in-progress", "agent/alpha"],
+        currentLane: null,
+      };
+      mocks.selectGroomingCandidate.mockResolvedValue(claimed);
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("blocked", {
+          verdict: { lane: { id: "local", confidence: "medium", reason: "not ready yet" } },
+          mutations: { labelsToAdd: ["priority/p2"], githubComment: "Parking this." },
+        }),
+      );
+
+      const result = await runHostedGroomer();
+      expect(result).not.toBeNull();
+      const plannedCall = mocks.prisma.groomingRun.update.mock.calls.find(
+        (call) => call[0]?.data?.stage === "planned",
+      );
+      expect(plannedCall![0].data).toMatchObject({ laneAfter: null });
+    });
+
+    it("fails closed when the row stores the retired 'backlog' id and no backlog lane is configured", async () => {
+      // The selector only fills a null row, so a candidate carrying "backlog"
+      // here is a genuinely stored retired id. It must not be mistaken for
+      // filler: the run is refused at selection cost — before the lease and
+      // the model call — and fails instead of recording an invalid lane.
+      setLaneConfig({
+        lanes: [
+          { id: "local", title: "Local", claimable: true, role: "default" },
+          { id: "frontier", title: "Frontier", claimable: true, role: "escalation" },
+        ],
+        laneAliases: { normal: "local", escalated: "frontier" },
+      });
+      const claimed = {
+        ...mockCandidate,
+        labels: ["status/in-progress", "agent/alpha"],
+        currentLane: "backlog",
+      };
+      mocks.selectGroomingCandidate.mockResolvedValue(claimed);
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("blocked", {
+          verdict: { lane: { id: "local", confidence: "medium", reason: "not ready yet" } },
+          mutations: { labelsToAdd: ["priority/p2"], githubComment: "Parking this." },
+        }),
+      );
+      await expect(runHostedGroomer()).rejects.toThrow(/unknown lane id "backlog"/);
+
+      // The creation-time seed never persists the retired id as a lane stamp.
+      expect(mocks.prisma.groomingRun.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            laneBefore: "backlog",
+            laneAfter: null,
+          }),
+        }),
+      );
+
+      expect(mocks.callGroomerLLM).not.toHaveBeenCalled();
+      expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+      expect(mocks.addIssueComment).not.toHaveBeenCalled();
+      expect(mocks.prisma.issue.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ currentLane: expect.anything() }) }),
+      );
+      expect(mocks.prisma.groomingRun.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            status: "failed",
+            errorMessage: expect.stringContaining('unknown lane id "backlog"'),
+          }),
+        }),
+      );
     });
   });
 });

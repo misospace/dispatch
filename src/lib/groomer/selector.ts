@@ -252,7 +252,12 @@ export async function selectGroomingCandidate(
     url: best.url,
     repoFullName: best.repository.fullName,
     labels: best.labels,
-    currentLane: best.currentLane ?? getBacklogLane()?.id ?? "backlog",
+    // Lane display fill for the groomer prompt only. A row with no lane may
+    // fill to the configured backlog lane, or stay null when the deployment
+    // has no non-claimable lane — never a fabricated legacy id, so a stored
+    // retired lane id cannot be confused with filler at the write clamp
+    // (dispatch#1588).
+    currentLane: best.currentLane ?? getBacklogLane()?.id ?? null,
     groomingSummary: best.groomingSummary,
     commentsCount: best.commentsCount,
     selectionReason,

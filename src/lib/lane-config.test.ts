@@ -19,6 +19,7 @@ import {
   laneMatchesConfigured,
   prFixLaneForRequest,
   resolveRequestLane,
+  assertValidLaneForWrite,
   setLaneConfig,
 } from "./lane-config";
 
@@ -780,5 +781,50 @@ describe("lane-config aliases", () => {
       expect(laneMatchesConfigured("escalated", "work")).toBe(true);
       expect(laneMatchesConfigured("backlog", "parking-lot")).toBe(true);
     });
+  });
+});
+
+describe("assertValidLaneForWrite", () => {
+  afterEach(() => {
+    resetLaneConfig();
+  });
+
+  it("passes through null and undefined (no lane set is valid)", () => {
+    resetLaneConfig();
+    expect(assertValidLaneForWrite(null)).toBeNull();
+    expect(assertValidLaneForWrite(undefined)).toBeUndefined();
+  });
+
+  it("returns a configured lane id unchanged", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "local", title: "Local", claimable: true, role: "default" },
+        { id: "frontier", title: "Frontier", claimable: true, role: "escalation" },
+        { id: "parking-lot", title: "Parking Lot", claimable: false },
+      ],
+    });
+    expect(assertValidLaneForWrite("local")).toBe("local");
+    expect(assertValidLaneForWrite("frontier")).toBe("frontier");
+    expect(assertValidLaneForWrite("parking-lot")).toBe("parking-lot");
+  });
+
+  it("resolves an alias source id to the configured lane id", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "local", title: "Local", claimable: true, role: "default" },
+        { id: "frontier", title: "Frontier", claimable: true, role: "escalation" },
+        { id: "parking-lot", title: "Parking Lot", claimable: false },
+      ],
+      laneAliases: { normal: "local", escalated: "frontier", backlog: "parking-lot" },
+    });
+    expect(assertValidLaneForWrite("normal")).toBe("local");
+    expect(assertValidLaneForWrite("escalated")).toBe("frontier");
+    expect(assertValidLaneForWrite("backlog")).toBe("parking-lot");
+  });
+
+  it("throws for an unknown id (e.g. legacy 'normal' with no alias configured)", () => {
+    resetLaneConfig();
+    expect(() => assertValidLaneForWrite("normal")).toThrow(/unknown lane id "normal"/);
+    expect(() => assertValidLaneForWrite("")).toThrow(/unknown lane id ""/);
   });
 });

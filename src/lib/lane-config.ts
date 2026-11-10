@@ -46,6 +46,11 @@ export interface LaneConfigSet {
    *
    * Example:
    *   { normal: "local", escalated: "frontier", backlog: "parking-lot" }
+   *
+   * Read-time resolution stays non-rewriting for legacy stored rows. Write-time
+   * callers must go through {@link assertValidLaneForWrite}, which resolves
+   * aliases and persists the resolved configured id — so any row written after
+   * a clamp-equipped write site carries a configured lane id.
    */
   laneAliases?: Record<string, string>;
 }
@@ -233,6 +238,40 @@ export function laneMatchesConfigured(storedLane: string | null | undefined, con
 }
 
 /**
+ * Write-time clamp for `Issue.currentLane` (and lane-bearing write fields such
+ * as `GroomingRun.laneAfter`): validate the id against the configured lane set
+ * before persisting it.
+ *
+ * - `null`/`undefined` pass through unchanged ("no lane set" is valid).
+ * - A configured lane id is returned unchanged.
+ * - An alias source id is resolved through `laneAliases` and the resolved
+ *   configured id is returned — callers persist the return value so new
+ *   writes never store alias names.
+ * - Anything else throws: the caller must refuse the write rather than
+ *   persist an id that no configured lane (or alias) recognizes.
+ *
+ * Read-time aliasing ({@link resolveLaneId}) still exists for rows stored
+ * before a lane reconfiguration; this helper only governs new writes. The
+ * provisional `laneBefore` mirror stamped at GroomingRun creation
+ * (src/lib/groomer/history.ts) intentionally stores the candidate's existing
+ * lane unclamped — it records prior state, not a new assignment. The
+ * provisional `laneAfter` seed is different: it is a lane-stamp column, so it
+ * carries only what this helper would accept (alias resolved) or `null` when
+ * the stored id is unknown — see `provisionalLaneStampOf` in
+ * src/lib/groomer/run.ts.
+ */
+export function assertValidLaneForWrite(laneId: string | null | undefined): string | null | undefined {
+  if (laneId === null || laneId === undefined) return laneId;
+  if (isValidLane(laneId)) return laneId;
+  const aliases = getLaneAliases();
+  const resolved = aliases[laneId];
+  if (resolved && isValidLane(resolved)) return resolved;
+  throw new Error(
+    `assertValidLaneForWrite: refusing to persist unknown lane id "${laneId}" (not configured and not resolvable via laneAliases)`,
+  );
+}
+
+/**
  * Resolve a request-time lane filter value.
  * Returns the configured lane ID if the input is valid or aliased,
  * or `null` if the input is unknown (caller should return 400).
@@ -282,6 +321,20 @@ export function getDefaultClaimableLane(): LaneConfig | undefined {
   const explicitDefault = lanes.find((l) => l.claimable && l.role === "default");
   if (explicitDefault) return explicitDefault;
   return lanes.find((l) => l.claimable);
+}
+
+/**
+ * The lane a newly-ingested issue should start on: the deployment's configured
+ * default claimable lane, or null when no claimable lane is configured. Used at
+ * every issue-create site so an ungroomed issue is grabbable on a real lane
+ * rather than the removed hardcoded "normal" column default (dispatch#964).
+ *
+ * This lives next to the lane configuration (and not in issue-sync) so a write
+ * site can read the default lane and validate it against the configured lane
+ * set at the point of persistence (dispatch#1588).
+ */
+export function defaultCurrentLane(): string | null {
+  return getDefaultClaimableLane()?.id ?? null;
 }
 
 /**

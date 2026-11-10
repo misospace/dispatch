@@ -23,6 +23,13 @@ export interface CreateGroomingRunInput {
   dryRun: boolean;
   labelsBefore: string[];
   laneBefore: string | null;
+  /**
+   * Provisional `laneAfter` seed. Defaults to mirroring `laneBefore` when
+   * omitted. Callers that must not persist an un-clampable lane id pass their
+   * own validated value; an explicit `null` means "no lane set" and is honored
+   * (it does not fall back to mirroring `laneBefore`).
+   */
+  laneAfter?: string | null;
   model: string | null;
   provider: string | null;
   timeoutMs: number | null;
@@ -72,7 +79,7 @@ export async function createGroomingRunRecord(
       labelsBefore: input.labelsBefore,
       labelsAfter: input.labelsBefore,
       laneBefore: input.laneBefore,
-      laneAfter: input.laneBefore,
+      laneAfter: input.laneAfter === undefined ? input.laneBefore : input.laneAfter,
       model: input.model,
       provider: input.provider,
       timeoutMs: input.timeoutMs,

@@ -153,6 +153,25 @@ describe("POST /api/issues/[issueId]/lane — business logic", () => {
     });
   });
 
+  it("resolves an aliased classification lane and persists the configured id (#1588)", async () => {
+    // "normal" is an alias of "local" in the test lane config: the write
+    // succeeds and stores the resolved configured id, not the alias name.
+    const res = await POST(
+      makeRequest("POST", { classification: { lane: "normal", confidence: "high", reason: "Concrete bug fix" } }),
+      makeContext(),
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.lane).toBe("local");
+    expect(mocks.createLane).toHaveBeenCalledWith({
+      data: expect.objectContaining({ lane: "local", confidence: "high", reason: "Concrete bug fix" }),
+    });
+    expect(mocks.updateIssue).toHaveBeenCalledWith({
+      where: { id: "issue-1" },
+      data: { currentLane: "local" },
+    });
+  });
+
   it("uses heuristic fallback when no classification provided and no current lane", async () => {
     const res = await POST(makeRequest("POST", {}), makeContext());
     expect(res.status).toBe(200);

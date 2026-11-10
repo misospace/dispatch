@@ -59,6 +59,11 @@ describe("parseLaneClassification", () => {
     expect(result).toEqual({ lane: "local", confidence: "high", reason: "Concrete bug fix" });
   });
 
+  it("resolves an aliased lane to its configured id (#1588)", () => {
+    const result = parseLaneClassification({ lane: "normal", confidence: "high", reason: "Legacy name" });
+    expect(result).toEqual({ lane: "local", confidence: "high", reason: "Legacy name" });
+  });
+
   it("parses with model field", () => {
     const result = parseLaneClassification({ lane: "frontier", confidence: "medium", reason: "Architecture decision", model: "test-model" });
     expect(result).toEqual({ lane: "frontier", confidence: "medium", reason: "Architecture decision", model: "test-model" });
@@ -106,6 +111,12 @@ describe("validateLaneRecord", () => {
     const result = validateLaneRecord({ lane: "local", confidence: "high", reason: "test reason" });
     expect(result.valid).toBe(true);
     expect(result.parsed).toEqual({ lane: "local", confidence: "high", reason: "test reason" });
+  });
+
+  it("resolves an aliased lane and parses the configured id (#1588)", () => {
+    const result = validateLaneRecord({ lane: "escalated", confidence: "high", reason: "test reason" });
+    expect(result.valid).toBe(true);
+    expect(result.parsed).toEqual({ lane: "frontier", confidence: "high", reason: "test reason" });
   });
 
   it("rejects invalid lane", () => {

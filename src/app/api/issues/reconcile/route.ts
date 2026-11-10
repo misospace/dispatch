@@ -20,7 +20,7 @@ import {
   type LifecycleEventClient,
   type PrMergeObservation,
 } from "@/lib/issue-lifecycle";
-import { isBacklogLane } from "@/lib/lane-config";
+import { isBacklogLane, assertValidLaneForWrite } from "@/lib/lane-config";
 import { computeLinkedPrHealth, toPersistedLinkedPrHealth, type LinkedPrHealth } from "@/lib/linked-pr-health";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { reconcileStalePrFixItems } from "@/lib/pr-fix-queue";
@@ -503,11 +503,12 @@ export async function POST(request: Request) {
               issue.body,
               currentLabels,
             );
+            const persistedLane = assertValidLaneForWrite(classification.lane)!;
             await prisma.$transaction([
               prisma.issueLane.create({
                 data: {
                   issueId: existingIssue.id,
-                  lane: classification.lane,
+                  lane: persistedLane,
                   confidence: classification.confidence,
                   reason: classification.reason,
                   model: "heuristic",
@@ -515,7 +516,7 @@ export async function POST(request: Request) {
               }),
               prisma.issue.update({
                 where: { repositoryId_number: { repositoryId: repo.id, number: issue.number } },
-                data: { currentLane: classification.lane },
+                data: { currentLane: persistedLane },
               }),
             ]);
             totalLaneClassified++;
@@ -542,11 +543,12 @@ export async function POST(request: Request) {
               const reason = reclassify === classification.lane
                 ? classification.reason
                 : `${classification.reason}; stale backlog lane fell back to the default claimable lane`;
+              const persistedLane = assertValidLaneForWrite(reclassify)!;
               await prisma.$transaction([
                 prisma.issueLane.create({
                   data: {
                     issueId: existingIssue.id,
-                    lane: reclassify,
+                    lane: persistedLane,
                     confidence: classification.confidence,
                     reason,
                     model: "reconcile",
@@ -554,7 +556,7 @@ export async function POST(request: Request) {
                 }),
                 prisma.issue.update({
                   where: { repositoryId_number: { repositoryId: repo.id, number: issue.number } },
-                  data: { currentLane: reclassify },
+                  data: { currentLane: persistedLane },
                 }),
               ]);
               totalLaneClassified++;
