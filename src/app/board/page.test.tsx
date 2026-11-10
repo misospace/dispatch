@@ -12,6 +12,7 @@ const { mocks } = vi.hoisted(() => ({
     countWorkflowRuns: vi.fn().mockResolvedValue(0),
     releasePulseStrip: vi.fn(() => null),
     collectReleasePulse: vi.fn(),
+    parseExcludedLabels: vi.fn().mockReturnValue([]),
   },
 }));
 
@@ -36,7 +37,7 @@ vi.mock("@/components/automation/release-pulse", () => ({
 
 vi.mock("@/lib/config", () => ({
   getTrackedRepos: mocks.getTrackedRepos,
-  parseExcludedLabels: vi.fn().mockReturnValue([]),
+  parseExcludedLabels: mocks.parseExcludedLabels,
 }));
 
 // Components render to React elements but are not deep-rendered here.
@@ -161,6 +162,73 @@ describe("BoardPage searchParams handling (Next 16 async)", () => {
 
     const filteredCall = mocks.findManyIssues.mock.calls[0][0];
     expect(filteredCall.where).toEqual(expect.objectContaining({ OR: expect.any(Array) }));
+  });
+});
+
+describe("BoardPage excluded-label filter (#1587)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.parseExcludedLabels.mockReturnValue([]);
+    mocks.findManyIssues.mockResolvedValue([]);
+    mocks.findManyRepos.mockResolvedValue([]);
+    mocks.aggregateIssues.mockResolvedValue({ _count: { _all: 0 }, _max: { lastSyncedAt: null } });
+    mocks.getTrackedRepos.mockResolvedValue([]);
+  });
+
+  it("excludes issues whose cached labels match DISPATCH_EXCLUDED_LABELS from the board query", async () => {
+    mocks.parseExcludedLabels.mockReturnValue(["wontfix"]);
+
+    await BoardPage({ searchParams: Promise.resolve({}) });
+
+    const filteredCall = mocks.findManyIssues.mock.calls[0][0];
+    // The Renovate exclusion clause is also in AND; the excluded-label clause
+    // must be appended alongside it, not clobber it.
+    expect(filteredCall.where.AND).toEqual(
+      expect.arrayContaining([{ NOT: { labels: { hasSome: ["wontfix"] } } }]),
+    );
+  });
+
+  it("combines the excluded-label filter with user label filters without clobbering them", async () => {
+    mocks.parseExcludedLabels.mockReturnValue(["wontfix"]);
+
+    await BoardPage({ searchParams: Promise.resolve({ agent: "agent/alpha" }) });
+
+    const filteredCall = mocks.findManyIssues.mock.calls[0][0];
+    expect(filteredCall.where.labels).toEqual({ has: "agent/alpha" });
+    expect(filteredCall.where.AND).toEqual(
+      expect.arrayContaining([{ NOT: { labels: { hasSome: ["wontfix"] } } }]),
+    );
+  });
+
+  it("excludes excluded-label issues from the filter-options query and the aggregate count", async () => {
+    mocks.parseExcludedLabels.mockReturnValue(["wontfix"]);
+
+    await BoardPage({ searchParams: Promise.resolve({}) });
+
+    // Second findMany call is the filter-options discovery query.
+    const optionsCall = mocks.findManyIssues.mock.calls[1][0];
+    expect(optionsCall.select).toEqual({ labels: true });
+    expect(optionsCall.where.AND).toEqual(
+      expect.arrayContaining([{ NOT: { labels: { hasSome: ["wontfix"] } } }]),
+    );
+
+    // The sync-status aggregate uses the same exclusion.
+    expect(mocks.aggregateIssues.mock.calls[0][0].where.AND).toEqual(
+      expect.arrayContaining([{ NOT: { labels: { hasSome: ["wontfix"] } } }]),
+    );
+  });
+
+  it("adds no excluded-label clause when DISPATCH_EXCLUDED_LABELS is unset", async () => {
+    await BoardPage({ searchParams: Promise.resolve({}) });
+
+    const excludedClause = { NOT: { labels: { hasSome: expect.anything() } } };
+    const filteredCall = mocks.findManyIssues.mock.calls[0][0];
+    if (filteredCall.where.AND) {
+      expect(filteredCall.where.AND).not.toEqual(expect.arrayContaining([excludedClause]));
+    }
+    expect(mocks.aggregateIssues.mock.calls[0][0].where.AND).not.toEqual(
+      expect.arrayContaining([excludedClause]),
+    );
   });
 });
 

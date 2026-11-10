@@ -1,4 +1,7 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
+import { Prisma } from "@prisma/client";
+import { readFileSync } from "fs";
+import { join } from "path";
 import { GitHubIssue } from "@/types";
 
 const { mocks } = vi.hoisted(() => ({
@@ -8,6 +11,26 @@ const { mocks } = vi.hoisted(() => ({
     issueFindUnique: vi.fn(),
     issueUpdate: vi.fn(),
     issueCreate: vi.fn(),
+    issueDeleteMany: vi.fn(),
+    transaction: vi.fn(),
+    queryRaw: vi.fn(),
+    agentRunCount: vi.fn(),
+    agentWorkCount: vi.fn(),
+    leaseCount: vi.fn(),
+    groomingRunCount: vi.fn(),
+    groomingApplicationCount: vi.fn(),
+    issueMutationGuardCount: vi.fn(),
+    groomerPendingReplyCount: vi.fn(),
+    issueHandoffSettlementCount: vi.fn(),
+    ownershipReleaseIntentCount: vi.fn(),
+    ownershipReconcileCandidateCount: vi.fn(),
+    groomingChildClaimCount: vi.fn(),
+    noPrConclusionCount: vi.fn(),
+    blockedExternalParkCount: vi.fn(),
+    issueLifecycleEventCount: vi.fn(),
+    issueLaneCount: vi.fn(),
+    auditLogCreate: vi.fn(),
+    txIssueFindUnique: vi.fn(),
     createLifecycleEvent: vi.fn(),
     upsertLifecycleEvent: vi.fn(),
   },
@@ -24,11 +47,31 @@ vi.mock("@/lib/prisma", () => ({
       findUnique: mocks.issueFindUnique,
       update: mocks.issueUpdate,
       create: mocks.issueCreate,
+      deleteMany: mocks.issueDeleteMany,
     },
     issueLifecycleEvent: {
       create: mocks.createLifecycleEvent,
       upsert: mocks.upsertLifecycleEvent,
+      count: mocks.issueLifecycleEventCount,
     },
+    // Interactive transaction client (#1587 prune): the callback receives a
+    // tx object carrying the same mocks the top-level client would use.
+    $transaction: mocks.transaction,
+    agentRun: { count: mocks.agentRunCount },
+    agentWork: { count: mocks.agentWorkCount },
+    lease: { count: mocks.leaseCount },
+    groomingRun: { count: mocks.groomingRunCount },
+    groomingApplication: { count: mocks.groomingApplicationCount },
+    issueMutationGuard: { count: mocks.issueMutationGuardCount },
+    groomerPendingReply: { count: mocks.groomerPendingReplyCount },
+    issueHandoffSettlement: { count: mocks.issueHandoffSettlementCount },
+    ownershipReleaseIntent: { count: mocks.ownershipReleaseIntentCount },
+    ownershipReconcileCandidate: { count: mocks.ownershipReconcileCandidateCount },
+    groomingChildClaim: { count: mocks.groomingChildClaimCount },
+    noPrConclusion: { count: mocks.noPrConclusionCount },
+    blockedExternalPark: { count: mocks.blockedExternalParkCount },
+    issueLane: { count: mocks.issueLaneCount },
+    auditLog: { create: mocks.auditLogCreate },
   },
 }));
 
@@ -47,6 +90,8 @@ import {
   SYNC_OVERLAP_BUFFER_MS,
 } from "./issue-sync";
 import { setLaneConfig, resetLaneConfig } from "@/lib/lane-config";
+
+const REPO_ROOT = join(__dirname, "..", "..");
 
 function githubIssue(number: number, overrides?: Partial<GitHubIssue>): GitHubIssue {
   return {
@@ -159,6 +204,7 @@ describe("syncIssuesForRepos", () => {
       findIssue: vi.fn().mockResolvedValue(null),
       updateIssue: vi.fn().mockResolvedValue(undefined),
       createIssue: vi.fn().mockResolvedValue(undefined),
+      deleteIssue: vi.fn().mockResolvedValue(true),
     };
   });
 
@@ -210,6 +256,7 @@ describe("syncIssuesForRepos", () => {
       findIssue: findMock,
       updateIssue: updateMock,
       createIssue: createMock,
+      deleteIssue: vi.fn().mockResolvedValue(true),
     };
 
     await syncIssuesForRepos(
@@ -234,6 +281,7 @@ describe("syncIssuesForRepos", () => {
       findIssue: vi.fn().mockResolvedValue({ id: "existing-1", labels: ["agent/saffron", "status/in-progress"] }),
       updateIssue: vi.fn().mockResolvedValue(undefined),
       createIssue: vi.fn().mockResolvedValue(undefined),
+      deleteIssue: vi.fn().mockResolvedValue(true),
     };
 
     await syncIssuesForRepos(
@@ -295,6 +343,160 @@ describe("syncIssuesForRepos", () => {
   });
 });
 
+describe("syncIssuesForRepos — excluded-label reconcile at sync (#1587)", () => {
+  let store: IssueStore;
+  let deleteMock: Mock<(id: string) => Promise<boolean>>;
+
+  beforeEach(() => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    deleteMock = vi.fn().mockResolvedValue(true);
+    store = {
+      findIssue: vi.fn().mockResolvedValue(null),
+      updateIssue: vi.fn().mockResolvedValue(undefined),
+      createIssue: vi.fn().mockResolvedValue(undefined),
+      deleteIssue: deleteMock,
+    };
+  });
+
+  const EXCLUDED = ["wontfix"];
+
+  function runSync(ghIssue: GitHubIssue) {
+    return syncIssuesForRepos(
+      [{ id: "repo-1", fullName: "org/repo" }],
+      async () => [ghIssue],
+      store,
+      EXCLUDED,
+    );
+  }
+
+  it("prunes a cached row whose GitHub labels have become excluded", async () => {
+    vi.mocked(store.findIssue).mockResolvedValue({ id: "zombie-1", labels: ["type/bug"] });
+
+    const response = await runSync(githubIssue(7, { labels: [{ name: "wontfix", color: "ffffff" }] }));
+
+    expect(store.deleteIssue).toHaveBeenCalledWith("zombie-1");
+    expect(store.updateIssue).not.toHaveBeenCalled();
+    expect(store.createIssue).not.toHaveBeenCalled();
+    expect(console.log).toHaveBeenCalledWith(expect.stringContaining("pruned cached issue org/repo#7"));
+    // A prune is a removal, not a sync: it never counts toward syncedCount.
+    expect(response.syncedCount).toBe(0);
+  });
+
+  it("skips a new issue with an excluded label — never ingested, then deleted", async () => {
+    // findIssue resolves null: the row was never cached.
+    await runSync(githubIssue(8, { labels: [{ name: "wontfix", color: "ffffff" }] }));
+
+    expect(store.createIssue).not.toHaveBeenCalled();
+    expect(deleteMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps a cached row the store refuses to delete, logs a warning, and persists the exclusion into the cached labels", async () => {
+    vi.mocked(store.findIssue).mockResolvedValue({ id: "zombie-1", labels: ["agent/alpha"] });
+    deleteMock.mockResolvedValueOnce(false);
+
+    await runSync(githubIssue(7, { labels: [{ name: "wontfix", color: "ffffff" }] }));
+
+    expect(deleteMock).toHaveBeenCalledWith("zombie-1");
+    expect(store.createIssue).not.toHaveBeenCalled();
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("kept cached issue org/repo#7"));
+    // The kept row must not stay dispatchable: board and queue exclusion
+    // filters read the *cached* labels, so the refusal persists the
+    // GitHub-authoritative labels — the excluded label among them — while
+    // preserving the cached agent/* labels (the dependent work likely belongs
+    // to a claim).
+    expect(store.updateIssue).toHaveBeenCalledWith(
+      "zombie-1",
+      expect.objectContaining({ labels: ["wontfix", "agent/alpha"] }),
+      { labels: ["agent/alpha"], state: null },
+    );
+  });
+
+  it("persists closed⇒done on a refused prune, without mirroring the relabel to GitHub", async () => {
+    // A refused prune writes the cache only: the branch continues before the
+    // closed⇒done mirror, and a closed excluded issue still lands on
+    // status/done in the cache. The status fix applies to the GitHub labels
+    // BEFORE the cached agent/* labels are merged on top.
+    vi.mocked(store.findIssue).mockResolvedValue({ id: "zombie-1", labels: ["agent/alpha"] });
+    deleteMock.mockResolvedValueOnce(false);
+
+    await runSync(
+      githubIssue(7, { state: "closed", labels: [{ name: "wontfix", color: "ffffff" }] }),
+    );
+
+    expect(store.updateIssue).toHaveBeenCalledWith(
+      "zombie-1",
+      expect.objectContaining({ labels: ["wontfix", "status/done", "agent/alpha"], state: "closed" }),
+      { labels: ["agent/alpha"], state: null },
+    );
+  });
+
+  it("does not prune on a cache-side match — GitHub labels are authoritative", async () => {
+    // The cached row still carries "wontfix" (prune pending), but GitHub no
+    // longer has it: the issue is back in scope and syncs normally.
+    vi.mocked(store.findIssue).mockResolvedValue({ id: "live-1", labels: ["wontfix"] });
+
+    await runSync(githubIssue(9));
+
+    expect(store.deleteIssue).not.toHaveBeenCalled();
+    expect(store.updateIssue).toHaveBeenCalled();
+  });
+
+  it("keeps the row and persists the exclusion labels when the prune itself fails, and keeps syncing the repo", async () => {
+    // The prune is the first BLOCKING write in the sync path: it waits on the
+    // row lock, so it can fail where the other writes cannot (a lock wait
+    // that outran the transaction timeout). One issue's failure must not skip
+    // the rest of the repo's sync, and the kept row must not keep its stale
+    // labels — the cached labels are what the board/queue exclusion filters
+    // read. So the failure falls through to the keep path.
+    vi.mocked(store.findIssue)
+      .mockResolvedValueOnce({ id: "zombie-1", labels: ["agent/alpha"] })
+      .mockResolvedValueOnce(null);
+    deleteMock.mockRejectedValueOnce(new Error("Transaction API error: transaction expired"));
+
+    const response = await syncIssuesForRepos(
+      [{ id: "repo-1", fullName: "org/repo" }],
+      async () => [
+        githubIssue(7, { labels: [{ name: "wontfix", color: "ffffff" }] }),
+        githubIssue(8),
+      ],
+      store,
+      EXCLUDED,
+    );
+
+    // The repo's sync continues: the next issue is ingested.
+    expect(response.syncedCount).toBe(1);
+    expect(response.results).toEqual([{ repo: "org/repo", synced: 1, error: null }]);
+    expect(store.createIssue).toHaveBeenCalledWith("repo-1", expect.objectContaining({ number: 8 }));
+    // The kept row carries the excluded label, so it stays out of the board
+    // and queue paths until a later sync can prune it.
+    expect(store.updateIssue).toHaveBeenCalledWith(
+      "zombie-1",
+      expect.objectContaining({ labels: ["wontfix", "agent/alpha"] }),
+      { labels: ["agent/alpha"], state: null },
+    );
+    expect(console.error).toHaveBeenCalledWith(
+      expect.stringContaining("prune failed for cached issue org/repo#7"),
+      expect.any(Error),
+    );
+    // The warning says the prune FAILED — not that dependent rows exist,
+    // which would be a false statement about why the row was kept.
+    expect(console.warn).toHaveBeenCalledWith(
+      expect.stringContaining("kept cached issue org/repo#7: prune failed"),
+    );
+  });
+
+  it("leaves non-excluded issues untouched by the prune path", async () => {
+    vi.mocked(store.findIssue).mockResolvedValue(null);
+
+    await runSync(githubIssue(10));
+
+    expect(store.createIssue).toHaveBeenCalledWith("repo-1", expect.objectContaining({ number: 10 }));
+    expect(deleteMock).not.toHaveBeenCalled();
+  });
+});
+
 describe("syncIssuesForRepos native blocked_by persistence", () => {
   let store: IssueStore;
 
@@ -308,6 +510,7 @@ describe("syncIssuesForRepos native blocked_by persistence", () => {
       findIssue: vi.fn().mockResolvedValue(null),
       updateIssue: vi.fn().mockResolvedValue(undefined),
       createIssue: createMock,
+      deleteIssue: vi.fn().mockResolvedValue(true),
     };
 
     await syncIssuesForRepos(
@@ -326,6 +529,7 @@ describe("syncIssuesForRepos native blocked_by persistence", () => {
       findIssue: vi.fn().mockResolvedValue({ id: "existing-2", labels: [] }),
       updateIssue: updateMock,
       createIssue: vi.fn().mockResolvedValue(undefined),
+      deleteIssue: vi.fn().mockResolvedValue(true),
     };
 
     await syncIssuesForRepos(
@@ -345,6 +549,7 @@ describe("syncIssuesForRepos native blocked_by persistence", () => {
       findIssue: vi.fn().mockResolvedValue({ id: "existing-2", labels: [] }),
       updateIssue: updateMock,
       createIssue: vi.fn().mockResolvedValue(undefined),
+      deleteIssue: vi.fn().mockResolvedValue(true),
     };
 
     // A blocker added after creation: the freshly-fetched non-empty set is
@@ -742,6 +947,308 @@ describe("makePrismaIssueStore — lifecycle evidence (#1202)", () => {
     const keys = mocks.upsertLifecycleEvent.mock.calls.map((call: any[]) => call[0].where.dedupeKey);
     expect(keys).toHaveLength(2);
     expect(new Set(keys).size).toBe(1);
+  });
+});
+
+describe("makePrismaIssueStore — excluded-reconcile delete (#1587)", () => {
+  // Every Issue relation that holds live state (work, coordination, policy).
+  // A row in any of them refuses the prune: the schema cascades those, so an
+  // unguarded delete would destroy real work. The pair with the derived
+  // history below is the only thing the prune may take with the row.
+  const dependentCounts = [
+    ["AgentRun", mocks.agentRunCount, "issueId"],
+    ["AgentWork", mocks.agentWorkCount, "issueId"],
+    ["Lease", mocks.leaseCount, "issueId"],
+    ["GroomingRun", mocks.groomingRunCount, "issueId"],
+    ["GroomingApplication", mocks.groomingApplicationCount, "issueId"],
+    ["IssueMutationGuard", mocks.issueMutationGuardCount, "issueId"],
+    ["GroomerPendingReply", mocks.groomerPendingReplyCount, "issueId"],
+    ["IssueHandoffSettlement", mocks.issueHandoffSettlementCount, "issueId"],
+    ["OwnershipReleaseIntent", mocks.ownershipReleaseIntentCount, "issueId"],
+    ["OwnershipReconcileCandidate", mocks.ownershipReconcileCandidateCount, "issueId"],
+    ["GroomingChildClaim", mocks.groomingChildClaimCount, "parentIssueId"],
+    ["NoPrConclusion", mocks.noPrConclusionCount, "issueId"],
+    ["BlockedExternalPark", mocks.blockedExternalParkCount, "issueId"],
+  ] as const;
+  // The row's own derived history: removed with it, counted and recorded.
+  const derivedCounts = [
+    ["IssueLifecycleEvent", mocks.issueLifecycleEventCount],
+    ["IssueLane", mocks.issueLaneCount],
+  ] as const;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Interactive transaction: the callback runs against a tx client carrying
+    // the same mocks as the top-level client.
+    mocks.transaction.mockImplementation((fn: (tx: any) => unknown) =>
+      fn({
+        $queryRaw: mocks.queryRaw,
+        agentRun: { count: mocks.agentRunCount },
+        agentWork: { count: mocks.agentWorkCount },
+        lease: { count: mocks.leaseCount },
+        groomingRun: { count: mocks.groomingRunCount },
+        groomingApplication: { count: mocks.groomingApplicationCount },
+        issueMutationGuard: { count: mocks.issueMutationGuardCount },
+        groomerPendingReply: { count: mocks.groomerPendingReplyCount },
+        issueHandoffSettlement: { count: mocks.issueHandoffSettlementCount },
+        ownershipReleaseIntent: { count: mocks.ownershipReleaseIntentCount },
+        ownershipReconcileCandidate: { count: mocks.ownershipReconcileCandidateCount },
+        groomingChildClaim: { count: mocks.groomingChildClaimCount },
+        noPrConclusion: { count: mocks.noPrConclusionCount },
+        blockedExternalPark: { count: mocks.blockedExternalParkCount },
+        issueLifecycleEvent: { count: mocks.issueLifecycleEventCount },
+        issueLane: { count: mocks.issueLaneCount },
+        auditLog: { create: mocks.auditLogCreate },
+        issue: { findUnique: mocks.txIssueFindUnique, deleteMany: mocks.issueDeleteMany },
+      }),
+    );
+    mocks.queryRaw.mockResolvedValue([]);
+    dependentCounts.forEach(([, count]) => count.mockResolvedValue(0));
+    derivedCounts.forEach(([, count]) => count.mockResolvedValue(0));
+    mocks.txIssueFindUnique.mockResolvedValue({
+      number: 42,
+      labels: ["wontfix"],
+      repository: { fullName: "org/repo" },
+    });
+    mocks.auditLogCreate.mockResolvedValue({ id: "audit-1" });
+    mocks.issueDeleteMany.mockResolvedValue({ count: 1 });
+  });
+
+  it("locks the row, checks every dependent model, then deletes", async () => {
+    const store = makePrismaIssueStore();
+
+    await expect(store.deleteIssue("zombie-1")).resolves.toBe(true);
+
+    // The lock must be taken: an insert referencing the issue takes a
+    // FOR KEY SHARE lock on the parent row, and FOR UPDATE is the mode that
+    // conflicts with it — such an insert waits until the check-then-delete
+    // decision commits. Pin the mode itself: FOR NO KEY UPDATE does NOT
+    // conflict with FOR KEY SHARE (a dependent insert could slip in between
+    // the counts and the delete and be cascade-deleted), and a weaker lock
+    // (FOR SHARE) would keep the call count and silently defeat the
+    // serialization. The row-returning SELECT must run through $queryRaw:
+    // $executeRaw is for statements that change rows and cannot return a
+    // result set, so the lock would never be taken through it.
+    expect(mocks.queryRaw).toHaveBeenCalledTimes(1);
+    const [lockQuery] = mocks.queryRaw.mock.calls[0] as [TemplateStringsArray, ...unknown[]];
+    const lockSql = lockQuery.join("$1");
+    expect(lockSql).toContain('FROM "Issue"');
+    expect(lockSql).toContain("FOR UPDATE");
+    expect(lockSql).not.toContain("FOR NO KEY UPDATE");
+    // Every relation that holds live state is counted, under its own foreign
+    // key name. A relation left out of this list cascades silently.
+    dependentCounts.forEach(([, count, field]) => {
+      expect(count).toHaveBeenCalledWith({ where: { [field]: "zombie-1" } });
+    });
+    expect(mocks.issueDeleteMany).toHaveBeenCalledWith({ where: { id: "zombie-1" } });
+  });
+
+  it("runs the decision under READ COMMITTED so the counts see a row committed after it started", async () => {
+    // The dependent-row counts must read the CURRENT state: under a stronger
+    // isolation level (REPEATABLE READ / SERIALIZABLE) they would read this
+    // transaction's original snapshot, miss a dependent row that committed
+    // while the decision was running, and the delete would destroy it. The
+    // level is pinned so the guarantee does not depend on the server default.
+    const store = makePrismaIssueStore();
+
+    await expect(store.deleteIssue("zombie-1")).resolves.toBe(true);
+
+    expect(mocks.transaction).toHaveBeenCalledWith(expect.any(Function), {
+      isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
+    });
+  });
+
+  it("reports pruned when the row vanished under the check", async () => {
+    // A row that is already gone satisfies the goal (the cache no longer
+    // holds it); false — and its "dependent rows exist" warning — is
+    // reserved for real refusals, so the log never mislabels this race.
+    mocks.issueDeleteMany.mockResolvedValue({ count: 0 });
+    const store = makePrismaIssueStore();
+
+    await expect(store.deleteIssue("zombie-1")).resolves.toBe(true);
+    // Nothing was removed, so nothing is recorded.
+    expect(mocks.auditLogCreate).not.toHaveBeenCalled();
+  });
+
+  it.each(dependentCounts)(
+    "refuses the delete when a dependent %s exists",
+    async (_name, count) => {
+      count.mockResolvedValue(1);
+      const store = makePrismaIssueStore();
+
+      await expect(store.deleteIssue("zombie-1")).resolves.toBe(false);
+      // No dependent row may cascade or null out: the row is kept whole.
+      expect(mocks.issueDeleteMany).not.toHaveBeenCalled();
+      // A refused prune removes nothing, so it records nothing.
+      expect(mocks.auditLogCreate).not.toHaveBeenCalled();
+    },
+  );
+
+  it("records the prune in an audit row, and counts the derived history that goes with it", async () => {
+    // The prune removes the row's own derived history (lifecycle events, lane
+    // classifications). That loss must be recorded, not silent: the audit row
+    // survives the delete because its issue link is nullable.
+    mocks.issueLifecycleEventCount.mockResolvedValue(3);
+    mocks.issueLaneCount.mockResolvedValue(1);
+    const store = makePrismaIssueStore();
+
+    await expect(store.deleteIssue("zombie-1")).resolves.toBe(true);
+
+    expect(mocks.auditLogCreate).toHaveBeenCalledTimes(1);
+    const audit = mocks.auditLogCreate.mock.calls[0][0].data;
+    expect(audit.action).toBe("prune_excluded_issue");
+    expect(audit.actor).toBe("sync");
+    expect(audit.repoFullName).toBe("org/repo");
+    expect(audit.issueNumber).toBe(42);
+    // The row this entry describes is deleted in the same transaction, so the
+    // link cannot be kept.
+    expect(audit.issueId).toBeNull();
+    expect(audit.beforeLabels).toEqual(["wontfix"]);
+    expect(audit.success).toBe(true);
+    expect(audit.notes).toContain("org/repo#42");
+    expect(audit.notes).toContain("3 lifecycle event(s)");
+    expect(audit.notes).toContain("1 lane classification(s)");
+    // The counts are read for THIS row.
+    expect(mocks.issueLifecycleEventCount).toHaveBeenCalledWith({ where: { issueId: "zombie-1" } });
+    expect(mocks.issueLaneCount).toHaveBeenCalledWith({ where: { issueId: "zombie-1" } });
+  });
+
+  it("classifies every relation the Issue model has", () => {
+    // The guard list is hand-maintained, so a relation added to the schema
+    // later would be cascade-deleted without anyone noticing. This test reads
+    // the schema and fails until every Issue relation is classified: guarded
+    // (a dependent row refuses the prune), derived history (removed with the
+    // row and recorded), or surviving (a nullable link that is only cleared).
+    const schema = readFileSync(join(REPO_ROOT, "prisma", "schema.prisma"), "utf-8");
+    const modelBlock = schema.slice(schema.indexOf("model Issue {"));
+    const body = modelBlock.slice(0, modelBlock.indexOf("\n}"));
+    const scalarTypes = new Set([
+      "String",
+      "Boolean",
+      "Int",
+      "Float",
+      "BigInt",
+      "Decimal",
+      "DateTime",
+      "Json",
+      "Bytes",
+    ]);
+    const relations = [...body.matchAll(/^\s+(\w+)\s+([A-Z]\w+)(\[\]|\?)?\s*$/gm)]
+      .map((match) => ({ field: match[1], model: match[2] }))
+      .filter((relation) => !scalarTypes.has(relation.model));
+
+    expect(relations.length).toBeGreaterThan(0);
+
+    const guarded = new Set<string>(dependentCounts.map(([model]) => model));
+    const derived = new Set(["IssueLifecycleEvent", "IssueLane"]);
+    const surviving = new Set(["AuditLog"]);
+    for (const relation of relations) {
+      expect(
+        guarded.has(relation.model) || derived.has(relation.model) || surviving.has(relation.model),
+        `Issue relation "${relation.field}" (${relation.model}) is not classified for the #1587 prune`,
+      ).toBe(true);
+    }
+    // And the guard list must not name a model the schema no longer has: a
+    // stale entry would count a table that no longer exists.
+    for (const [model] of dependentCounts) {
+      expect(
+        relations.some((relation) => relation.model === model),
+        `the prune guard names ${model}, which the Issue model no longer relates to`,
+      ).toBe(true);
+    }
+  });
+
+  it("writes no audit row when the row is already gone", async () => {
+    // The row vanished while the transaction waited for the lock: the goal is
+    // already met, and nothing was removed, so nothing is recorded.
+    mocks.txIssueFindUnique.mockResolvedValue(null);
+    const store = makePrismaIssueStore();
+
+    await expect(store.deleteIssue("zombie-1")).resolves.toBe(true);
+
+    expect(mocks.auditLogCreate).not.toHaveBeenCalled();
+    expect(mocks.issueDeleteMany).not.toHaveBeenCalled();
+  });
+
+  it("keeps the repo mapping on refusal so the persisted-label update records lifecycle events", async () => {
+    // The refusal path's follow-up updateIssue persists the excluded labels
+    // and needs the repo name the findIssue stashed to record the
+    // excluded-label transition as lifecycle evidence (#1202). Clearing the
+    // entry inside deleteIssue would silently skip that recording.
+    mocks.issueFindUnique.mockResolvedValue({
+      id: "zombie-1",
+      labels: ["agent/alpha"],
+      state: "open",
+      repository: { fullName: "org/repo" },
+    });
+    mocks.upsertLifecycleEvent.mockResolvedValue({ id: "evt-1" });
+    mocks.issueUpdate.mockResolvedValue({ id: "zombie-1" });
+    mocks.leaseCount.mockResolvedValue(1);
+    const store = makePrismaIssueStore();
+
+    await store.findIssue("repo-1", 42);
+    await expect(store.deleteIssue("zombie-1")).resolves.toBe(false);
+    await store.updateIssue(
+      "zombie-1",
+      {
+        number: 42,
+        title: "Issue 42",
+        body: null,
+        url: "https://github.com/org/repo/issues/42",
+        labels: ["wontfix", "agent/alpha"],
+        assignees: [],
+        commentsCount: 0,
+        state: "open",
+        createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        updatedAt: new Date("2026-01-02T00:00:00.000Z"),
+        closedAt: null,
+        lastSyncedAt: new Date("2026-01-02T00:00:00.000Z"),
+      },
+      { labels: ["status/ready", "agent/alpha"], state: "open" },
+    );
+
+    expect(mocks.upsertLifecycleEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({ repoFullName: "org/repo" }),
+      }),
+    );
+  });
+
+  it("drops the repo mapping once the issue is pruned", async () => {
+    // The entry must not outlive the row: after a successful prune no update
+    // follows for that id, and a stray late call must not fabricate lifecycle
+    // evidence for an issue that no longer exists.
+    mocks.issueFindUnique.mockResolvedValue({
+      id: "zombie-1",
+      labels: [],
+      state: "open",
+      repository: { fullName: "org/repo" },
+    });
+    mocks.upsertLifecycleEvent.mockResolvedValue({ id: "evt-1" });
+    mocks.issueUpdate.mockResolvedValue({ id: "zombie-1" });
+    const store = makePrismaIssueStore();
+
+    await store.findIssue("repo-1", 42);
+    await expect(store.deleteIssue("zombie-1")).resolves.toBe(true);
+    await store.updateIssue(
+      "zombie-1",
+      {
+        number: 42,
+        title: "Issue 42",
+        body: null,
+        url: "https://github.com/org/repo/issues/42",
+        labels: ["status/in-review"],
+        assignees: [],
+        commentsCount: 0,
+        state: "open",
+        createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        updatedAt: new Date("2026-01-02T00:00:00.000Z"),
+        closedAt: null,
+        lastSyncedAt: new Date("2026-01-02T00:00:00.000Z"),
+      },
+      { labels: [], state: "open" },
+    );
+    expect(mocks.upsertLifecycleEvent).not.toHaveBeenCalled();
   });
 });
 
