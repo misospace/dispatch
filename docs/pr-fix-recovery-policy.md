@@ -557,15 +557,15 @@ Rules:
   already-settled status yields `action: "skipped"` with no mutation
   (`resolvePrFixFromAgentReport`, `src/lib/pr-fix-queue/report-resolution.ts:136`; fences at `src/lib/pr-fix-queue/report-resolution.ts:192`, `src/lib/pr-fix-queue/report-resolution.ts:204`, `src/lib/pr-fix-queue/report-resolution.ts:251`). An old
   worker can never settle newer feedback.
-- **Commit-time pins.** Settlement, reclaim, and enqueue writes are
-  generation-conditional and, where they touch the watermark, pinned on the
+- **Commit-time pins.** Settlement, reclaim, enqueue, and terminal-reap writes
+  are generation-conditional and, where they touch the watermark, pinned on the
   exact snapshot they decided from, so a concurrent re-issue between read and
-  write no-ops the loser. **Current exception:** the terminal reap in
-  `reconcileStalePrFixItems` (`src/lib/pr-fix-queue/reconcile.ts:51`) and `reconcileArchivedRepoPrFixItems`
-  (`src/lib/pr-fix-queue/reconcile.ts:119`) writes `STALE` by `id` only, with no generation/status predicate, so
-  a concurrent requeue can be clobbered. **Proposed:** make the reaps
-  generation-pinned, or scope this invariant to settlement/reclaim/enqueue
-  writes and document the reap exception.
+  write no-ops the loser. The terminal reap in `reconcileStalePrFixItems`
+  (`src/lib/pr-fix-queue/reconcile.ts:50`) and `reconcileArchivedRepoPrFixItems`
+  (`src/lib/pr-fix-queue/reconcile.ts:118`) pins each `STALE` write on `id`,
+  `status`, and `generation` (#1253): a concurrent requeue or settlement that
+  bumped the generation or moved the status in the read→write gap wins, and the
+  reap no-ops (count 0, no history row) instead of clobbering it.
 - **Hand-out ownership.** An acked attempt is protected unless every acking
   agent is provably dead (#1419: ack age past `PR_FIX_ACK_LIVENESS_MS` plus no
   recent agent activity); reclamation otherwise targets only unacked stamped
@@ -621,8 +621,8 @@ These are the invariants implementation tests must pin:
     `BLOCKED` or a hold; only an operator release does.
 14. **Unknown evidence** — unparseable input neither absorbs nor loops; it
     defers and audits.
-15. **Reconcile vs requeue** — a generation-pinned reap does not clobber a
-    concurrent requeue (or the reap exception is explicitly accepted).
+15. **Reconcile vs requeue** — the generation-pinned reap does not clobber a
+    concurrent requeue.
 16. **Wait downgrade** — a new dependency-less wait parks fail-closed and is not
     evidence-reactivatable; a legacy wait is flagged, not bulk-downgraded.
 17. **Delayed webhook during the attempt** — hand-out at 10:00 (watermark
@@ -735,7 +735,7 @@ observation is recorded for audit only.
 | WAITING_EXTERNAL concrete dependency | Free-text note + timer only (`src/lib/pr-fix-queue/settlement.ts:31`, `src/lib/pr-fix-queue/external-wait.ts:52`) | No machine-checkable dependency/evidence/recovery trigger; "no patch" can masquerade as an external wait. |
 | Event-driven invalidation of a wait | Cooldown only | No recovery-trigger or fresh-feedback invalidation. |
 | Preserve human decisions | `BLOCKED` sticky; worker settlements pinned (`src/lib/pr-fix-queue/settlement.ts:238`) | No explicit maintainer hold distinct from `BLOCKED`; no stale-disposition flag when evidence arrives. |
-| Settlement fencing | Attempt token + generation pins + ack/reclaim (`src/lib/pr-fix-queue/report-resolution.ts:136`, `src/lib/pr-fix-queue/claim-handout.ts:271`) | Reap writes are not generation-conditional (`src/lib/pr-fix-queue/reconcile.ts:51`, `src/lib/pr-fix-queue/reconcile.ts:119`). |
+| Settlement fencing | Attempt token + generation pins + ack/reclaim (`src/lib/pr-fix-queue/report-resolution.ts:136`, `src/lib/pr-fix-queue/claim-handout.ts:271`); terminal reaps are generation-AND-status pinned too (`src/lib/pr-fix-queue/reconcile.ts:50`, `src/lib/pr-fix-queue/reconcile.ts:118`) | No known gap in settlement/reclaim/reap fencing. |
 | Bounded periodic reconciliation | `pr-followup` sync + `reconcile` reap closed/archived | Reconciliation reaps terminal PRs but does not apply the freshness transition table to active items. |
 | Unknown evidence | Split: unknown event kinds non-actionable; unknown head actionable (`src/lib/pr-fix-queue/evidence.ts:242`) | No single documented policy; no audit entry. |
 
@@ -759,7 +759,9 @@ observation is recorded for audit only.
    `(identity, version)`; extend `PrFixOutcome`/`VALID_PR_FIX_OUTCOMES`
    (`src/types/index.ts:266`) if `external_wait` is promoted to a stored
    outcome, or keep it status-implied.
-6. Make the terminal reap writes generation-pinned (or document the exception).
+6. Terminal reap writes are generation-pinned — done (#1253): each `STALE` write
+   pins `id`, `status`, and `generation` (`src/lib/pr-fix-queue/reconcile.ts:50`,
+   `src/lib/pr-fix-queue/reconcile.ts:118`).
 7. Add the negative-control tests above.
 
 ## Open questions
