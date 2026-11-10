@@ -491,6 +491,11 @@ export async function POST(request: Request) {
           }
 
           // Classify lane using heuristics — first-time set, or stale-backlog reclassification.
+          // Each write also records an IssueLane history row in the same
+          // transaction (#1598): lane history is the source consumers read
+          // (GET /api/issues/[issueId]/lane reads the latest IssueLane row,
+          // not the column), so a currentLane write without a history row is
+          // invisible to them. Same shape as the lane route's writer.
           if (existingIssue && !existingIssue.currentLane) {
             // First-time classification: lane was never set.
             const classification = classifyLaneByHeuristics(
@@ -498,10 +503,21 @@ export async function POST(request: Request) {
               issue.body,
               currentLabels,
             );
-            await prisma.issue.update({
-              where: { repositoryId_number: { repositoryId: repo.id, number: issue.number } },
-              data: { currentLane: classification.lane },
-            });
+            await prisma.$transaction([
+              prisma.issueLane.create({
+                data: {
+                  issueId: existingIssue.id,
+                  lane: classification.lane,
+                  confidence: classification.confidence,
+                  reason: classification.reason,
+                  model: "heuristic",
+                },
+              }),
+              prisma.issue.update({
+                where: { repositoryId_number: { repositoryId: repo.id, number: issue.number } },
+                data: { currentLane: classification.lane },
+              }),
+            ]);
             totalLaneClassified++;
           } else if (existingIssue && existingIssue.currentLane && isBacklogLane(existingIssue.currentLane)) {
             // Stale-backlog reclassification: the issue has an active status label
@@ -513,10 +529,34 @@ export async function POST(request: Request) {
               currentLabels,
             );
             if (reclassify) {
-              await prisma.issue.update({
-                where: { repositoryId_number: { repositoryId: repo.id, number: issue.number } },
-                data: { currentLane: reclassify },
-              });
+              // The reclassification delegates to the same heuristic
+              // classifier, so its confidence/reason describe the signals
+              // behind the decision; when the classifier itself still says
+              // backlog, `shouldReclassifyStaleBacklog` fell back to the
+              // default claimable lane and the note records that.
+              const classification = classifyLaneByHeuristics(
+                issue.title,
+                issue.body,
+                currentLabels,
+              );
+              const reason = reclassify === classification.lane
+                ? classification.reason
+                : `${classification.reason}; stale backlog lane fell back to the default claimable lane`;
+              await prisma.$transaction([
+                prisma.issueLane.create({
+                  data: {
+                    issueId: existingIssue.id,
+                    lane: reclassify,
+                    confidence: classification.confidence,
+                    reason,
+                    model: "reconcile",
+                  },
+                }),
+                prisma.issue.update({
+                  where: { repositoryId_number: { repositoryId: repo.id, number: issue.number } },
+                  data: { currentLane: reclassify },
+                }),
+              ]);
               totalLaneClassified++;
             }
           }
