@@ -568,10 +568,6 @@ export function makePrismaIssueStore(): IssueStore {
       await prisma.issue.update({ where: { id }, data });
     },
     async deleteIssue(id: string): Promise<boolean> {
-      // The row left the repo's write path with this decision; drop the
-      // pending-repo-name entry so it cannot outlive the issue.
-      repoByIssueId.delete(id);
-
       // #1587 excluded-reconcile delete. Every Issue foreign key cascades or
       // null-outs (see prisma/migrations), so a bare delete would silently
       // take leases, agent runs, and grooming history with it. Refuse when
@@ -585,8 +581,10 @@ export function makePrismaIssueStore(): IssueStore {
       // this decision and can never slip in between the count and the delete.
       // If this deletes, that insert then fails its foreign key — correct,
       // since the excluded issue is no longer dispatchable work.
-      return prisma.$transaction(async (tx) => {
-        await tx.$executeRaw`SELECT id FROM "Issue" WHERE id = ${id} FOR UPDATE`;
+      // Row-returning SELECT goes through $queryRaw ($executeRaw is for
+      // statements that change rows and cannot return a result set).
+      const pruned = await prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM "Issue" WHERE id = ${id} FOR UPDATE`;
 
         const dependents = await Promise.all([
           tx.agentRun.count({ where: { issueId: id } }),
@@ -605,6 +603,13 @@ export function makePrismaIssueStore(): IssueStore {
         await tx.issue.deleteMany({ where: { id } });
         return true;
       });
+      // The pending-repo-name entry is dropped only once the issue itself is
+      // gone. On a refusal the sync core persists the GitHub-authoritative
+      // labels via updateIssue, which needs this entry to record the
+      // excluded-label transition as lifecycle evidence (#1202) — clearing it
+      // up front would silently skip that recording.
+      if (pruned) repoByIssueId.delete(id);
+      return pruned;
     },
     async createIssue(repositoryId: string, data: SyncedIssueData) {
       // Stamp the configured default claimable lane so a freshly-ingested,

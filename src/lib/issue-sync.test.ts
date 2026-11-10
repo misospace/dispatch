@@ -10,7 +10,7 @@ const { mocks } = vi.hoisted(() => ({
     issueCreate: vi.fn(),
     issueDeleteMany: vi.fn(),
     transaction: vi.fn(),
-    executeRaw: vi.fn(),
+    queryRaw: vi.fn(),
     agentRunCount: vi.fn(),
     agentWorkCount: vi.fn(),
     leaseCount: vi.fn(),
@@ -893,7 +893,7 @@ describe("makePrismaIssueStore — excluded-reconcile delete (#1587)", () => {
     // the same mocks as the top-level client.
     mocks.transaction.mockImplementation((fn: (tx: any) => unknown) =>
       fn({
-        $executeRaw: mocks.executeRaw,
+        $queryRaw: mocks.queryRaw,
         agentRun: { count: mocks.agentRunCount },
         agentWork: { count: mocks.agentWorkCount },
         lease: { count: mocks.leaseCount },
@@ -902,7 +902,7 @@ describe("makePrismaIssueStore — excluded-reconcile delete (#1587)", () => {
         issue: { deleteMany: mocks.issueDeleteMany },
       }),
     );
-    mocks.executeRaw.mockResolvedValue(0);
+    mocks.queryRaw.mockResolvedValue([]);
     countMocks.forEach((count) => count.mockResolvedValue(0));
     mocks.issueDeleteMany.mockResolvedValue({ count: 1 });
   });
@@ -919,9 +919,11 @@ describe("makePrismaIssueStore — excluded-reconcile delete (#1587)", () => {
     // conflict with FOR KEY SHARE (a dependent insert could slip in between
     // the counts and the delete and be cascade-deleted), and a weaker lock
     // (FOR SHARE) would keep the call count and silently defeat the
-    // serialization.
-    expect(mocks.executeRaw).toHaveBeenCalledTimes(1);
-    const [lockQuery] = mocks.executeRaw.mock.calls[0] as [TemplateStringsArray, ...unknown[]];
+    // serialization. The row-returning SELECT must run through $queryRaw:
+    // $executeRaw is for statements that change rows and cannot return a
+    // result set, so the lock would never be taken through it.
+    expect(mocks.queryRaw).toHaveBeenCalledTimes(1);
+    const [lockQuery] = mocks.queryRaw.mock.calls[0] as [TemplateStringsArray, ...unknown[]];
     const lockSql = lockQuery.join("$1");
     expect(lockSql).toContain('FROM "Issue"');
     expect(lockSql).toContain("FOR UPDATE");
@@ -955,6 +957,87 @@ describe("makePrismaIssueStore — excluded-reconcile delete (#1587)", () => {
     await expect(store.deleteIssue("zombie-1")).resolves.toBe(false);
     // No dependent-work row may cascade or null out: the row is kept whole.
     expect(mocks.issueDeleteMany).not.toHaveBeenCalled();
+  });
+
+  it("keeps the repo mapping on refusal so the persisted-label update records lifecycle events", async () => {
+    // The refusal path's follow-up updateIssue persists the excluded labels
+    // and needs the repo name the findIssue stashed to record the
+    // excluded-label transition as lifecycle evidence (#1202). Clearing the
+    // entry inside deleteIssue would silently skip that recording.
+    mocks.issueFindUnique.mockResolvedValue({
+      id: "zombie-1",
+      labels: ["agent/alpha"],
+      state: "open",
+      repository: { fullName: "org/repo" },
+    });
+    mocks.upsertLifecycleEvent.mockResolvedValue({ id: "evt-1" });
+    mocks.issueUpdate.mockResolvedValue({ id: "zombie-1" });
+    mocks.leaseCount.mockResolvedValue(1);
+    const store = makePrismaIssueStore();
+
+    await store.findIssue("repo-1", 42);
+    await expect(store.deleteIssue("zombie-1")).resolves.toBe(false);
+    await store.updateIssue(
+      "zombie-1",
+      {
+        number: 42,
+        title: "Issue 42",
+        body: null,
+        url: "https://github.com/org/repo/issues/42",
+        labels: ["wontfix", "agent/alpha"],
+        assignees: [],
+        commentsCount: 0,
+        state: "open",
+        createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        updatedAt: new Date("2026-01-02T00:00:00.000Z"),
+        closedAt: null,
+        lastSyncedAt: new Date("2026-01-02T00:00:00.000Z"),
+      },
+      { labels: ["status/ready", "agent/alpha"], state: "open" },
+    );
+
+    expect(mocks.upsertLifecycleEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({ repoFullName: "org/repo" }),
+      }),
+    );
+  });
+
+  it("drops the repo mapping once the issue is pruned", async () => {
+    // The entry must not outlive the row: after a successful prune no update
+    // follows for that id, and a stray late call must not fabricate lifecycle
+    // evidence for an issue that no longer exists.
+    mocks.issueFindUnique.mockResolvedValue({
+      id: "zombie-1",
+      labels: [],
+      state: "open",
+      repository: { fullName: "org/repo" },
+    });
+    mocks.upsertLifecycleEvent.mockResolvedValue({ id: "evt-1" });
+    mocks.issueUpdate.mockResolvedValue({ id: "zombie-1" });
+    const store = makePrismaIssueStore();
+
+    await store.findIssue("repo-1", 42);
+    await expect(store.deleteIssue("zombie-1")).resolves.toBe(true);
+    await store.updateIssue(
+      "zombie-1",
+      {
+        number: 42,
+        title: "Issue 42",
+        body: null,
+        url: "https://github.com/org/repo/issues/42",
+        labels: ["status/in-review"],
+        assignees: [],
+        commentsCount: 0,
+        state: "open",
+        createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        updatedAt: new Date("2026-01-02T00:00:00.000Z"),
+        closedAt: null,
+        lastSyncedAt: new Date("2026-01-02T00:00:00.000Z"),
+      },
+      { labels: [], state: "open" },
+    );
+    expect(mocks.upsertLifecycleEvent).not.toHaveBeenCalled();
   });
 });
 
