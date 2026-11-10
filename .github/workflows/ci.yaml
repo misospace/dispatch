@@ -268,11 +268,17 @@ jobs:
       # is a where-clause guarantee on the row the selector reads (the stale
       # branch reads `groomingStaleAt`), so only a real PostgreSQL can prove
       # that a replayed application cleared the mark and the selector stopped
-      # re-offering the row.
+      # re-offering the row. The #1587 excluded-reconcile prune joins it for
+      # the same class of reason: "a landed dependent row is never cascade-
+      # deleted" is a ROW-LOCK guarantee (SELECT ... FOR UPDATE on the parent
+      # must conflict with the FOR KEY SHARE lock a dependent insert takes) —
+      # a weaker lock mode let the delete destroy just-committed dependent
+      # work — and the row-returning raw SELECT behind it cannot be proven by
+      # a mocked transaction client at all.
       - name: Concurrency and idempotency against a real PostgreSQL
         env:
           RUN_DB_INTEGRATION: "1"
-        run: npx vitest run src/lib/sync-lock.integration.test.ts "src/app/api/agents/[agentName]/tasks/report/route.integration.test.ts" src/lib/groomer/apply.integration.test.ts src/lib/groomer/blocked-reconciliation.integration.test.ts src/lib/groomer/stale-replay.integration.test.ts src/lib/pr-fix-external-wait.integration.test.ts src/lib/issue-mutation-guard.integration.test.ts src/lib/agent-work.integration.test.ts src/lib/pr-fix-rebase-type.integration.test.ts src/lib/lease-expiry-recovery.integration.test.ts src/lib/attempt-requeue-fence.integration.test.ts src/lib/pr-fix-handout-lane-fence.integration.test.ts
+        run: npx vitest run src/lib/sync-lock.integration.test.ts "src/app/api/agents/[agentName]/tasks/report/route.integration.test.ts" src/lib/groomer/apply.integration.test.ts src/lib/groomer/blocked-reconciliation.integration.test.ts src/lib/groomer/stale-replay.integration.test.ts src/lib/pr-fix-external-wait.integration.test.ts src/lib/issue-mutation-guard.integration.test.ts src/lib/agent-work.integration.test.ts src/lib/pr-fix-rebase-type.integration.test.ts src/lib/lease-expiry-recovery.integration.test.ts src/lib/attempt-requeue-fence.integration.test.ts src/lib/pr-fix-handout-lane-fence.integration.test.ts src/lib/issue-sync-delete.integration.test.ts
 
   coverage:
     name: Coverage
