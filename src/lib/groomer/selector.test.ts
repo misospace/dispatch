@@ -29,6 +29,7 @@ vi.mock("@/lib/prisma", () => ({
 describe("selectGroomingCandidate", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    delete process.env.DISPATCH_EXCLUDED_LABELS;
     mocks.issueFindMany.mockResolvedValue([]);
   });
 
@@ -589,6 +590,81 @@ describe("selectGroomingCandidate", () => {
       ]);
       mocks.groomingRunFindMany.mockResolvedValue([]);
       expect(await selectGroomingCandidate(hosted)).toMatchObject({ number: 3, selectionReason: "freshness_unknown" });
+    });
+  });
+
+  describe("excluded-label filter (#1604)", () => {
+    afterEach(() => {
+      delete process.env.DISPATCH_EXCLUDED_LABELS;
+    });
+
+    it("keeps DISPATCH_EXCLUDED_LABELS issues out of the candidate query", async () => {
+      process.env.DISPATCH_EXCLUDED_LABELS = "wontfix, duplicate";
+      await selectGroomingCandidate();
+      const where = mocks.issueFindMany.mock.calls[0][0].where;
+      const andClauses: unknown[] = Array.isArray(where.AND) ? where.AND : where.AND ? [where.AND] : [];
+      expect(andClauses).toEqual(
+        expect.arrayContaining([{ NOT: { labels: { hasSome: ["wontfix", "duplicate"] } } }]),
+      );
+    });
+
+    it("adds no excluded-label clause when DISPATCH_EXCLUDED_LABELS is unset", async () => {
+      await selectGroomingCandidate();
+      const where = mocks.issueFindMany.mock.calls[0][0].where;
+      const andClauses: unknown[] = Array.isArray(where.AND) ? where.AND : where.AND ? [where.AND] : [];
+      // The Renovate and umbrella exclusions nest under NOT.OR; only the
+      // excluded-label filter puts labels.hasSome directly inside a NOT.
+      const labelExclusions = andClauses.filter(
+        (clause) => (clause as { NOT?: { labels?: { hasSome?: unknown } } }).NOT?.labels?.hasSome,
+      );
+      expect(labelExclusions).toHaveLength(0);
+    });
+
+    it("does not exempt a targeted groom from the exclusion", async () => {
+      process.env.DISPATCH_EXCLUDED_LABELS = "wontfix";
+      await selectGroomingCandidate({ issueNumber: 9 });
+      const where = mocks.issueFindMany.mock.calls[0][0].where;
+      expect(where.AND).toEqual(
+        expect.arrayContaining([{ NOT: { labels: { hasSome: ["wontfix"] } } }]),
+      );
+    });
+
+    it("never selects an excluded-label issue as the grooming candidate", async () => {
+      process.env.DISPATCH_EXCLUDED_LABELS = "wontfix";
+      const rows = [
+        {
+          number: 10,
+          title: "Excluded issue",
+          url: "https://github.com/org/repo/issues/10",
+          labels: ["wontfix"],
+          currentLane: null,
+          repository: { fullName: "org/repo" },
+        },
+        {
+          number: 20,
+          title: "Comparable issue",
+          url: "https://github.com/org/repo/issues/20",
+          labels: ["chore"],
+          currentLane: null,
+          repository: { fullName: "org/repo" },
+        },
+      ];
+      // Both rows score the same, so the lowest issue number wins when both
+      // are candidates — the excluded row would be selected without the
+      // filter. The fake honours the clause the query actually carries, so
+      // the excluded row drops out because of the filter, not the fixture.
+      mocks.issueFindMany.mockImplementation(async (args: { where?: Record<string, unknown> }) => {
+        const and = args.where?.AND;
+        const clauses: unknown[] = Array.isArray(and) ? and : and ? [and] : [];
+        const excluded = clauses
+          .map((clause) => (clause as { NOT?: { labels?: { hasSome?: unknown } } }).NOT?.labels?.hasSome)
+          .filter((hasSome): hasSome is string[] => Array.isArray(hasSome));
+        return rows.filter((row) => !excluded.some((set) => row.labels.some((label) => set.includes(label))));
+      });
+
+      const result = await selectGroomingCandidate();
+
+      expect(result?.number).toBe(20);
     });
   });
 });

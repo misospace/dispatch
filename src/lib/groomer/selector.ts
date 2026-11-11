@@ -1,11 +1,14 @@
 import { prisma } from "@/lib/prisma";
 import { isBacklogLane, getBacklogLane } from "@/lib/lane-config";
 import {
+  appendIssueWhere,
   applyRenovateIssueExclusion,
   applyUmbrellaIssueExclusion,
+  buildExcludedLabelWhere,
   buildGroomingStateExclusionWhere,
   isRenovateIssue,
 } from "@/lib/issue-filters";
+import { parseExcludedLabels } from "@/lib/config";
 import {
   ADMISSION_ISSUE_SELECT,
   evaluateQueueAdmission,
@@ -95,6 +98,11 @@ export async function selectGroomingCandidate(
   }
   applyRenovateIssueExclusion(issueWhere);
   applyUmbrellaIssueExclusion(issueWhere);
+  // #1604: a kept row (the sync prune is blocked by dependent work) still
+  // carries its operator-excluded label, so the candidate query must filter
+  // it like the board and queue readers do — unconditional, like the
+  // Renovate and umbrella exclusions above (a targeted groom included).
+  appendIssueWhere(issueWhere, buildExcludedLabelWhere(parseExcludedLabels(process.env.DISPATCH_EXCLUDED_LABELS)));
 
   // A targeted re-groom (issueNumber supplied) bypasses the blocked/not-ready
   // exclusion and the later eligibility check so parked or fully classified

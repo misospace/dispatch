@@ -272,6 +272,41 @@ describe("POST /api/issues/claim — business logic", () => {
     expect((await res.json()).error).toBe("Cannot claim a closed issue");
   });
 
+  // #1604: the readers hide excluded-labelled issues; a claim by issue id
+  // must refuse them too, before any remote-label fetch or local write.
+  it("refuses an issue whose cached labels match DISPATCH_EXCLUDED_LABELS", async () => {
+    process.env.DISPATCH_EXCLUDED_LABELS = "wontfix, hold";
+    try {
+      mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: ["wontfix"] });
+      const res = await POST(makeRequest());
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toContain("DISPATCH_EXCLUDED_LABELS");
+      expect(mocks.getLiveIssueLabels).not.toHaveBeenCalled();
+      expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+      expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+      expect(mocks.leaseCreate).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.DISPATCH_EXCLUDED_LABELS;
+    }
+  });
+
+  it("does not exempt the excluded-label refusal from a maintainer force-claim", async () => {
+    process.env.DISPATCH_EXCLUDED_LABELS = "wontfix";
+    try {
+      mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: ["wontfix", "agent/other"] });
+      const res = await POST(makeRequest({ force: true }));
+      expect(res.status).toBe(400);
+      // The refusal lands before the live-label fetch, so force never reaches
+      // the conflicting-agent removal path: no live read, no label write.
+      expect(mocks.getLiveIssueLabels).not.toHaveBeenCalled();
+      expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+      expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+      expect(mocks.leaseCreate).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.DISPATCH_EXCLUDED_LABELS;
+    }
+  });
+
   it.each(["status/blocked", "status/done"])("refuses %s while resuming without remote or lease writes", async (status) => {
     guardState.resuming = true;
     mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: [status] });
