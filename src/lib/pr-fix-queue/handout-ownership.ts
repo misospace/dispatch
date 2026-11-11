@@ -1,4 +1,6 @@
-import { ownershipAuthorizesHandout, prFixOwnershipEvidence, type PrFixOwnershipEvidence, resolveIngestionClaimant } from "../pr-fix-ownership";
+import { ownershipAuthorizesHandout, prFixOwnershipEvidence, claimantIsHumanOwned, type PrFixOwnershipEvidence, resolveIngestionClaimant } from "../pr-fix-ownership";
+import { normalizePrFixType } from "@/types";
+import { rebaseExecutorAgentNames, rebaseExecutorClaimantExclusion } from "./lane-admission";
 import { type PrFixQueueClient } from "./client";
 import { normalizeQueueRepo } from "./shared";
 
@@ -43,6 +45,30 @@ export function prFixOwnershipMode(env: NodeJS.ProcessEnv = process.env): PrFixO
   return "enforce";
 }
 
+/**
+ * #1615: the operator-declared PR-fix worker identity space — the agent
+ * names a PR-fix claimant may carry for the row to remain auto-offerable.
+ * Comma or whitespace separated, case-insensitive, duplicates collapse.
+ *
+ * Fail-open by design (deliberately unlike the rebase lane's pool): an
+ * unset or empty value leaves the set empty, classification is unavailable,
+ * and NO claimant is ever refused for being outside it — the pre-#1615
+ * behavior. Declaring the space is the operator's opt-in to the #1615
+ * withholds, because an incomplete list would silently strand items whose
+ * claimant is a real connector missing from it.
+ */
+export function prFixWorkerAgentIdentitySet(
+  env: NodeJS.ProcessEnv = process.env,
+): ReadonlySet<string> {
+  const raw = env.DISPATCH_PR_FIX_AGENTS ?? "";
+  return new Set(
+    raw
+      .split(/[\s,]+/)
+      .map((name) => name.trim().toLowerCase())
+      .filter(Boolean),
+  );
+}
+
 /** The row fields the ownership gate reads (subset of a queue row). */
 export type PrFixOwnershipRow = {
   id?: string;
@@ -54,7 +80,25 @@ export type PrFixOwnershipRow = {
   author?: string | null;
   claimant?: string | null;
   claimantSource?: string | null;
+  /**
+   * #1615: the row's DISPATCHED lane (`attemptType`, falling back to `type`
+   * — the same derivation the rebase gate and settlement key on). The
+   * rebase-executor claimant arm applies only to a known non-REBASE value;
+   * an absent value skips the arm (fail-open for a legacy row shape).
+   */
+  fixType?: string | null;
 };
+
+/**
+ * The refusal classes of the ownership gate. `null` on an eligible row;
+ * otherwise the arm that refused:
+ * - "unresolved" — missing/ambiguous/legacy ownership (#1569);
+ * - "human-owned" — a label/author-sourced claimant outside the declared
+ *   PR-fix worker identity space (#1615 Part A);
+ * - "rebase-executor-claimant" — a rebase-executor claimant on a non-REBASE
+ *   item (#1615 Part B): the rebase executor is not a fix-work owner.
+ */
+export type PrFixOwnershipRefusal = "unresolved" | "human-owned" | "rebase-executor-claimant" | null;
 
 /**
  * The ownership arm of the hand-out gate (#1569). Applies to EVERY
@@ -72,13 +116,81 @@ export type PrFixOwnershipRow = {
  * is NOT an exemption for ownership: it is still an automatic hand-out, and
  * an operator who means to dispatch an unresolved row stamps it explicitly
  * (recovery endpoint), which is the auditable act.
+ *
+ * #1615 adds two REFUSAL arms for RESOLVED claimants that no connector can
+ * own, both operator-config-derived (Dispatch never invents identity lists):
+ * - "human-owned" — a label/PR-author-sourced claimant outside the declared
+ *   PR-fix worker identity space (`DISPATCH_PR_FIX_AGENTS`; the arm is inert
+ *   while that space is undeclared). The item stays QUEUED as the human's
+ *   queue entry instead of being offered, declined, and park-looped.
+ * - "rebase-executor-claimant" — a claimant in the rebase-executor pool
+ *   (`DISPATCH_REBASE_AGENTS`) on an item whose non-empty dispatched lane
+ *   does not normalize to REBASE (any other value, known type or not).
+ *   Resolution keeps the pool off new rows (see `ClaimantResolutionOptions`);
+ *   this arm stops an already-recorded poison claimant from re-entering the
+ *   decline loop.
+ * Both arms refuse in EVERY rollout mode, exactly like the unresolved arm.
  */
 export function evaluatePrFixHandoutOwnership(
   row: PrFixOwnershipRow,
   mode: PrFixOwnershipMode = prFixOwnershipMode(),
-): { decision: "eligible" | "refuse"; evidence: PrFixOwnershipEvidence } {
+  /**
+   * #1615: the declared PR-fix worker identity space. Defaults from
+   * `DISPATCH_PR_FIX_AGENTS`; an empty set disables the human-owned arm.
+   */
+  workerAgents: ReadonlySet<string> = prFixWorkerAgentIdentitySet(),
+): { decision: "eligible" | "refuse"; evidence: PrFixOwnershipEvidence; refusal: PrFixOwnershipRefusal } {
   const evidence = prFixOwnershipEvidence(row);
-  if (ownershipAuthorizesHandout(evidence)) return { decision: "eligible", evidence };
+  if (ownershipAuthorizesHandout(evidence)) {
+    // #1615 Part A: a RESOLVED claimant can still be un-ownable — a human's
+    // board claim (agent/owner label) or PR authorship that names nobody in
+    // the declared worker identity space. The row belongs to that human;
+    // offering it only burns attempt budget on offers no connector may
+    // accept. Refused like an unresolved row: no stamp, no hand-out, no
+    // attempt.
+    if (claimantIsHumanOwned(evidence, workerAgents)) {
+      const logFields = {
+        repoFullName: row.repo,
+        pullRequestNumber: row.pr,
+        generation: row.generation ?? null,
+        claimant: evidence.originalClaimant,
+        ownershipProvenance: evidence.provenance,
+      };
+      if (mode === "audit") {
+        console.info("[next-task-pr-fix] AUDIT: refusing PR-fix hand-out with HUMAN-OWNED claimant (#1615)", logFields);
+      } else {
+        console.info("[next-task-pr-fix] refusing PR-fix hand-out with HUMAN-OWNED claimant (#1615)", logFields);
+      }
+      return { decision: "refuse", evidence, refusal: "human-owned" };
+    }
+    // #1615 Part B (recorded rows): a rebase-executor claimant on a
+    // non-REBASE item is structurally un-routable — every fix connector
+    // declines the lane-mismatched identity. Resolution keeps the pool off
+    // new rows; this arm stops an already-recorded poison claimant from
+    // re-entering the decline loop.
+    if (
+      typeof row.fixType === "string" &&
+      row.fixType.trim() !== "" &&
+      normalizePrFixType(row.fixType) !== "REBASE" &&
+      rebaseExecutorAgentNames().has((evidence.originalClaimant ?? "").trim().toLowerCase())
+    ) {
+      const logFields = {
+        repoFullName: row.repo,
+        pullRequestNumber: row.pr,
+        generation: row.generation ?? null,
+        claimant: evidence.originalClaimant,
+        ownershipProvenance: evidence.provenance,
+        dispatchedLane: normalizePrFixType(row.fixType),
+      };
+      if (mode === "audit") {
+        console.info("[next-task-pr-fix] AUDIT: refusing PR-fix hand-out with a REBASE-EXECUTOR claimant on a non-REBASE item (#1615)", logFields);
+      } else {
+        console.info("[next-task-pr-fix] refusing PR-fix hand-out with a REBASE-EXECUTOR claimant on a non-REBASE item (#1615)", logFields);
+      }
+      return { decision: "refuse", evidence, refusal: "rebase-executor-claimant" };
+    }
+    return { decision: "eligible", evidence, refusal: null };
+  }
   // #1569: NO mode hands an unresolved row out. "audit" keeps its
   // migration-window observability (a distinguishable log marker), "off"
   // keeps its no-issuance-write posture — both still refuse.
@@ -93,7 +205,7 @@ export function evaluatePrFixHandoutOwnership(
   } else {
     console.info("[next-task-pr-fix] refusing PR-fix hand-out with UNRESOLVED ownership (#1569)", logFields);
   }
-  return { decision: "refuse", evidence };
+  return { decision: "refuse", evidence, refusal: "unresolved" };
 }
 
 /**
@@ -121,6 +233,14 @@ export async function backfillPrFixClaimant(
     author?: string | null;
     claimant?: string | null;
     claimantSource?: string | null;
+    /**
+     * #1615: the row's dispatched lane (`attemptType ?? type`). On a known
+     * non-REBASE value, the rebase-executor pool is excluded as claimant
+     * evidence — a rebase executor is not a fix-work owner, so its name
+     * (agent label or a live lease) falls through to the next source
+     * instead of propagating an un-routable claimant onto the row.
+     */
+    fixType?: string | null;
   },
 ): Promise<{ claimant: string | null; claimantSource: string | null }> {
   if (typeof row.claimant === "string" && row.claimant.trim() !== "") {
@@ -129,7 +249,17 @@ export async function backfillPrFixClaimant(
     // report a recorded lease/operator/agent claimant as "legacy".
     return { claimant: row.claimant, claimantSource: row.claimantSource ?? null };
   }
-  const resolution = await resolveIngestionClaimant(client, row.repo, row.issue ?? null, row.author);
+  // #1615: on a known non-REBASE item the rebase-executor pool is not
+  // claimant evidence. An unknown/absent lane value skips the exclusion
+  // (fail-open for a legacy row shape — the gate re-decides at issuance).
+  const resolution = await resolveIngestionClaimant(
+    client,
+    row.repo,
+    row.issue ?? null,
+    row.author,
+    new Date(),
+    rebaseExecutorClaimantExclusion(row.fixType),
+  );
   if (resolution.state !== "resolved") return { claimant: null, claimantSource: null };
   try {
     const { count } = await client.prFixQueueItem.updateMany({

@@ -111,6 +111,31 @@ Queue listings carry `claimant`, `claimantSource`, and `ownership` additively.
 - A failed claimant-fact read records nothing at all. The row stays unresolved (`claimantSource` NULL, reported as `legacy`), and a later observation or recovery re-resolves it — a transient database error is never stored as provenance.
 - A refused hand-out disturbs nothing on the row: no dispatch stamp, no evidence-watermark change, no hand-out record.
 
+## Human-owned and rebase-executor claimants (#1615)
+
+A resolved claimant can still be an identity that no connector may own. Two flows caused offer, decline, and park loops. Both fixes are operator-config-derived. Dispatch never invents an identity list.
+
+### Human-owned claimants (Part A)
+
+A human can claim an issue on the board. The claim records an `agent/<name>` label, and the PR-fix item resolves that label as the claimant. No connector holds that identity, so every connector declines the hand-out. The item belongs to that human. It is their queue entry, not the pool's.
+
+The operator declares the PR-fix worker identity space with `DISPATCH_PR_FIX_AGENTS` (comma or whitespace separated agent names, case-insensitive). A claimant from an unauthenticated source (`agent-label`, `owner-label`, or `pr-author`) that names nobody in this space is human-owned. The hand-out gate refuses the row in every rollout mode. The row stays QUEUED, burns no attempt, and the operator queue lists it with `humanOwned: true`.
+
+Fail-open rule: an unset or empty `DISPATCH_PR_FIX_AGENTS` declares no space. Classification is then unavailable, nothing is human-owned, and dispatch behaves as before #1615. An incomplete list can strand items, so declare the full connector set when you opt in.
+
+A live `lease` holder and an `operator` stamp never classify as human-owned. Both identities authenticated to Dispatch through its own API, so they are worker identities by construction.
+
+### Rebase-executor claimants (Part B)
+
+The rebase executor (`DISPATCH_REBASE_AGENTS` pool) can be the claimant of record for a PR whose follow-up work is ordinary fix work. The fix work is not rebase work, and no fix connector can own a claimant bound to the rebase connector's queue lane. The item is structurally un-routable.
+
+Two rules keep the pool off non-REBASE items:
+
+1. At claimant resolution (enqueue, materialization, requeue, and the lazy issuance backfill), a rebase-executor name is not ownership evidence on a non-REBASE item. An `agent/<name>` label is filtered out, and a live lease held by the pool name is treated as absent. Resolution falls through to the next source, or records `missing` for operator stamping. The excluded name also cannot manufacture an `ambiguous` state against the identities that remain. A REBASE-typed item keeps its rebase-executor claimant.
+2. At the hand-out gate, a row with an already-recorded rebase-executor claimant and a non-REBASE dispatched lane is refused in every rollout mode. A recorded claimant is never cleared (the write rules above), so the refusal stops the decline loop; it ends when the PR settles.
+
+A bare `*` in `DISPATCH_REBASE_AGENTS` is a lane-eligibility opt-in only. It declares no executor names and excludes nothing from claimant resolution.
+
 ## Companion rollout note
 
 A consuming client enforces its own claimant-to-lane bindings using this evidence. Dispatch deliberately does not.

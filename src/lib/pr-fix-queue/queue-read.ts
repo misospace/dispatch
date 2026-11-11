@@ -1,7 +1,9 @@
 import { normalizePrFixLane, normalizePrFixType, PR_FIX_TYPE_PRIORITY } from "@/types";
 import { fetchPullRequestHeadSha } from "../github-prs";
 import { parseStoredExternalWait } from "../pr-fix-external-wait";
+import { claimantIsHumanOwned, prFixOwnershipEvidence } from "../pr-fix-ownership";
 import { type PrFixQueueClient } from "./client";
+import { prFixWorkerAgentIdentitySet } from "./handout-ownership";
 import { reactivateDueExternalWaits } from "./external-wait";
 
 export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { lane?: string | null; includeBlocked?: boolean; prioritizeByType?: boolean } = {}) {
@@ -45,6 +47,18 @@ export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { 
     if (item.status !== "WAITING_EXTERNAL") continue;
     item.externalWait = parseStoredExternalWait(item.externalWait);
     item.legacyWait = item.externalWait === null;
+  }
+
+  // #1615: derived HUMAN-OWNED classification, surfaced additively on every
+  // listed row. A claimant established by a label or PR authorship that is
+  // outside the declared PR-fix worker identity space (`DISPATCH_PR_FIX_AGENTS`)
+  // is the operator/UI queue's "claimed by human" signal: the item belongs
+  // to that human and the hand-out gate refuses it, so it must be visible as
+  // human-owned instead of park-looping through offers no connector accepts.
+  // Inert while the identity space is undeclared (empty set → always false).
+  const workerAgents = prFixWorkerAgentIdentitySet();
+  for (const item of items) {
+    item.humanOwned = claimantIsHumanOwned(prFixOwnershipEvidence(item), workerAgents);
   }
 
   return items;

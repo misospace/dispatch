@@ -10,7 +10,11 @@ import {
   createLinkedPrFixItem,
   enqueuePrFixItem,
   evaluatePrFixHandoutOwnership,
+  listQueuedPrFixItems,
   prFixOwnershipMode,
+  prFixWorkerAgentIdentitySet,
+  rebaseExecutorAgentNames,
+  rebaseExecutorClaimantExclusion,
   requeuePrFixItem,
   setPrFixClaimant,
   toAgentQueuePrFixItem,
@@ -117,6 +121,13 @@ function makeClient(
   return client as PrFixQueueClient & { row: any; history: any[] };
 }
 
+/** Adds the findMany surface listQueuedPrFixItems needs (reactivation scan + list read). */
+function withListSurface(client: any) {
+  client.prFixQueueItem.findMany = async ({ where }: any) =>
+    where?.status === "WAITING_EXTERNAL" ? [] : client.row ? [client.row] : [];
+  return client;
+}
+
 const ENQUEUE_INPUT = {
   repo: "org/repo",
   pr: 42,
@@ -127,6 +138,60 @@ const ENQUEUE_INPUT = {
 
 afterEach(() => {
   delete process.env.DISPATCH_PR_FIX_OWNERSHIP_MODE;
+  delete process.env.DISPATCH_REBASE_AGENTS;
+  delete process.env.DISPATCH_PR_FIX_AGENTS;
+});
+
+describe("prFixWorkerAgentIdentitySet (#1615)", () => {
+  it("parses a comma/whitespace separated, case-insensitive, deduplicated list", () => {
+    const envWith = (value?: string) =>
+      ({ NODE_ENV: "test", ...(value === undefined ? {} : { DISPATCH_PR_FIX_AGENTS: value }) }) as NodeJS.ProcessEnv;
+    expect(prFixWorkerAgentIdentitySet(envWith())).toEqual(new Set());
+    expect(prFixWorkerAgentIdentitySet(envWith(""))).toEqual(new Set());
+    expect(prFixWorkerAgentIdentitySet(envWith("  "))).toEqual(new Set());
+    expect(prFixWorkerAgentIdentitySet(envWith("Courier-Local,\ncourier-cloud , COURIER-LOCAL"))).toEqual(
+      new Set(["courier-local", "courier-cloud"]),
+    );
+    // Whitespace-separated values parse like the rebase pool does — a space
+    // must never split into a bogus two-word name.
+    expect(prFixWorkerAgentIdentitySet(envWith("courier-local courier-cloud"))).toEqual(
+      new Set(["courier-local", "courier-cloud"]),
+    );
+  });
+});
+
+describe("rebaseExecutorAgentNames / rebaseExecutorClaimantExclusion (#1615)", () => {
+  it("parses the pool lowercase and treats the * wildcard as NO declared executor names", () => {
+    process.env.DISPATCH_REBASE_AGENTS = "Courier-Rebase, other";
+    try {
+      expect(rebaseExecutorAgentNames()).toEqual(new Set(["courier-rebase", "other"]));
+    } finally {
+      delete process.env.DISPATCH_REBASE_AGENTS;
+    }
+    process.env.DISPATCH_REBASE_AGENTS = "*";
+    try {
+      // A wildcard is a lane-ELIGIBILITY opt-in, not a declaration that
+      // every agent name is a rebase executor: nothing is excluded.
+      expect(rebaseExecutorAgentNames().size).toBe(0);
+      expect(rebaseExecutorClaimantExclusion("OTHER")).toBeUndefined();
+    } finally {
+      delete process.env.DISPATCH_REBASE_AGENTS;
+    }
+  });
+
+  it("excludes only on a known non-REBASE dispatched lane", () => {
+    process.env.DISPATCH_REBASE_AGENTS = "courier-rebase";
+    try {
+      expect(rebaseExecutorClaimantExclusion("OTHER")?.excludeClaimantNames).toEqual(new Set(["courier-rebase"]));
+      expect(rebaseExecutorClaimantExclusion("review_feedback")?.excludeClaimantNames).toEqual(new Set(["courier-rebase"]));
+      expect(rebaseExecutorClaimantExclusion("REBASE")).toBeUndefined();
+      expect(rebaseExecutorClaimantExclusion(null)).toBeUndefined();
+      expect(rebaseExecutorClaimantExclusion(undefined)).toBeUndefined();
+      expect(rebaseExecutorClaimantExclusion("  ")).toBeUndefined();
+    } finally {
+      delete process.env.DISPATCH_REBASE_AGENTS;
+    }
+  });
 });
 
 describe("prFixOwnershipMode (#1569)", () => {
@@ -194,6 +259,203 @@ describe("evaluatePrFixHandoutOwnership (#1569)", () => {
     } finally {
       spy.mockRestore();
     }
+  });
+});
+
+describe("evaluatePrFixHandoutOwnership #1615 arms", () => {
+  const workers = new Set(["courier-x"]);
+
+  it("refuses a HUMAN-OWNED label/author claimant outside the declared worker identity space", () => {
+    const human = { repo: "org/repo", pr: 1, claimant: "smurf", claimantSource: "agent-label", lane: "NORMAL" };
+    expect(evaluatePrFixHandoutOwnership(human, "enforce", workers)).toEqual(
+      expect.objectContaining({ decision: "refuse", refusal: "human-owned" }),
+    );
+    // Every unauthenticated provenance classifies: owner labels and PR
+    // authorship too.
+    expect(
+      evaluatePrFixHandoutOwnership({ ...human, claimantSource: "owner-label" }, "enforce", workers).refusal,
+    ).toBe("human-owned");
+    expect(
+      evaluatePrFixHandoutOwnership({ ...human, claimantSource: "pr-author" }, "enforce", workers).refusal,
+    ).toBe("human-owned");
+  });
+
+  it("never classifies authenticated provenance (lease, operator) as human-owned", () => {
+    const row = { repo: "org/repo", pr: 1, claimant: "smurf", lane: "NORMAL" };
+    expect(
+      evaluatePrFixHandoutOwnership({ ...row, claimantSource: "lease" }, "enforce", workers).decision,
+    ).toBe("eligible");
+    expect(
+      evaluatePrFixHandoutOwnership({ ...row, claimantSource: "operator" }, "enforce", workers).decision,
+    ).toBe("eligible");
+  });
+
+  it("is fail-open: an undeclared worker identity space classifies nobody", () => {
+    const human = { repo: "org/repo", pr: 1, claimant: "smurf", claimantSource: "agent-label", lane: "NORMAL" };
+    expect(evaluatePrFixHandoutOwnership(human, "enforce", new Set()).decision).toBe("eligible");
+  });
+
+  it("keeps a claimant inside the declared worker space offerable", () => {
+    const worker = { repo: "org/repo", pr: 1, claimant: "Courier-X", claimantSource: "agent-label", lane: "NORMAL" };
+    expect(evaluatePrFixHandoutOwnership(worker, "enforce", workers)).toEqual(
+      expect.objectContaining({ decision: "eligible", refusal: null }),
+    );
+  });
+
+  it("refuses a rebase-executor claimant on a non-REBASE item in EVERY mode", () => {
+    process.env.DISPATCH_REBASE_AGENTS = "courier-rebase";
+    try {
+      const poisoned = {
+        repo: "org/repo", pr: 1, claimant: "courier-rebase", claimantSource: "agent-label",
+        lane: "NORMAL", fixType: "REVIEW_FEEDBACK",
+      };
+      for (const mode of ["enforce", "audit", "off"] as const) {
+        expect(evaluatePrFixHandoutOwnership(poisoned, mode, new Set())).toEqual(
+          expect.objectContaining({ decision: "refuse", refusal: "rebase-executor-claimant" }),
+        );
+      }
+    } finally {
+      delete process.env.DISPATCH_REBASE_AGENTS;
+    }
+  });
+
+  it("never applies the rebase-executor arm to a REBASE item or an unknown lane value", () => {
+    process.env.DISPATCH_REBASE_AGENTS = "courier-rebase";
+    try {
+      const legitimate = {
+        repo: "org/repo", pr: 1, claimant: "courier-rebase", claimantSource: "agent-label",
+        lane: "NORMAL", fixType: "REBASE",
+      };
+      expect(evaluatePrFixHandoutOwnership(legitimate, "enforce", new Set()).decision).toBe("eligible");
+      // Absent/empty fixType: fail-open for a legacy row shape.
+      expect(
+        evaluatePrFixHandoutOwnership({ ...legitimate, fixType: null }, "enforce", new Set()).decision,
+      ).toBe("eligible");
+      // An undeclared rebase pool refuses nobody on this arm.
+      delete process.env.DISPATCH_REBASE_AGENTS;
+      expect(
+        evaluatePrFixHandoutOwnership({ ...legitimate, fixType: "OTHER" }, "enforce", new Set()).decision,
+      ).toBe("eligible");
+    } finally {
+      delete process.env.DISPATCH_REBASE_AGENTS;
+    }
+  });
+
+  it("refuses a recorded lease-provenance rebase-executor claimant on a non-REBASE item", () => {
+    // The recorded-poison arm is provenance-blind: a lease-provenance
+    // courier-rebase claimant (recorded by a pre-#1615 row) is just as
+    // un-routable on a non-REBASE item as an agent-label one.
+    process.env.DISPATCH_REBASE_AGENTS = "courier-rebase";
+    try {
+      const poisoned = {
+        repo: "org/repo", pr: 1, claimant: "courier-rebase", claimantSource: "lease",
+        lane: "NORMAL", fixType: "CI_FAILURE",
+      };
+      expect(evaluatePrFixHandoutOwnership(poisoned, "enforce", new Set()).refusal).toBe("rebase-executor-claimant");
+    } finally {
+      delete process.env.DISPATCH_REBASE_AGENTS;
+    }
+  });
+});
+
+describe("#1615 offer-policy integration", () => {
+  it("enqueue skips a rebase-executor agent label on a non-REBASE item and records the fall-through", async () => {
+    process.env.DISPATCH_REBASE_AGENTS = "courier-rebase";
+    try {
+      const client = makeClient(null, { issueRow: { id: "iss-1", labels: ["agent/courier-rebase"] } });
+      await enqueuePrFixItem(client, { ...ENQUEUE_INPUT, issue: 7 });
+      // The excluded label is not ownership evidence: no owner label exists,
+      // so the row records the honest "missing" state instead of a claimant
+      // no fix connector can own.
+      expect(client.row.claimant).toBeNull();
+      expect(client.row.claimantSource).toBe("missing");
+
+      // A REBASE-typed enqueue keeps the rebase executor as its claimant.
+      const rebaseClient = makeClient(null, { issueRow: { id: "iss-2", labels: ["agent/courier-rebase"] } });
+      await enqueuePrFixItem(rebaseClient, { ...ENQUEUE_INPUT, issue: 8, type: "REBASE" });
+      expect(rebaseClient.row.claimant).toBe("courier-rebase");
+      expect(rebaseClient.row.claimantSource).toBe("agent-label");
+    } finally {
+      delete process.env.DISPATCH_REBASE_AGENTS;
+    }
+  });
+
+  it("backfill skips a rebase-executor agent label on a non-REBASE row", async () => {
+    process.env.DISPATCH_REBASE_AGENTS = "courier-rebase";
+    try {
+      const row = makeQueueRow({ claimant: null, claimantSource: null });
+      const client = makeClient(row, { issueRow: { id: "iss-1", labels: ["agent/courier-rebase"] } });
+      const result = await backfillPrFixClaimant(client, {
+        id: "item-1", repo: "org/repo", issue: 7, author: "bot", claimant: null, fixType: "OTHER",
+      });
+      expect(result).toEqual({ claimant: null, claimantSource: null });
+      expect(client.row.claimant).toBeNull();
+    } finally {
+      delete process.env.DISPATCH_REBASE_AGENTS;
+    }
+  });
+
+  it("materialization and operator requeue also skip a rebase-executor claimant on non-REBASE rows", async () => {
+    process.env.DISPATCH_REBASE_AGENTS = "courier-rebase";
+    try {
+      const { item } = await createLinkedPrFixItem(makeClient(null, { issueRow: { id: "iss-1", labels: ["agent/courier-rebase"] } }), {
+        repo: "org/repo",
+        pr: 99,
+        issue: 7,
+        lane: "NORMAL",
+        reason: "linked follow-up",
+        feedback: ["r"],
+        evidenceKey: "linked-health:7:x",
+      });
+      expect(item.claimant).toBeNull();
+      expect(item.claimantSource).toBe("missing");
+
+      const row = makeQueueRow({ status: "BLOCKED", lane: "NEEDS_HUMAN", issue: 7, claimant: null, claimantSource: "missing" });
+      const client = makeClient(row, { issueRow: { id: "iss-1", labels: ["agent/courier-rebase"] } });
+      await requeuePrFixItem(client, { repo: "org/repo", pr: 42 });
+      expect(client.row.claimant).toBeNull();
+      // The excluded observation is unresolved: requeue writes nothing, so
+      // the row's failure state stays exactly as it was (no churn write).
+      expect(client.row.claimantSource).toBe("missing");
+    } finally {
+      delete process.env.DISPATCH_REBASE_AGENTS;
+    }
+  });
+
+  it("lists a human-owned row with humanOwned=true for the operator queue", async () => {
+    process.env.DISPATCH_PR_FIX_AGENTS = "courier-x";
+    try {
+      const human = makeQueueRow({ claimant: "smurf", claimantSource: "agent-label" });
+      const client = withListSurface(makeClient(human));
+      const [listed] = await listQueuedPrFixItems(client, {});
+      expect(listed.humanOwned).toBe(true);
+
+      const worker = makeQueueRow({ claimant: "courier-x", claimantSource: "agent-label" });
+      const workerClient = withListSurface(makeClient(worker));
+      const [workerListed] = await listQueuedPrFixItems(workerClient, {});
+      expect(workerListed.humanOwned).toBe(false);
+
+      // The owner-label and pr-author provenance classes classify too.
+      const owner = makeQueueRow({ claimant: "smurf", claimantSource: "owner-label" });
+      const [ownerListed] = await listQueuedPrFixItems(withListSurface(makeClient(owner)), {});
+      expect(ownerListed.humanOwned).toBe(true);
+      const author = makeQueueRow({ claimant: "smurf", claimantSource: "pr-author" });
+      const [authorListed] = await listQueuedPrFixItems(withListSurface(makeClient(author)), {});
+      expect(authorListed.humanOwned).toBe(true);
+      // A lease-provenance identity is authenticated — never human-owned.
+      const lease = makeQueueRow({ claimant: "not-a-declared-worker", claimantSource: "lease" });
+      const [leaseListed] = await listQueuedPrFixItems(withListSurface(makeClient(lease)), {});
+      expect(leaseListed.humanOwned).toBe(false);
+    } finally {
+      delete process.env.DISPATCH_PR_FIX_AGENTS;
+    }
+  });
+
+  it("surfaces humanOwned=false for every row while the worker identity space is undeclared", async () => {
+    const human = makeQueueRow({ claimant: "smurf", claimantSource: "agent-label" });
+    const client = withListSurface(makeClient(human));
+    const [listed] = await listQueuedPrFixItems(client, {});
+    expect(listed.humanOwned).toBe(false);
   });
 });
 

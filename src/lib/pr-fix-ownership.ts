@@ -111,6 +111,31 @@ export type ClaimantResolution =
   | { state: "unavailable" };
 
 /**
+ * #1615: resolution options for claimant sources that name a DIFFERENT
+ * worker pool. The only exclusion today is the rebase-executor pool
+ * (`DISPATCH_REBASE_AGENTS`): a rebase executor is not a fix-work owner, so
+ * on a non-REBASE item its name is not ownership evidence from ANY source —
+ * an `agent/<name>` label is filtered out, and a live lease held by an
+ * excluded name is treated as absent. Resolution falls through to the next
+ * source (owner label, then missing) instead of propagating a claimant no
+ * fix connector can own; a refusal the operator can recover (a "missing"
+ * state takes a stamp) is strictly better than a recorded poison claimant
+ * no path can clear. The exclusion compares names case-insensitively (the
+ * pool is parsed lowercase).
+ */
+export interface ClaimantResolutionOptions {
+  /** Identity names that must never resolve as the claimant. */
+  excludeClaimantNames?: ReadonlySet<string>;
+}
+
+function isExcludedClaimant(
+  name: string,
+  options: ClaimantResolutionOptions | undefined,
+): boolean {
+  return options?.excludeClaimantNames?.has(name.toLowerCase()) ?? false;
+}
+
+/**
  * The durable claimant patch for one ingestion observation, or null when the
  * observation must NOT write: a resolved identity, an honest failure state
  * ("missing" / "ambiguous"), and never a read failure.
@@ -143,15 +168,31 @@ function distinct(names: Iterable<string>): string[] {
  *   label → "owner-label";
  * - nothing → "missing".
  *
+ * #1615: `options.excludeClaimantNames` removes names from consideration
+ * BEFORE every check above — an excluded name is filtered from the agent
+ * labels and from the live lease, so it neither resolves nor creates an
+ * "ambiguous" disagreement, and resolution falls through to the owner label
+ * or "missing".
+ *
  * A SINGLE owner label coexisting with a lease/agent identity is category
  * evidence, not a conflict: `owner/*` names the board owner, `agent/*` and
  * the lease name the working claimant (the owner-label source only fires
  * when nothing higher exists).
  */
-export function resolveClaimantFromIssueFacts(facts: ClaimantIssueFacts): ClaimantResolution {
-  const agentLabels = distinct(facts.agentLabelNames);
+export function resolveClaimantFromIssueFacts(
+  facts: ClaimantIssueFacts,
+  options?: ClaimantResolutionOptions,
+): ClaimantResolution {
+  // #1615: an excluded name (a rebase executor on a non-REBASE item) is NOT
+  // ownership evidence at all — the name is filtered from the agent labels
+  // AND from the live lease before the agreement checks, so it can neither
+  // resolve nor manufacture an ambiguity against the identities that remain.
+  const agentLabels = distinct(facts.agentLabelNames).filter(
+    (name) => !isExcludedClaimant(name, options),
+  );
   const ownerLabels = distinct(facts.ownerLabelNames);
-  const lease = facts.leaseAgent?.trim() || null;
+  const leaseCandidate = facts.leaseAgent?.trim() || null;
+  const lease = leaseCandidate !== null && !isExcludedClaimant(leaseCandidate, options) ? leaseCandidate : null;
 
   if (ownerLabels.length > 1) return { state: "ambiguous" };
 
@@ -204,6 +245,7 @@ export async function resolvePrFixClaimantFacts(
   repo: string,
   issueNumber: number,
   now: Date = new Date(),
+  options?: ClaimantResolutionOptions,
 ): Promise<ClaimantResolution | null> {
   try {
     const row = await client.issue?.findFirst({
@@ -229,7 +271,7 @@ export async function resolvePrFixClaimantFacts(
       });
       leaseAgent = lease?.agentName ?? null;
     }
-    return resolveClaimantFromIssueFacts({ leaseAgent, agentLabelNames, ownerLabelNames });
+    return resolveClaimantFromIssueFacts({ leaseAgent, agentLabelNames, ownerLabelNames }, options);
   } catch {
     return null;
   }
@@ -248,9 +290,10 @@ export async function resolveIngestionClaimant(
   issueNumber: number | null | undefined,
   prAuthor: string | null | undefined,
   now: Date = new Date(),
+  options?: ClaimantResolutionOptions,
 ): Promise<ClaimantResolution> {
   if (issueNumber !== null && issueNumber !== undefined) {
-    const resolved = await resolvePrFixClaimantFacts(client, repo, issueNumber, now);
+    const resolved = await resolvePrFixClaimantFacts(client, repo, issueNumber, now, options);
     if (resolved) return resolved;
     return { state: "unavailable" };
   }
@@ -312,4 +355,34 @@ export function prFixOwnershipEvidence(row: {
  */
 export function ownershipAuthorizesHandout(evidence: PrFixOwnershipEvidence): boolean {
   return evidence.originalClaimant !== null;
+}
+
+/**
+ * #1615: the HUMAN-OWNED classification. A claimant established by a source
+ * that never authenticated the identity as a Dispatch worker — an
+ * `agent/<name>` or `owner/<name>` board label, or the PR author login —
+ * whose name is OUTSIDE the operator-declared PR-fix worker identity space
+ * (`prFixWorkerAgentIdentitySet`, the `DISPATCH_PR_FIX_AGENTS` list) belongs
+ * to a human: the row is that human's queue entry, and it must never be
+ * auto-offered to a connector pool that cannot own it.
+ *
+ * Sources that DO authenticate the identity through Dispatch's own API are
+ * never classified human: a live `lease` holder and an `operator` stamp are
+ * bearer-authenticated acts, so they are worker identities by construction.
+ *
+ * Fail-open by design: with NO worker identity space configured (an empty
+ * set — `DISPATCH_PR_FIX_AGENTS` unset or empty), classification is
+ * unavailable and nothing is human-owned, which preserves the unclassified
+ * dispatch behavior for deployments that have not declared the space.
+ */
+const UNAUTHENTICATED_CLAIMANT_SOURCES: ReadonlySet<string> = new Set(["agent-label", "owner-label", "pr-author"]);
+
+export function claimantIsHumanOwned(
+  evidence: PrFixOwnershipEvidence,
+  workerAgents: ReadonlySet<string>,
+): boolean {
+  if (workerAgents.size === 0) return false;
+  if (evidence.originalClaimant === null) return false;
+  if (!UNAUTHENTICATED_CLAIMANT_SOURCES.has(evidence.provenance)) return false;
+  return !workerAgents.has(evidence.originalClaimant.trim().toLowerCase());
 }

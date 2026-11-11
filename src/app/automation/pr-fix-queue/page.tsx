@@ -29,6 +29,12 @@ interface PrFixItem {
   // WAITING_EXTERNAL rows; `legacyWait` flags a pre-contract free-text wait.
   externalWait?: { kind: string; ref: string; evidence: string; trigger: { kind: string; note?: string } } | null;
   legacyWait?: boolean;
+  // #1615: derived human-owned classification — the claimant came from a
+  // board label or PR authorship and is outside the declared PR-fix worker
+  // identity space, so the item is the human's queue entry and is never
+  // auto-offered to connectors.
+  humanOwned?: boolean;
+  claimant?: string | null;
 }
 
 const PARKED_OUTCOME_LABELS: Record<string, string> = {
@@ -374,6 +380,11 @@ export default function PrFixQueuePage() {
                     <TableCell className="text-sm max-w-xs truncate">{item.reason}</TableCell>
                     <TableCell>
                       <Badge variant="secondary">{item.lane}</Badge>
+                      {item.humanOwned && (
+                        <Badge className="ml-1 bg-purple-100 text-purple-800" title={`Claimed by human${item.claimant ? ` (${item.claimant})` : ""}; never auto-offered to connectors (#1615)`}>
+                          claimed by human
+                        </Badge>
+                      )}
                     </TableCell>
                     <TableCell className="text-sm text-muted-foreground">{formatTime(item.queuedAt)}</TableCell>
                     <TableCell>

@@ -3,6 +3,7 @@ import { surfacePrFixRequeued } from "../pr-fix-surfacing";
 import { resolveIngestionClaimant } from "../pr-fix-ownership";
 import { type PrFixQueueClient } from "./client";
 import { normalizeQueueRepo } from "./shared";
+import { rebaseExecutorClaimantExclusion } from "./lane-admission";
 import { type RequeuePrFixInput } from "./inputs";
 import { linkedIssueEscalationClassified, releaseLaneFromParentClass } from "./escalation-lane";
 import { freshAttemptGeneration } from "./handout";
@@ -55,9 +56,19 @@ export async function requeuePrFixItem(client: PrFixQueueClient, rawInput: Reque
     // resolved — re-resolve from the authoritative records inside the same
     // transaction. Only computed while the claimant is still NULL; a
     // recorded claimant is never re-derived, refreshed, or transferred.
+    // #1615: on a non-REBASE item the rebase-executor pool is not claimant
+    // evidence (same rule as enqueue), so a requeue of a poison-free row
+    // cannot re-propagate a rebase-executor claimant onto it.
     const requeueClaimantPatch =
       existing.claimant == null
-        ? await resolveIngestionClaimant(tx, input.repo, existing.issue, existing.author)
+        ? await resolveIngestionClaimant(
+            tx,
+            input.repo,
+            existing.issue,
+            existing.author,
+            undefined,
+            rebaseExecutorClaimantExclusion(existing.type),
+          )
         : null;
     // #1569: the re-resolved claimant rides its OWN write, pinned on
     // `claimant IS NULL`, not the requeue payload — so a concurrent operator

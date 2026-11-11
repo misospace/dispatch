@@ -3,9 +3,9 @@
 
 export type { PrFixQueueClient } from "./pr-fix-queue/client";
 export { MAX_EVIDENCE_LENGTH, nonEmpty, resolvePrFixOutcome, normalizeQueueRepo, DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS, DEFAULT_PR_FIX_MAX_RECLAIMS, prFixHandoutTimeoutMs, maxPrFixReclaims, DEFAULT_PR_FIX_ACK_LIVENESS_MS, prFixAckLivenessMs } from "./pr-fix-queue/shared";
-export { REBASE_LANE_ADVISORY_LOCK_KEY, parseRebaseAgentPool, isRebaseLaneAgent, withRebaseLaneAdmission, withHandoutLaneExclusivityFence } from "./pr-fix-queue/lane-admission";
-export { prFixOwnershipMode, evaluatePrFixHandoutOwnership, backfillPrFixClaimant, setPrFixClaimant } from "./pr-fix-queue/handout-ownership";
-export type { PrFixOwnershipMode, PrFixOwnershipRow } from "./pr-fix-queue/handout-ownership";
+export { REBASE_LANE_ADVISORY_LOCK_KEY, parseRebaseAgentPool, isRebaseLaneAgent, rebaseExecutorAgentNames, rebaseExecutorClaimantExclusion, withRebaseLaneAdmission, withHandoutLaneExclusivityFence } from "./pr-fix-queue/lane-admission";
+export { prFixOwnershipMode, prFixWorkerAgentIdentitySet, evaluatePrFixHandoutOwnership, backfillPrFixClaimant, setPrFixClaimant } from "./pr-fix-queue/handout-ownership";
+export type { PrFixOwnershipMode, PrFixOwnershipRow, PrFixOwnershipRefusal } from "./pr-fix-queue/handout-ownership";
 export { parseEnqueuePrFixInput, parseMarkPrFixInput, parseAckPrFixHandoutInput, parseRequeuePrFixInput } from "./pr-fix-queue/inputs";
 export type { EnqueuePrFixInput, CreateLinkedPrFixInput, MarkPrFixInput, RequeuePrFixInput, AckPrFixHandoutInput, AckPrFixHandoutResult } from "./pr-fix-queue/inputs";
 export { getExplicitEscalationLane, linkedIssueEscalationClassified, enforcePrFixHandoutLaneExclusivity } from "./pr-fix-queue/escalation-lane";
