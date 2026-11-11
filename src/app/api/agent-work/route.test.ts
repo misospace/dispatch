@@ -967,6 +967,60 @@ describe("POST /api/agent-work", () => {
       expect(body.success).toBe(true);
     });
 
+    // #1610: the excluded set is an operator visibility opt-out — a reassign
+    // must not hand an issue whose cached labels match it to another agent.
+    // The refusal lands before any ownership write, like the claim route's
+    // label gates.
+    it("refuses to reassign an issue whose cached labels match DISPATCH_EXCLUDED_LABELS (#1610)", async () => {
+      process.env.DISPATCH_EXCLUDED_LABELS = "wontfix";
+      try {
+        agentWork.findUnique.mockResolvedValueOnce(reassignWorkRow());
+        issueFindUnique.mockResolvedValue({
+          ...reassignIssue,
+          labels: ["agent/old-agent", "status/in-progress", "wontfix"],
+        });
+
+        const res = await makePostRequest({
+          action: "reassign",
+          workId: "work-1",
+          newAgentName: "new-agent",
+        });
+
+        expect(res.status).toBe(400);
+        expect((await res.json()).error).toContain("DISPATCH_EXCLUDED_LABELS");
+        // Nothing was written: no intent supersede, no claim release, no
+        // lease mint, no label add.
+        expect(supersedeOwnershipReleaseIntentMock).not.toHaveBeenCalled();
+        expect(mockReleaseIssueClaim).not.toHaveBeenCalled();
+        expect(mockUpsertLease).not.toHaveBeenCalled();
+        expect(mockAddIssueLabel).not.toHaveBeenCalled();
+      } finally {
+        delete process.env.DISPATCH_EXCLUDED_LABELS;
+      }
+    });
+
+    it("reassigns an issue whose cached labels do not match the excluded set (#1610)", async () => {
+      process.env.DISPATCH_EXCLUDED_LABELS = "wontfix";
+      try {
+        agentWork.findUnique.mockResolvedValueOnce(reassignWorkRow());
+        // reassignIssue's default labels (the describe's beforeEach default)
+        // do not match the excluded set.
+        issueFindUnique.mockResolvedValue(reassignIssue);
+
+        const res = await makePostRequest({
+          action: "reassign",
+          workId: "work-1",
+          newAgentName: "new-agent",
+        });
+
+        expect(res.status).toBe(200);
+        expect((await res.json()).success).toBe(true);
+        expect(mockAddIssueLabel).toHaveBeenCalled();
+      } finally {
+        delete process.env.DISPATCH_EXCLUDED_LABELS;
+      }
+    });
+
     it("returns 404 for nonexistent workId", async () => {
       agentWork.findUnique.mockResolvedValueOnce(null);
       const res = await makePostRequest({

@@ -14,6 +14,8 @@ import { releaseIssueClaim, fencedClaimClient, releaseIssueClaimWorstCaseCalls }
 import { recordClaimEvent } from "@/lib/issue-lifecycle";
 import { buildNewLabels } from "@/lib/assignment-conflicts";
 import { withIssueMutationGuard, fencedWriteTimeoutForCalls } from "@/lib/issue-mutation-guard";
+import { isIssueExcludedByLabels } from "@/lib/issue-filters";
+import { parseExcludedLabels } from "@/lib/config";
 import { AGENT_PREFIX } from "@/types";
 
 export const dynamic = "force-dynamic";
@@ -570,6 +572,28 @@ async function reassignAgentWork(body: Record<string, unknown>) {
           if (!issue) {
             return { complete: true, value: errorResponse("Issue not found in local cache", 404) };
           }
+
+          // #1610: the excluded set is an operator visibility opt-out — the
+          // sync prune (#1594) keeps an excluded row cached when dependent
+          // work blocks deletion, and a reassign of that row's work must not
+          // hand the issue to another agent. Same cached labels and same
+          // predicate as the claim gate, the sync prune and the start gate
+          // (#1605); the set comes from parseExcludedLabels, so there is no
+          // second definition. The refusal lands before every write — the
+          // intent supersede, the fenced claim release and the label add —
+          // matching the claim route's order, where the label gates refuse
+          // before any ownership write.
+          const excludedLabels = parseExcludedLabels(process.env.DISPATCH_EXCLUDED_LABELS);
+          if (excludedLabels.length > 0 && isIssueExcludedByLabels(issue.labels, excludedLabels)) {
+            return {
+              complete: true,
+              value: errorResponse(
+                "Issue labels match DISPATCH_EXCLUDED_LABELS; agent work cannot be reassigned to another agent",
+                400,
+              ),
+            };
+          }
+
           const repoFullName = issue.repository.fullName;
           const issueNumber = issue.number;
           auditRepoFullName = repoFullName;

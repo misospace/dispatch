@@ -150,6 +150,33 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
     expect(body.issues.backlog).toEqual({ queued: 1, inProgress: 0 });
   });
 
+  // #1610: lane counts must not include issues whose cached labels match
+  // DISPATCH_EXCLUDED_LABELS — the sync prune (#1594) keeps such a row cached
+  // when dependent work blocks deletion, so the exclusion happens in the query.
+  it("applies the DISPATCH_EXCLUDED_LABELS filter to the issue query (#1610)", async () => {
+    process.env.DISPATCH_EXCLUDED_LABELS = "wontfix, hold";
+    try {
+      await makeRequest(`http://localhost/api/agents/${TEST_AGENT}/work-summary`);
+
+      const where = mocks.issueFindMany.mock.calls[0][0].where;
+      expect(where.AND).toContainEqual({ NOT: { labels: { hasSome: ["wontfix", "hold"] } } });
+    } finally {
+      delete process.env.DISPATCH_EXCLUDED_LABELS;
+    }
+  });
+
+  it("adds no excluded-label clause when DISPATCH_EXCLUDED_LABELS is unset (#1610)", async () => {
+    await makeRequest(`http://localhost/api/agents/${TEST_AGENT}/work-summary`);
+
+    const where = mocks.issueFindMany.mock.calls[0][0].where;
+    // The Renovate exclusion is the only AND clause; it excludes by title/label
+    // OR-list, not by the excluded-label shape below.
+    const excludedClauses = (where.AND ?? []).filter(
+      (clause: any) => clause?.NOT && "labels" in clause.NOT,
+    );
+    expect(excludedClauses).toEqual([]);
+  });
+
   it("treats no status label as queued", async () => {
     mocks.issueFindMany.mockResolvedValue([
       { labels: ["priority/p1"], currentLane: "local" },

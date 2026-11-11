@@ -5,7 +5,8 @@ import { enforceWorkerAgentScope } from "@/lib/worker-identity";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { listQueuedPrFixItems } from "@/lib/pr-fix-queue";
 import { getConfiguredLanes, getDefaultClaimableLane, resolveLaneId } from "@/lib/lane-config";
-import { applyRenovateIssueExclusion } from "@/lib/issue-filters";
+import { applyRenovateIssueExclusion, appendIssueWhere, buildExcludedLabelWhere } from "@/lib/issue-filters";
+import { parseExcludedLabels } from "@/lib/config";
 
 type WorkSummaryLaneCounts = { queued: number; inProgress: number };
 type PrFixLaneCounts = { total: number; blocked: number; parked: number };
@@ -46,6 +47,12 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
       repository: { enabled: true },
     };
     applyRenovateIssueExclusion(issueWhere);
+    // #1610: lane counts must not include issues whose cached labels match
+    // DISPATCH_EXCLUDED_LABELS — the sync prune (#1594) keeps such a row
+    // cached when dependent work blocks deletion. Same shared filter the
+    // issues list applies; the excluded set comes from parseExcludedLabels,
+    // so there is no second definition of it.
+    appendIssueWhere(issueWhere, buildExcludedLabelWhere(parseExcludedLabels(process.env.DISPATCH_EXCLUDED_LABELS)));
 
     const issues = await prisma.issue.findMany({
       where: issueWhere,
