@@ -1,5 +1,7 @@
 import { Prisma } from "@prisma/client";
+import { normalizePrFixType } from "@/types";
 import { laneMatchesConfigured } from "../lane-config";
+import { type ClaimantResolutionOptions } from "../pr-fix-ownership";
 import { type PrFixQueueClient } from "./client";
 import { enforcePrFixHandoutLaneExclusivity, getExplicitEscalationLane, handoutExclusivityFromParentClass, type LinkedIssueEscalationClassification } from "./escalation-lane";
 
@@ -40,6 +42,46 @@ export function parseRebaseAgentPool(raw: string | undefined): Set<string> | nul
 export function isRebaseLaneAgent(agentName: string): boolean {
   const pool = parseRebaseAgentPool(process.env.DISPATCH_REBASE_AGENTS);
   return pool === null || pool.has(agentName.trim().toLowerCase());
+}
+
+/**
+ * #1615: the operator-declared rebase-executor pool as a plain lowercase
+ * name set, for CLAIMANT classification (distinct from lane eligibility).
+ * A rebase executor is a mechanical-rebase worker by contract (#1327), so
+ * it is not a fix-work owner: resolution and the hand-out gate use this set
+ * to keep a rebase-executor identity off non-REBASE items.
+ *
+ * The bare `*` wildcard is a lane-ELIGIBILITY opt-in (every agent may poll
+ * the rebase lane); it does not declare that every agent name is a rebase
+ * executor, so it yields an empty set here — no name is excluded from
+ * claimant resolution on a wildcard.
+ */
+export function rebaseExecutorAgentNames(
+  raw: string | undefined = process.env.DISPATCH_REBASE_AGENTS,
+): ReadonlySet<string> {
+  return parseRebaseAgentPool(raw) ?? new Set();
+}
+
+/**
+ * #1615: the claimant-resolution exclusion for a candidate with the given
+ * dispatched lane: on a known non-REBASE item the rebase-executor pool is
+ * not claimant evidence from ANY source, so its names are excluded and
+ * resolution falls through to the next source (or "missing", which operator
+ * stamping can recover). An absent/empty lane value returns undefined —
+ * fail-open for a legacy row shape; the hand-out gate re-decides at
+ * issuance.
+ */
+export function rebaseExecutorClaimantExclusion(
+  fixType: string | null | undefined,
+): ClaimantResolutionOptions | undefined {
+  if (typeof fixType !== "string" || fixType.trim() === "" || normalizePrFixType(fixType) === "REBASE") {
+    return undefined;
+  }
+  // An empty pool (unset env, or the bare `*` wildcard) excludes nothing —
+  // a no-op exclusion must not read as an exclusion at all.
+  const names = rebaseExecutorAgentNames();
+  if (names.size === 0) return undefined;
+  return { excludeClaimantNames: names };
 }
 
 /**

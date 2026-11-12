@@ -7,6 +7,7 @@ import { evaluateRecovery, recoveryCooldownMs, type RecoveryDecision } from "../
 import { ingestionClaimantPatch, resolveIngestionClaimant } from "../pr-fix-ownership";
 import { type PrFixQueueClient } from "./client";
 import { maxPrFixReclaims, normalizeQueueRepo, uniqueAppend } from "./shared";
+import { rebaseExecutorClaimantExclusion } from "./lane-admission";
 import { type CreateLinkedPrFixInput, type EnqueuePrFixInput } from "./inputs";
 import { linkedIssueEscalationClassified } from "./escalation-lane";
 import { appendPostDispatchEvidenceEntry, buildPrFixBlockedContext, carriesLedgerFields, encodePostDispatchEvidenceKey, readEvidenceLedgerView, recordEvidenceTransition, type EvidenceLedgerView, type EvidenceObservation } from "./evidence";
@@ -76,7 +77,18 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
   // "operator" included) is never transferred, refreshed, or cleared by
   // re-ingestion, so a later owner change or lane flip cannot move existing
   // PR ownership.
-  const claimantResolution = await resolveIngestionClaimant(client, input.repo, input.issue, input.author);
+  // #1615: on a non-REBASE item the rebase-executor pool (DISPATCH_REBASE_AGENTS)
+  // is not claimant evidence — the rebase executor is not a fix-work owner —
+  // so its name (agent label or a live lease) falls through to the next
+  // source instead of propagating a claimant no fix connector can own.
+  const claimantResolution = await resolveIngestionClaimant(
+    client,
+    input.repo,
+    input.issue,
+    input.author,
+    undefined,
+    rebaseExecutorClaimantExclusion(type),
+  );
   const claimantPatch = ingestionClaimantPatch(claimantResolution);
   // A NORMAL classification may be raised to the exclusive escalation lane by
   // the linked issue; it never lowers ESCALATED, and it never touches a
@@ -881,7 +893,17 @@ export async function createLinkedPrFixItem(
   // unresolved issue records its failure state; the issuance-time lazy
   // backfill and operator recovery resolve it later. Ownership is never
   // inherited from any consuming poll.
-  const claimantResolution = await resolveIngestionClaimant(client, input.repo, input.issue, null);
+  // #1615: on a non-REBASE item the rebase-executor pool is not claimant
+  // evidence (same rule as enqueuePrFixItem).
+  const materializedType = normalizePrFixType(input.type);
+  const claimantResolution = await resolveIngestionClaimant(
+    client,
+    input.repo,
+    input.issue,
+    null,
+    undefined,
+    rebaseExecutorClaimantExclusion(materializedType),
+  );
   // #1569: same rule as enqueue — a resolved identity or an honest failure
   // state is recorded at materialization; a failed fact read records nothing
   // and the row stays unresolved ("legacy").

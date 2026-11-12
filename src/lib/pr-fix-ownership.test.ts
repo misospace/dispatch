@@ -121,6 +121,85 @@ describe("resolveClaimantFromIssueFacts", () => {
     ).toEqual({ state: "missing" });
   });
 
+  describe("#1615: excluded claimant names (rebase-executor pool)", () => {
+    const excluded = new Set(["courier-rebase"]);
+
+    it("skips an excluded agent label and falls through to missing", () => {
+      expect(
+        resolveClaimantFromIssueFacts(
+          { leaseAgent: null, agentLabelNames: ["courier-rebase"], ownerLabelNames: [] },
+          { excludeClaimantNames: excluded },
+        ),
+      ).toEqual({ state: "missing" });
+    });
+
+    it("skips an excluded name case-insensitively", () => {
+      expect(
+        resolveClaimantFromIssueFacts(
+          { leaseAgent: null, agentLabelNames: ["Courier-Rebase"], ownerLabelNames: [] },
+          { excludeClaimantNames: excluded },
+        ),
+      ).toEqual({ state: "missing" });
+    });
+
+    it("an excluded name falls through to a single owner label", () => {
+      expect(
+        resolveClaimantFromIssueFacts(
+          { leaseAgent: null, agentLabelNames: ["courier-rebase"], ownerLabelNames: ["alice"] },
+          { excludeClaimantNames: excluded },
+        ),
+      ).toEqual({ state: "resolved", claimant: "alice", source: "owner-label" });
+    });
+
+    it("an excluded agent label neither resolves nor manufactures ambiguity against the lease", () => {
+      // Without the exclusion this is "ambiguous" (lease vs disagreeing
+      // label); the excluded label is not ownership evidence, so the live
+      // lease resolves alone.
+      expect(
+        resolveClaimantFromIssueFacts(
+          { leaseAgent: "courier-local", agentLabelNames: ["courier-rebase"], ownerLabelNames: [] },
+          { excludeClaimantNames: excluded },
+        ),
+      ).toEqual({ state: "resolved", claimant: "courier-local", source: "lease" });
+    });
+
+    it("a live lease HELD by an excluded name is treated as absent", () => {
+      // The rebase executor is not a fix-work owner from ANY source: a lease
+      // it holds on a non-REBASE item's issue must not resolve as the
+      // claimant, because a recorded lease-provenance poison claimant has no
+      // recovery path (the operator stamp pins on claimant IS NULL). The
+      // exclusion keeps the row in the operator-recoverable "missing" state.
+      expect(
+        resolveClaimantFromIssueFacts(
+          { leaseAgent: "courier-rebase", agentLabelNames: [], ownerLabelNames: [] },
+          { excludeClaimantNames: excluded },
+        ),
+      ).toEqual({ state: "missing" });
+      // And it falls through to the owner label when one exists.
+      expect(
+        resolveClaimantFromIssueFacts(
+          { leaseAgent: "courier-rebase", agentLabelNames: [], ownerLabelNames: ["alice"] },
+          { excludeClaimantNames: excluded },
+        ),
+      ).toEqual({ state: "resolved", claimant: "alice", source: "owner-label" });
+    });
+
+    it("leaves ordinary resolution untouched when no names are excluded", () => {
+      expect(
+        resolveClaimantFromIssueFacts(
+          { leaseAgent: null, agentLabelNames: ["alpha"], ownerLabelNames: [] },
+          { excludeClaimantNames: new Set() },
+        ),
+      ).toEqual({ state: "resolved", claimant: "alpha", source: "agent-label" });
+      expect(
+        resolveClaimantFromIssueFacts(
+          { leaseAgent: null, agentLabelNames: ["alpha"], ownerLabelNames: [] },
+          undefined,
+        ),
+      ).toEqual({ state: "resolved", claimant: "alpha", source: "agent-label" });
+    });
+  });
+
   it("treats a whitespace-only lease agent as absent", () => {
     expect(
       resolveClaimantFromIssueFacts({ leaseAgent: "   ", agentLabelNames: [], ownerLabelNames: ["alice"] }),

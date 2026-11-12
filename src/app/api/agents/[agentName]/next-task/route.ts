@@ -555,6 +555,9 @@ export async function GET(
           author: candidate.author ?? null,
           claimant: candidate.claimant ?? null,
           claimantSource: candidate.claimantSource ?? null,
+          // #1615: the dispatched lane gates the rebase-executor claimant
+          // arms (resolution skip + refusal) — they never apply to REBASE.
+          fixType: dispatchedLane ?? null,
         };
         if (snapshotOwnership.claimant === null && prFixOwnershipMode() !== "off") {
           const backfilled = await backfillPrFixClaimant(asPrFixQueueClient(prisma), {
@@ -563,6 +566,7 @@ export async function GET(
             issue: snapshotOwnership.issue,
             author: snapshotOwnership.author,
             claimant: null,
+            fixType: dispatchedLane ?? null,
           });
           if (backfilled.claimant !== null) {
             snapshotOwnership.claimant = backfilled.claimant;
@@ -650,32 +654,34 @@ export async function GET(
          // performed one pinned, idempotent `claimant IS NULL` backfill, so a
          // refused-by-gate poll can leave a resolved claimant recorded; it
          // never leaves a dispatch stamp, a watermark change, or a hand-out.
-         let ownershipClaimant: string | null = confirmed.claimant;
-         let ownershipClaimantSource: string | null = confirmed.claimantSource;
-         if (ownershipClaimant === null && prFixOwnershipMode() !== "off") {
-           const backfilled = await backfillPrFixClaimant(client, {
-             id: candidate.id,
-             repo: candidate.repo,
-             issue: candidate.issue ?? null,
-             author: confirmed.author,
-             claimant: null,
-           });
-           if (backfilled.claimant !== null) {
-             ownershipClaimant = backfilled.claimant;
-             ownershipClaimantSource = backfilled.claimantSource;
-           }
-         }
-         const liveOwnership = evaluatePrFixHandoutOwnership({
-           id: candidate.id,
-           repo: candidate.repo,
-           pr: candidate.pr,
-           generation: confirmed.generation,
-           lane: confirmed.lane,
-           issue: candidate.issue ?? null,
-           author: confirmed.author,
-           claimant: ownershipClaimant,
-           claimantSource: ownershipClaimantSource,
-         });
+          let ownershipClaimant: string | null = confirmed.claimant;
+          let ownershipClaimantSource: string | null = confirmed.claimantSource;
+          if (ownershipClaimant === null && prFixOwnershipMode() !== "off") {
+            const backfilled = await backfillPrFixClaimant(client, {
+              id: candidate.id,
+              repo: candidate.repo,
+              issue: candidate.issue ?? null,
+              author: confirmed.author,
+              claimant: null,
+              fixType: confirmed.attemptType ?? dispatchedLane ?? null,
+            });
+            if (backfilled.claimant !== null) {
+              ownershipClaimant = backfilled.claimant;
+              ownershipClaimantSource = backfilled.claimantSource;
+            }
+          }
+          const liveOwnership = evaluatePrFixHandoutOwnership({
+            id: candidate.id,
+            repo: candidate.repo,
+            pr: candidate.pr,
+            generation: confirmed.generation,
+            lane: confirmed.lane,
+            issue: candidate.issue ?? null,
+            author: confirmed.author,
+            claimant: ownershipClaimant,
+            claimantSource: ownershipClaimantSource,
+            fixType: confirmed.attemptType ?? dispatchedLane ?? null,
+          });
          if (liveOwnership.decision === "refuse") return null;
          // Mint the per-hand-out receipt token (#1256 review): every issuance
          // rotates in a fresh opaque token, pushed atomically with the hand-out
