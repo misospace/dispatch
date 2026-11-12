@@ -1,5 +1,46 @@
 # Changelog
 
+## [0.5.76](https://github.com/misospace/dispatch/compare/v0.5.75...v0.5.76) (2026-11-12)
+
+
+### Features
+
+* **board:** distinct un-routable display state for issues in unconfigured lanes ([#1597](https://github.com/misospace/dispatch/issues/1597)) ([899a20e](https://github.com/misospace/dispatch/commit/899a20ebc43009d602dcfaf29f4f8fb00e74d5f3)), closes [#1590](https://github.com/misospace/dispatch/issues/1590)
+* **deps:** update dependency @vitejs/plugin-react (6.2.1 → 6.3.0) ([#1579](https://github.com/misospace/dispatch/issues/1579)) ([b9c39a2](https://github.com/misospace/dispatch/commit/b9c39a2d739d5378181a053155791824bd4f4f01))
+* **deps:** update dependency lucide-react (1.70.0 → 1.71.0) ([#1609](https://github.com/misospace/dispatch/issues/1609)) ([cde11a7](https://github.com/misospace/dispatch/commit/cde11a76eda930b6645ae81ce2315a11f5f89501))
+* **deps:** update dependency lucide-react (1.71.0 → 1.72.0) ([#1614](https://github.com/misospace/dispatch/issues/1614)) ([ca8e017](https://github.com/misospace/dispatch/commit/ca8e017610a1521a4fe494c79cdfdd20c30f8cf1))
+* **lane:** write-time clamp — validate currentLane against lane config at every write site ([#1595](https://github.com/misospace/dispatch/issues/1595)) ([de0ab52](https://github.com/misospace/dispatch/commit/de0ab521d2ec92750ed16c87ff90919058592dff))
+
+
+### Bug Fixes
+
+* **agent-work:** refuse start when cached labels match DISPATCH_EXCLUDED_LABELS ([#1605](https://github.com/misospace/dispatch/issues/1605)) ([#1607](https://github.com/misospace/dispatch/issues/1607)) ([5ef022f](https://github.com/misospace/dispatch/commit/5ef022fd8a29a1b6ca4c461c9eecadf71301c95c))
+* **api:** apply the excluded-label filter to the remaining cached-label readers ([#1610](https://github.com/misospace/dispatch/issues/1610)) ([#1613](https://github.com/misospace/dispatch/issues/1613)) ([92f6254](https://github.com/misospace/dispatch/commit/92f6254bb11e8653c829aafac991cdc06f11f061))
+* **deps:** update dependency @testing-library/user-event (14.6.8 → 14.6.9) ([#1608](https://github.com/misospace/dispatch/issues/1608)) ([c70e7b3](https://github.com/misospace/dispatch/commit/c70e7b3928e929454d80c8c2028812b2af79d728))
+* **deps:** update dependency astro (7.4.10 → 7.4.11) ([#1618](https://github.com/misospace/dispatch/issues/1618)) ([e0ba209](https://github.com/misospace/dispatch/commit/e0ba20995c1be06e2f88e58839c08ef91e4dacdd))
+* **deps:** update dependency astro (7.4.7 → 7.4.8) ([#1578](https://github.com/misospace/dispatch/issues/1578)) ([078e54d](https://github.com/misospace/dispatch/commit/078e54d2ffe944b821ab6d9cc2b0d6d8e28612b6))
+* **deps:** update dependency astro (7.4.8 → 7.4.9) ([#1611](https://github.com/misospace/dispatch/issues/1611)) ([5559921](https://github.com/misospace/dispatch/commit/55599211fac41f1f2ea7e69a734ad801369be55f))
+* **deps:** update dependency astro (7.4.9 → 7.4.10) ([#1612](https://github.com/misospace/dispatch/issues/1612)) ([c47073b](https://github.com/misospace/dispatch/commit/c47073b89670ea2843057331b31cfdc40b7c0b14))
+* **deps:** update nextjs monorepo (16.4.5 → 16.4.6) ([#1585](https://github.com/misospace/dispatch/issues/1585)) ([e866353](https://github.com/misospace/dispatch/commit/e866353faf78fe02015fb2318062640bc00fe5fd))
+* **deps:** update node.js (26.13.0 → v26.13.1) ([#1616](https://github.com/misospace/dispatch/issues/1616)) ([7488e40](https://github.com/misospace/dispatch/commit/7488e4030c9928f960fd7c9a2ae0468952196c8f))
+* **deps:** update tailwindcss monorepo (4.3.3 → 4.3.5) ([#1583](https://github.com/misospace/dispatch/issues/1583)) ([a299dfc](https://github.com/misospace/dispatch/commit/a299dfceb6fff77461a5f527a3989d833c4e35db))
+* **issues:** apply the excluded-label filter to every remaining reader ([#1604](https://github.com/misospace/dispatch/issues/1604)) ([#1606](https://github.com/misospace/dispatch/issues/1606)) ([c60b506](https://github.com/misospace/dispatch/commit/c60b50695542daad146e81b9c4b5f5f95ff9892b))
+* **pr-fix-queue:** keep un-ownable claimants out of the connector hand-out pool ([#1615](https://github.com/misospace/dispatch/issues/1615)) ([#1617](https://github.com/misospace/dispatch/issues/1617)) ([31695a9](https://github.com/misospace/dispatch/commit/31695a9e9b74efc40f30d9b0584bce276a18e4c6))
+* **reconcile:** record IssueLane history row for every currentLane write ([#1598](https://github.com/misospace/dispatch/issues/1598)) ([#1599](https://github.com/misospace/dispatch/issues/1599)) ([aca1493](https://github.com/misospace/dispatch/commit/aca14936b7d95840f1c6ebb1cde1cbba73a45649))
+* **sync:** sweep cached issues with retired lane ids to backlog ([#1589](https://github.com/misospace/dispatch/issues/1589)) ([#1596](https://github.com/misospace/dispatch/issues/1596)) ([3371b36](https://github.com/misospace/dispatch/commit/3371b36da91affee6f177669c6dcbdd06398d366))
+* **test:** pin NODE_ENV=test in vitest.config.ts ([#1591](https://github.com/misospace/dispatch/issues/1591)) ([#1603](https://github.com/misospace/dispatch/issues/1603)) ([eac9f6d](https://github.com/misospace/dispatch/commit/eac9f6df69964346306dc918266276aa148dffc3))
+
+
+### Chores
+
+* **deps:** lock file maintenance ([#1577](https://github.com/misospace/dispatch/issues/1577)) ([62cf88e](https://github.com/misospace/dispatch/commit/62cf88e9b3ed24f1987e6319c28df1dfbb4c4854))
+
+
+### Refactors
+
+* deduplicate byte-identical shared helpers ([#1581](https://github.com/misospace/dispatch/issues/1581)) ([4c3f9a1](https://github.com/misospace/dispatch/commit/4c3f9a1d34f50da65a078e42b377059c0b3ac037))
+* split pr-fix-queue.ts into cohesive submodules ([#1592](https://github.com/misospace/dispatch/issues/1592)) ([#1601](https://github.com/misospace/dispatch/issues/1601)) ([ab9f662](https://github.com/misospace/dispatch/commit/ab9f662b55f49528f827653d03ded1bb778189b8))
+
 ## [0.5.75](https://github.com/misospace/dispatch/compare/v0.5.74...v0.5.75) (2026-11-09)
 
 
