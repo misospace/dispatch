@@ -373,6 +373,29 @@ describe("syncIssuesForRepos", () => {
     );
   });
 
+  it("treats a store result without the activeLeaseAgents key as no lease backing (#1623)", async () => {
+    // A store that predates the field opts into full GitHub authority: the
+    // cached stale label is dropped, not preserved by the legacy union.
+    store = {
+      findIssue: vi.fn().mockResolvedValue({ id: "existing-1", labels: ["agent/nu"] }),
+      updateIssue: vi.fn().mockResolvedValue(undefined),
+      createIssue: vi.fn().mockResolvedValue(undefined),
+      deleteIssue: vi.fn().mockResolvedValue(true),
+    };
+
+    await syncIssuesForRepos(
+      [{ id: "repo-1", fullName: "org/repo" }],
+      async () => [githubIssue(1)],
+      store,
+    );
+
+    expect(store.updateIssue).toHaveBeenCalledWith(
+      "existing-1",
+      expect.objectContaining({ labels: ["type/bug"] }),
+      expect.objectContaining({ labels: ["agent/nu"] }),
+    );
+  });
+
   it("stores status/done for a closed issue and mirrors the change to GitHub", async () => {
     const syncGithubLabels = vi.fn().mockResolvedValue(undefined);
 
@@ -1020,6 +1043,44 @@ describe("makePrismaIssueStore — lifecycle evidence (#1202)", () => {
     const keys = mocks.upsertLifecycleEvent.mock.calls.map((call: any[]) => call[0].where.dedupeKey);
     expect(keys).toHaveLength(2);
     expect(new Set(keys).size).toBe(1);
+  });
+});
+
+describe("makePrismaIssueStore.findIssue — active lease vouching (#1623)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("reports distinct agent names for unexpired leases using the resolver's liveness predicate", async () => {
+    mocks.issueFindUnique.mockResolvedValue({
+      id: "issue-1",
+      labels: ["agent/alpha", "status/in-progress"],
+      state: "open",
+      repository: { fullName: "org/repo" },
+      leases: [{ agentName: "alpha" }, { agentName: "alpha" }, { agentName: "beta" }],
+    });
+
+    const found = await makePrismaIssueStore().findIssue("repo-1", 42);
+
+    expect(found).toMatchObject({ id: "issue-1", activeLeaseAgents: ["alpha", "beta"] });
+    // The liveness filter is the claimant resolver's own predicate —
+    // expiredAt > now, no disposition filter — so the sync's preservation set
+    // and the resolver's lease candidate cannot disagree about who is live.
+    const select = mocks.issueFindUnique.mock.calls[0][0].select;
+    expect(select.leases.where).toEqual({ expiredAt: { gt: expect.any(Date) } });
+  });
+
+  it("reports no active leases when the row holds none", async () => {
+    mocks.issueFindUnique.mockResolvedValue({
+      id: "issue-1",
+      labels: ["status/ready"],
+      state: "open",
+      repository: { fullName: "org/repo" },
+      leases: [],
+    });
+
+    const found = await makePrismaIssueStore().findIssue("repo-1", 42);
+    expect(found?.activeLeaseAgents).toEqual([]);
   });
 });
 

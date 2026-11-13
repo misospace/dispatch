@@ -171,8 +171,12 @@ export function githubIssueToSyncedIssueData(ghIssue: GitHubIssue, lastSyncedAt 
  * it is a label a live Lease still vouches for: the claim endpoint commits
  * the lease (its claim intent) BEFORE the remote label add, so a sync whose
  * GitHub fetch predates a fresh claim still preserves that claim instead of
- * stranding it. That is the race the original union protected, without the
- * permanent staleness it caused.
+ * stranding it. "Live" follows the claimant resolver's own predicate — an
+ * unexpired lease ROW (`expiredAt > now`), any disposition: terminal
+ * dispositions deliberately keep the row as durable evidence until the TTL
+ * lapses, and releases are deletes, so a released claim never vouches.
+ * That is the race the original union protected, without the permanent
+ * staleness it caused.
  */
 export function mergeLabels(
   ghLabels: string[],
