@@ -3,11 +3,10 @@ import { KanbanBoardClient } from "./kanban-board-client";
 import { FilterBar } from "@/components/filter-bar";
 import { SyncIssuesButton } from "@/components/sync-issues-button";
 import { Card, CardContent } from "@/components/ui/card";
-import { getTrackedRepos, parseExcludedLabels } from "@/lib/config";
+import { getTrackedRepos } from "@/lib/config";
 import {
-  appendIssueWhere,
+  applyExcludedLabelExclusion,
   applyRenovateIssueExclusion,
-  buildExcludedLabelWhere,
   buildLabelWhere,
   buildVisibleIssueWhere,
   discoverLabelFilterOptions,
@@ -24,18 +23,6 @@ import { buildReleasePulseView, releasePulseStripVisible, type ReleasePulseView 
 import { ReleasePulseStrip } from "@/components/automation/release-pulse";
 
 export const dynamic = "force-dynamic";
-
-/**
- * Excluded-label issues must not be visible on the board. The board queries
- * the cache directly, so it must apply the same `buildExcludedLabelWhere`
- * predicate the issues API route uses: a refused prune (#1587) leaves a kept
- * row whose cached labels carry the excluded label, and this filter is what
- * keeps that row out of the columns, the filter options, and the count.
- */
-function applyExcludedLabelExclusion(where: Record<string, unknown>): void {
-  const excludedLabels = parseExcludedLabels(process.env.DISPATCH_EXCLUDED_LABELS);
-  appendIssueWhere(where, buildExcludedLabelWhere(excludedLabels));
-}
 
 async function getIssues(repo?: string, agent?: string, owner?: string, priority?: string, lane?: string, includeClosed?: boolean) {
   const where: Record<string, unknown> = { repository: { enabled: true } };

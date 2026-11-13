@@ -4,14 +4,13 @@ import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import {
   appendIssueWhere,
+  applyExcludedLabelExclusion,
   applyRenovateIssueExclusion,
-  buildExcludedLabelWhere,
   buildLabelWhere,
   buildNoStatusWhere,
   buildVisibleIssueWhere,
   toProjectLabel,
 } from "@/lib/issue-filters";
-import { parseExcludedLabels } from "@/lib/config";
 import { isValidLane, getLaneIds, resolveRequestLane, getLaneAliases } from "@/lib/lane-config";
 import { STATUS_LABELS } from "@/types";
 import { withDependencyBlockReasons } from "@/lib/issue-dependency-annotation";
@@ -56,9 +55,7 @@ export async function GET(request: Request) {
     const labels = buildLabelWhere([agent, owner, toProjectLabel(project), priority]);
     if (labels) where.labels = labels;
 
-    const excludedLabels = parseExcludedLabels(process.env.DISPATCH_EXCLUDED_LABELS);
-    const excludedLabelFilter = buildExcludedLabelWhere(excludedLabels);
-    appendIssueWhere(where, excludedLabelFilter);
+    applyExcludedLabelExclusion(where);
 
     // Filter for untriaged issues (no status/* label) — grooming intake
     const noStatusFilter = buildNoStatusWhere(untriaged === "true");

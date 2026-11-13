@@ -2,8 +2,7 @@ import { prisma } from "@/lib/prisma";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableRow } from "@/components/ui/table";
 import { STATUS_LABELS, getAgentFromLabels } from "@/types";
-import { appendIssueWhere, applyRenovateIssueExclusion, buildExcludedLabelWhere } from "@/lib/issue-filters";
-import { parseExcludedLabels } from "@/lib/config";
+import { applyExcludedLabelExclusion, applyRenovateIssueExclusion } from "@/lib/issue-filters";
 
 export const dynamic = "force-dynamic";
 
@@ -12,7 +11,7 @@ async function getStats() {
   applyRenovateIssueExclusion(issueWhere);
   // #1604: the dashboard must not count an issue the operator excluded —
   // a kept row (sync prune blocked by dependent work) still carries the label.
-  appendIssueWhere(issueWhere, buildExcludedLabelWhere(parseExcludedLabels(process.env.DISPATCH_EXCLUDED_LABELS)));
+  applyExcludedLabelExclusion(issueWhere);
 
   const [issues, recentRuns, recentLogs] = await Promise.all([
     prisma.issue.findMany({

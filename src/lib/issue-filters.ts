@@ -1,4 +1,5 @@
 import { AGENT_PREFIX, isAgentLabel, isOwnerLabel, OWNER_PREFIX, STATUS_LABELS } from "@/types";
+import { parseExcludedLabels } from "@/lib/config-parsers";
 import { UMBRELLA_LABEL } from "@/lib/decomposition";
 import { INCOMPLETE_INVESTIGATION_REASON_PREFIX } from "@/lib/groomer/investigation-gap";
 
@@ -67,6 +68,17 @@ export function isIssueExcludedByLabels(issueLabels: string[], excludedLabels: s
 export function buildExcludedLabelWhere(excludedLabels: string[]) {
   if (excludedLabels.length === 0) return undefined;
   return { NOT: { labels: { hasSome: excludedLabels } } };
+}
+
+/**
+ * Apply the operator's DISPATCH_EXCLUDED_LABELS visibility filter to an issue
+ * where clause — the shared env→where composition every cached-issue reader
+ * uses. A refused sync prune (#1587) leaves a kept row whose cached labels
+ * still carry the excluded label; this filter is what keeps that row
+ * invisible, uncounted, and ungroomable across readers.
+ */
+export function applyExcludedLabelExclusion(where: Record<string, unknown>): void {
+  appendIssueWhere(where, buildExcludedLabelWhere(parseExcludedLabels(process.env.DISPATCH_EXCLUDED_LABELS)));
 }
 
 /**
