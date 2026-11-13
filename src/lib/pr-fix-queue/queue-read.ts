@@ -56,9 +56,17 @@ export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { 
   // to that human and the hand-out gate refuses it, so it must be visible as
   // human-owned instead of park-looping through offers no connector accepts.
   // Inert while the identity space is undeclared (empty set → always false).
+  //
+  // #1623: `claimantAmbiguous` surfaces the other unresolved provenance the
+  // gate refuses unconditionally — sources that conflicted (e.g. several
+  // distinct `agent/*` labels on the cached issue). A QUEUED row with this
+  // flag never gets a hand-out, so it must display as blocked-with-reason
+  // instead of looking like work any poller could pick up.
   const workerAgents = prFixWorkerAgentIdentitySet();
   for (const item of items) {
-    item.humanOwned = claimantIsHumanOwned(prFixOwnershipEvidence(item), workerAgents);
+    const evidence = prFixOwnershipEvidence(item);
+    item.humanOwned = claimantIsHumanOwned(evidence, workerAgents);
+    item.claimantAmbiguous = evidence.provenance === "ambiguous";
   }
 
   return items;

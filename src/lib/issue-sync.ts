@@ -71,10 +71,17 @@ export interface IssueSyncSnapshot {
 }
 
 export interface IssueStore {
+  /**
+   * The cached row for one issue, plus `activeLeaseAgents`: the agents whose
+   * Lease is still live (`expiredAt > now`) for that issue (#1623). The sync
+   * core uses it to decide which cached `agent/*` labels a fresh GitHub set
+   * may not drop — see mergeLabels. A store that reports no active leases
+   * opts into full GitHub authority over the cached agent set.
+   */
   findIssue(
     repositoryId: string,
     number: number,
-  ): Promise<{ id: string; labels: string[]; state?: string } | null>;
+  ): Promise<{ id: string; labels: string[]; state?: string; activeLeaseAgents?: string[] } | null>;
   updateIssue(id: string, data: SyncedIssueData, previous?: IssueSyncSnapshot | null): Promise<void>;
   createIssue(repositoryId: string, data: SyncedIssueData): Promise<void>;
   /**
@@ -151,14 +158,41 @@ export function githubIssueToSyncedIssueData(ghIssue: GitHubIssue, lastSyncedAt 
 }
 
 /**
- * Preserve agent/* labels from the existing Prisma record when syncing from GitHub.
- * This prevents race conditions where the claim endpoint adds an agent/* label to
- * Prisma and GitHub, but a concurrent sync overwrites it with stale data.
+ * Reconcile the cached `agent/*` set against a fresh GitHub label set (#1623).
+ *
+ * GitHub is authoritative: an `agent/*` label GitHub no longer carries is
+ * DROPPED, so a remote removal (unassign, release sweep, manual cleanup)
+ * converges on the next sync instead of being re-added forever. The old
+ * unconditional union made every cached agent label immortal — stale labels
+ * piled up until `resolveClaimantFromIssueFacts` saw several distinct agents
+ * and reported "ambiguous", permanently refusing PR-fix hand-outs.
+ *
+ * The one cached agent label a sync may keep against a GitHub set that lacks
+ * it is a label a live Lease still vouches for: the claim endpoint commits
+ * the lease (its claim intent) BEFORE the remote label add, so a sync whose
+ * GitHub fetch predates a fresh claim still preserves that claim instead of
+ * stranding it. "Live" follows the claimant resolver's own predicate — an
+ * unexpired lease ROW (`expiredAt > now`), any disposition: terminal
+ * dispositions deliberately keep the row as durable evidence until the TTL
+ * lapses, and releases are deletes, so a released claim never vouches.
+ * That is the race the original union protected, without the permanent
+ * staleness it caused.
  */
-export function mergeLabels(ghLabels: string[], existingAgentLabels: string[]): string[] {
+export function mergeLabels(
+  ghLabels: string[],
+  existingAgentLabels: string[],
+  activeLeaseAgents: string[] = [],
+): string[] {
   const ghLabelSet = new Set(ghLabels);
-  // Only add agent labels that aren't already on GitHub (avoids duplicates)
-  const preserved = existingAgentLabels.filter((l) => l.startsWith("agent/") && !ghLabelSet.has(l));
+  const leased = new Set(activeLeaseAgents.map((name) => name.trim()));
+  // Only lease-backed agent labels survive a GitHub set that no longer
+  // carries them; everything else follows GitHub.
+  const preserved = existingAgentLabels.filter(
+    (l) =>
+      l.startsWith("agent/") &&
+      leased.has(l.slice("agent/".length).trim()) &&
+      !ghLabelSet.has(l),
+  );
   return [...ghLabels, ...preserved];
 }
 
@@ -170,7 +204,7 @@ export function mergeLabels(ghLabels: string[], existingAgentLabels: string[]): 
  */
 function syncedIssueDataFor(
   ghIssue: GitHubIssue,
-  existingIssue: { labels: string[] } | null,
+  existingIssue: { labels: string[]; activeLeaseAgents?: string[] } | null,
 ): { issueData: SyncedIssueData; statusFix: { added: string[]; removed: string[] } } {
   const issueData = githubIssueToSyncedIssueData(ghIssue);
 
@@ -179,9 +213,14 @@ function syncedIssueDataFor(
   issueData.labels = statusFix.labels;
 
   if (existingIssue && existingIssue.labels.length > 0) {
-    // Preserve agent/* labels from the cached record in case GitHub hasn't
-    // propagated a concurrent claim yet (see mergeLabels).
-    issueData.labels = mergeLabels(issueData.labels, existingIssue.labels);
+    // Reconcile the cached agent/* labels against the GitHub set: stale ones
+    // are dropped, lease-backed ones survive a GitHub read that predates a
+    // concurrent claim (see mergeLabels, #1623).
+    issueData.labels = mergeLabels(
+      issueData.labels,
+      existingIssue.labels,
+      existingIssue.activeLeaseAgents ?? [],
+    );
   }
   return { issueData, statusFix };
 }
@@ -570,13 +609,31 @@ export function makePrismaIssueStore(): IssueStore {
 
   return {
     findIssue(repositoryId: string, number: number) {
-      return prisma.issue.findUnique({
-        where: { repositoryId_number: { repositoryId, number } },
-        select: { id: true, labels: true, state: true, repository: { select: { fullName: true } } },
-      }).then((issue) => {
-        if (issue) repoByIssueId.set(issue.id, issue.repository.fullName);
-        return issue;
-      });
+      // The active-lease predicate matches the claimant resolver and
+      // findActiveLeasesForIssue (#1623): one read of the same liveness rule,
+      // so the sync's preservation set and the resolver's lease candidate
+      // cannot disagree about who is live.
+      const now = new Date();
+      return prisma.issue
+        .findUnique({
+          where: { repositoryId_number: { repositoryId, number } },
+          select: {
+            id: true,
+            labels: true,
+            state: true,
+            repository: { select: { fullName: true } },
+            leases: { where: { expiredAt: { gt: now } }, select: { agentName: true } },
+          },
+        })
+        .then((issue) => {
+          if (!issue) return null;
+          repoByIssueId.set(issue.id, issue.repository.fullName);
+          const { leases, ...rest } = issue;
+          return {
+            ...rest,
+            activeLeaseAgents: [...new Set((leases ?? []).map((lease) => lease.agentName))],
+          };
+        });
     },
     async updateIssue(id: string, data: SyncedIssueData, previous?: IssueSyncSnapshot | null) {
       const repoFullName = repoByIssueId.get(id);

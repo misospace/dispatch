@@ -51,6 +51,24 @@ describe("PR Fix Queue page", () => {
     expect(screen.queryByRole("button", { name: /requeue/i })).not.toBeInTheDocument();
   });
 
+  it("shows a queued row with an ambiguous claimant as blocked-with-reason (#1623)", async () => {
+    mockAuthedFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => [
+        { id: "1", repo: "org/repo", pr: 50, status: "QUEUED", lane: "NORMAL", reason: "ci failure", title: null, url: null, queuedAt: "2026-01-01T00:00:00Z", claimant: null, claimantAmbiguous: true },
+        { id: "2", repo: "org/repo", pr: 51, status: "QUEUED", lane: "NORMAL", reason: "review feedback", title: null, url: null, queuedAt: "2026-01-02T00:00:00Z", claimantAmbiguous: false },
+      ],
+    });
+
+    render(<PrFixQueuePage />);
+
+    await waitFor(() => {
+      expect(screen.getByText("claimant ambiguous")).toBeInTheDocument();
+    });
+    // Only the ambiguous row is flagged; an ordinary queued row is not.
+    expect(screen.getAllByText("claimant ambiguous")).toHaveLength(1);
+  });
+
   it("shows empty state when no items", async () => {
     mockAuthedFetch.mockResolvedValueOnce({
       ok: true,
