@@ -1,6 +1,7 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi, afterEach, beforeEach } from "vitest";
 import {
   appendIssueWhere,
+  applyExcludedLabelExclusion,
   applyRenovateIssueExclusion,
   buildExcludedLabelWhere,
   buildGroomingStateExclusionWhere,
@@ -77,6 +78,35 @@ describe("issue exclusion filters", () => {
   it("builds excluded label filters with Prisma-supported scalar-list syntax", () => {
     expect(buildExcludedLabelWhere(["renovate"])).toEqual({
       NOT: { labels: { hasSome: ["renovate"] } },
+    });
+  });
+
+  describe("applyExcludedLabelExclusion", () => {
+    const original = process.env.DISPATCH_EXCLUDED_LABELS;
+    afterEach(() => {
+      if (original === undefined) delete process.env.DISPATCH_EXCLUDED_LABELS;
+      else process.env.DISPATCH_EXCLUDED_LABELS = original;
+    });
+
+    it("no-ops when DISPATCH_EXCLUDED_LABELS is unset", () => {
+      delete process.env.DISPATCH_EXCLUDED_LABELS;
+      const where: Record<string, unknown> = { repository: { enabled: true } };
+      applyExcludedLabelExclusion(where);
+      expect(where).toEqual({ repository: { enabled: true } });
+    });
+
+    it("no-ops on an empty/whitespace-only exclusion set", () => {
+      process.env.DISPATCH_EXCLUDED_LABELS = " ,, \n ";
+      const where: Record<string, unknown> = {};
+      applyExcludedLabelExclusion(where);
+      expect(where).toEqual({});
+    });
+
+    it("appends the parsed exclusion as an AND clause", () => {
+      process.env.DISPATCH_EXCLUDED_LABELS = "wip, blocked/infra\nwip";
+      const where: Record<string, unknown> = { open: true };
+      applyExcludedLabelExclusion(where);
+      expect(where.AND).toEqual([{ NOT: { labels: { hasSome: ["wip", "blocked/infra"] } } }]);
     });
   });
 

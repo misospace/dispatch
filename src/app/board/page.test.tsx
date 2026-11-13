@@ -37,6 +37,11 @@ vi.mock("@/components/automation/release-pulse", () => ({
 
 vi.mock("@/lib/config", () => ({
   getTrackedRepos: mocks.getTrackedRepos,
+}));
+
+// issue-filters composes the excluded-label where clause through the
+// Prisma-free parser module, so that is the module the test must intercept.
+vi.mock("@/lib/config-parsers", () => ({
   parseExcludedLabels: mocks.parseExcludedLabels,
 }));
 

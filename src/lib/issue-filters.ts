@@ -1,5 +1,5 @@
 import { AGENT_PREFIX, isAgentLabel, isOwnerLabel, OWNER_PREFIX, STATUS_LABELS } from "@/types";
-import { parseExcludedLabels } from "@/lib/config";
+import { parseExcludedLabels } from "@/lib/config-parsers";
 import { UMBRELLA_LABEL } from "@/lib/decomposition";
 import { INCOMPLETE_INVESTIGATION_REASON_PREFIX } from "@/lib/groomer/investigation-gap";
 

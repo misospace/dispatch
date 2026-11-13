@@ -1,42 +1,17 @@
 import { prisma } from "@/lib/prisma";
+import { isValidRepoName, parseRepoList } from "@/lib/config-parsers";
 
-/**
- * Parse a comma/newline-delimited list into trimmed, deduped entries
- * (order preserved). Shared by the agent, excluded-label, repo, and Courier
- * admission-namespace parsers (#1537).
- */
-export function parseDelimitedList(input: string | undefined): string[] {
-  if (!input) return [];
-
-  const seen = new Set<string>();
-  const result: string[] = [];
-
-  const parts = input.split(/[,\n]/);
-  for (const part of parts) {
-    const trimmed = part.trim();
-    if (!trimmed) continue;
-    if (seen.has(trimmed)) continue;
-    seen.add(trimmed);
-    result.push(trimmed);
-  }
-
-  return result;
-}
-
-export function parseRepoList(input: string | undefined): string[] {
-  return parseDelimitedList(input).filter(isValidRepoName);
-}
-
-export function parseAgentList(input: string | undefined): string[] {
-  return parseDelimitedList(input);
-}
-
-export function isValidRepoName(fullName: string): boolean {
-  const parts = fullName.split("/");
-  if (parts.length !== 2) return false;
-  const [owner, repo] = parts;
-  return Boolean(owner && repo && !owner.includes(" ") && !repo.includes(" "));
-}
+// The pure env parsers live in the Prisma-free `@/lib/config-parsers` so that
+// client-reachable modules (issue-filters via the filter bar) can use them
+// without pulling `@/lib/prisma` into the browser bundle. Re-exported here for
+// the existing server-side callers.
+export {
+  isValidRepoName,
+  parseAgentList,
+  parseDelimitedList,
+  parseExcludedLabels,
+  parseRepoList,
+} from "@/lib/config-parsers";
 
 export async function getTrackedRepos(): Promise<string[]> {
   const dbRepos = await prisma.automationRepo.findMany({
@@ -63,10 +38,6 @@ export async function getTrackedRepos(): Promise<string[]> {
   }
 
   return envRepos;
-}
-
-export function parseExcludedLabels(input: string | undefined): string[] {
-  return parseDelimitedList(input);
 }
 
 export async function getSyncRepos(): Promise<{ id: string; fullName: string }[]> {
