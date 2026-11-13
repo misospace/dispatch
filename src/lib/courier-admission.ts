@@ -285,7 +285,7 @@ export async function submitAdmission(fields: AdmissionRequestFields, config: Ex
     }
     return {
       outcome: "uncertain",
-      diagnostic: `courier admission request failed: ${errorMessage(error)}`,
+      diagnostic: redactSecret(`courier admission request failed: ${errorMessage(error)}`, config.token),
       timeout: false,
     };
   }
