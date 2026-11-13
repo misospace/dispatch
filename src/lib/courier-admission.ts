@@ -153,8 +153,10 @@ export type AdmissionResult =
   | { outcome: "rejected"; httpStatus: number; diagnostic: string }
   /**
    * Delivery outcome unknown: timeout, network failure, refused redirect,
-   * 5xx, or a malformed 2xx body. Safe to retry later with the SAME key;
-   * Courier's idempotency key dedupes a double admission.
+   * 5xx, a malformed 2xx body, or a response-body read failure (#1627 —
+   * headers arrived, so the request may have reached Courier). Safe to
+   * retry later with the SAME key; Courier's idempotency key dedupes a
+   * double admission.
    */
   | { outcome: "uncertain"; httpStatus?: number; diagnostic: string; timeout: boolean };
 
@@ -229,6 +231,21 @@ function parseAdmissionIdentity(status: number, bodyText: string): AdmissionResu
 }
 
 /**
+ * Read `name` / `message` off a thrown value WITHOUT requiring `instanceof
+ * Error`: fetch/abort failures arrive as `DOMException` (`TimeoutError`,
+ * `AbortError`), which does not subclass `Error` in every runtime.
+ */
+function errorName(error: unknown): string {
+  const name = (error as { name?: unknown } | null | undefined)?.name;
+  return typeof name === "string" ? name : "";
+}
+
+function errorMessage(error: unknown): string {
+  const message = (error as { message?: unknown } | null | undefined)?.message;
+  return typeof message === "string" && message ? message : "Unknown network error";
+}
+
+/**
  * Submit one admission request to the configured endpoint. One network
  * attempt per call — retry policy (uncertain delivery, original key, bounded)
  * is the caller's state machine, not this module's.
@@ -251,29 +268,52 @@ export async function submitAdmission(fields: AdmissionRequestFields, config: Ex
       signal: AbortSignal.timeout(config.timeoutMs),
     });
   } catch (error) {
-    if (error instanceof Error && error.name === "TimeoutError") {
+    const name = errorName(error);
+    if (name === "TimeoutError") {
       return {
         outcome: "uncertain",
         diagnostic: `courier admission timed out after ${config.timeoutMs}ms; delivery outcome unknown`,
         timeout: true,
       };
     }
-    if (error instanceof Error && error.name === "AbortError") {
+    if (name === "AbortError") {
       return {
         outcome: "uncertain",
         diagnostic: `courier admission request aborted after ${config.timeoutMs}ms; delivery outcome unknown`,
         timeout: true,
       };
     }
-    const detail = error instanceof Error ? error.message : "Unknown network error";
     return {
       outcome: "uncertain",
-      diagnostic: `courier admission request failed: ${detail}`,
+      diagnostic: `courier admission request failed: ${errorMessage(error)}`,
       timeout: false,
     };
   }
 
-  const bodyText = await response.text();
+  // Body consumption runs OUTSIDE the fetch guard (#1627): fetch resolves once
+  // response headers arrive, so a timeout or connection reset while READING
+  // the body throws here — and the request may already have reached Courier.
+  // Settle it as uncertain delivery (same retry-with-SAME-key contract as a
+  // failed fetch) instead of letting it escape to the caller's state machine.
+  let bodyText: string;
+  try {
+    bodyText = await response.text();
+  } catch (error) {
+    const name = errorName(error);
+    const timedOut = name === "TimeoutError" || name === "AbortError";
+    return {
+      outcome: "uncertain",
+      httpStatus: response.status,
+      diagnostic: redactSecret(
+        timedOut
+          ? `courier admission response body read timed out after ${config.timeoutMs}ms; delivery outcome unknown`
+          : `courier admission response body read failed: ${errorMessage(error)}; delivery outcome unknown`,
+        config.token,
+      ),
+      timeout: timedOut,
+    };
+  }
+
   if (response.status === 200 || response.status === 201) {
     return parseAdmissionIdentity(response.status, bodyText);
   }
