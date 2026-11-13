@@ -4,12 +4,10 @@ import { Badge } from "@/components/ui/badge";
 import { BOARD_COLUMNS, STATUS_LABELS } from "@/types";
 import type { IssueWithRepo } from "@/types";
 import {
-  appendIssueWhere,
+  applyExcludedLabelExclusion,
   applyRenovateIssueExclusion,
-  buildExcludedLabelWhere,
   buildVisibleIssueWhere,
 } from "@/lib/issue-filters";
-import { parseExcludedLabels } from "@/lib/config";
 import { getProjectIssueStatus, groupIssuesByProject } from "@/lib/projects";
 import { withNormalizedReleaseSignal } from "@/lib/groomer/plan";
 
@@ -28,7 +26,7 @@ async function getProjects() {
   // #1604: a kept row (the sync prune is blocked by dependent work) still
   // carries its operator-excluded label, so every reader must filter it —
   // as the board page and /api/issues do.
-  appendIssueWhere(where, buildExcludedLabelWhere(parseExcludedLabels(process.env.DISPATCH_EXCLUDED_LABELS)));
+  applyExcludedLabelExclusion(where);
 
   const issues = await prisma.issue.findMany({
     where,
