@@ -457,6 +457,26 @@ describe("#1615 offer-policy integration", () => {
     const [listed] = await listQueuedPrFixItems(client, {});
     expect(listed.humanOwned).toBe(false);
   });
+
+  it("lists a persisted-ambiguous row with claimantAmbiguous=true (#1623)", async () => {
+    const ambiguous = makeQueueRow({ claimant: null, claimantSource: "ambiguous" });
+    const [listedAmbiguous] = await listQueuedPrFixItems(withListSurface(makeClient(ambiguous)), {});
+    expect(listedAmbiguous.claimantAmbiguous).toBe(true);
+
+    // Resolved, missing, and legacy failure states are never flagged: only
+    // the ambiguous provenance the gate refuses without a recoverable reason.
+    const resolved = makeQueueRow({ claimant: "courier-x", claimantSource: "lease" });
+    const [listedResolved] = await listQueuedPrFixItems(withListSurface(makeClient(resolved)), {});
+    expect(listedResolved.claimantAmbiguous).toBe(false);
+
+    const missing = makeQueueRow({ claimant: null, claimantSource: "missing" });
+    const [listedMissing] = await listQueuedPrFixItems(withListSurface(makeClient(missing)), {});
+    expect(listedMissing.claimantAmbiguous).toBe(false);
+
+    const legacy = makeQueueRow({ claimant: null, claimantSource: null });
+    const [listedLegacy] = await listQueuedPrFixItems(withListSurface(makeClient(legacy)), {});
+    expect(listedLegacy.claimantAmbiguous).toBe(false);
+  });
 });
 
 describe("enqueuePrFixItem claimant capture (#1569)", () => {

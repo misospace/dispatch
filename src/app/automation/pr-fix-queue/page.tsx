@@ -35,6 +35,11 @@ interface PrFixItem {
   // auto-offered to connectors.
   humanOwned?: boolean;
   claimant?: string | null;
+  // #1623: the ownership sources conflicted (e.g. several distinct agent/*
+  // labels on the cached issue), so the hand-out gate refuses this row until
+  // re-ingestion, an operator requeue, or a maintainer claimant repair
+  // resolves it. Shown as blocked-with-reason on an otherwise-QUEUED row.
+  claimantAmbiguous?: boolean;
 }
 
 const PARKED_OUTCOME_LABELS: Record<string, string> = {
@@ -383,6 +388,11 @@ export default function PrFixQueuePage() {
                       {item.humanOwned && (
                         <Badge className="ml-1 bg-purple-100 text-purple-800" title={`Claimed by human${item.claimant ? ` (${item.claimant})` : ""}; never auto-offered to connectors (#1615)`}>
                           claimed by human
+                        </Badge>
+                      )}
+                      {item.claimantAmbiguous && (
+                        <Badge className="ml-1 bg-amber-100 text-amber-800" title="Ownership sources conflict (e.g. several distinct agent labels on the cached issue); hand-out stays refused until re-ingestion, an operator requeue, or a maintainer claimant repair resolves it (#1623)">
+                          claimant ambiguous
                         </Badge>
                       )}
                     </TableCell>

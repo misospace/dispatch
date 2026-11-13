@@ -120,20 +120,45 @@ function githubIssue(number: number, overrides?: Partial<GitHubIssue>): GitHubIs
 }
 
 describe("mergeLabels", () => {
-  it("preserves agent/* labels not present on GitHub", () => {
+  it("preserves a lease-backed agent/* label the GitHub read does not carry yet", () => {
     const ghLabels = ["type/bug", "priority/p1"];
     const existingLabels = ["agent/saffron", "status/in-progress", "priority/p1"];
-    const result = mergeLabels(ghLabels, existingLabels);
+    const result = mergeLabels(ghLabels, existingLabels, ["saffron"]);
     expect(result).toContain("agent/saffron");
     // status/in-progress is NOT preserved (only agent/* labels are)
     expect(result).toContain("type/bug");
     expect(result).toContain("priority/p1");
   });
 
+  it("drops a cached agent/* label GitHub removed and no lease vouches for (#1623)", () => {
+    const ghLabels = ["type/bug", "agent/codex"];
+    const existingLabels = ["agent/nu", "agent/courier-local", "agent/codex"];
+    const result = mergeLabels(ghLabels, existingLabels, []);
+    expect(result).toEqual(["type/bug", "agent/codex"]);
+  });
+
+  it("preserves only the lease-backed labels when several cached agents disagree", () => {
+    const ghLabels = ["type/bug"];
+    const existingLabels = ["agent/nu", "agent/codex"];
+    const result = mergeLabels(ghLabels, existingLabels, ["codex"]);
+    expect(result).toEqual(["type/bug", "agent/codex"]);
+  });
+
+  it("ignores a lease whose agent names no cached label", () => {
+    const ghLabels = ["type/bug"];
+    const result = mergeLabels(ghLabels, ["agent/nu"], ["saffron"]);
+    expect(result).toEqual(["type/bug"]);
+  });
+
+  it("matches lease agent names with surrounding whitespace trimmed", () => {
+    const result = mergeLabels(["type/bug"], ["agent/saffron"], [" saffron "]);
+    expect(result).toContain("agent/saffron");
+  });
+
   it("avoids duplicates when GitHub already has the agent label", () => {
     const ghLabels = ["type/bug", "agent/saffron"];
     const existingLabels = ["agent/saffron", "status/in-progress"];
-    const result = mergeLabels(ghLabels, existingLabels);
+    const result = mergeLabels(ghLabels, existingLabels, ["saffron"]);
     // Should have agent/saffron only once
     const count = result.filter((l) => l === "agent/saffron").length;
     expect(count).toBe(1);
@@ -142,7 +167,7 @@ describe("mergeLabels", () => {
   it("only preserves labels starting with agent/", () => {
     const ghLabels = ["type/bug"];
     const existingLabels = ["agent/saffron", "status/in-progress", "priority/p1"];
-    const result = mergeLabels(ghLabels, existingLabels);
+    const result = mergeLabels(ghLabels, existingLabels, ["saffron"]);
     expect(result).toContain("agent/saffron");
     // Other labels from existing should NOT be merged (only agent/*)
     expect(result).not.toContain("status/in-progress");
@@ -152,14 +177,18 @@ describe("mergeLabels", () => {
   it("returns GitHub labels unchanged when no agent/* in existing", () => {
     const ghLabels = ["type/bug", "priority/p1"];
     const existingLabels = ["status/in-progress"];
-    const result = mergeLabels(ghLabels, existingLabels);
+    const result = mergeLabels(ghLabels, existingLabels, ["saffron"]);
     expect(result).toEqual(ghLabels);
+  });
+
+  it("treats a missing lease list as no active leases (GitHub is authoritative)", () => {
+    expect(mergeLabels([], ["agent/x"])).toEqual([]);
+    expect(mergeLabels([], ["agent/x"], [])).toEqual([]);
   });
 
   it("handles empty arrays", () => {
     expect(mergeLabels([], [])).toEqual([]);
     expect(mergeLabels(["a"], [])).toEqual(["a"]);
-    expect(mergeLabels([], ["agent/x"])).toEqual(["agent/x"]);
   });
 });
 
@@ -285,9 +314,13 @@ describe("syncIssuesForRepos", () => {
     expect(createMock).toHaveBeenCalledWith("repo-1", expect.objectContaining({ number: 2 }));
   });
 
-  it("preserves agent/* labels from the cached record when updating", async () => {
+  it("preserves lease-backed agent/* labels when the GitHub read predates the claim", async () => {
     store = {
-      findIssue: vi.fn().mockResolvedValue({ id: "existing-1", labels: ["agent/saffron", "status/in-progress"] }),
+      findIssue: vi.fn().mockResolvedValue({
+        id: "existing-1",
+        labels: ["agent/saffron", "status/in-progress"],
+        activeLeaseAgents: ["saffron"],
+      }),
       updateIssue: vi.fn().mockResolvedValue(undefined),
       createIssue: vi.fn().mockResolvedValue(undefined),
       deleteIssue: vi.fn().mockResolvedValue(true),
@@ -299,12 +332,43 @@ describe("syncIssuesForRepos", () => {
       store,
     );
 
-    // GitHub labels stay the base; only agent/* labels are preserved from the cache.
+    // GitHub labels stay the base; the lease-backed agent/* label survives the
+    // stale GitHub read.
     expect(store.updateIssue).toHaveBeenCalledWith(
       "existing-1",
       expect.objectContaining({ labels: ["type/bug", "agent/saffron"] }),
       expect.objectContaining({
         labels: ["agent/saffron", "status/in-progress"],
+      }),
+    );
+  });
+
+  it("drops stale cached agent/* labels GitHub no longer carries (#1623)", async () => {
+    store = {
+      findIssue: vi.fn().mockResolvedValue({
+        id: "existing-1",
+        labels: ["agent/nu", "agent/courier-local", "agent/codex", "status/ready"],
+        activeLeaseAgents: [],
+      }),
+      updateIssue: vi.fn().mockResolvedValue(undefined),
+      createIssue: vi.fn().mockResolvedValue(undefined),
+      deleteIssue: vi.fn().mockResolvedValue(true),
+    };
+
+    await syncIssuesForRepos(
+      [{ id: "repo-1", fullName: "org/repo" }],
+      async () => [githubIssue(1, { labels: [{ name: "type/bug", color: "f" }, { name: "agent/codex", color: "f" }] })],
+      store,
+    );
+
+    // GitHub is authoritative: the unleased stale labels are gone, leaving a
+    // single distinct agent so claimant resolution stops reporting
+    // "ambiguous".
+    expect(store.updateIssue).toHaveBeenCalledWith(
+      "existing-1",
+      expect.objectContaining({ labels: ["type/bug", "agent/codex"] }),
+      expect.objectContaining({
+        labels: ["agent/nu", "agent/courier-local", "agent/codex", "status/ready"],
       }),
     );
   });
@@ -402,7 +466,7 @@ describe("syncIssuesForRepos — excluded-label reconcile at sync (#1587)", () =
   });
 
   it("keeps a cached row the store refuses to delete, logs a warning, and persists the exclusion into the cached labels", async () => {
-    vi.mocked(store.findIssue).mockResolvedValue({ id: "zombie-1", labels: ["agent/alpha"] });
+    vi.mocked(store.findIssue).mockResolvedValue({ id: "zombie-1", labels: ["agent/alpha"], activeLeaseAgents: ["alpha"] });
     deleteMock.mockResolvedValueOnce(false);
 
     await runSync(githubIssue(7, { labels: [{ name: "wontfix", color: "ffffff" }] }));
@@ -412,9 +476,9 @@ describe("syncIssuesForRepos — excluded-label reconcile at sync (#1587)", () =
     expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("kept cached issue org/repo#7"));
     // The kept row must not stay dispatchable: board and queue exclusion
     // filters read the *cached* labels, so the refusal persists the
-    // GitHub-authoritative labels — the excluded label among them — while
-    // preserving the cached agent/* labels (the dependent work likely belongs
-    // to a claim).
+    // GitHub-authoritative labels — the excluded label among them. The
+    // lease-backed agent/* label survives the merge (the dependent work is a
+    // live claim).
     expect(store.updateIssue).toHaveBeenCalledWith(
       "zombie-1",
       expect.objectContaining({ labels: ["wontfix", "agent/alpha"] }),
@@ -426,8 +490,8 @@ describe("syncIssuesForRepos — excluded-label reconcile at sync (#1587)", () =
     // A refused prune writes the cache only: the branch continues before the
     // closed⇒done mirror, and a closed excluded issue still lands on
     // status/done in the cache. The status fix applies to the GitHub labels
-    // BEFORE the cached agent/* labels are merged on top.
-    vi.mocked(store.findIssue).mockResolvedValue({ id: "zombie-1", labels: ["agent/alpha"] });
+    // BEFORE the lease-backed agent/* labels are merged on top.
+    vi.mocked(store.findIssue).mockResolvedValue({ id: "zombie-1", labels: ["agent/alpha"], activeLeaseAgents: ["alpha"] });
     deleteMock.mockResolvedValueOnce(false);
 
     await runSync(
@@ -460,7 +524,7 @@ describe("syncIssuesForRepos — excluded-label reconcile at sync (#1587)", () =
     // labels — the cached labels are what the board/queue exclusion filters
     // read. So the failure falls through to the keep path.
     vi.mocked(store.findIssue)
-      .mockResolvedValueOnce({ id: "zombie-1", labels: ["agent/alpha"] })
+      .mockResolvedValueOnce({ id: "zombie-1", labels: ["agent/alpha"], activeLeaseAgents: ["alpha"] })
       .mockResolvedValueOnce(null);
     deleteMock.mockRejectedValueOnce(new Error("Transaction API error: transaction expired"));
 
