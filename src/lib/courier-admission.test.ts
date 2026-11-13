@@ -229,4 +229,70 @@ describe("submitAdmission", () => {
     expect(result).toMatchObject({ outcome: "uncertain", timeout: false });
     if (result.outcome === "uncertain") expect(result.diagnostic).toContain("ECONNREFUSED");
   });
+
+  // #1627: fetch resolves after headers arrive; a failure while READING the
+  // body must settle as uncertain delivery, never escape as a throw.
+  it("settles a rejected response body (AbortError/TimeoutError) as uncertain with timeout=true", async () => {
+    for (const error of [
+      new DOMException("body timed out", "AbortError"),
+      new DOMException("body timed out", "TimeoutError"),
+    ]) {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue({ ok: true, status: 201, text: () => Promise.reject(error) } as unknown as Response),
+      );
+      const result = await submitAdmission(FIELDS, config);
+      expect(result).toMatchObject({ outcome: "uncertain", httpStatus: 201, timeout: true });
+      if (result.outcome === "uncertain") expect(result.diagnostic).toMatch(/body read timed out/i);
+    }
+  });
+
+  it("settles a non-timeout body-read failure as uncertain with timeout=false and a redacted diagnostic", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 201,
+        text: () => Promise.reject(new TypeError(`connection reset while reading with ${TOKEN}`)),
+      } as unknown as Response),
+    );
+    const result = await submitAdmission(FIELDS, config);
+    expect(result).toMatchObject({ outcome: "uncertain", httpStatus: 201, timeout: false });
+    if (result.outcome === "uncertain") {
+      expect(result.diagnostic).toContain("connection reset");
+      expect(result.diagnostic).not.toContain(TOKEN);
+    }
+  });
+
+  it("settles an unreadable 4xx body as uncertain, never a terminal rejection", async () => {
+    // An unreadable error body is not proof of refusal — only a successfully
+    // read 4xx response may settle as the terminal `rejected` outcome.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 422,
+        text: () => Promise.reject(new TypeError("connection reset")),
+      } as unknown as Response),
+    );
+    const result = await submitAdmission(FIELDS, config);
+    expect(result).toMatchObject({ outcome: "uncertain", httpStatus: 422, timeout: false });
+  });
+
+  it("bounds a long body-read diagnostic", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 201,
+        text: () => Promise.reject(new Error("x".repeat(900))),
+      } as unknown as Response),
+    );
+    const result = await submitAdmission(FIELDS, config);
+    expect(result.outcome).toBe("uncertain");
+    if (result.outcome === "uncertain") {
+      expect(result.diagnostic).toMatch(/\[truncated\]$/);
+      expect(result.diagnostic.length).toBeLessThanOrEqual(500 + "…[truncated]".length);
+    }
+  });
 });

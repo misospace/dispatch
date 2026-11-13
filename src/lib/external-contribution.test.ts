@@ -266,6 +266,36 @@ describe("external contribution in-flight claim", () => {
     expect(ledger.rows[0].deliveryStatus).toBe("accepted");
   });
 
+  it("settles a rejected response body as uncertain so the same key retries without waiting for the lease", async () => {
+    // #1627: fetch resolves after headers arrive; text() rejects mid-read.
+    // The client must return uncertain (not throw), so the row settles with a
+    // diagnostic and a cleared lease instead of staying in_flight until expiry.
+    const bodyFailure = {
+      ok: true,
+      status: 201,
+      text: () => Promise.reject(new DOMException("body timed out", "AbortError")),
+    } as unknown as Response;
+    fetchMock.mockResolvedValueOnce(bodyFailure);
+    const first = await submit({ idempotencyKey: "key-body-fail" });
+    expect(first.outcome).toBe("uncertain");
+    if (first.outcome === "uncertain") expect(first.timeout).toBe(true);
+    expect(ledger.rows[0].deliveryStatus).toBe("uncertain");
+    expect(ledger.rows[0].inFlightUntil).toBeNull(); // no live claim remains
+    expect(ledger.rows[0].attemptCount).toBe(1);
+    expect(ledger.rows[0].lastError).toBeTruthy();
+    expect(ledger.rows[0].lastError).not.toContain(COURIER_TOKEN);
+
+    // The original key is reusable immediately (no lease wait) and carries the
+    // SAME idempotency key out to Courier on attempt 2.
+    fetchMock.mockResolvedValueOnce(courierCreated("run-body-retry"));
+    const second = await submit({ idempotencyKey: "key-body-fail" });
+    expect(second.outcome).toBe("created");
+    expect(ledger.rows[0].attemptCount).toBe(2);
+    expect(ledger.rows[0].deliveryStatus).toBe("accepted");
+    const sent = JSON.parse((fetchMock.mock.calls[1] as [URL, RequestInit])[1].body as string);
+    expect(sent.idempotencyKey).toBe(second.request.idempotencyKey);
+  });
+
   it("never recovers past the bounded attempt budget, even from a stale lease", async () => {
     ledger.plantRow({
       idempotencyKey: "key-maxed",
