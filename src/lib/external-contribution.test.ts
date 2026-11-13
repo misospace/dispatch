@@ -24,7 +24,10 @@ const CONFIG = {
   endpoint: new URL("https://courier.internal/v1/contributions"),
   token: COURIER_TOKEN,
   namespaces: ["team-alpha"],
-  timeoutMs: 2_000,
+  // The production default (30s). The lease is this timeout plus the margin,
+  // so a loaded machine still has room for a duplicate submission to land
+  // inside the live lease of the attempt it duplicates.
+  timeoutMs: 30_000,
 };
 
 const ACTOR = { actor: "operator" };
@@ -60,6 +63,15 @@ function courierRejected(status = 400): Response {
     ok: false,
     status,
     text: () => Promise.resolve(JSON.stringify({ error: "lane unknown" })),
+  } as unknown as Response;
+}
+
+/** A 5xx Courier response — settles `uncertain` and consumes the attempt. */
+function courierUnavailable(status = 503): Response {
+  return {
+    ok: false,
+    status,
+    text: () => Promise.resolve(JSON.stringify({ error: "courier is unavailable" })),
   } as unknown as Response;
 }
 
@@ -329,5 +341,59 @@ describe("external contribution in-flight claim", () => {
     expect(result.outcome).toBe("payload_conflict");
     expect(fetchMock).not.toHaveBeenCalled();
     expect(ledger.rows[0].attemptCount).toBe(1);
+  });
+
+  it("reports in_flight to a same-key duplicate while the FINAL attempt is live (#1628)", async () => {
+    const key = "key-final-live";
+    // Four settled 5xx responses: each consumes one bounded attempt and leaves
+    // the row `uncertain`.
+    for (let i = 0; i < 4; i++) fetchMock.mockResolvedValueOnce(courierUnavailable());
+    for (let i = 0; i < 4; i++) {
+      const settled = await submit({ idempotencyKey: key });
+      expect(settled.outcome).toBe("uncertain");
+    }
+    expect(ledger.rows[0].attemptCount).toBe(4);
+    expect(ledger.rows[0].deliveryStatus).toBe("uncertain");
+
+    // The fifth (final) attempt claims the whole budget and blocks in fetch.
+    const gate = deferred();
+    fetchMock.mockImplementationOnce(() => gate.promise);
+    const finalAttempt = submit({ idempotencyKey: key });
+    await vi.waitFor(() => expect(ledger.rows[0]?.deliveryStatus).toBe("in_flight"));
+    expect(ledger.rows[0].attemptCount).toBe(MAX_DELIVERY_ATTEMPTS);
+    const finalToken = ledger.rows[0].attemptToken;
+
+    // A same-key, same-payload duplicate arrives while the final attempt runs.
+    const duplicate = await submit({ idempotencyKey: key });
+    expect(duplicate.outcome).toBe("in_flight");
+    expect(fetchMock).toHaveBeenCalledTimes(5); // no additional Courier request
+    expect(ledger.rows[0].attemptCount).toBe(MAX_DELIVERY_ATTEMPTS); // no attempt burned
+    expect(ledger.rows[0].attemptToken).toBe(finalToken); // ownership untouched
+    expect(ledger.rows[0].idempotencyKey).toBe(key); // identity untouched
+    expect(ledger.rows[0].payloadDigest).toBe(digestFor(key)); // payload untouched
+    expect(ledger.rows[0].deliveryStatus).toBe("in_flight");
+
+    // The final attempt still settles normally — the duplicate stole nothing.
+    gate.resolve(courierCreated("run-final"));
+    expect((await finalAttempt).outcome).toBe("created");
+    expect(ledger.rows[0].deliveryStatus).toBe("accepted");
+    expect(ledger.rows[0].courierRun).toBe("run-final");
+    expect(ledger.rows[0].attemptCount).toBe(MAX_DELIVERY_ATTEMPTS);
+  });
+
+  it("reports retry_exhausted for a settled uncertain row at the attempt limit", async () => {
+    const key = "key-uncertain-max";
+    for (let i = 0; i < MAX_DELIVERY_ATTEMPTS; i++) fetchMock.mockResolvedValueOnce(courierUnavailable());
+    for (let i = 0; i < MAX_DELIVERY_ATTEMPTS; i++) {
+      const settled = await submit({ idempotencyKey: key });
+      expect(settled.outcome).toBe("uncertain");
+    }
+    expect(ledger.rows[0].attemptCount).toBe(MAX_DELIVERY_ATTEMPTS);
+    expect(ledger.rows[0].deliveryStatus).toBe("uncertain");
+
+    const exhausted = await submit({ idempotencyKey: key });
+    expect(exhausted.outcome).toBe("retry_exhausted");
+    expect(fetchMock).toHaveBeenCalledTimes(MAX_DELIVERY_ATTEMPTS); // no 6th request
+    expect(ledger.rows[0].attemptCount).toBe(MAX_DELIVERY_ATTEMPTS);
   });
 });

@@ -30,6 +30,12 @@
  *   - A caller that loses the claim (someone else holds a live lease) returns
  *     the row as `in_flight` WITHOUT a network call: no attempt increment, no
  *     key or payload change.
+ *   - The bounded attempt budget limits how many attempts may START; it never
+ *     cancels an attempt that is already running (#1628). A LIVE attempt
+ *     therefore outranks the budget: while the final attempt holds an
+ *     unexpired lease the row is reported `in_flight` (the delivery may still
+ *     succeed), never `retry_exhausted` (which would tell the caller to
+ *     abandon the identity and create a new one).
  *   - The lease bounds a crashed attempt: if Dispatch dies after claiming but
  *     before settling, the lease expires `inFlightLeaseMs` after attempt start
  *     (configured admission timeout + `IN_FLIGHT_LEASE_MARGIN_MS`, so it
@@ -254,16 +260,48 @@ export type SubmissionOutcome =
   | { outcome: "rejected"; request: ExternalContributionRow; httpStatus: number };
 
 /**
+ * True when the row holds a LIVE in-flight attempt — an attempt that is still
+ * running under an unexpired lease.
+ *
+ * Rationale (#1628): the bounded attempt budget limits how many attempts may
+ * START; it never cancels an attempt that is already running. A live attempt
+ * therefore outranks the budget — the delivery may still succeed, so the row
+ * is reported `in_flight` rather than `retry_exhausted` (which tells the
+ * caller to abandon the identity and create a new one).
+ */
+function hasLiveInFlightAttempt(row: ExternalContributionRow, now: Date): boolean {
+  return (
+    row.deliveryStatus === "in_flight" &&
+    row.inFlightUntil !== null &&
+    row.inFlightUntil.getTime() > now.getTime()
+  );
+}
+
+/**
  * Classify an already-persisted row against the incoming request, BEFORE any
  * network call. Pure so both the fresh-row and lost-create-race paths share it.
- * Live rows (`pending`, and `in_flight` regardless of lease freshness) return
- * null so the atomic claim decides attempt ownership — the claim re-checks
- * lease staleness atomically, which a read-then-classify cannot.
+ *
+ * Precedence:
+ *   1. changed payload under an existing key -> `payload_conflict`;
+ *   2. already accepted -> `replay_accepted`;
+ *   3. already rejected -> `replay_rejected`;
+ *   4. a LIVE in-flight attempt (unexpired lease) -> null: the running attempt
+ *      outranks the attempt budget (#1628) and may still succeed, so the row is
+ *      never reported `retry_exhausted` here. Null hands the decision to the
+ *      atomic claim, which re-checks lease staleness atomically — which a
+ *      read-then-classify cannot — and, when the budget is already spent,
+ *      re-reads the row and reports the live attempt as `in_flight`;
+ *   5. attempt budget spent -> `retry_exhausted` (a settled `uncertain` row at
+ *      the limit, or an `in_flight` row whose lease has EXPIRED at the limit);
+ *   6. otherwise null — the atomic claim decides attempt ownership.
  */
 function classifyExisting(row: ExternalContributionRow, digest: string): SubmissionOutcome | null {
   if (row.payloadDigest !== digest) return { outcome: "payload_conflict", request: row };
   if (row.deliveryStatus === "accepted") return { outcome: "replay_accepted", request: row };
   if (row.deliveryStatus === "rejected") return { outcome: "replay_rejected", request: row };
+  // Lease liveness is judged against a timestamp captured at classification
+  // time (right after this row read), never against a stale earlier stamp.
+  if (hasLiveInFlightAttempt(row, new Date())) return null;
   if (row.attemptCount >= MAX_DELIVERY_ATTEMPTS) return { outcome: "retry_exhausted", request: row };
   return null;
 }
@@ -272,9 +310,17 @@ function classifyExisting(row: ExternalContributionRow, digest: string): Submiss
  * Report a freshly re-read row's CURRENT truth after losing the atomic claim
  * or after this attempt's settlement was rejected as stale — always without a
  * network call, and always reflecting the winning caller's state.
+ *
+ * A LIVE in-flight attempt outranks the attempt budget here too (#1628): a
+ * running final attempt is reported `in_flight` even when the budget is spent,
+ * because the delivery may still succeed. `retry_exhausted` is reported only
+ * when the row is exhausted AND holds no live attempt.
  */
 function classifyCurrent(row: ExternalContributionRow, digest: string): SubmissionOutcome {
   const exhausted = row.attemptCount >= MAX_DELIVERY_ATTEMPTS;
+  // Lease liveness is judged against a timestamp captured at classification
+  // time (right after this row read), never against a stale earlier stamp.
+  const live = hasLiveInFlightAttempt(row, new Date());
   if (row.payloadDigest !== digest) return { outcome: "payload_conflict", request: row };
   switch (row.deliveryStatus) {
     case "accepted":
@@ -282,12 +328,17 @@ function classifyCurrent(row: ExternalContributionRow, digest: string): Submissi
     case "rejected":
       return { outcome: "replay_rejected", request: row };
     case "uncertain":
+      // A settled row never holds a live lease — every settlement clears
+      // `inFlightUntil` — so the live-attempt rule below cannot apply here.
       return exhausted
         ? { outcome: "retry_exhausted", request: row }
         : { outcome: "uncertain", request: row, timeout: false };
     default:
       // `pending` and `in_flight`: another caller holds the attempt (or just
-      // claimed it). Report in-flight without touching anything.
+      // claimed it). A live attempt is reported in-flight without touching
+      // anything — even at the attempt limit, where the running delivery may
+      // still succeed.
+      if (live) return { outcome: "in_flight", request: row };
       return exhausted
         ? { outcome: "retry_exhausted", request: row }
         : { outcome: "in_flight", request: row };

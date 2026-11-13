@@ -306,6 +306,30 @@ describe("POST /api/external-contributions", () => {
     expect(harness.rows[0].idempotencyKey).toBe("key-inflight");
   });
 
+  it("returns the in-flight row (200) while the FINAL attempt holds a live lease (#1628)", async () => {
+    // The bounded budget is spent, but the running delivery is still live:
+    // the caller must not be told to abandon the request identity.
+    harness.plantRow({
+      idempotencyKey: "key-final-live",
+      payloadDigest: digestOfBody({ ...BASE_BODY, idempotencyKey: "key-final-live" }),
+      deliveryStatus: "in_flight",
+      attemptCount: MAX_DELIVERY_ATTEMPTS,
+      attemptToken: "final-attempt",
+      lastAttemptAt: new Date(),
+      inFlightUntil: new Date(Date.now() + 60_000),
+    });
+
+    const res = await post({ ...BASE_BODY, idempotencyKey: "key-final-live" });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.status).toBe("in_flight");
+    expect(body.error).toBeUndefined();
+    expect(body.attempts).toBe(MAX_DELIVERY_ATTEMPTS); // no attempt slot was burned
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(harness.rows[0].attemptCount).toBe(MAX_DELIVERY_ATTEMPTS);
+    expect(harness.rows[0].attemptToken).toBe("final-attempt");
+  });
+
   it("keeps one identity when a concurrent create loses the unique race", async () => {
     // Simulate the interleaving: findUnique sees nothing, the concurrent
     // winner's row lands, our create hits P2002, re-read finds the winner.

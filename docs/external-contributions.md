@@ -70,6 +70,22 @@ Delivery statuses recorded on the `ExternalContributionRequest` ledger row:
 | `rejected` | Explicit Courier refusal (any 4xx, mirrored in the response status) | Terminal — a new contribution needs a new request |
 | `uncertain` | Timeout, network failure, refused redirect, 5xx, or a malformed 2xx body — delivery outcome unknown | Retried with the ORIGINAL key, bounded by `MAX_DELIVERY_ATTEMPTS` (5) |
 
+The response status reports what the submission did:
+
+| Status | When |
+|---|---|
+| 201 | Courier created the admission |
+| 200 | Courier resumed the admission, the row was already accepted, or another attempt holds the row as `in_flight` |
+| 400 | The request body is invalid, the namespace is not approved, or Courier refused the request. A refusal keeps the status code from Courier. |
+| 409 | The payload conflicts with the request identity that the key already holds, or Courier rejected that identity before |
+| 502 | The delivery outcome is unknown. The next submission retries with the same idempotency key. |
+| 504 | Courier sent no answer in time. The delivery outcome is unknown. |
+| 503 | The admission endpoint, the credential, or the approved namespace list is not configured. The same status applies when the attempt budget is spent and no attempt is live. |
+
+A submission that finds a live attempt answers 200 with `status: "in_flight"`.
+The caller polls the same idempotency key. It must not create a new request,
+because the running delivery can still succeed.
+
 ## Concurrency invariant
 
 Dispatch never intentionally has two live Courier admission HTTP requests for
@@ -108,6 +124,14 @@ double-submit), so attempt ownership is durable state:
    whose request was retried after recovery) can never overwrite the newer
    attempt's result — it is dropped and the caller reports the row's current
    truth.
+6. **A live attempt outranks the attempt budget.** The budget limits how many
+   attempts can start. It does not cancel an attempt that is already running.
+   While the final attempt holds an unexpired lease, a submission with the
+   same key receives the row as `in_flight`. It never receives
+   `retry_exhausted`, because the running delivery can still succeed, and
+   `retry_exhausted` asks the caller to abandon the identity. The budget still
+   bounds the work: a row with an expired lease at the limit reports
+   `retry_exhausted`, and no sixth delivery starts.
 
 ## Exactly-once rules
 
