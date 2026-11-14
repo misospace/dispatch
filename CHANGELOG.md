@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.5.77](https://github.com/misospace/dispatch/compare/v0.5.76...v0.5.77) (2026-11-14)
+
+
+### Features
+
+* **deps:** update dependency eslint (10.14.0 → 10.15.0) ([#1632](https://github.com/misospace/dispatch/issues/1632)) ([4620f4d](https://github.com/misospace/dispatch/commit/4620f4dc77f444d2572c7702a434b86bfa8ed2be))
+* **deps:** update dependency lucide-react (1.72.0 → 1.73.0) ([#1633](https://github.com/misospace/dispatch/issues/1633)) ([3489ff7](https://github.com/misospace/dispatch/commit/3489ff7d55949232d6d3d5bb2928afd1f1280bd1))
+
+
+### Bug Fixes
+
+* **courier-admission:** settle response-body read failures as uncertain delivery ([#1627](https://github.com/misospace/dispatch/issues/1627)) ([#1629](https://github.com/misospace/dispatch/issues/1629)) ([45f6e7c](https://github.com/misospace/dispatch/commit/45f6e7ce4e144f1f1ffbc44b1860a84f9c2e5629))
+* **deps:** update dependency @testing-library/user-event (14.6.9 → 14.6.10) ([#1619](https://github.com/misospace/dispatch/issues/1619)) ([8b28369](https://github.com/misospace/dispatch/commit/8b2836961b465ce57521ff5a5d1aeebe196ea8ec))
+* **deps:** update dependency astro (7.4.11 → 7.4.12) ([#1631](https://github.com/misospace/dispatch/issues/1631)) ([cd3e1af](https://github.com/misospace/dispatch/commit/cd3e1afd9bf6cf2eabd486742bff70dd0bde58de))
+* **deps:** update dependency jsdom (31.0.0 → 31.0.1) ([#1626](https://github.com/misospace/dispatch/issues/1626)) ([ece7e2b](https://github.com/misospace/dispatch/commit/ece7e2b629f58993fa068b762c1243aaadfdbd78))
+* **external-contributions:** keep a live final attempt in_flight ([#1628](https://github.com/misospace/dispatch/issues/1628)) ([#1630](https://github.com/misospace/dispatch/issues/1630)) ([86a56c7](https://github.com/misospace/dispatch/commit/86a56c7c2fe43246d62e24c097d77f889f94d36d))
+* **sync:** reconcile cached agent labels against GitHub so stale labels stop poisoning claimants ([#1625](https://github.com/misospace/dispatch/issues/1625)) ([548b540](https://github.com/misospace/dispatch/commit/548b54065a45337bf6251e02e1cb88a4f6fbf7b5))
+
+
+### Refactors
+
+* consolidate excluded-label where composition into applyExcludedLabelExclusion ([#1624](https://github.com/misospace/dispatch/issues/1624)) ([a42889d](https://github.com/misospace/dispatch/commit/a42889d0a5b4a84c351b5e41508923966b162ff2))
+
 ## [0.5.76](https://github.com/misospace/dispatch/compare/v0.5.75...v0.5.76) (2026-11-12)
 
 
