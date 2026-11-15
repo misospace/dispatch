@@ -352,6 +352,13 @@ as the `pr-fix-sweep` job:
   (`handoutAcks`, `dispatchedAt`, `dispatchedGeneration`) and a derived
   `idleReason`; the observability snapshot counts `overdueAcked`.
 - A **merged or closed** PR goes `STALE` (nothing left to fix).
+- A **hard-deleted** PR also goes `STALE` (#1641): the PR vanished from every
+  PR listing, so the merged/closed reap never sees the row. The pr-followup
+  sync runs an item-driven deleted-PR reap (`reconcileDeletedPrFixItems`):
+  one per-PR probe per active row; a `404` at a repo that reads fine is a
+  confirmed deletion and the row gets the same generation-AND-status-pinned
+  terminal write. A `404` at an unreadable repo, a transport failure, or a
+  rate limit is an unknown and defers — fail-open, like the archived-repo reap.
 - **Unknown PR state** defers the item (`unknownState`): a possibly-closed PR is
   never reclaimed into a fresh attempt.
 - Past `PR_FIX_MAX_RECLAIMS` (default 3) the item parks as `PARKED` with

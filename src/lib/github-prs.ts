@@ -283,6 +283,29 @@ export async function fetchPullRequestState(
   return { state: null, mergedAt: null };
 }
 
+/**
+ * Existence probe for a single PR (#1641). Tri-state by design:
+ * "present" (2xx), "deleted" (404), and "unknown" (any other status or a
+ * transport failure). Every other per-PR probe collapses 404 into its
+ * null/unverifiable shape, which is right for deferrals but leaves the
+ * queue unable to tell a deleted PR from an unreachable one. 404 is the
+ * definitive gone signal at GitHub; the caller still owns the
+ * "repo actually reachable" qualification before treating it as fact.
+ */
+export async function fetchPullRequestPresence(
+  repoFullName: string,
+  prNumber: number,
+): Promise<"present" | "deleted" | "unknown"> {
+  try {
+    const headers = await getHeadersAsync();
+    const resp = await fetchWithRetry(`${GITHUB_API}/repos/${repoFullName}/pulls/${prNumber}`, { headers });
+    if (resp.ok) return "present";
+    if (resp.status === 404) return "deleted";
+  } catch {
+  }
+  return "unknown";
+}
+
 export async function fetchPullRequestMergeState(
   repoFullName: string,
   prNumber: number,

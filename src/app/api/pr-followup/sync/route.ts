@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
-import { reconcileStalePrFixItems, reconcileArchivedRepoPrFixItems, reconcileExternalWaitTriggers } from "@/lib/pr-fix-queue";
+import { reconcileStalePrFixItems, reconcileArchivedRepoPrFixItems, reconcileDeletedPrFixItems, reconcileExternalWaitTriggers } from "@/lib/pr-fix-queue";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { getTrackedRepos } from "@/lib/config";
 import { getGitHubToken, fetchPaginated, fetchPullRequests, fetchPullRequestMergeState, fetchFailedJobLogExcerpt, fetchClosedPullRequests, jobIdFromCheckRunUrl, type GithubPR as GithubPRBase } from "@/lib/github";
@@ -461,6 +461,13 @@ export async function POST(request: NextRequest) {
     const archivedResult = rateLimited
       ? { markedStale: 0 }
       : await reconcileArchivedRepoPrFixItems(asPrFixQueueClient(prisma));
+    // #1641: a hard-deleted PR vanished from every listing, so the
+    // merged/closed reap above can never see its rows. Probe the per-PR
+    // endpoint for each active item: a 404 at a reachable repo is a
+    // confirmed deletion; present/transport-failure/unreadable-repo defer.
+    const deletedResult = rateLimited
+      ? { markedStale: 0 }
+      : await reconcileDeletedPrFixItems(asPrFixQueueClient(prisma));
 
     // #1253: bounded trigger reconciliation for structured external waits —
     // a recorded dependency that now satisfies its predicate reactivates the
@@ -492,6 +499,7 @@ export async function POST(request: NextRequest) {
       skipped: totalSkipped + result.skipped,
       staleReaped: staleResult.markedStale,
       archivedReaped: archivedResult.markedStale,
+      deletedReaped: deletedResult.markedStale,
       externalWaitRechecked: waitTriggerResult.reactivated,
       rateLimited,
     });

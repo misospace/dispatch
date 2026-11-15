@@ -75,6 +75,7 @@ describe("github domain modules expose expected exports", () => {
       "fetchPullRequestHealthSignals",
       "fetchPullRequestLabels",
       "fetchPullRequestMergeState",
+      "fetchPullRequestPresence",
       "fetchPullRequestReviewThreadStates",
       "fetchPullRequestState",
       "fetchPullRequests",
@@ -106,7 +107,7 @@ describe("github domain modules expose expected exports", () => {
       "triggerWorkflowDispatch", "fetchLatestCommit", "fetchCompare", "jobIdFromCheckRunUrl",
       "extractLogExcerpt", "fetchFailedJobLogExcerpt",
       "fetchPullRequests", "fetchClosedPullRequests", "fetchPullRequestHealthSignals",
-      "fetchPullRequestState", "fetchPullRequestMergeState", "fetchPullRequestCheckFailures",
+      "fetchPullRequestState", "fetchPullRequestPresence", "fetchPullRequestMergeState", "fetchPullRequestCheckFailures",
       "fetchLinkedPrHealthInput",
       "fetchRepositoryMetadata", "searchRepositoryCode", "fetchRepositoryFileText",
     ];

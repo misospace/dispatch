@@ -55,6 +55,7 @@ export {
   type PrHealthSignals,
   fetchPullRequestHealthSignals,
   fetchPullRequestState,
+  fetchPullRequestPresence,
   fetchPullRequestMergeState,
   fetchPullRequestHeadSha,
   fetchPullRequestCheckFailures,
