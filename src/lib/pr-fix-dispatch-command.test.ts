@@ -13,6 +13,7 @@ const { mocks } = vi.hoisted(() => ({
     addIssueComment: vi.fn().mockResolvedValue({ url: null }),
     addIssueLabel: vi.fn().mockResolvedValue(undefined),
     removeIssueLabel: vi.fn().mockResolvedValue(undefined),
+    repoLabelExists: vi.fn().mockResolvedValue(true),
     fetchIssueLabels: vi.fn(),
     fetchCollaboratorPermission: vi.fn().mockResolvedValue({ status: "ok", permission: "read" }),
     fetchPullRequestDetail: vi.fn(),
@@ -42,6 +43,7 @@ vi.mock("@/lib/github-issues", () => ({
   addIssueComment: mocks.addIssueComment,
   addIssueLabel: mocks.addIssueLabel,
   removeIssueLabel: mocks.removeIssueLabel,
+  repoLabelExists: mocks.repoLabelExists,
   fetchIssueLabels: mocks.fetchIssueLabels,
   fetchCollaboratorPermission: mocks.fetchCollaboratorPermission,
 }));
@@ -114,6 +116,7 @@ function resetDefaultFlowMocks() {
   mocks.addIssueComment.mockResolvedValue({ url: null });
   mocks.addIssueLabel.mockResolvedValue(undefined);
   mocks.removeIssueLabel.mockResolvedValue(undefined);
+  mocks.repoLabelExists.mockResolvedValue(true);
   mocks.auditLogCreate.mockResolvedValue({});
   mocks.enqueuePrFixItem.mockResolvedValue({ status: "QUEUED", lane: "NORMAL", claimant: "foo", claimantSource: "agent-label" });
 }
@@ -178,6 +181,41 @@ describe("deriveBlockingReview", () => {
       HEAD,
     );
     expect(blocking).toBeNull();
+  });
+
+  it("supersession: the reviewer's later DISMISSED clears the block (review round 5, M1)", () => {
+    const blocking = deriveBlockingReview(
+      [
+        review({ id: 1, submittedAt: "2026-11-12T00:00:00Z" }),
+        review({ id: 2, state: "DISMISSED", submittedAt: "2026-11-13T00:00:00Z", body: "same review, dismissed" }),
+      ],
+      HEAD,
+    );
+    expect(blocking).toBeNull();
+  });
+
+  it("supersession: a DISMISSED review does not clear a NEWER CHANGES_REQUESTED", () => {
+    const blocking = deriveBlockingReview(
+      [
+        review({ id: 1, state: "DISMISSED", submittedAt: "2026-11-12T00:00:00Z" }),
+        review({ id: 2, submittedAt: "2026-11-13T00:00:00Z", body: "re-requested" }),
+      ],
+      HEAD,
+    );
+    expect(blocking?.review.body).toBe("re-requested");
+    expect(blocking?.stale).toBe(false);
+  });
+
+  it("supersession: one reviewer's dismissal does not clear another reviewer's block", () => {
+    const blocking = deriveBlockingReview(
+      [
+        review({ id: 1, user: "reviewer-a", submittedAt: "2026-11-12T00:00:00Z" }),
+        review({ id: 2, user: "reviewer-b", state: "DISMISSED", submittedAt: "2026-11-13T00:00:00Z" }),
+      ],
+      HEAD,
+    );
+    expect(blocking?.review.user).toBe("reviewer-a");
+    expect(blocking?.stale).toBe(false);
   });
 
   it("picks the newest of several blocking reviews", () => {
@@ -669,6 +707,43 @@ describe("handleDispatchFixCommand", () => {
     expect(mocks.addIssueLabel).not.toHaveBeenCalled();
     const reply = mocks.addIssueComment.mock.calls.at(-1)![2];
     expect(reply).toContain("NOT applied");
+  });
+
+  it("refuses lane= when the target label is not declared in the repository (review round 5, M2)", async () => {
+    mocks.fetchCollaboratorPermission.mockResolvedValue({ status: "ok", permission: "maintain" });
+    mocks.repoLabelExists.mockResolvedValue(false);
+    const outcome = await handleDispatchFixCommand(baseCommand({ commentBody: "/dispatch-fix lane=hyper" }));
+    expect(outcome.outcome).toBe("refused");
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.enqueuePrFixItem).not.toHaveBeenCalled();
+    const reply = mocks.addIssueComment.mock.calls.at(-1)![2];
+    expect(reply).toContain("does not exist");
+    expect(reply).toContain("labels.yaml");
+    const data = mocks.auditLogCreate.mock.calls.at(-1)![0].data;
+    expect(data.success).toBe(false);
+    expect(data.errorMessage).toContain("lane label not declared");
+  });
+
+  it("treats an unreadable label check as retryable error, not a refusal (review round 5, M2)", async () => {
+    mocks.fetchCollaboratorPermission.mockResolvedValue({ status: "ok", permission: "maintain" });
+    mocks.repoLabelExists.mockResolvedValue(null);
+    const outcome = await handleDispatchFixCommand(baseCommand({ commentBody: "/dispatch-fix lane=hyper" }));
+    expect(outcome.outcome).toBe("error");
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.enqueuePrFixItem).not.toHaveBeenCalled();
+    const reply = mocks.addIssueComment.mock.calls.at(-1)![2];
+    expect(reply).toContain("Retry later");
+  });
+
+  it("skips the label-existence check when the issue already carries the target label", async () => {
+    mocks.fetchIssueLabels.mockResolvedValue(["agent/courier-hyper"]);
+    mocks.issueFindFirst.mockResolvedValue({ id: "i1", labels: ["agent/courier-hyper"] });
+    const outcome = await handleDispatchFixCommand(baseCommand({ commentBody: "/dispatch-fix lane=hyper" }));
+    expect(outcome.outcome).toBe("enqueued");
+    expect(mocks.repoLabelExists).not.toHaveBeenCalled();
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
   });
 
   it("rate-limits per actor + PR and audits the refusal", async () => {

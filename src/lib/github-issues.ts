@@ -400,6 +400,31 @@ export async function removeIssueLabel(
   }
 }
 
+/**
+ * Whether a repository-level label exists. `null` means the check could not
+ * be read (network/API failure) — callers must treat that as unavailable,
+ * not as "missing": a false refusal and a false confirmation are both wrong.
+ */
+export async function repoLabelExists(
+  repoFullName: string,
+  label: string
+): Promise<boolean | null> {
+  try {
+    const [owner, repo] = repoFullName.split("/");
+    const url = `${GITHUB_API}/repos/${owner}/${repo}/labels/${encodeURIComponent(label)}`;
+    const response = await fetchWithRetry(url, { headers: await getHeadersAsync() });
+    if (response.status === 404) return false;
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`GitHub API error: ${response.status} ${text}`);
+    }
+    return true;
+  } catch (error) {
+    console.warn(`[github-issues] label check unavailable for ${repoFullName} (${label}):`, error instanceof Error ? error.message : error);
+    return null;
+  }
+}
+
 export async function syncStatusLabels(
   repoFullName: string,
   issueNumber: number,

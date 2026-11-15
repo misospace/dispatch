@@ -37,6 +37,7 @@ import {
   fetchCollaboratorPermission,
   fetchIssueLabels,
   removeIssueLabel,
+  repoLabelExists,
 } from "@/lib/github-issues";
 import {
   fetchPullRequestDetail,
@@ -116,24 +117,28 @@ export function parseDispatchFixCommand(
 
 /** The aggregate review decision over a PR's reviews, using the same
  * latest-per-user semantics as `deriveReviewDecision` in github-prs.ts:
- * a reviewer's newest APPROVED/CHANGES_REQUESTED review supersedes their
- * earlier ones, and any standing CHANGES_REQUESTED blocks. */
+ * a reviewer's newest APPROVED/CHANGES_REQUESTED/DISMISSED review supersedes
+ * their earlier ones, and any standing CHANGES_REQUESTED blocks. DISMISSED
+ * participates in the supersession (review round 5, M1): GitHub records a
+ * dismissal as the reviewer's latest review state, so a review dismissed
+ * after a CHANGES_REQUESTED must unblock — otherwise an earlier request
+ * would stand forever and the command would enqueue obsolete feedback. */
 export function deriveBlockingReview(
   reviews: PullRequestReview[],
   headSha: string | null,
 ): { review: PullRequestReview; stale: boolean } | null {
-  const latestByUser = new Map<string, { review: PullRequestReview; submittedAt: number }>();
+  const latestByUser = new Map<string, { review: PullRequestReview; submittedAt: number; blocking: boolean }>();
   for (const review of reviews) {
     const state = review.state?.toUpperCase();
-    if (!review.user || (state !== "APPROVED" && state !== "CHANGES_REQUESTED")) continue;
+    if (!review.user || (state !== "APPROVED" && state !== "CHANGES_REQUESTED" && state !== "DISMISSED")) continue;
     const submittedAt = review.submittedAt ? Date.parse(review.submittedAt) : 0;
     const prev = latestByUser.get(review.user);
     if (!prev || submittedAt >= prev.submittedAt) {
-      latestByUser.set(review.user, { review, submittedAt });
+      latestByUser.set(review.user, { review, submittedAt, blocking: state === "CHANGES_REQUESTED" });
     }
   }
   const blocking = Array.from(latestByUser.values())
-    .filter((entry) => entry.review.state?.toUpperCase() === "CHANGES_REQUESTED")
+    .filter((entry) => entry.blocking)
     .sort((a, b) => b.submittedAt - a.submittedAt);
   if (blocking.length === 0) return null;
   // A newer CHANGES_REQUESTED anchored to an older head must not mask a
@@ -476,6 +481,33 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
       if (!agentLabels.includes(targetLabel) && !isOperator) {
         laneSwap = ` (note: \`lane=${parsed.lane}\` was NOT applied — reassigning the linked issue's agent label requires a repo admin/maintainer.)`;
       } else if (!agentLabels.includes(targetLabel)) {
+        // Managed-label gate (review round 5, M2): the swap only ever
+        // assigns a label the repository already declares — it never
+        // mints a new `agent/courier-<profile>` label, so the assignable
+        // label space stays exactly the operator-declared set (e.g. via
+        // `.github/labels.yaml` label sync) instead of proliferating with
+        // every profile name a commenter tries. The check runs BEFORE the
+        // removals so a missing label leaves the issue's assignment
+        // untouched; an unreadable check is retryable, not a refusal.
+        const labelExists = await repoLabelExists(repoFullName, targetLabel);
+        if (labelExists === null) {
+          await reply(
+            repoFullName,
+            prNumber,
+            `\`/dispatch-fix\` failed: the label \`${targetLabel}\` could not be checked on GitHub — nothing was enqueued. Retry later.`,
+          );
+          await auditCommand(repoFullName, linkedIssue, commenter, false, "lane label check unavailable");
+          return result("error", "lane label check unavailable");
+        }
+        if (!labelExists) {
+          await reply(
+            repoFullName,
+            prNumber,
+            `\`/dispatch-fix\` refused: the label \`${targetLabel}\` does not exist in this repository — declare it first (e.g. via \`.github/labels.yaml\`), then retry. Nothing was enqueued.`,
+          );
+          await auditCommand(repoFullName, linkedIssue, commenter, false, "lane label not declared");
+          return result("refused", "lane label not declared");
+        }
         const others = agentLabels.filter((l) => l !== targetLabel);
         try {
           // Remove the old agent label BEFORE adding the target (review
