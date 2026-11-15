@@ -428,6 +428,42 @@ describe("handleDispatchFixCommand", () => {
     expect(mocks.addIssueComment).not.toHaveBeenCalled();
   });
 
+  it("stays silent toward a bot PR author on every refusal path (AI review: all replies are bot-guarded)", async () => {
+    // A bot that authored the PR is authorized (author tier), so these
+    // refusals run past the authorization gate — each must be handled
+    // without posting a reply, while still writing its audit row.
+    mocks.fetchPullRequestDetail.mockResolvedValue({ ...PR_DETAIL, author: "github-actions[bot]", draft: true });
+    const draft = await handleDispatchFixCommand(baseCommand({ commenter: "github-actions[bot]" }));
+    expect(draft.outcome).toBe("refused");
+    expect(mocks.addIssueComment).not.toHaveBeenCalled();
+    expect(mocks.auditLogCreate).toHaveBeenCalled();
+
+    mocks.addIssueComment.mockClear();
+    mocks.auditLogCreate.mockClear();
+    mocks.fetchPullRequestDetail.mockResolvedValue({ ...PR_DETAIL, author: "github-actions[bot]", headRepoFullName: "someone/repo" });
+    const fork = await handleDispatchFixCommand(baseCommand({ commenter: "github-actions[bot]" }));
+    expect(fork.outcome).toBe("refused");
+    expect(mocks.addIssueComment).not.toHaveBeenCalled();
+    expect(mocks.auditLogCreate).toHaveBeenCalled();
+
+    mocks.addIssueComment.mockClear();
+    mocks.auditLogCreate.mockClear();
+    mocks.fetchPullRequestDetail.mockResolvedValue({ ...PR_DETAIL, author: "github-actions[bot]", title: "No link", body: "" });
+    const unlinked = await handleDispatchFixCommand(baseCommand({ commenter: "github-actions[bot]" }));
+    expect(unlinked.outcome).toBe("refused");
+    expect(mocks.addIssueComment).not.toHaveBeenCalled();
+    expect(mocks.auditLogCreate).toHaveBeenCalled();
+  });
+
+  it("stays silent toward a bot PR author on the success path, but still enqueues and audits", async () => {
+    mocks.fetchPullRequestDetail.mockResolvedValue({ ...PR_DETAIL, author: "github-actions[bot]" });
+    const outcome = await handleDispatchFixCommand(baseCommand({ commenter: "github-actions[bot]" }));
+    expect(outcome.outcome).toBe("enqueued");
+    expect(mocks.enqueuePrFixItem).toHaveBeenCalled();
+    expect(mocks.addIssueComment).not.toHaveBeenCalled();
+    expect(mocks.auditLogCreate).toHaveBeenCalled();
+  });
+
   it("refuses merged, closed and draft PRs", async () => {
     for (const detail of [
       { ...PR_DETAIL, state: "closed" },

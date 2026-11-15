@@ -285,7 +285,7 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
     // command posts a retryable notice rather than a verdict.
     const prDetail = await fetchPullRequestDetail(repoFullName, prNumber);
     if (!prDetail) {
-      await reply(repoFullName, prNumber, "`/dispatch-fix` failed: the PR's current state could not be read from GitHub — nothing was enqueued. Retry later.");
+      await replyUnlessBot(commenter, repoFullName, prNumber, "`/dispatch-fix` failed: the PR's current state could not be read from GitHub — nothing was enqueued. Retry later.");
       await auditCommand(repoFullName, null, commenter, false, "PR detail unavailable");
       return result("error", "PR detail unavailable");
     }
@@ -322,12 +322,12 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
     // Eligibility check 1 (#1622): open, not merged, not draft — mirroring
     // the requeue path's merged/closed refusal.
     if (prDetail.state !== "open" || prDetail.mergedAt) {
-      await reply(repoFullName, prNumber, `\`/dispatch-fix\` refused: this PR is ${prDetail.mergedAt ? "merged" : (prDetail.state ?? "closed")} — nothing to fix.`);
+      await replyUnlessBot(commenter, repoFullName, prNumber, `\`/dispatch-fix\` refused: this PR is ${prDetail.mergedAt ? "merged" : (prDetail.state ?? "closed")} — nothing to fix.`);
       await auditCommand(repoFullName, null, commenter, false, `pr not open (state=${prDetail.state}, merged=${!!prDetail.mergedAt})`);
       return result("refused", "pr not open");
     }
     if (prDetail.draft) {
-      await reply(repoFullName, prNumber, "`/dispatch-fix` refused: this PR is a draft — mark it ready for review first.");
+      await replyUnlessBot(commenter, repoFullName, prNumber, "`/dispatch-fix` refused: this PR is a draft — mark it ready for review first.");
       await auditCommand(repoFullName, null, commenter, false, "pr is draft");
       return result("refused", "pr is draft");
     }
@@ -339,7 +339,8 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
     // deleted fork) the base-repo ownership of the branch cannot be
     // verified at all — fail closed rather than accept (review M6).
     if (!prDetail.headRepoFullName) {
-      await reply(
+      await replyUnlessBot(
+        commenter,
         repoFullName,
         prNumber,
         "`/dispatch-fix` refused: the PR's head repository could not be verified (likely a deleted or inaccessible fork) — the fix loop only works on branches of the base repository. Re-open the PR from a base-repo branch and retry.",
@@ -348,7 +349,7 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
       return result("refused", "head repo unverifiable (deleted or inaccessible)");
     }
     if (prDetail.headRepoFullName.toLowerCase() !== repoFullName.toLowerCase()) {
-      await reply(repoFullName, prNumber, `\`/dispatch-fix\` refused: this PR comes from a fork (\`${prDetail.headRepoFullName}\`) — the fix loop only works on branches of the base repository.`);
+      await replyUnlessBot(commenter, repoFullName, prNumber, `\`/dispatch-fix\` refused: this PR comes from a fork (\`${prDetail.headRepoFullName}\`) — the fix loop only works on branches of the base repository.`);
       await auditCommand(repoFullName, null, commenter, false, `fork PR (head repo ${prDetail.headRepoFullName})`);
       return result("refused", "fork pr");
     }
@@ -358,18 +359,19 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
     // against a stale head would park after one attempt.
     const reviews = await fetchPullRequestReviews(repoFullName, prNumber);
     if (!reviews) {
-      await reply(repoFullName, prNumber, "`/dispatch-fix` failed: the PR's reviews could not be read from GitHub — nothing was enqueued. Retry later.");
+      await replyUnlessBot(commenter, repoFullName, prNumber, "`/dispatch-fix` failed: the PR's reviews could not be read from GitHub — nothing was enqueued. Retry later.");
       await auditCommand(repoFullName, null, commenter, false, "reviews unavailable");
       return result("error", "reviews unavailable");
     }
     const blocking = deriveBlockingReview(reviews, prDetail.headSha);
     if (!blocking) {
-      await reply(repoFullName, prNumber, "`/dispatch-fix` refused: no pending CHANGES_REQUESTED review on this PR.");
+      await replyUnlessBot(commenter, repoFullName, prNumber, "`/dispatch-fix` refused: no pending CHANGES_REQUESTED review on this PR.");
       await auditCommand(repoFullName, null, commenter, false, "no changes-requested review");
       return result("refused", "no changes-requested review");
     }
     if (blocking.stale) {
-      await reply(
+      await replyUnlessBot(
+        commenter,
         repoFullName,
         prNumber,
         `\`/dispatch-fix\` refused: the CHANGES_REQUESTED review is stale — it was written against an earlier head (\`${(blocking.review.commitId ?? "unknown").slice(0, 8)}\`, current head \`${(prDetail.headSha ?? "unknown").slice(0, 8)}\`). Push or re-review first.`,
@@ -383,7 +385,7 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
     // feedback entry is "".
     const reviewBody = review.body ?? "";
     if (!reviewBody.trim()) {
-      await reply(repoFullName, prNumber, "`/dispatch-fix` refused: the CHANGES_REQUESTED review carries no written feedback — nothing to hand off.");
+      await replyUnlessBot(commenter, repoFullName, prNumber, "`/dispatch-fix` refused: the CHANGES_REQUESTED review carries no written feedback — nothing to hand off.");
       await auditCommand(repoFullName, null, commenter, false, "empty review body");
       return result("refused", "empty review body");
     }
@@ -396,7 +398,8 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
     const linkageText = [prDetail.title, prDetail.body].filter(Boolean).join("\n");
     const crossRepo = crossRepoReferences(linkageText, repoFullName);
     if (crossRepo.length > 0) {
-      await reply(
+      await replyUnlessBot(
+        commenter,
         repoFullName,
         prNumber,
         `\`/dispatch-fix\` refused: the PR references an issue in another repository (${Array.from(new Set(crossRepo)).join(", ")}) — reference an issue of \`${repoFullName}\` only.`,
@@ -406,7 +409,8 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
     }
     const distinctRefs = new Set(linkageText.match(/#(\d+)/g) ?? []);
     if (distinctRefs.size > 1) {
-      await reply(
+      await replyUnlessBot(
+        commenter,
         repoFullName,
         prNumber,
         `\`/dispatch-fix\` refused: ambiguous issue linkage — the PR references ${Array.from(distinctRefs).join(", ")}. Reference exactly one issue.`,
@@ -416,7 +420,7 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
     }
     const linkedIssue = extractLinkedIssue({ title: prDetail.title, body: prDetail.body });
     if (!linkedIssue) {
-      await reply(repoFullName, prNumber, "`/dispatch-fix` refused: no linked issue found — reference the issue in the PR title or body (e.g. `Fixes #123`).");
+      await replyUnlessBot(commenter, repoFullName, prNumber, "`/dispatch-fix` refused: no linked issue found — reference the issue in the PR title or body (e.g. `Fixes #123`).");
       await auditCommand(repoFullName, null, commenter, false, "no linked issue");
       return result("refused", "no linked issue");
     }
@@ -433,13 +437,13 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
       select: { id: true, labels: true },
     });
     if (!cachedIssue) {
-      await reply(repoFullName, prNumber, `\`/dispatch-fix\` refused: linked issue #${linkedIssue} is not in Dispatch's issue cache yet — wait for the next sync and retry.`);
+      await replyUnlessBot(commenter, repoFullName, prNumber, `\`/dispatch-fix\` refused: linked issue #${linkedIssue} is not in Dispatch's issue cache yet — wait for the next sync and retry.`);
       await auditCommand(repoFullName, linkedIssue, commenter, false, "linked issue not cached");
       return result("refused", "linked issue not cached");
     }
     const issueLabels = await fetchIssueLabels(repoFullName, linkedIssue);
     if (!issueLabels) {
-      await reply(repoFullName, prNumber, `\`/dispatch-fix\` failed: the linked issue's labels could not be read from GitHub — nothing was enqueued. Retry later.`);
+      await replyUnlessBot(commenter, repoFullName, prNumber, `\`/dispatch-fix\` failed: the linked issue's labels could not be read from GitHub — nothing was enqueued. Retry later.`);
       await auditCommand(repoFullName, linkedIssue, commenter, false, "linked issue labels unavailable");
       return result("error", "linked issue labels unavailable");
     }
@@ -447,7 +451,8 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
     trackedBeforeLabels = agentLabels;
     trackedAfterLabels = agentLabels;
     if (agentLabels.length > 1) {
-      await reply(
+      await replyUnlessBot(
+        commenter,
         repoFullName,
         prNumber,
         `\`/dispatch-fix\` refused: linked issue #${linkedIssue} carries multiple agent labels (${agentLabels.join(", ")}) — resolve the assignment first.`,
@@ -502,7 +507,8 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
         // untouched; an unreadable check is retryable, not a refusal.
         const labelExists = await repoLabelExists(repoFullName, targetLabel);
         if (labelExists === null) {
-          await reply(
+          await replyUnlessBot(
+            commenter,
             repoFullName,
             prNumber,
             `\`/dispatch-fix\` failed: the label \`${targetLabel}\` could not be checked on GitHub — nothing was enqueued. Retry later.`,
@@ -511,7 +517,8 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
           return result("error", "lane label check unavailable");
         }
         if (!labelExists) {
-          await reply(
+          await replyUnlessBot(
+            commenter,
             repoFullName,
             prNumber,
             `\`/dispatch-fix\` refused: the label \`${targetLabel}\` does not exist in this repository — declare it first (e.g. via \`.github/labels.yaml\`), then retry. Nothing was enqueued.`,
@@ -550,7 +557,8 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
             ? ` The previous agent label ${agentLabels.join(", ")} was already removed from the issue.`
             : "";
           console.error(`[/dispatch-fix] agent-label swap failed for ${repoFullName}#${linkedIssue}:`, error);
-          await reply(
+          await replyUnlessBot(
+            commenter,
             repoFullName,
             prNumber,
             `\`/dispatch-fix\` failed: the agent-label swap to \`${targetLabel}\` did not fully land — nothing was enqueued.${removedNote} Check that the \`${targetLabel}\` label exists in this repository, then retry the command.`,
@@ -643,7 +651,8 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
     const claimantNote = item.claimant
       ? ` Claimant recorded on the queue row: \`${item.claimant}\` (source: ${item.claimantSource ?? "legacy"}).`
       : " No claimant was recorded on the queue row — the ownership gate will refuse its hand-out until the claimant is resolved.";
-    await reply(
+    await replyUnlessBot(
+      commenter,
       repoFullName,
       prNumber,
       `\`/dispatch-fix\` handed this PR to the fix loop: queue item is \`${item.status}\` on queue lane \`${item.lane}\` (position ${queuePosition} in that queue), evidence \`${evidenceKey}\`.${laneSwap}${claimantNote}`,
@@ -696,7 +705,9 @@ async function reply(repoFullName: string, prNumber: number, body: string): Prom
 
 /**
  * Reply only to humans (#1622): answering another bot's command is how
- * bot-to-bot reply loops start, so a bot commenter's refusal is silent.
+ * bot-to-bot reply loops start. Every reply — refusal, retryable failure,
+ * or confirmation — goes through this guard, so a bot commenter's command
+ * is handled silently (the audit row still records the outcome).
  */
 async function replyUnlessBot(commenter: string, repoFullName: string, prNumber: number, body: string): Promise<void> {
   if (isBotIdentity(commenter)) return;
