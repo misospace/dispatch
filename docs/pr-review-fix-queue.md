@@ -359,6 +359,9 @@ as the `pr-fix-sweep` job:
   confirmed deletion and the row gets the same generation-AND-status-pinned
   terminal write. A `404` at an unreadable repo, a transport failure, or a
   rate limit is an unknown and defers — fail-open, like the archived-repo reap.
+  Per repo, three consecutive unknown/failed probes stop that repo's probes
+  for the pass (other repos keep theirs), so a dead or rate-limited forge
+  bounds the fan-out instead of turning every row into a retried timeout.
 - **Unknown PR state** defers the item (`unknownState`): a possibly-closed PR is
   never reclaimed into a fresh attempt.
 - Past `PR_FIX_MAX_RECLAIMS` (default 3) the item parks as `PARKED` with

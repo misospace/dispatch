@@ -119,53 +119,78 @@ describe("deleted upstream PRs (#1641)", () => {
 
     const result = await reconcileDeletedPrFixItems(client, vi.fn(async () => {
       throw new Error("boom");
-    }) as any);
+    }));
 
     expect(result).toEqual({ checked: 1, markedStale: 0, errored: 1 });
     expect(client.items[0].status).toBe("QUEUED");
     expect(client.history).toHaveLength(0);
   });
 
-  it("three consecutive unknown probes abort the pass and defer the rest (outage breaker)", async () => {
+  it("three consecutive unknown/failed probes for ONE repo defer that repo's remaining rows without starving other repos", async () => {
     const client = makeClient([
-      item("a", "org/flaky", 1, "QUEUED"),
-      item("b", "org/flaky", 2, "QUEUED"),
-      item("c", "org/flaky", 3, "QUEUED"),
-      item("d", "org/gone", 4, "QUEUED"),
+      item("a", "org/flaky", 1, "QUEUED"), // unknown → streak 1
+      item("b", "org/flaky", 2, "QUEUED"), // throws  → streak 2 (shared with unknowns)
+      item("c", "org/flaky", 3, "QUEUED"), // unknown → streak 3: repo defers
+      item("d", "org/flaky", 4, "QUEUED"), // never probed this pass
+      item("e", "org/gone", 5, "QUEUED"),  // other repo unaffected: reaped
     ]);
-    const probe = vi.fn(async (repo: string): Promise<PrFixPrPresence> =>
-      repo === "org/gone" ? "deleted" : "unknown",
-    );
+    const probe = vi.fn(async (repo: string, pr: number): Promise<PrFixPrPresence> => {
+      if (repo === "org/gone") return "deleted";
+      if (pr === 2) throw new Error("network");
+      return "unknown";
+    });
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
     const result = await reconcileDeletedPrFixItems(client, probe);
 
-    expect(result).toEqual({ checked: 3, markedStale: 0, errored: 0 });
-    expect(probe).toHaveBeenCalledTimes(3);
+    expect(result).toEqual({ checked: 4, markedStale: 1, errored: 1 });
     expect(client.items[3].status).toBe("QUEUED");
-    expect(client.history).toHaveLength(0);
+    expect(client.items[4].status).toBe("STALE");
+    expect(client.history).toHaveLength(1);
+    expect(warnSpy.mock.calls.some((call) => String(call[0]).includes("org/flaky"))).toBe(true);
     warnSpy.mockRestore();
   });
 
-  it("a confirmed or present answer resets the unknown streak — a healthy queue still gets full coverage", async () => {
+  it("a present or deleted answer resets the repo streak — confirmed deletions behind unknowns still reap", async () => {
     const client = makeClient([
-      item("a", "org/flaky", 1, "QUEUED"),
-      item("b", "org/flaky", 2, "QUEUED"),
-      item("c", "org/live", 3, "QUEUED"),
-      item("d", "org/flaky", 4, "QUEUED"),
-      item("e", "org/flaky", 5, "QUEUED"),
-      item("f", "org/gone", 6, "QUEUED"),
+      item("a", "org/mix", 1, "QUEUED"), // unknown → 1
+      item("b", "org/mix", 2, "QUEUED"), // unknown → 2
+      item("c", "org/mix", 3, "QUEUED"), // deleted → reset (reaped)
+      item("d", "org/mix", 4, "QUEUED"), // unknown → 1
+      item("e", "org/mix", 5, "QUEUED"), // present → reset
+      item("f", "org/mix", 6, "QUEUED"), // unknown → 1
+      item("g", "org/mix", 7, "QUEUED"), // unknown → 2 — breaker fires only
+      item("h", "org/mix", 8, "QUEUED"), //   without the present-reset
     ]);
-    const probe = vi.fn(async (repo: string): Promise<PrFixPrPresence> =>
-      repo === "org/gone" ? "deleted" : repo === "org/live" ? "present" : "unknown",
+    const probe = vi.fn(async (_repo: string, pr: number): Promise<PrFixPrPresence> =>
+      pr === 3 ? "deleted" : pr === 5 ? "present" : "unknown",
     );
 
     const result = await reconcileDeletedPrFixItems(client, probe);
 
-    // Streak 2 → reset by "present" → streak 2 again → "deleted" reaps the
-    // last row; the breaker never fired.
-    expect(result).toEqual({ checked: 6, markedStale: 1, errored: 0 });
-    expect(client.items[5].status).toBe("STALE");
+    // Both resets held: streak never reached 3, so every row got probed.
+    // Dropping either reset defers h (checked 7) — the pins are independent.
+    expect(result).toEqual({ checked: 8, markedStale: 1, errored: 0 });
+    expect(client.items[2].status).toBe("STALE");
+    expect(client.items[7].status).toBe("QUEUED");
+  });
+
+  it("a reap write failure counts as errored without feeding the probe breaker", async () => {
+    const client = makeClient([
+      item("a", "org/gone", 1, "QUEUED"),
+      item("b", "org/gone", 2, "QUEUED"),
+      item("c", "org/gone", 3, "QUEUED"),
+      item("d", "org/gone", 4, "QUEUED"),
+    ]);
+    client.prFixQueueItem.updateMany = async () => {
+      throw new Error("db down");
+    };
+
+    const result = await reconcileDeletedPrFixItems(client, vi.fn(async (): Promise<PrFixPrPresence> => "deleted"));
+
+    // All four rows keep being probed despite three write failures: the
+    // forge answered every probe, so nothing feeds the unknown breaker.
+    expect(result).toEqual({ checked: 4, markedStale: 0, errored: 4 });
   });
 });
 

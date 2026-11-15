@@ -181,8 +181,11 @@ export async function probePrFixPrPresence(repo: string, pr: number): Promise<Pr
   return "deleted";
 }
 
-/** Consecutive unknown/failed probes that abort one deleted-PR reap pass. */
-const DELETED_REAP_UNKNOWN_STREAK_LIMIT = 3;
+/** Consecutive unknown/failed probes that stop probing a repo's remaining
+ *  rows for one deleted-PR reap pass. Counted per repo: unknowns are mostly
+ *  repo-shaped (unreadable/deleted repo), and a global streak would let a
+ *  few permanently-unknown rows starve every later row on every pass. */
+const DELETED_REAP_REPO_STREAK_LIMIT = 3;
 
 /**
  * Mark active pr-fix-queue items STALE when their upstream PR is confirmed
@@ -194,11 +197,13 @@ const DELETED_REAP_UNKNOWN_STREAK_LIMIT = 3;
  * the missing fact; only a confirmed "deleted" reaps, through the same
  * generation-AND-status-pinned terminal write. One per-PR probe per active
  * item (no batch endpoint exists); a probe that throws counts as errored
- * and defers. A run of consecutive unknown/failed probes (outage or rate
- * limit turning each probe into retried timeouts) aborts the pass early:
- * a queue-wide fan-out against a flaky forge must not burn the whole sync
- * window, and deferral is always safe — the confirmed deletion is still
- * there for the next healthy pass.
+ * and defers. After `DELETED_REAP_REPO_STREAK_LIMIT` consecutive unknown or
+ * failed probes for one repo (outage/rate-limit turning each probe into
+ * retried timeouts, or an unreadable repo that answers that way forever),
+ * that repo's remaining rows defer to a later pass, so a flaky forge
+ * bounds the fan-out at a few probes per repo per pass without letting a
+ * few permanently-unknown rows starve confirmed deletions behind them. A
+ * reap-WRITE failure is not a probe unknown: it counts as errored only.
  */
 export async function reconcileDeletedPrFixItems(
   client: PrFixQueueClient,
@@ -207,37 +212,47 @@ export async function reconcileDeletedPrFixItems(
   let checked = 0;
   let markedStale = 0;
   let errored = 0;
-  let unknownStreak = 0;
+  const unknownStreakByRepo = new Map<string, number>();
 
   const active = await client.prFixQueueItem.findMany({ where: { status: { in: [...ACTIVE_REAP_STATUSES] } } });
   for (const item of active) {
+    const streak = unknownStreakByRepo.get(item.repo) ?? 0;
+    if (streak >= DELETED_REAP_REPO_STREAK_LIMIT) continue; // this repo tripped the breaker this pass
     checked++;
+    let presence: PrFixPrPresence;
     try {
-      const presence = await probePresence(item.repo, item.pr);
-      if (presence === "deleted") {
-        unknownStreak = 0;
+      presence = await probePresence(item.repo, item.pr);
+    } catch (err) {
+      errored++;
+      unknownStreakByRepo.set(item.repo, streak + 1);
+      if (streak + 1 >= DELETED_REAP_REPO_STREAK_LIMIT) {
+        console.warn(`[pr-fix-queue] deleted-PR reap deferring remaining items for ${item.repo} after ${streak + 1} consecutive unknown/failed probes (#1641)`);
+      }
+      continue;
+    }
+    if (presence === "deleted") {
+      unknownStreakByRepo.set(item.repo, 0);
+      try {
         const count = await markPrFixItemStale(
           client,
           item,
           "Upstream PR deleted (404 at the per-PR endpoint, repo reachable) at reconcile time (#1641)",
         );
         if (count === 1) markedStale++;
-        continue;
+      } catch (err) {
+        // The forge answered — a local write failure defers this row as
+        // errored without feeding the probe-unknown breaker.
+        errored++;
       }
-      if (presence === "present") {
-        unknownStreak = 0;
-        continue;
-      }
-      if (++unknownStreak >= DELETED_REAP_UNKNOWN_STREAK_LIMIT) {
-        console.warn(`[pr-fix-queue] deleted-PR reap stopped after ${unknownStreak} consecutive unknown probes; ${active.length - checked} active item(s) deferred to a later pass (#1641)`);
-        break;
-      }
-    } catch (err) {
-      errored++;
-      if (++unknownStreak >= DELETED_REAP_UNKNOWN_STREAK_LIMIT) {
-        console.warn(`[pr-fix-queue] deleted-PR reap stopped after ${unknownStreak} consecutive failed probes; ${active.length - checked} active item(s) deferred to a later pass (#1641)`);
-        break;
-      }
+      continue;
+    }
+    if (presence === "present") {
+      unknownStreakByRepo.set(item.repo, 0);
+      continue;
+    }
+    unknownStreakByRepo.set(item.repo, streak + 1);
+    if (streak + 1 >= DELETED_REAP_REPO_STREAK_LIMIT) {
+      console.warn(`[pr-fix-queue] deleted-PR reap deferring remaining items for ${item.repo} after ${streak + 1} consecutive unknown/failed probes (#1641)`);
     }
   }
 
