@@ -1273,6 +1273,12 @@ describe("isInformationalComment", () => {
     expect(isInformationalComment("<!-- dispatch-pr-fix-parked -->\n> ⏸️ parked after repeated attempts")).toBe(true);
   });
 
+  it("flags the /dispatch-fix command's own reply (round-9 review minor)", () => {
+    expect(
+      isInformationalComment("`/dispatch-fix` enqueued: worker will address the CHANGES_REQUESTED review.\n\n<!-- dispatch-fix-reply -->"),
+    ).toBe(true);
+  });
+
   it("does NOT flag an ai-pr-reviewer comment even with a marker", () => {
     const body = `<!-- Sticky Pull Request Comment -->
 <!-- ai-pr-reviewer:${JSON.stringify({ review_result: "issues", open_findings: [{ severity: "blocker", message: "no upgrade performed" }] })} -->

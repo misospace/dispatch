@@ -59,6 +59,7 @@ vi.mock("@/lib/pr-fix-queue", async (importOriginal) => ({
 }));
 
 import { resetRateLimits } from "@/lib/rate-limit";
+import { DISPATCH_FIX_REPLY_MARKER } from "@/lib/pr-fix-surfacing";
 import {
   deriveBlockingReview,
   handleDispatchFixCommand,
@@ -364,6 +365,14 @@ describe("handleDispatchFixCommand", () => {
     expect(reply[0]).toBe("org/repo");
     expect(reply[1]).toBe(5);
     expect(reply[2]).toContain("`QUEUED`");
+  });
+
+  it("marks every reply with the informational marker so ingestion never re-ingests it (round-9 review minor)", async () => {
+    await handleDispatchFixCommand(baseCommand());
+    const reply = mocks.addIssueComment.mock.calls[0][2] as string;
+    expect(reply.trimEnd().endsWith(DISPATCH_FIX_REPLY_MARKER)).toBe(true);
+    // And the marker never makes a reply parse as a command comment.
+    expect(parseDispatchFixCommand(reply)).toBeNull();
   });
 
   it("scopes the queue position to the repo (not global)", async () => {

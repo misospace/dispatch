@@ -47,6 +47,7 @@ import {
 import { AGENT_PREFIX, type PrFixStatus } from "@/types";
 import { computeEvidenceContentSignature, computeEvidenceVersion } from "@/lib/pr-fix-evidence";
 import { enqueuePrFixItem, normalizeQueueRepo } from "@/lib/pr-fix-queue";
+import { DISPATCH_FIX_REPLY_MARKER } from "@/lib/pr-fix-surfacing";
 import { extractLinkedIssue, isBotIdentity, reviewLane } from "@/lib/pr-followup-ingestion";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
@@ -780,7 +781,13 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
 
 /** Post a reply comment on the PR (PRs are issues for the comments API). */
 async function reply(repoFullName: string, prNumber: number, body: string): Promise<void> {
-  await addIssueComment(repoFullName, prNumber, body);
+  // Hidden marker (review round 9, minor): the command's own confirmation or
+  // refusal must never be re-ingested as ordinary comment feedback. On a
+  // bot-authored PR the reply is attributed to the (bot) PR author and passes
+  // the ingestion bot-author gate; the marker routes it to the informational
+  // filter instead. It must not be the comment's first bytes, so it can never
+  // make a human reply look like a command comment either.
+  await addIssueComment(repoFullName, prNumber, `${body}\n\n${DISPATCH_FIX_REPLY_MARKER}`);
 }
 
 /**

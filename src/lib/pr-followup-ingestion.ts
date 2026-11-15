@@ -13,7 +13,7 @@ import { CONFLICTING_STATUSES, FAILURE_CONCLUSIONS } from "@/lib/linked-pr-healt
 import { rebaseWorkItem } from "@/lib/pr-fix-rebase";
 import { extractFailureMarker, extractFailureWorkflow, isScanFailure } from "@/lib/ci-failure-ingestion";
 import { getConfiguredLanes, getEscalationLane } from "@/lib/lane-config";
-import { PARKED_COMMENT_MARKER } from "@/lib/pr-fix-surfacing";
+import { PARKED_COMMENT_MARKER, DISPATCH_FIX_REPLY_MARKER } from "@/lib/pr-fix-surfacing";
 import {
   conditionEvidenceKey,
   computeEvidenceContentSignature,
@@ -235,6 +235,7 @@ const INFORMATIONAL_COMMENT_MARKERS = [
   "<!-- Sticky Pull Request Comment",
   "<!-- dispatch-pr-fix-blocked -->",
   PARKED_COMMENT_MARKER,
+  DISPATCH_FIX_REPLY_MARKER,
 ];
 
 /**
