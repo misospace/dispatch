@@ -16,6 +16,7 @@ export {
   createIssue,
   updateIssueComment,
   addIssueLabel,
+  fetchIssueLabels,
   type UpdateIssueFields,
   updateIssueTitleAndBody,
   removeIssueLabel,
@@ -60,6 +61,10 @@ export {
   fetchPullRequestCheckFailures,
   fetchLinkedPrHealthInput,
   fetchPullRequestCommitMessages,
+  type PullRequestDetail,
+  fetchPullRequestDetail,
+  type PullRequestReview,
+  fetchPullRequestReviews,
 } from "./github-prs";
 
 export {

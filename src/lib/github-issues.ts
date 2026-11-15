@@ -288,6 +288,29 @@ export async function updateIssueComment(
   }
 }
 
+/**
+ * Read an issue's (or PR's — the issues endpoint serves both) current
+ * labels from GitHub. Null means GitHub state was unavailable, so callers
+ * must treat every failure as untrusted rather than "no labels".
+ */
+export async function fetchIssueLabels(
+  repoFullName: string,
+  issueNumber: number,
+): Promise<string[] | null> {
+  try {
+    const [owner, repo] = repoFullName.split("/");
+    const url = `${GITHUB_API}/repos/${owner}/${repo}/issues/${issueNumber}/labels?per_page=100`;
+    const response = await fetchWithRetry(url, { headers: await getHeadersAsync() });
+    if (!response.ok) return null;
+    const data = await response.json();
+    if (!Array.isArray(data)) return null;
+    return data.flatMap((label: { name?: string }) => typeof label.name === "string" ? [label.name] : []);
+  } catch (error) {
+    console.warn(`[github-issues] labels unavailable for ${repoFullName}#${issueNumber}:`, error instanceof Error ? error.message : error);
+    return null;
+  }
+}
+
 export async function addIssueLabel(
   repoFullName: string,
   issueNumber: number,

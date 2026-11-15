@@ -72,12 +72,22 @@ function getConfig(): PrFollowupConfig {
 // ─── Author / Branch Allowlist ──────────────────────────────────────────────
 
 /**
- * Check if a PR author is an allowed bot identity.
+ * Check if PR author is allowed bot identity.
  */
 export function isAllowedBotAuthor(author: string | null | undefined): boolean {
   if (!author) return false;
-  const config = getConfig();
-  return config.botIdentities.includes(author);
+  return isBotIdentity(author);
+}
+
+/**
+ * Check if a login is one of the configured bot identities (the loop's own
+ * automation logins). The /dispatch-fix command uses this to stay silent
+ * toward bot commenters (#1622): replying to another bot's comment is how
+ * bot-to-bot reply loops start.
+ */
+export function isBotIdentity(login: string | null | undefined): boolean {
+  if (!login) return false;
+  return getConfig().botIdentities.includes(login);
 }
 
 /**
@@ -358,8 +368,11 @@ function laneFor(feedback: string): "NORMAL" | "NEEDS_HUMAN" {
  * Without this, the reviewer's narrative prose matches no classifyFeedback
  * pattern and every AI review dead-ends at needs_human. Human prose reviews
  * (no structured payload) still fall back to the keyword classifier.
+ *
+ * Exported for the /dispatch-fix command (#1622), which enqueues through the
+ * same review evidence path and must not grow a diverging lane rule.
  */
-function reviewLane(body: string): "NORMAL" | "NEEDS_HUMAN" {
+export function reviewLane(body: string): "NORMAL" | "NEEDS_HUMAN" {
   // CHANGES_REQUESTED goes to the fix lane. Full stop.
   //
   // This used to run the review body through classifyFeedback's keyword list, so a

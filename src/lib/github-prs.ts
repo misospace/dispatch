@@ -202,6 +202,107 @@ export async function fetchPullRequestLabels(repoFullName: string, prNumber: num
   }
 }
 
+/**
+ * Full detail read of one PR. Used by the /dispatch-fix comment command
+ * (#1622), which needs eligibility facts the state/health helpers don't
+ * carry: draft, author, title/body (for linked-issue extraction) and the
+ * head ref alongside the head SHA.
+ *
+ * Returns null when GitHub is unreachable or the PR is gone — callers
+ * refuse the command rather than guess.
+ */
+export interface PullRequestDetail {
+  state: string | null;
+  mergedAt: string | null;
+  draft: boolean | null;
+  headSha: string | null;
+  headRef: string | null;
+  /** The head branch's own repository (`head.repo.full_name`) — differs from
+   * the base repo for fork PRs, which the /dispatch-fix command refuses
+   * (#1622): a fix worker given the item would operate on the base repo,
+   * not the fork where the branch lives. */
+  headRepoFullName: string | null;
+  author: string | null;
+  title: string | null;
+  body: string | null;
+  htmlUrl: string | null;
+}
+
+export async function fetchPullRequestDetail(
+  repoFullName: string,
+  prNumber: number,
+): Promise<PullRequestDetail | null> {
+  try {
+    const headers = await getHeadersAsync();
+    const resp = await fetchWithRetry(`${GITHUB_API}/repos/${repoFullName}/pulls/${prNumber}`, { headers });
+    if (resp.ok) {
+      const detail = (await resp.json()) as {
+        state?: string | null;
+        merged_at?: string | null;
+        draft?: boolean | null;
+        head?: { sha?: string | null; ref?: string | null; repo?: { full_name?: string | null } | null };
+        user?: { login?: string | null };
+        title?: string | null;
+        body?: string | null;
+        html_url?: string | null;
+      };
+      return {
+        state: detail.state ?? null,
+        mergedAt: detail.merged_at ?? null,
+        draft: detail.draft ?? null,
+        headSha: detail.head?.sha ?? null,
+        headRef: detail.head?.ref ?? null,
+        headRepoFullName: detail.head?.repo?.full_name ?? null,
+        author: detail.user?.login ?? null,
+        title: detail.title ?? null,
+        body: detail.body ?? null,
+        htmlUrl: detail.html_url ?? null,
+      };
+    }
+  } catch {
+  }
+  return null;
+}
+
+/** One review from `pulls/N/reviews`, projected to the fields the
+ * /dispatch-fix command reads (#1622). `user` is the reviewer's login. */
+export interface PullRequestReview {
+  id: number | null;
+  user: string | null;
+  state: string | null;
+  submittedAt: string | null;
+  commitId: string | null;
+  body: string | null;
+}
+
+/** Read a PR's reviews (paginated). Null means GitHub was unavailable. */
+export async function fetchPullRequestReviews(
+  repoFullName: string,
+  prNumber: number,
+): Promise<PullRequestReview[] | null> {
+  try {
+    const reviews = await fetchPaginated<{
+      id?: number;
+      user?: { login?: string | null } | null;
+      state?: string | null;
+      submitted_at?: string | null;
+      commit_id?: string | null;
+      body?: string | null;
+    }>(`${GITHUB_API}/repos/${repoFullName}/pulls/${prNumber}/reviews?per_page=100`);
+    return reviews.map((review) => ({
+      id: typeof review.id === "number" ? review.id : null,
+      user: review.user?.login ?? null,
+      state: review.state ?? null,
+      submittedAt: review.submitted_at ?? null,
+      commitId: review.commit_id ?? null,
+      body: review.body ?? null,
+    }));
+  } catch (error) {
+    console.warn(`[github-prs] reviews unavailable for ${repoFullName}#${prNumber}:`, error instanceof Error ? error.message : error);
+    return null;
+  }
+}
+
 export async function fetchClosedPullRequests(repoFullName: string, maxItems = 100): Promise<GithubPR[]> {
   const url = `${GITHUB_API}/repos/${repoFullName}/pulls?state=closed&sort=updated&direction=desc&per_page=100`;
   return fetchPaginated<GithubPR>(url, maxItems);
