@@ -225,7 +225,9 @@ export async function POST(request: Request) {
       const issueComment = body as Record<string, any>;
       const pr = issueComment.issue?.pull_request;
       const commentBody = issueComment.comment?.body;
-      if (pr && typeof commentBody === "string" && parseDispatchFixCommand(commentBody)) {
+      // `created` only (review INFO-7): an edited or deleted command comment
+      // must not re-run the handoff.
+      if (issueComment.action === "created" && pr && typeof commentBody === "string" && parseDispatchFixCommand(commentBody)) {
         const repoFullName = issueComment.repository?.full_name;
         const prNumber = issueComment.issue?.number;
         const commenter = issueComment.comment?.user?.login;

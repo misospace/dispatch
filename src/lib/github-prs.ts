@@ -281,6 +281,8 @@ export async function fetchPullRequestReviews(
   prNumber: number,
 ): Promise<PullRequestReview[] | null> {
   try {
+    // Bounded: the command only needs the latest reviews, so walking a
+    // very long review history page by page is pointless.
     const reviews = await fetchPaginated<{
       id?: number;
       user?: { login?: string | null } | null;
@@ -288,7 +290,7 @@ export async function fetchPullRequestReviews(
       submitted_at?: string | null;
       commit_id?: string | null;
       body?: string | null;
-    }>(`${GITHUB_API}/repos/${repoFullName}/pulls/${prNumber}/reviews?per_page=100`);
+    }>(`${GITHUB_API}/repos/${repoFullName}/pulls/${prNumber}/reviews?per_page=100`, 100);
     return reviews.map((review) => ({
       id: typeof review.id === "number" ? review.id : null,
       user: review.user?.login ?? null,

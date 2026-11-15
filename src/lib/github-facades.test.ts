@@ -27,23 +27,23 @@ describe("github domain modules expose expected exports", () => {
   });
 
   it("github-issues exports issue/label/comment symbols", () => {
-expect(Object.keys(Issues).sort()).toEqual([
-"addIssueComment",
-"addIssueLabel",
-"closeIssue",
-"createIssue",
-"fetchCollaboratorPermission",
-"fetchIssue",
-"fetchIssueComments",
-"fetchIssueLabels",
-"fetchIssueNativeBlockers",
-"fetchIssues",
-"removeIssueLabel",
-"syncStatusLabels",
-"updateIssueComment",
-"updateIssueLabels",
-"updateIssueTitleAndBody",
-]);
+    expect(Object.keys(Issues).sort()).toEqual([
+      "addIssueComment",
+      "addIssueLabel",
+      "closeIssue",
+      "createIssue",
+      "fetchCollaboratorPermission",
+      "fetchIssue",
+      "fetchIssueComments",
+      "fetchIssueLabels",
+      "fetchIssueNativeBlockers",
+      "fetchIssues",
+      "removeIssueLabel",
+      "syncStatusLabels",
+      "updateIssueComment",
+      "updateIssueLabels",
+      "updateIssueTitleAndBody",
+    ]);
   });
 
   it("github-ci exports CI/workflows/runs/jobs/releases/packages/commits/logs symbols", () => {
@@ -67,21 +67,21 @@ expect(Object.keys(Issues).sort()).toEqual([
   });
 
   it("github-prs exports PR/review/health symbols", () => {
-expect(Object.keys(Prs).sort()).toEqual([
-"fetchClosedPullRequests",
-"fetchLinkedPrHealthInput",
-"fetchPullRequestCheckFailures",
-"fetchPullRequestCommitMessages",
-"fetchPullRequestDetail",
-"fetchPullRequestHeadSha",
-"fetchPullRequestHealthSignals",
-"fetchPullRequestLabels",
-"fetchPullRequestMergeState",
-"fetchPullRequestReviewThreadStates",
-"fetchPullRequestReviews",
-"fetchPullRequestState",
-"fetchPullRequests",
-]);
+    expect(Object.keys(Prs).sort()).toEqual([
+      "fetchClosedPullRequests",
+      "fetchLinkedPrHealthInput",
+      "fetchPullRequestCheckFailures",
+      "fetchPullRequestCommitMessages",
+      "fetchPullRequestDetail",
+      "fetchPullRequestHeadSha",
+      "fetchPullRequestHealthSignals",
+      "fetchPullRequestLabels",
+      "fetchPullRequestMergeState",
+      "fetchPullRequestReviewThreadStates",
+      "fetchPullRequestReviews",
+      "fetchPullRequestState",
+      "fetchPullRequests",
+    ]);
   });
 
   it("github-code-search exports repo metadata/search/contents symbols", () => {

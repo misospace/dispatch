@@ -17,12 +17,17 @@
  * a repo admin/maintainer) posts the command on that PR.
  *
  * Ordering guarantee (#1622, review M2): the optional `lane=<profile>`
- * agent-label swap happens BEFORE the enqueue. `enqueuePrFixItem` resolves
- * the row's ORIGINAL CLAIMANT once, at creation, from the linked issue's
- * live label/lease state (#1569) and a recorded claimant is never
- * transferred by re-ingestion — so the swap must already be on GitHub when
+ * agent-label swap happens BEFORE the enqueue, and its result is MIRRORED
+ * INTO the Prisma `Issue.labels` cache before `enqueuePrFixItem` runs.
+ * `enqueuePrFixItem` resolves the row's ORIGINAL CLAIMANT once, at creation,
+ * from the cached `Issue.labels`/lease state (#1569 — it never reads
+ * GitHub), and a recorded claimant is never transferred by re-ingestion —
+ * so the cache, not just GitHub, must already show the post-swap label when
  * the enqueue reads the issue, or the row would be frozen with the pre-swap
  * owner and the operator's lane reassignment would never reach the queue.
+ * (Precedent: the claim route mirrors its label change into the cache the
+ * same way.) GitHub's own labeled/unlabeled deliveries later re-confirm the
+ * same state.
  */
 
 import { asPrFixQueueClient, prisma } from "@/lib/prisma";
@@ -89,7 +94,9 @@ export function parseDispatchFixCommand(
   body: string | null | undefined,
 ): { ok: true; lane?: string } | { ok: false; reason: string } | null {
   if (!body) return null;
-  const trimmed = body.trim();
+  // Collapse newlines so the command and its argument may be split across
+  // lines (`/dispatch-fix\nlane=hyper`).
+  const trimmed = body.trim().replace(/\s+/g, " ");
   if (trimmed !== COMMAND && !trimmed.startsWith(`${COMMAND} `)) return null;
   const rest = trimmed.slice(COMMAND.length).trim();
   if (!rest) return { ok: true };
@@ -177,6 +184,11 @@ function result(
  */
 export async function handleDispatchFixCommand(input: DispatchFixCommandInput): Promise<DispatchFixCommandResult> {
   const { repoFullName, prNumber, commenter, commentBody } = input;
+  // The linked issue's agent-label state as this command observed and (if
+  // the lane swap ran) changed it — read by the catch below so a failure
+  // after a landed swap audits the real label columns.
+  let trackedBeforeLabels: string[] = [];
+  let trackedAfterLabels: string[] = [];
   const parsed = parseDispatchFixCommand(commentBody);
   // Not a command — the route never calls here without a parse first, but a
   // null here keeps the contract total.
@@ -348,7 +360,7 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
     // one cannot be verified (review M4).
     const cachedIssue = await prisma.issue.findFirst({
       where: { repository: { fullName: { equals: normalizedRepo, mode: "insensitive" } }, number: linkedIssue },
-      select: { id: true },
+      select: { id: true, labels: true },
     });
     if (!cachedIssue) {
       await reply(repoFullName, prNumber, `\`/dispatch-fix\` refused: linked issue #${linkedIssue} is not in Dispatch's issue cache yet — wait for the next sync and retry.`);
@@ -362,6 +374,8 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
       return result("error", "linked issue labels unavailable");
     }
     const agentLabels = issueLabels.filter((label) => label.startsWith(AGENT_PREFIX));
+    trackedBeforeLabels = agentLabels;
+    trackedAfterLabels = agentLabels;
     if (agentLabels.length > 1) {
       await reply(
         repoFullName,
@@ -380,7 +394,8 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
       where: { repo_pr: { repo: normalizedRepo, pr: prNumber } },
     });
     if (existingItem && existingItem.status === DUPLICATE_BLOCKING_STATUS) {
-      await reply(
+      await replyUnlessBot(
+        commenter,
         repoFullName,
         prNumber,
         `\`/dispatch-fix\`: this PR already has a QUEUED pr-fix queue item (lane ${existingItem.lane}) — not enqueueing a duplicate.`,
@@ -390,59 +405,61 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
     }
 
     // The lane reassignment (#1622), performed BEFORE the enqueue so the
-    // claimant resolution at creation (#1569) reads the post-swap label
+    // claimant resolution at creation (#1569) sees the post-swap label
     // (review M2). Restricted to the operator tier (review M6): a PR author
     // without admin/maintain rights may hand off their own PR but not
-    // rewrite the linked issue's assignment. Converges to exactly one
-    // `agent/*` label — add the target first, then remove every other
-    // agent label — so a stale read or a lost race can never leave the
-    // ambiguous two-label state the ownership gate refuses (review M3).
-    // GitHub's own labeled/unlabeled webhook deliveries keep the Prisma
-    // cache fresh, so the cache is not written here.
+    // rewrite the linked issue's assignment. The multi-label state was
+    // already refused above, so the swap is: add the target, remove the one
+    // other `agent/*` label if any, then MIRROR the resulting label set
+    // into the Prisma cache — the enqueue's claimant resolution reads the
+    // cache, not GitHub (review M2 second round), and a recorded claimant
+    // is never re-resolved later.
     let laneSwap = "";
     let afterLabels = agentLabels;
     if (parsed.lane) {
       const targetLabel = `${AGENT_PREFIX}courier-${parsed.lane}`;
-      if (agentLabels.includes(targetLabel)) {
-        laneSwap = agentLabels.length === 1
-          ? ``
-          : ` Linked issue #${linkedIssue} agent labels ${agentLabels.join(", ")} → ${targetLabel} (the requested lane was already set; extras removed).`;
-        if (agentLabels.length > 1) {
-          // Converge even when no add is needed.
-          try {
-            for (const label of agentLabels.filter((l) => l !== targetLabel)) {
-              await removeIssueLabel(repoFullName, linkedIssue, label);
-            }
-            afterLabels = [targetLabel];
-          } catch (error) {
-            console.error(`[/dispatch-fix] agent-label convergence failed for ${repoFullName}#${linkedIssue}:`, error);
-            await reply(repoFullName, prNumber, `\`/dispatch-fix\` failed: the linked issue's agent labels could not be converged to \`${targetLabel}\` — nothing was enqueued. Retry the command.`);
-            await auditCommand(repoFullName, linkedIssue, commenter, false, "agent-label convergence failed");
-            return result("error", "agent-label convergence failed");
-          }
-        }
-      } else if (!isOperator) {
+      if (!agentLabels.includes(targetLabel) && !isOperator) {
         laneSwap = ` (note: \`lane=${parsed.lane}\` was NOT applied — reassigning the linked issue's agent label requires a repo admin/maintainer.)`;
-      } else {
+      } else if (!agentLabels.includes(targetLabel)) {
         try {
           await addIssueLabel(repoFullName, linkedIssue, targetLabel);
+          afterLabels = [targetLabel];
+          trackedAfterLabels = afterLabels;
           const others = agentLabels.filter((l) => l !== targetLabel);
           for (const label of others) {
             await removeIssueLabel(repoFullName, linkedIssue, label);
           }
-          afterLabels = [targetLabel];
           laneSwap = others.length > 0
             ? ` Linked issue #${linkedIssue} reassigned ${others.join(", ")} → ${targetLabel}.`
             : ` Linked issue #${linkedIssue} assigned ${targetLabel}.`;
         } catch (error) {
           // The swap failed: do NOT enqueue. A row created now would freeze
-          // its claimant on the pre-swap label state (review M2), so the
-          // operator retries the whole command instead of getting a
-          // wrongly-owned queue item.
+          // its claimant on the pre-swap label state (review M2). The audit
+          // reflects the PARTIAL swap result (review MINOR-2): the target
+          // may be on the issue while an old label removal failed.
           console.error(`[/dispatch-fix] agent-label swap failed for ${repoFullName}#${linkedIssue}:`, error);
-          await reply(repoFullName, prNumber, `\`/dispatch-fix\` failed: the agent-label swap to \`${targetLabel}\` did not land — nothing was enqueued. Retry the command.`);
-          await auditCommand(repoFullName, linkedIssue, commenter, false, "agent-label swap failed; nothing enqueued");
+          await reply(
+            repoFullName,
+            prNumber,
+            `\`/dispatch-fix\` failed: the agent-label swap to \`${targetLabel}\` did not fully land — nothing was enqueued. Check that the \`${targetLabel}\` label exists in this repository, then retry the command.`,
+          );
+          await auditCommand(repoFullName, linkedIssue, commenter, false, "agent-label swap failed; nothing enqueued", undefined, agentLabels, afterLabels);
           return result("error", "agent-label swap failed");
+        }
+        // Mirror the post-swap label set into the cached Issue row (CAS on
+        // the snapshot the check read), so the claimant resolution the
+        // enqueue is about to run sees the new owner instead of the
+        // pre-swap one. A lost race means a concurrent label delivery
+        // already refreshed the cache — log and let the enqueue read that
+        // fresher state.
+        const cachedAgentFree = (cachedIssue.labels ?? []).filter((l) => !l.startsWith(AGENT_PREFIX));
+        const mirrored = [...cachedAgentFree, ...afterLabels];
+        const { count } = await prisma.issue.updateMany({
+          where: { id: cachedIssue.id, labels: { equals: cachedIssue.labels } },
+          data: { labels: mirrored },
+        });
+        if (count === 0) {
+          console.warn(`[/dispatch-fix] issue-label cache mirror lost a race for ${repoFullName}#${linkedIssue}; enqueue reads the fresher cache state`);
         }
       }
     }
@@ -452,7 +469,7 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
     // deterministic evidence key, and ledger fields mirroring the review
     // ingestion projection so a replayed command is inert. No claimant is
     // passed — `enqueuePrFixItem` resolves the original claimant itself
-    // (#1569), now from the post-swap label state.
+    // (#1569), from the mirrored post-swap cache state.
     //
     // Evidence-key shape (#1622, issue-pinned): `pr-review:<pr>:<head8>` is
     // per-(PR, head) rather than the ingestion path's per-review
@@ -500,15 +517,15 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
     });
 
     // Confirmation reply (#1622): legible handover — where the item landed
-    // and who the hand-out gate will see as the original claimant. The
-    // queue position is scoped to this repo's lane queue (review m8).
+    // and (for lane swaps) which agent profile now owns the linked issue.
+    // The queue position is scoped to this repo's lane queue (review m8).
     const queuePosition = await prisma.prFixQueueItem.count({
       where: { repo: normalizedRepo, lane: item.lane, status: "QUEUED" },
     });
     await reply(
       repoFullName,
       prNumber,
-      `\`/dispatch-fix\` handed this PR to the fix loop: queue item is \`${item.status}\` on lane \`${item.lane}\` (position ${queuePosition} in that queue), evidence \`${evidenceKey}\`.${laneSwap}`,
+      `\`/dispatch-fix\` handed this PR to the fix loop: queue item is \`${item.status}\` on queue lane \`${item.lane}\` (position ${queuePosition} in that queue), evidence \`${evidenceKey}\`.${laneSwap}`,
     );
     await auditCommand(
       repoFullName,
@@ -516,7 +533,7 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
       commenter,
       true,
       null,
-      `pr=${prNumber} lane=${item.lane} source=/dispatch-fix evidence=${evidenceKey}`,
+      `pr=${prNumber} queueLane=${item.lane} laneProfile=${parsed.ok && parsed.lane ? parsed.lane : "-"} source=/dispatch-fix evidence=${evidenceKey}`,
       agentLabels,
       afterLabels,
     );
@@ -524,12 +541,26 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
   } catch (error) {
     // Never throw: report on the thread (best-effort — a failing forge read
     // must not mask the original failure) and leave a failure audit row
-    // (#1622 audit, review m1).
+    // (#1622 audit, review m1). The audit's label columns reflect what this
+    // command actually did before failing: a failure AFTER a landed
+    // lane swap audited with empty labels would misstate a repo-visible
+    // ownership mutation (review MINOR-2). "Nothing was enqueued" stays
+    // true — the catch is only reachable past the swap by an enqueue throw,
+    // and the row that throw failed to write cannot exist.
     const message = error instanceof Error ? error.message : String(error);
     console.error(`[/dispatch-fix] command failed for ${repoFullName}#${prNumber}:`, error);
     try {
       await replyUnlessBot(commenter, repoFullName, prNumber, `\`/dispatch-fix\` failed with an internal error — nothing was enqueued. Retry later.`);
-      await auditCommand(repoFullName, null, commenter, false, message);
+      await auditCommand(
+        repoFullName,
+        null,
+        commenter,
+        false,
+        message,
+        undefined,
+        trackedBeforeLabels,
+        trackedAfterLabels,
+      );
     } catch (auditError) {
       console.error("[/dispatch-fix] failure audit write also failed:", auditError);
     }
