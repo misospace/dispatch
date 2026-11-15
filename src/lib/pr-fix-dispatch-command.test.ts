@@ -190,6 +190,33 @@ describe("deriveBlockingReview", () => {
     );
     expect(blocking?.review.body).toBe("new");
   });
+
+  it("a newer stale request from another reviewer does not mask a current-head request", () => {
+    // Regression (review round 4, M1): selecting the newest blocking review
+    // before checking its head let a newer stale CHANGES_REQUESTED mask a
+    // valid current-head request and falsely refuse the command.
+    const blocking = deriveBlockingReview(
+      [
+        review({ id: 1, user: "early-reviewer", submittedAt: "2026-11-12T00:00:00Z", body: "current-head feedback" }),
+        review({ id: 2, user: "late-reviewer", submittedAt: "2026-11-14T00:00:00Z", commitId: "0000000", body: "stale feedback" }),
+      ],
+      HEAD,
+    );
+    expect(blocking?.review.body).toBe("current-head feedback");
+    expect(blocking?.stale).toBe(false);
+  });
+
+  it("reports stale only when every standing request is off the current head", () => {
+    const blocking = deriveBlockingReview(
+      [
+        review({ id: 1, submittedAt: "2026-11-12T00:00:00Z", commitId: "0000000" }),
+        review({ id: 2, submittedAt: "2026-11-13T00:00:00Z", commitId: "1111111" }),
+      ],
+      HEAD,
+    );
+    expect(blocking?.review.id).toBe(2);
+    expect(blocking?.stale).toBe(true);
+  });
 });
 
 describe("handleDispatchFixCommand", () => {

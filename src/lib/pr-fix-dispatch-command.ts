@@ -135,13 +135,17 @@ export function deriveBlockingReview(
   const blocking = Array.from(latestByUser.values())
     .filter((entry) => entry.review.state?.toUpperCase() === "CHANGES_REQUESTED")
     .sort((a, b) => b.submittedAt - a.submittedAt);
-  const review = blocking[0]?.review;
-  if (!review) return null;
-  // A review anchored to a different commit is stale: the feedback is
-  // evidence-keyed against the head it was written on, so handing it out
-  // against a newer head parks the item after one attempt (#1622 check 2).
-  const stale = !headSha || !review.commitId || review.commitId !== headSha;
-  return { review, stale };
+  if (blocking.length === 0) return null;
+  // A newer CHANGES_REQUESTED anchored to an older head must not mask a
+  // current-head request from another reviewer (review round 4, M1): the
+  // stale request is evidence against a head that no longer exists, so the
+  // newest current-head request wins and stale is reported only when every
+  // standing request was written against an earlier head.
+  const onCurrentHead = headSha
+    ? blocking.filter((entry) => entry.review.commitId === headSha)
+    : [];
+  const chosen = onCurrentHead[0] ?? blocking[0];
+  return { review: chosen.review, stale: onCurrentHead.length === 0 };
 }
 
 /** A repo-qualified issue reference (`owner/repo#N`) whose qualifier is not

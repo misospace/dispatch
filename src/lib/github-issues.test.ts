@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { GitHubIssue } from "@/types";
-import { fetchIssue, fetchIssueNativeBlockers, fetchIssues } from "./github-issues";
+import { fetchCollaboratorPermission, fetchIssue, fetchIssueLabels, fetchIssueNativeBlockers, fetchIssues } from "./github-issues";
 
 const fetchWithRetry = vi.fn();
 const fetchPaginated = vi.fn();
@@ -246,5 +246,66 @@ describe("fetchIssue enrichment opt-in", () => {
 
     expect(issue.number).toBe(4);
     expect((issue as any).nativeBlockedBy).toBeUndefined();
+  });
+});
+
+describe("fetchIssueLabels", () => {
+  it("paginates to the end so a label past the first 100 is still seen", async () => {
+    // Regression (review round 4, M3): a first-100 read could miss the single
+    // agent label on a heavily labeled issue and break the enforced
+    // single-agent-label invariant.
+    fetchPaginated.mockResolvedValue(
+      Array.from({ length: 101 }, (_, i) => ({ name: i === 100 ? "agent/foo" : `filler/${i}` })),
+    );
+
+    const labels = await fetchIssueLabels("acme/app", 9);
+
+    expect(fetchPaginated).toHaveBeenCalledWith(
+      "https://api.github.com/repos/acme/app/issues/9/labels?per_page=100",
+    );
+    expect(labels).toHaveLength(101);
+    expect(labels?.at(-1)).toBe("agent/foo");
+  });
+
+  it("returns null when a page fetch throws", async () => {
+    fetchPaginated.mockRejectedValue(new Error("GitHub API error: 502"));
+
+    expect(await fetchIssueLabels("acme/app", 9)).toBeNull();
+  });
+
+  it("drops entries with a non-string name", async () => {
+    fetchPaginated.mockResolvedValue([{ name: "status/ready" }, {}, { name: 7 }]);
+
+    expect(await fetchIssueLabels("acme/app", 9)).toEqual(["status/ready"]);
+  });
+});
+
+describe("fetchCollaboratorPermission", () => {
+  it("prefers role_name when the permission field reports maintainers as write", async () => {
+    // Regression (review round 4, M2): GitHub's collaborator-permission API
+    // reports the maintain role through role_name while `permission` says
+    // "write", so requiring permission === "maintain" rejected real maintainers.
+    fetchWithRetry.mockResolvedValue(okJson({ permission: "write", role_name: "maintain" }));
+
+    expect(await fetchCollaboratorPermission("acme/app", "maintainer")).toEqual({
+      status: "ok",
+      permission: "maintain",
+    });
+  });
+
+  it("falls back to the permission field when role_name is absent", async () => {
+    fetchWithRetry.mockResolvedValue(okJson({ permission: "write" }));
+
+    expect(await fetchCollaboratorPermission("acme/app", "writer")).toEqual({
+      status: "ok",
+      permission: "write",
+    });
+  });
+
+  it("returns an error when neither field carries a recognized permission", async () => {
+    fetchWithRetry.mockResolvedValue(okJson({ permission: "banana", role_name: 42 }));
+
+    const result = await fetchCollaboratorPermission("acme/app", "odd");
+    expect(result.status).toBe("error");
   });
 });
