@@ -50,6 +50,16 @@ Configuration:
 
 Signature verification uses HMAC-SHA256 with `WEBHOOK_SECRET`.
 
+**Head-repository check (#1637).** Before either path accepts PR-fix work, it
+compares the PR's head repository against the base repository. They must match,
+ignoring case. A fork PR fails this check. Its `branch` names a branch of the
+fork, and the fix loop operates on the base repository, where that branch
+usually does not exist. A missing or unreadable head repository also fails
+(fail-closed). The webhook path reads the value from the event payload, so a
+payload shape that carries no head repository (for example `issue_comment`) is
+refused; the pull-based sync scan reads the full PR object and covers the same
+comments later. The `/dispatch-fix` command path enforces the same rule (#1622).
+
 **Fail-closed default:** If `WEBHOOK_SECRET` is not configured, requests are
 rejected with a 503 response unless `WEBHOOK_GATEWAY_MODE` is explicitly set to
 `"true"` (indicating the endpoint is behind an API gateway that handles its own

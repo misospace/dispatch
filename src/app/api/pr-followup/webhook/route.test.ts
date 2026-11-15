@@ -261,7 +261,7 @@ describe("POST /api/pr-followup/webhook", () => {
         html_url: "https://github.com/org/repo/pull/42",
         title: "Fix bug",
         user: { login: "bot-user" },
-        head: { ref: "fix/issue-1" },
+        head: { ref: "fix/issue-1", repo: { full_name: "org/repo" } },
         base: { repo: { full_name: "org/repo" } },
       },
     };
@@ -283,7 +283,7 @@ describe("POST /api/pr-followup/webhook", () => {
         html_url: "https://github.com/org/repo/pull/42",
         title: "Fix bug",
         user: { login: "bot-user" },
-        head: { ref: "fix/issue-1" },
+        head: { ref: "fix/issue-1", repo: { full_name: "org/repo" } },
         base: { repo: { full_name: "org/repo" } },
         mergeable_state: "clean",
       },
@@ -308,7 +308,7 @@ describe("POST /api/pr-followup/webhook", () => {
         html_url: "https://github.com/org/repo/pull/42",
         title: "Fix bug",
         user: { login: "bot-user" },
-        head: { ref: "fix/issue-1" },
+        head: { ref: "fix/issue-1", repo: { full_name: "org/repo" } },
         base: { repo: { full_name: "org/repo" } },
       },
     };
@@ -334,7 +334,7 @@ describe("POST /api/pr-followup/webhook", () => {
         html_url: "https://github.com/org/repo/pull/42",
         title: "Fix bug",
         user: { login: "bot-user" },
-        head: { ref: "fix/issue-1" },
+        head: { ref: "fix/issue-1", repo: { full_name: "org/repo" } },
         base: { repo: { full_name: "org/repo" } },
       },
     };
@@ -361,7 +361,7 @@ describe("POST /api/pr-followup/webhook", () => {
         html_url: "https://github.com/org/repo/pull/42",
         title: "Fix bug",
         user: { login: "bot-user" },
-        head: { ref: "fix/issue-1" },
+        head: { ref: "fix/issue-1", repo: { full_name: "org/repo" } },
         base: { repo: { full_name: "org/repo" } },
       },
     };
@@ -527,6 +527,7 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
         repoFullName: "org/repo",
         prNumber: 42,
         branch: "fix/issue-7",
+        headRepoFullName: "org/repo",
         url: "https://github.com/org/repo/pull/42",
         title: "Fix bug (#7)",
         author: "itsmiso-ai",
@@ -568,6 +569,7 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
         repoFullName: "org/repo",
         prNumber: 42,
         branch: "fix/issue-7",
+        headRepoFullName: "org/repo",
         url: "https://github.com/org/repo/pull/42",
         title: "Fix bug (#7)",
         author: "itsmiso-ai",
@@ -583,14 +585,33 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
     ]);
   });
 
+  // Run the REAL ingestion pipeline so the #1637 head-repo gate decides
+  // enqueue vs skip, against a queue client that fails loudly if any
+  // enqueue is attempted.
+  async function realIngestion() {
+    const actual = await vi.importActual<typeof import("@/lib/pr-followup-ingestion")>(
+      "@/lib/pr-followup-ingestion",
+    );
+    mocks.processPrFollowupEvents.mockImplementation(actual.processPrFollowupEvents);
+    const client = { $transaction: vi.fn(), issue: { findFirst: vi.fn() } };
+    mocks.prFixQueueClient.mockReturnValue(client);
+    return client;
+  }
+
   // Regression for #1087: the issue object has no `repository` or `head`, so
   // the repo must come from the top-level `repository`.
-  it("builds a comment event from issue_comment on a pull request", async () => {
+  // #1637: the issue_comment payload carries no PR head repo at all, so the
+  // ingestion gate refuses the delivery fail-closed (enqueued 0, skipped 1);
+  // the pull-based sync scan covers the same comments instead. The author and
+  // body below pass every earlier filter, so the refusal is the head-repo gate.
+  it("refuses issue_comment on a pull request fail-closed — no head repo (#1637)", async () => {
+    const client = await realIngestion();
+
     const res = await signedRequest("issue_comment", {
       action: "created",
       comment: {
         id: 888,
-        body: "please rebase",
+        body: "lint error: unused import in src/app.ts",
         user: { login: "reviewer" },
         html_url: "https://github.com/org/repo/pull/42#issuecomment-888",
       },
@@ -602,7 +623,7 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
         body: "Closes #7",
         html_url: "https://github.com/org/repo/pull/42",
         repository_url: "https://api.github.com/repos/org/repo",
-        user: { login: "itsmiso-ai" },
+        user: { login: "github-actions[bot]" },
         pull_request: {
           url: "https://api.github.com/repos/org/repo/pulls/42",
           html_url: "https://github.com/org/repo/pull/42",
@@ -614,23 +635,14 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
     });
 
     expect(res.status).toBe(200);
-    expect(ingestedEvents()).toEqual([
-      {
-        eventType: "comment",
-        repoFullName: "org/repo",
-        prNumber: 42,
-        branch: null,
-        url: "https://github.com/org/repo/pull/42",
-        title: "Fix bug (#7)",
-        author: "itsmiso-ai",
-        body: "please rebase",
-        id: "888",
-        linkedIssue: 7,
-        headSha: null,
-        actorLogin: "reviewer",
-        source: "webhook",
-      },
-    ]);
+    const body = await res.json();
+    expect(body.eventsReceived).toBe(1);
+    expect(body.enqueued).toBe(0);
+    expect(body.skipped).toBe(1);
+    expect(client.$transaction).not.toHaveBeenCalled();
+    expect(ingestedEvents()[0]).toEqual(
+      expect.objectContaining({ eventType: "comment", repoFullName: "org/repo" }),
+    );
   });
 
   it("ignores issue_comment on a plain issue (no pull_request)", async () => {
@@ -675,7 +687,7 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
             id: 9001,
             number: 42,
             url: "https://api.github.com/repos/org/repo/pulls/42",
-            head: { ref: "fix/issue-7", sha: "abc123", repo: { id: 1296269, url: "https://api.github.com/repos/org/repo", name: "repo" } },
+            head: { ref: "fix/issue-7", sha: "abc123", repo: { id: 1296269, url: "https://api.github.com/repos/org/repo", name: "repo", full_name: "org/repo" } },
             base: { ref: "main", sha: "def456", repo: { id: 1296269, url: "https://api.github.com/repos/org/repo", name: "repo" } },
           },
         ],
@@ -691,6 +703,7 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
         repoFullName: "org/repo",
         prNumber: 42,
         branch: "fix/issue-7",
+        headRepoFullName: "org/repo",
         url: "https://api.github.com/repos/org/repo/pulls/42",
         checkRunUrl: "https://github.com/org/repo/runs/321",
         title: "lint",
@@ -730,7 +743,7 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
           {
             id: 9001,
             number: 42,
-            head: { ref: "fix/issue-7", sha: "abc123", repo: { id: 1296269, url: "https://api.github.com/repos/org/repo", name: "repo" } },
+            head: { ref: "fix/issue-7", sha: "abc123", repo: { id: 1296269, url: "https://api.github.com/repos/org/repo", name: "repo", full_name: "org/repo" } },
             base: { ref: "main", sha: "def456", repo: { id: 1296269, url: "https://api.github.com/repos/org/repo", name: "repo" } },
           },
         ],
@@ -746,6 +759,7 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
         repoFullName: "org/repo",
         prNumber: 42,
         branch: "fix/issue-7",
+        headRepoFullName: "org/repo",
         url: "",
         checkRunUrl: "https://github.com/org/repo/runs/324",
         title: "lint",
@@ -824,6 +838,7 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
         repoFullName: "org/repo",
         prNumber: 42,
         branch: "fix/issue-7",
+        headRepoFullName: "org/repo",
         url: "https://github.com/org/repo/pull/42",
         title: "Fix bug (#7)",
         author: "itsmiso-ai",
@@ -836,6 +851,70 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
         source: "webhook",
       },
     ]);
+  });
+
+  // #1637: the owner check reads the BASE repo, so a same-org or bot-authored
+  // fork PR passes it while its branch names a branch of the FORK — the fix
+  // worker would operate on a branch the base repo does not have. The head-repo
+  // verification must refuse the fork fail-closed at ingestion.
+  it("refuses a CHANGES_REQUESTED review whose head repo is a fork (#1637)", async () => {
+    const client = await realIngestion();
+
+    const res = await signedRequest("pull_request_review", {
+      action: "submitted",
+      review: {
+        id: 556,
+        body: "Please fix",
+        state: "CHANGES_REQUESTED",
+        user: { login: "reviewer" },
+        commit_id: "abc123",
+      },
+      pull_request: {
+        ...pullRequest,
+        user: { login: "github-actions[bot]" },
+        head: { ref: "fix/issue-7", sha: "abc123", repo: { full_name: "outsider/repo-fork" } },
+      },
+      repository,
+      sender,
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.eventsReceived).toBe(1);
+    expect(body.enqueued).toBe(0);
+    expect(body.skipped).toBe(1);
+    expect(client.$transaction).not.toHaveBeenCalled();
+  });
+
+  // #1637 fail-closed: a missing head.repo is no proof the head is the base
+  // repo, so the delivery is refused the same as an outright fork.
+  it("refuses a review delivery with no head.repo at all (#1637)", async () => {
+    const client = await realIngestion();
+
+    const res = await signedRequest("pull_request_review", {
+      action: "submitted",
+      review: {
+        id: 557,
+        body: "Please fix",
+        state: "CHANGES_REQUESTED",
+        user: { login: "reviewer" },
+        commit_id: "abc123",
+      },
+      pull_request: {
+        ...pullRequest,
+        user: { login: "github-actions[bot]" },
+        head: { ref: "fix/issue-7", sha: "abc123" },
+      },
+      repository,
+      sender,
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.eventsReceived).toBe(1);
+    expect(body.enqueued).toBe(0);
+    expect(body.skipped).toBe(1);
+    expect(client.$transaction).not.toHaveBeenCalled();
   });
 
   it("returns 'No events to process' for a known event with no pull_request payload", async () => {
@@ -879,7 +958,7 @@ describe("POST /api/pr-followup/webhook — rate limit", () => {
         number: 42,
         html_url: "https://github.com/org/repo/pull/42",
         title: "Fix bug",
-        head: { ref: "fix/issue-1" },
+        head: { ref: "fix/issue-1", repo: { full_name: "org/repo" } },
         base: { repo: { full_name: "org/repo" } },
       },
     };

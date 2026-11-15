@@ -252,6 +252,9 @@ function observeConflict(client: any) {
     repoFullName: REPO,
     prNumber: PR,
     branch: "courier/misospace/miso-gallery/issue-654",
+    // #1637: the sync-route producer carries the head-repo proof; this helper
+    // mirrors that contract (the gate refuses without it).
+    headRepoFullName: REPO,
     url: `https://github.com/${REPO}/pull/${PR}`,
     title: "fix(security): reject null-byte paths in sanitize_path",
     author: "itsmiso-ai",
