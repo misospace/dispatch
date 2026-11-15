@@ -115,14 +115,13 @@ export function parseDispatchFixCommand(
   return { ok: true, lane };
 }
 
-/** The aggregate review decision over a PR's reviews, using the same
- * latest-per-user semantics as `deriveReviewDecision` in github-prs.ts:
- * a reviewer's newest APPROVED/CHANGES_REQUESTED/DISMISSED review supersedes
- * their earlier ones, and any standing CHANGES_REQUESTED blocks. DISMISSED
- * participates in the supersession (review round 5, M1): GitHub records a
- * dismissal as the reviewer's latest review state, so a review dismissed
- * after a CHANGES_REQUESTED must unblock — otherwise an earlier request
- * would stand forever and the command would enqueue obsolete feedback. */
+/** The aggregate review decision over a PR's reviews, in the shape of
+ * `deriveReviewDecision` in github-prs.ts but with one deliberate divergence
+ * (review round 5, M1): DISMISSED participates in the per-user supersession
+ * here — a reviewer's newest APPROVED/CHANGES_REQUESTED/DISMISSED review
+ * supersedes their earlier ones, and any standing CHANGES_REQUESTED blocks.
+ * A dismissal recorded after a CHANGES_REQUESTED must unblock, or the
+ * command would enqueue feedback from a review the reviewer withdrew. */
 export function deriveBlockingReview(
   reviews: PullRequestReview[],
   headSha: string | null,

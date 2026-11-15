@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { GitHubIssue } from "@/types";
-import { fetchCollaboratorPermission, fetchIssue, fetchIssueLabels, fetchIssueNativeBlockers, fetchIssues } from "./github-issues";
+import { fetchCollaboratorPermission, fetchIssue, fetchIssueLabels, fetchIssueNativeBlockers, fetchIssues, repoLabelExists } from "./github-issues";
 
 const fetchWithRetry = vi.fn();
 const fetchPaginated = vi.fn();
@@ -355,5 +355,30 @@ describe("fetchCollaboratorPermission", () => {
 
     const result = await fetchCollaboratorPermission("acme/app", "odd");
     expect(result.status).toBe("error");
+  });
+});
+
+describe("repoLabelExists", () => {
+  it("returns true for an existing label (200)", async () => {
+    fetchWithRetry.mockResolvedValue(okJson({ name: "agent/courier-hyper" }));
+    await expect(repoLabelExists("acme/app", "agent/courier-hyper")).resolves.toBe(true);
+    expect(fetchWithRetry.mock.calls[0][0]).toBe(
+      "https://api.github.com/repos/acme/app/labels/agent%2Fcourier-hyper",
+    );
+  });
+
+  it("returns false for a missing label (404) — not an error", async () => {
+    fetchWithRetry.mockResolvedValue({ ok: false, status: 404, text: async () => "Not Found" });
+    await expect(repoLabelExists("acme/app", "agent/courier-missing")).resolves.toBe(false);
+  });
+
+  it("returns null (unavailable) on an API error — never false", async () => {
+    fetchWithRetry.mockResolvedValue({ ok: false, status: 403, text: async () => "Forbidden" });
+    await expect(repoLabelExists("acme/app", "agent/courier-hyper")).resolves.toBeNull();
+  });
+
+  it("returns null on a network failure", async () => {
+    fetchWithRetry.mockRejectedValue(new Error("socket hang up"));
+    await expect(repoLabelExists("acme/app", "agent/courier-hyper")).resolves.toBeNull();
   });
 });

@@ -717,6 +717,7 @@ describe("handleDispatchFixCommand", () => {
     expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
     expect(mocks.addIssueLabel).not.toHaveBeenCalled();
     expect(mocks.enqueuePrFixItem).not.toHaveBeenCalled();
+    expect(mocks.issueUpdateMany).not.toHaveBeenCalled();
     const reply = mocks.addIssueComment.mock.calls.at(-1)![2];
     expect(reply).toContain("does not exist");
     expect(reply).toContain("labels.yaml");
