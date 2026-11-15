@@ -334,8 +334,20 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
 
     // Fork PRs are refused (review m10): the item's `branch` would name a
     // branch of the fork while the fix worker would operate on the base
-    // repo, where the same branch name usually does not exist.
-    if (prDetail.headRepoFullName && prDetail.headRepoFullName.toLowerCase() !== repoFullName.toLowerCase()) {
+    // repo, where the same branch name usually does not exist. When the
+    // head repository is unavailable (`head.repo.full_name = null`, e.g. a
+    // deleted fork) the base-repo ownership of the branch cannot be
+    // verified at all — fail closed rather than accept (review M6).
+    if (!prDetail.headRepoFullName) {
+      await reply(
+        repoFullName,
+        prNumber,
+        "`/dispatch-fix` refused: the PR's head repository could not be verified — the fix loop only works on branches of the base repository.",
+      );
+      await auditCommand(repoFullName, null, commenter, false, "head repo unavailable");
+      return result("refused", "head repo unavailable");
+    }
+    if (prDetail.headRepoFullName.toLowerCase() !== repoFullName.toLowerCase()) {
       await reply(repoFullName, prNumber, `\`/dispatch-fix\` refused: this PR comes from a fork (\`${prDetail.headRepoFullName}\`) — the fix loop only works on branches of the base repository.`);
       await auditCommand(repoFullName, null, commenter, false, `fork PR (head repo ${prDetail.headRepoFullName})`);
       return result("refused", "fork pr");
