@@ -188,9 +188,11 @@ function sameLabelSet(a: string[], b: string[]): boolean {
  * bounded retries, the mirror is written unconditionally: this command
  * authored the authoritative label state on GitHub moments before, and
  * enqueueing against a stale cached claimant (review M1, second round) is
- * worse than clobbering a concurrent non-agent label edit in the tiny
- * window. A vanished row or a failing write throws into the caller's outer
- * catch — the command replies and enqueues nothing.
+ * worse than clobbering a concurrent label edit in the tiny window — note
+ * the fallback replaces the WHOLE agent set, so it deliberately wins over a
+ * concurrent agent-label assignment too (review round 3, minor 3). A
+ * vanished row or a failing write throws into the caller's outer catch —
+ * the command replies and enqueues nothing.
  */
 async function mirrorAgentLabelSet(issueId: string, agentSet: string[], snapshot: string[]): Promise<void> {
   let base = snapshot;
@@ -458,10 +460,11 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
     // without admin/maintain rights may hand off their own PR but not
     // rewrite the linked issue's assignment. The multi-label state was
     // already refused above, so the swap is: remove the one other `agent/*`
-    // label if any, add the target, then MIRROR the resulting label set
-    // into the Prisma cache — the enqueue's claimant resolution reads the
-    // cache, not GitHub (review M2 second round), and a recorded claimant
-    // is never re-resolved later.
+    // label if any, add the target, then converge the Prisma cache to the
+    // authoritative GitHub set (the verify-and-mirror step right before the
+    // enqueue) — the enqueue's claimant resolution reads the cache, not
+    // GitHub (review M2 second round), and a recorded claimant is never
+    // re-resolved later.
     let laneSwap = "";
     let afterLabels = agentLabels;
     if (parsed.lane) {
@@ -493,29 +496,37 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
           // The swap failed: do NOT enqueue. A row created now would freeze
           // its claimant on the pre-swap label state (review M2). The audit
           // reflects the PARTIAL swap result (review MINOR-2): `afterLabels`
-          // tracks exactly what landed — removals only (`[]`), or nothing.
+          // tracks exactly what landed — removals only (`[]`), or nothing —
+          // and the reply names labels already removed, so the operator can
+          // restore the assignment (review round 3, minor 4).
+          const removedNote = afterLabels.length === 0 && agentLabels.length > 0
+            ? ` The previous agent label ${agentLabels.join(", ")} was already removed from the issue.`
+            : "";
           console.error(`[/dispatch-fix] agent-label swap failed for ${repoFullName}#${linkedIssue}:`, error);
           await reply(
             repoFullName,
             prNumber,
-            `\`/dispatch-fix\` failed: the agent-label swap to \`${targetLabel}\` did not fully land — nothing was enqueued. Check that the \`${targetLabel}\` label exists in this repository, then retry the command.`,
+            `\`/dispatch-fix\` failed: the agent-label swap to \`${targetLabel}\` did not fully land — nothing was enqueued.${removedNote} Check that the \`${targetLabel}\` label exists in this repository, then retry the command.`,
           );
           await auditCommand(repoFullName, linkedIssue, commenter, false, "agent-label swap failed; nothing enqueued", undefined, agentLabels, afterLabels);
           return result("error", "agent-label swap failed");
         }
-        // Mirror the post-swap label set into the cached Issue row, so the
-        // claimant resolution the enqueue is about to run sees the new
-        // owner instead of the pre-swap one (review M1, second round: CAS
-        // retries then a final unconditional write — never a stale cached
-        // claimant).
-        await mirrorAgentLabelSet(cachedIssue.id, afterLabels, cachedIssue.labels ?? []);
-      } else {
-        // The target is already on the issue on GitHub, but the cached row
-        // may still lag the forge: mirror the authoritative agent set too,
-        // so the enqueue resolves the post-swap claimant either way (review
-        // M1, second round — the mirror is not swap-only).
-        await mirrorAgentLabelSet(cachedIssue.id, agentLabels, cachedIssue.labels ?? []);
       }
+    }
+
+    // Verify-and-mirror (review M1, second round; hoisted in round 3 so it
+    // covers EVERY enqueue path — plain `/dispatch-fix`, landed swap, and
+    // already-on-target): the enqueue's claimant resolution reads the cached
+    // `Issue.labels` only, so the cached agent set must match the
+    // authoritative GitHub set before the enqueue runs. Re-read the cache
+    // here (a concurrent sync/webhook writer may have moved it since the
+    // eligibility check) and converge when it lags; the re-read also shrinks
+    // — without closing — the window between the mirror and the enqueue's
+    // own claimant read (review round 3, minor 5).
+    const cachedNow = await prisma.issue.findFirst({ where: { id: cachedIssue.id }, select: { labels: true } });
+    const cachedAgentNow = (cachedNow?.labels ?? []).filter((l) => l.startsWith(AGENT_PREFIX));
+    if (!sameLabelSet(cachedAgentNow, afterLabels)) {
+      await mirrorAgentLabelSet(cachedIssue.id, afterLabels, cachedNow?.labels ?? []);
     }
 
     // Enqueue through the same path the operator endpoint uses (#1622):
@@ -572,15 +583,19 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
 
     // Confirmation reply (#1622): legible handover — where the item landed,
     // (for lane swaps) which agent profile now owns the linked issue, and
-    // the claimant the ownership gate will resolve from the issue state
-    // (linked-issue implementation guidance; AI review minor, round 2).
+    // the claimant the ownership gate will see, REPORTED FROM THE ROW THE
+    // ENQUEUE RETURNED rather than predicted from labels: the resolution
+    // precedence (live lease, owner labels, #1615 worker-space and
+    // rebase-executor rules) and an existing row's never-transferred
+    // claimant all live inside `enqueuePrFixItem` (#1569), so only the row
+    // knows what the gate will actually see (review round 3, major 1).
     // The queue position is scoped to this repo's lane queue (review m8).
     const queuePosition = await prisma.prFixQueueItem.count({
       where: { repo: normalizedRepo, lane: item.lane, status: "QUEUED" },
     });
-    const claimantNote = afterLabels.length > 0
-      ? ` Claimant the ownership gate will see: \`${afterLabels[0]}\`.`
-      : " The linked issue carries no agent label — the claimant resolves at hand-out from lease/PR-author state.";
+    const claimantNote = item.claimant
+      ? ` Claimant recorded on the queue row: \`${item.claimant}\` (source: ${item.claimantSource ?? "legacy"}).`
+      : " No claimant was recorded on the queue row — the ownership gate will refuse its hand-out until the claimant is resolved.";
     await reply(
       repoFullName,
       prNumber,

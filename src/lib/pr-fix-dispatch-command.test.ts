@@ -17,7 +17,7 @@ const { mocks } = vi.hoisted(() => ({
     fetchCollaboratorPermission: vi.fn().mockResolvedValue({ status: "ok", permission: "read" }),
     fetchPullRequestDetail: vi.fn(),
     fetchPullRequestReviews: vi.fn(),
-    enqueuePrFixItem: vi.fn().mockResolvedValue({ status: "QUEUED", lane: "NORMAL" }),
+    enqueuePrFixItem: vi.fn().mockResolvedValue({ status: "QUEUED", lane: "NORMAL", claimant: "foo", claimantSource: "agent-label" }),
   },
 }));
 
@@ -115,7 +115,7 @@ function resetDefaultFlowMocks() {
   mocks.addIssueLabel.mockResolvedValue(undefined);
   mocks.removeIssueLabel.mockResolvedValue(undefined);
   mocks.auditLogCreate.mockResolvedValue({});
-  mocks.enqueuePrFixItem.mockResolvedValue({ status: "QUEUED", lane: "NORMAL" });
+  mocks.enqueuePrFixItem.mockResolvedValue({ status: "QUEUED", lane: "NORMAL", claimant: "foo", claimantSource: "agent-label" });
 }
 
 describe("parseDispatchFixCommand", () => {
@@ -243,28 +243,62 @@ describe("handleDispatchFixCommand", () => {
     expect(data.notes).toContain("source=/dispatch-fix");
   });
 
+  it("names the claimant recorded on the queue row in the confirmation reply (AI review major, round 3)", async () => {
+    // The note reports the row's RECORDED claimant, not a label prediction.
+    await handleDispatchFixCommand(baseCommand());
+    expect(mocks.addIssueComment.mock.calls[0][2]).toContain("Claimant recorded on the queue row: `foo` (source: agent-label)");
+    mocks.addIssueComment.mockClear();
+    // No recorded claimant: the reply says the gate will refuse, not invent one.
+    mocks.enqueuePrFixItem.mockResolvedValue({ status: "QUEUED", lane: "NORMAL", claimant: null, claimantSource: "ambiguous" });
+    await handleDispatchFixCommand(baseCommand());
+    expect(mocks.addIssueComment.mock.calls[0][2]).toContain("No claimant was recorded on the queue row");
+    expect(mocks.addIssueComment.mock.calls[0][2]).toContain("ownership gate will refuse");
+  });
+
+  it("converges the cached agent set to GitHub on the plain (no lane=) path before enqueueing (AI review major 2, round 3)", async () => {
+    // GitHub shows agent/foo; the cached row still lags with agent/old.
+    mocks.issueFindFirst.mockResolvedValue({ id: "i1", labels: ["agent/old"] });
+    const outcome = await handleDispatchFixCommand(baseCommand());
+    expect(outcome.outcome).toBe("enqueued");
+    expect(mocks.issueUpdateMany).toHaveBeenCalledWith({
+      where: { id: "i1", labels: { equals: ["agent/old"] } },
+      data: { labels: ["agent/foo"] },
+    });
+  });
+
+  it("fails closed (no enqueue) when the plain-path cache mirror cannot write", async () => {
+    mocks.issueFindFirst.mockResolvedValue({ id: "i1", labels: ["agent/old"] });
+    mocks.issueUpdateMany.mockRejectedValue(new Error("mirror down"));
+    const outcome = await handleDispatchFixCommand(baseCommand());
+    expect(outcome.outcome).toBe("error");
+    expect(mocks.enqueuePrFixItem).not.toHaveBeenCalled();
+    const data = mocks.auditLogCreate.mock.calls.at(-1)![0].data;
+    expect(data.success).toBe(false);
+  });
+
+  it("skips the mirror write when a concurrent delivery already refreshed the cache to the post-swap set", async () => {
+    mocks.fetchCollaboratorPermission.mockResolvedValue({ status: "ok", permission: "maintain" });
+    mocks.issueFindFirst
+      // eligibility-check cache read
+      .mockResolvedValueOnce({ id: "i1", labels: ["agent/foo"] })
+      // verify-and-mirror read: still the pre-swap set
+      .mockResolvedValueOnce({ id: "i1", labels: ["agent/foo"] })
+      // mirror's post-CAS-loss re-read: the webhook echo already converged it
+      .mockResolvedValue({ id: "i1", labels: ["agent/courier-hyper"] });
+    mocks.issueUpdateMany.mockResolvedValue({ count: 0 });
+    const outcome = await handleDispatchFixCommand(baseCommand({ commentBody: "/dispatch-fix lane=hyper" }));
+    expect(outcome.outcome).toBe("enqueued");
+    expect(mocks.enqueuePrFixItem).toHaveBeenCalledTimes(1);
+    // No unconditional overwrite needed — the fresh cache was already correct.
+    expect(mocks.issueUpdate).not.toHaveBeenCalled();
+  });
+
   it("posts a confirmation reply", async () => {
     await handleDispatchFixCommand(baseCommand());
     const reply = mocks.addIssueComment.mock.calls[0];
     expect(reply[0]).toBe("org/repo");
     expect(reply[1]).toBe(5);
     expect(reply[2]).toContain("`QUEUED`");
-  });
-
-  it("names the claimant the ownership gate will see in the confirmation reply (AI review minor, round 2)", async () => {
-    // With the issue's GitHub agent label:
-    await handleDispatchFixCommand(baseCommand());
-    expect(mocks.addIssueComment.mock.calls[0][2]).toContain("Claimant the ownership gate will see: `agent/foo`");
-    mocks.addIssueComment.mockClear();
-    // After an operator lane swap:
-    mocks.fetchCollaboratorPermission.mockResolvedValue({ status: "ok", permission: "maintain" });
-    await handleDispatchFixCommand(baseCommand({ commenter: "maintainer", commentBody: "/dispatch-fix lane=hyper" }));
-    expect(mocks.addIssueComment.mock.calls[0][2]).toContain("Claimant the ownership gate will see: `agent/courier-hyper`");
-    mocks.addIssueComment.mockClear();
-    // Zero agent labels: the fallback resolution is named, not a claimant.
-    mocks.fetchIssueLabels.mockResolvedValue(["status/ready"]);
-    await handleDispatchFixCommand(baseCommand());
-    expect(mocks.addIssueComment.mock.calls[0][2]).toContain("no agent label");
   });
 
   it("scopes the queue position to the repo (not global)", async () => {
@@ -503,6 +537,10 @@ describe("handleDispatchFixCommand", () => {
     expect(data.beforeLabels).toEqual(["agent/foo"]);
     // Remove-first: the old label is already off the issue when the add fails.
     expect(data.afterLabels).toEqual([]);
+    // The reply names the dropped assignment so the operator can restore it
+    // (review round 3, minor 4).
+    const reply = mocks.addIssueComment.mock.calls[0][2];
+    expect(reply).toContain("agent/foo was already removed");
   });
 
   it("aborts before any write when the removal fails (add never lands, review M2 round 2)", async () => {
