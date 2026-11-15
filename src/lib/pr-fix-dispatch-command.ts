@@ -247,6 +247,11 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
   // after a landed swap audits the real label columns.
   let trackedBeforeLabels: string[] = [];
   let trackedAfterLabels: string[] = [];
+  // Set the moment `enqueuePrFixItem` resolves. A failure AFTER this point
+  // (queue count, confirmation reply, success audit) must never be reported
+  // as "nothing was enqueued" — the queue row exists — and must never skip
+  // the audit because a reply failed (review round 8, major 1).
+  let enqueued: { evidenceKey: string; linkedIssue: number; beforeLabels: string[]; afterLabels: string[] } | null = null;
   const parsed = parseDispatchFixCommand(commentBody);
   // Not a command — the route never calls here without a parse first, but a
   // null here keeps the contract total.
@@ -635,6 +640,7 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
       evidenceHeadSha: prDetail.headSha,
       evidenceSource: "webhook",
     });
+    enqueued = { evidenceKey, linkedIssue, beforeLabels: agentLabels, afterLabels };
 
     // Confirmation reply (#1622): legible handover — where the item landed,
     // (for lane swaps) which agent profile now owns the linked issue, and
@@ -674,13 +680,54 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
     // (#1622 audit, review m1). The audit's label columns reflect what this
     // command actually did before failing: a failure AFTER a landed
     // lane swap audited with empty labels would misstate a repo-visible
-    // ownership mutation (review MINOR-2). "Nothing was enqueued" stays
-    // true — the catch is only reachable past the swap by an enqueue throw,
-    // and the row that throw failed to write cannot exist.
+    // ownership mutation (review MINOR-2).
     const message = error instanceof Error ? error.message : String(error);
     console.error(`[/dispatch-fix] command failed for ${repoFullName}#${prNumber}:`, error);
+    if (enqueued) {
+      // The enqueue LANDED; only a post-enqueue step (queue count,
+      // confirmation reply, or the success audit) failed. Reporting
+      // "nothing was enqueued" here would be false — the queue row exists
+      // and a blind re-run is refused as a duplicate — and the audit must
+      // not depend on the reply: reply and audit are attempted
+      // independently, so a failing reply can never suppress the audit row
+      // (review round 8, major 1). The row audits success (the enqueue is
+      // the command's core action) with the follow-up failure in the notes.
+      try {
+        await replyUnlessBot(
+          commenter,
+          repoFullName,
+          prNumber,
+          `\`/dispatch-fix\` handed this PR to the fix loop (evidence \`${enqueued.evidenceKey}\`), but a follow-up step failed after the enqueue — check the pr-fix queue before re-running the command (a re-run is refused while the item is QUEUED).`,
+        );
+      } catch (replyError) {
+        console.error("[/dispatch-fix] post-enqueue failure reply also failed:", replyError);
+      }
+      try {
+        await auditCommand(
+          repoFullName,
+          enqueued.linkedIssue,
+          commenter,
+          true,
+          null,
+          `pr=${prNumber} item enqueued; post-enqueue follow-up failed: ${message} source=/dispatch-fix evidence=${enqueued.evidenceKey}`,
+          enqueued.beforeLabels,
+          enqueued.afterLabels,
+        );
+      } catch (auditError) {
+        console.error("[/dispatch-fix] post-enqueue audit write also failed:", auditError);
+      }
+      return result("error", `enqueued, but the post-enqueue follow-up failed: ${message}`);
+    }
+    // "Nothing was enqueued" stays true on this path — the catch is only
+    // reachable past the swap by an enqueue throw, and the row that throw
+    // failed to write cannot exist. Reply and audit are still independent:
+    // a failing reply must not suppress the audit row.
     try {
       await replyUnlessBot(commenter, repoFullName, prNumber, `\`/dispatch-fix\` failed with an internal error — nothing was enqueued. Retry later.`);
+    } catch (replyError) {
+      console.error("[/dispatch-fix] failure reply also failed:", replyError);
+    }
+    try {
       await auditCommand(
         repoFullName,
         null,

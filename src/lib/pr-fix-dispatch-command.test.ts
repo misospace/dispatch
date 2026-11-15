@@ -838,6 +838,47 @@ describe("handleDispatchFixCommand", () => {
     expect(data.errorMessage).toContain("db down");
   });
 
+  it("never reports 'nothing was enqueued' when a POST-enqueue step fails (AI review major, round 8)", async () => {
+    // The queue-count read after a landed enqueue throws: the catch must
+    // say the item was handed off, not that nothing was enqueued.
+    mocks.prFixQueueItemCount.mockRejectedValue(new Error("count failed"));
+    const outcome = await handleDispatchFixCommand(baseCommand());
+    expect(outcome.outcome).toBe("error");
+    expect(outcome.detail).toContain("enqueued");
+    const reply = mocks.addIssueComment.mock.calls.at(-1)![2];
+    expect(reply).toContain("handed this PR to the fix loop");
+    expect(reply).not.toContain("nothing was enqueued");
+    // The audit row records the landed enqueue with the follow-up failure.
+    const data = mocks.auditLogCreate.mock.calls.at(-1)![0].data;
+    expect(data.success).toBe(true);
+    expect(data.issueNumber).toBe(101);
+    expect(data.notes).toContain("post-enqueue follow-up failed: count failed");
+    expect(data.notes).toContain(`evidence=pr-review:5:${HEAD.slice(0, 8)}`);
+  });
+
+  it("still writes the failure audit when the confirmation reply fails after the enqueue (AI review major, round 8)", async () => {
+    // The confirmation reply throws after a landed enqueue: the audit row
+    // must still be written (reply and audit are attempted independently).
+    mocks.addIssueComment.mockRejectedValue(new Error("forge down"));
+    const outcome = await handleDispatchFixCommand(baseCommand());
+    expect(outcome.outcome).toBe("error");
+    expect(mocks.auditLogCreate).toHaveBeenCalledTimes(1);
+    const data = mocks.auditLogCreate.mock.calls[0][0].data;
+    expect(data.success).toBe(true);
+    expect(data.notes).toContain("post-enqueue follow-up failed: forge down");
+  });
+
+  it("writes the failure audit even when the failure reply itself fails", async () => {
+    mocks.enqueuePrFixItem.mockRejectedValue(new Error("db down"));
+    mocks.addIssueComment.mockRejectedValue(new Error("forge down"));
+    const outcome = await handleDispatchFixCommand(baseCommand());
+    expect(outcome.outcome).toBe("error");
+    expect(mocks.auditLogCreate).toHaveBeenCalledTimes(1);
+    const data = mocks.auditLogCreate.mock.calls[0][0].data;
+    expect(data.success).toBe(false);
+    expect(data.errorMessage).toContain("db down");
+  });
+
   it("replies and audits when forge state is unavailable", async () => {
     mocks.fetchPullRequestDetail.mockResolvedValue(null);
     const outcome = await handleDispatchFixCommand(baseCommand());
