@@ -6,6 +6,7 @@ const { mocks } = vi.hoisted(() => ({
     repositoryFindUnique: vi.fn().mockResolvedValue({ id: "r1", fullName: "org/repo" }),
     issueFindFirst: vi.fn(),
     issueUpdateMany: vi.fn().mockResolvedValue({ count: 1 }),
+    issueUpdate: vi.fn().mockResolvedValue({}),
     prFixQueueItemFindUnique: vi.fn(),
     prFixQueueItemCount: vi.fn().mockResolvedValue(1),
     auditLogCreate: vi.fn().mockResolvedValue({}),
@@ -26,6 +27,7 @@ vi.mock("@/lib/prisma", () => ({
     issue: {
       findFirst: mocks.issueFindFirst,
       updateMany: mocks.issueUpdateMany,
+      update: mocks.issueUpdate,
     },
     prFixQueueItem: {
       findUnique: mocks.prFixQueueItemFindUnique,
@@ -105,6 +107,8 @@ function resetDefaultFlowMocks() {
   mocks.fetchPullRequestReviews.mockResolvedValue([review()]);
   mocks.issueFindFirst.mockResolvedValue({ id: "i1", labels: ["agent/foo"] });
   mocks.fetchIssueLabels.mockResolvedValue(["agent/foo"]);
+  mocks.issueUpdateMany.mockResolvedValue({ count: 1 });
+  mocks.issueUpdate.mockResolvedValue({});
   mocks.prFixQueueItemFindUnique.mockResolvedValue(null);
   mocks.fetchCollaboratorPermission.mockResolvedValue({ status: "ok", permission: "read" });
   mocks.addIssueComment.mockResolvedValue({ url: null });
@@ -245,6 +249,22 @@ describe("handleDispatchFixCommand", () => {
     expect(reply[0]).toBe("org/repo");
     expect(reply[1]).toBe(5);
     expect(reply[2]).toContain("`QUEUED`");
+  });
+
+  it("names the claimant the ownership gate will see in the confirmation reply (AI review minor, round 2)", async () => {
+    // With the issue's GitHub agent label:
+    await handleDispatchFixCommand(baseCommand());
+    expect(mocks.addIssueComment.mock.calls[0][2]).toContain("Claimant the ownership gate will see: `agent/foo`");
+    mocks.addIssueComment.mockClear();
+    // After an operator lane swap:
+    mocks.fetchCollaboratorPermission.mockResolvedValue({ status: "ok", permission: "maintain" });
+    await handleDispatchFixCommand(baseCommand({ commenter: "maintainer", commentBody: "/dispatch-fix lane=hyper" }));
+    expect(mocks.addIssueComment.mock.calls[0][2]).toContain("Claimant the ownership gate will see: `agent/courier-hyper`");
+    mocks.addIssueComment.mockClear();
+    // Zero agent labels: the fallback resolution is named, not a claimant.
+    mocks.fetchIssueLabels.mockResolvedValue(["status/ready"]);
+    await handleDispatchFixCommand(baseCommand());
+    expect(mocks.addIssueComment.mock.calls[0][2]).toContain("no agent label");
   });
 
   it("scopes the queue position to the repo (not global)", async () => {
@@ -472,7 +492,7 @@ describe("handleDispatchFixCommand", () => {
     expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 101, "agent/foo");
   });
 
-  it("aborts without enqueueing when the label swap fails", async () => {
+  it("aborts without enqueueing when the label swap fails (removals landed, add did not)", async () => {
     mocks.fetchCollaboratorPermission.mockResolvedValue({ status: "ok", permission: "maintain" });
     mocks.addIssueLabel.mockRejectedValue(new Error("422"));
     const outcome = await handleDispatchFixCommand(baseCommand({ commentBody: "/dispatch-fix lane=hyper" }));
@@ -481,27 +501,77 @@ describe("handleDispatchFixCommand", () => {
     const data = mocks.auditLogCreate.mock.calls.at(-1)![0].data;
     expect(data.success).toBe(false);
     expect(data.beforeLabels).toEqual(["agent/foo"]);
-    expect(data.afterLabels).toEqual(["agent/foo"]);
+    // Remove-first: the old label is already off the issue when the add fails.
+    expect(data.afterLabels).toEqual([]);
   });
 
-  it("audits the partial swap result when the removal fails after the add landed", async () => {
+  it("aborts before any write when the removal fails (add never lands, review M2 round 2)", async () => {
     mocks.fetchCollaboratorPermission.mockResolvedValue({ status: "ok", permission: "maintain" });
     mocks.removeIssueLabel.mockRejectedValue(new Error("boom"));
     const outcome = await handleDispatchFixCommand(baseCommand({ commentBody: "/dispatch-fix lane=hyper" }));
     expect(outcome.outcome).toBe("error");
     expect(mocks.enqueuePrFixItem).not.toHaveBeenCalled();
+    // Add-first would have left TWO agent labels here; remove-first leaves
+    // the original single label untouched.
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
     const data = mocks.auditLogCreate.mock.calls.at(-1)![0].data;
     expect(data.beforeLabels).toEqual(["agent/foo"]);
-    // The target landed on GitHub before the removal failed.
-    expect(data.afterLabels).toEqual(["agent/courier-hyper"]);
+    expect(data.afterLabels).toEqual(["agent/foo"]);
   });
 
-  it("still enqueues when the cache mirror loses its race", async () => {
+  it("removes the old agent label before adding the target (single-label invariant through the swap)", async () => {
     mocks.fetchCollaboratorPermission.mockResolvedValue({ status: "ok", permission: "maintain" });
-    mocks.issueUpdateMany.mockResolvedValue({ count: 0 });
+    const order: string[] = [];
+    mocks.removeIssueLabel.mockImplementation(async () => {
+      order.push("remove");
+    });
+    mocks.addIssueLabel.mockImplementation(async () => {
+      order.push("add");
+    });
+    await handleDispatchFixCommand(baseCommand({ commentBody: "/dispatch-fix lane=hyper" }));
+    expect(order).toEqual(["remove", "add"]);
+  });
+
+  it("converges the cache mirror after a lost CAS race (retries, then an unconditional write) before enqueueing", async () => {
+    mocks.fetchCollaboratorPermission.mockResolvedValue({ status: "ok", permission: "maintain" });
+    const order: string[] = [];
+    mocks.issueUpdateMany.mockImplementation(async () => {
+      order.push("cas");
+      return { count: 0 };
+    });
+    mocks.issueUpdate.mockImplementation(async () => {
+      order.push("unconditional");
+      return {};
+    });
+    mocks.enqueuePrFixItem.mockImplementation(async () => {
+      order.push("enqueue");
+      return { status: "QUEUED", lane: "NORMAL" };
+    });
     const outcome = await handleDispatchFixCommand(baseCommand({ commentBody: "/dispatch-fix lane=hyper" }));
     expect(outcome.outcome).toBe("enqueued");
     expect(mocks.enqueuePrFixItem).toHaveBeenCalledTimes(1);
+    // The stale cached claimant is overwritten before the enqueue reads it.
+    expect(order.indexOf("unconditional")).toBeGreaterThan(-1);
+    expect(order.indexOf("enqueue")).toBeGreaterThan(order.indexOf("unconditional"));
+    expect(mocks.issueUpdate).toHaveBeenCalledWith({
+      where: { id: "i1" },
+      data: { labels: ["agent/courier-hyper"] },
+    });
+  });
+
+  it("mirrors the cache without a swap when the issue already carries the requested lane label (review M1 round 2)", async () => {
+    mocks.fetchCollaboratorPermission.mockResolvedValue({ status: "ok", permission: "maintain" });
+    mocks.fetchIssueLabels.mockResolvedValue(["agent/courier-hyper"]);
+    const outcome = await handleDispatchFixCommand(baseCommand({ commentBody: "/dispatch-fix lane=hyper" }));
+    expect(outcome.outcome).toBe("enqueued");
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+    // The cached row may still lag GitHub: the mirror runs even though the
+    // swap itself is a no-op, so the enqueue resolves the target claimant.
+    expect(mocks.issueUpdateMany).toHaveBeenCalledWith({
+      where: { id: "i1", labels: { equals: ["agent/foo"] } },
+      data: { labels: ["agent/courier-hyper"] },
+    });
   });
 
   it("adds the lane label without a removal when the issue has none", async () => {
