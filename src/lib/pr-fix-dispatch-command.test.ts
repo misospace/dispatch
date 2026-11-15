@@ -452,15 +452,22 @@ describe("handleDispatchFixCommand", () => {
   });
 
   it("refuses when the head repository cannot be verified (fail closed)", async () => {
-    mocks.fetchPullRequestDetail.mockResolvedValue({ ...PR_DETAIL, headRepoFullName: null });
-    const outcome = await handleDispatchFixCommand(baseCommand());
-    expect(outcome.outcome).toBe("refused");
-    expect(mocks.addIssueComment).toHaveBeenCalled();
-    const reply = mocks.addIssueComment.mock.calls[0][2];
-    expect(reply).toContain("could not be verified");
-    expect(mocks.enqueuePrFixItem).not.toHaveBeenCalled();
-    const data = mocks.auditLogCreate.mock.calls.at(-1)![0].data;
-    expect(data.success).toBe(false);
+    for (const headRepoFullName of [null, ""]) {
+      mocks.fetchPullRequestDetail.mockResolvedValue({ ...PR_DETAIL, headRepoFullName });
+      const outcome = await handleDispatchFixCommand(baseCommand());
+      expect(outcome.outcome).toBe("refused");
+      expect(outcome.detail).toBe("head repo unverifiable (deleted or inaccessible)");
+      expect(mocks.addIssueComment).toHaveBeenCalled();
+      const reply = mocks.addIssueComment.mock.calls[0][2];
+      expect(reply).toContain("could not be verified");
+      expect(mocks.enqueuePrFixItem).not.toHaveBeenCalled();
+      expect(mocks.fetchPullRequestReviews).not.toHaveBeenCalled();
+      const data = mocks.auditLogCreate.mock.calls.at(-1)![0].data;
+      expect(data.success).toBe(false);
+      expect(data.errorMessage).toBe("head repo unverifiable (deleted or inaccessible)");
+      mocks.addIssueComment.mockClear();
+      mocks.auditLogCreate.mockClear();
+    }
   });
 
   it("refuses when there is no CHANGES_REQUESTED review", async () => {

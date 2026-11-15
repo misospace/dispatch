@@ -342,10 +342,10 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
       await reply(
         repoFullName,
         prNumber,
-        "`/dispatch-fix` refused: the PR's head repository could not be verified — the fix loop only works on branches of the base repository.",
+        "`/dispatch-fix` refused: the PR's head repository could not be verified (likely a deleted or inaccessible fork) — the fix loop only works on branches of the base repository. Re-open the PR from a base-repo branch and retry.",
       );
-      await auditCommand(repoFullName, null, commenter, false, "head repo unavailable");
-      return result("refused", "head repo unavailable");
+      await auditCommand(repoFullName, null, commenter, false, "head repo unverifiable (deleted or inaccessible)");
+      return result("refused", "head repo unverifiable (deleted or inaccessible)");
     }
     if (prDetail.headRepoFullName.toLowerCase() !== repoFullName.toLowerCase()) {
       await reply(repoFullName, prNumber, `\`/dispatch-fix\` refused: this PR comes from a fork (\`${prDetail.headRepoFullName}\`) — the fix loop only works on branches of the base repository.`);
