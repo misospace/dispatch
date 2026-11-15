@@ -250,8 +250,24 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
   // Set the moment `enqueuePrFixItem` resolves. A failure AFTER this point
   // (queue count, confirmation reply, success audit) must never be reported
   // as "nothing was enqueued" — the queue row exists — and must never skip
-  // the audit because a reply failed (review round 8, major 1).
-  let enqueued: { evidenceKey: string; linkedIssue: number; beforeLabels: string[]; afterLabels: string[] } | null = null;
+  // the audit because a reply failed (review round 8, major 1). The row
+  // fields let the degraded reply report what actually landed.
+  let enqueued: {
+    evidenceKey: string;
+    linkedIssue: number;
+    beforeLabels: string[];
+    afterLabels: string[];
+    lane: string;
+    status: string;
+    claimant: string | null;
+    claimantSource: string | null;
+    laneSwap: string;
+  } | null = null;
+  // Whether the confirmation reply (or any reply) already reached the
+  // thread after the enqueue: the degraded failure reply is skipped when
+  // one did, so a failing success-audit cannot post a second, seemingly
+  // contradictory comment (review round 8, minor).
+  let postedAfterEnqueue = false;
   const parsed = parseDispatchFixCommand(commentBody);
   // Not a command — the route never calls here without a parse first, but a
   // null here keeps the contract total.
@@ -640,7 +656,17 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
       evidenceHeadSha: prDetail.headSha,
       evidenceSource: "webhook",
     });
-    enqueued = { evidenceKey, linkedIssue, beforeLabels: agentLabels, afterLabels };
+    enqueued = {
+      evidenceKey,
+      linkedIssue,
+      beforeLabels: agentLabels,
+      afterLabels,
+      lane: item.lane,
+      status: item.status,
+      claimant: item.claimant ?? null,
+      claimantSource: item.claimantSource ?? null,
+      laneSwap,
+    };
 
     // Confirmation reply (#1622): legible handover — where the item landed,
     // (for lane swaps) which agent profile now owns the linked issue, and
@@ -663,6 +689,7 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
       prNumber,
       `\`/dispatch-fix\` handed this PR to the fix loop: queue item is \`${item.status}\` on queue lane \`${item.lane}\` (position ${queuePosition} in that queue), evidence \`${evidenceKey}\`.${laneSwap}${claimantNote}`,
     );
+    postedAfterEnqueue = true;
     await auditCommand(
       repoFullName,
       linkedIssue,
@@ -691,16 +718,22 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
       // not depend on the reply: reply and audit are attempted
       // independently, so a failing reply can never suppress the audit row
       // (review round 8, major 1). The row audits success (the enqueue is
-      // the command's core action) with the follow-up failure in the notes.
-      try {
-        await replyUnlessBot(
-          commenter,
-          repoFullName,
-          prNumber,
-          `\`/dispatch-fix\` handed this PR to the fix loop (evidence \`${enqueued.evidenceKey}\`), but a follow-up step failed after the enqueue — check the pr-fix queue before re-running the command (a re-run is refused while the item is QUEUED).`,
-        );
-      } catch (replyError) {
-        console.error("[/dispatch-fix] post-enqueue failure reply also failed:", replyError);
+      // the command's core action) with the follow-up failure in
+      // errorMessage/notes so failure counters and filters stay honest.
+      if (!postedAfterEnqueue) {
+        const claimantNote = enqueued.claimant
+          ? ` Claimant recorded on the queue row: \`${enqueued.claimant}\` (source: ${enqueued.claimantSource ?? "legacy"}).`
+          : " No claimant was recorded on the queue row — the ownership gate will refuse its hand-out until the claimant is resolved.";
+        try {
+          await replyUnlessBot(
+            commenter,
+            repoFullName,
+            prNumber,
+            `\`/dispatch-fix\` handed this PR to the fix loop: queue item is \`${enqueued.status}\` on queue lane \`${enqueued.lane}\`, evidence \`${enqueued.evidenceKey}\`.${enqueued.laneSwap}${claimantNote} A follow-up step failed after the enqueue — check the pr-fix queue before re-running the command (a re-run is refused while the item is QUEUED).`,
+          );
+        } catch (replyError) {
+          console.error("[/dispatch-fix] post-enqueue failure reply also failed:", replyError);
+        }
       }
       try {
         await auditCommand(
@@ -708,8 +741,8 @@ export async function handleDispatchFixCommand(input: DispatchFixCommandInput): 
           enqueued.linkedIssue,
           commenter,
           true,
-          null,
-          `pr=${prNumber} item enqueued; post-enqueue follow-up failed: ${message} source=/dispatch-fix evidence=${enqueued.evidenceKey}`,
+          `post-enqueue follow-up failed: ${message}`,
+          `pr=${prNumber} item enqueued (status=${enqueued.status} lane=${enqueued.lane}) source=/dispatch-fix evidence=${enqueued.evidenceKey}`,
           enqueued.beforeLabels,
           enqueued.afterLabels,
         );

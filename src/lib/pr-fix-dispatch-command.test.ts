@@ -847,12 +847,14 @@ describe("handleDispatchFixCommand", () => {
     expect(outcome.detail).toContain("enqueued");
     const reply = mocks.addIssueComment.mock.calls.at(-1)![2];
     expect(reply).toContain("handed this PR to the fix loop");
+    expect(reply).toContain("`QUEUED`");
+    expect(reply).toContain("Claimant recorded on the queue row: `foo`");
     expect(reply).not.toContain("nothing was enqueued");
     // The audit row records the landed enqueue with the follow-up failure.
     const data = mocks.auditLogCreate.mock.calls.at(-1)![0].data;
     expect(data.success).toBe(true);
     expect(data.issueNumber).toBe(101);
-    expect(data.notes).toContain("post-enqueue follow-up failed: count failed");
+    expect(data.errorMessage).toContain("post-enqueue follow-up failed: count failed");
     expect(data.notes).toContain(`evidence=pr-review:5:${HEAD.slice(0, 8)}`);
   });
 
@@ -865,7 +867,31 @@ describe("handleDispatchFixCommand", () => {
     expect(mocks.auditLogCreate).toHaveBeenCalledTimes(1);
     const data = mocks.auditLogCreate.mock.calls[0][0].data;
     expect(data.success).toBe(true);
-    expect(data.notes).toContain("post-enqueue follow-up failed: forge down");
+    expect(data.errorMessage).toContain("post-enqueue follow-up failed: forge down");
+  });
+
+  it("pins the swapped label columns on the post-enqueue failure audit row (AI review round 8, minor)", async () => {
+    mocks.fetchCollaboratorPermission.mockResolvedValue({ status: "ok", permission: "maintain" });
+    mocks.prFixQueueItemCount.mockRejectedValue(new Error("count failed"));
+    await handleDispatchFixCommand(baseCommand({ commentBody: "/dispatch-fix lane=hyper" }));
+    const data = mocks.auditLogCreate.mock.calls.at(-1)![0].data;
+    expect(data.beforeLabels).toEqual(["agent/foo"]);
+    expect(data.afterLabels).toEqual(["agent/courier-hyper"]);
+    const reply = mocks.addIssueComment.mock.calls.at(-1)![2];
+    expect(reply).toContain("reassigned agent/foo → agent/courier-hyper");
+  });
+
+  it("does not post a second, contradictory reply when the success audit itself fails (AI review round 8, minor)", async () => {
+    // The confirmation reply already landed; the failing step is the audit
+    // write. The degraded branch retries the audit but stays off the thread.
+    mocks.auditLogCreate.mockRejectedValueOnce(new Error("audit down"));
+    const outcome = await handleDispatchFixCommand(baseCommand());
+    expect(outcome.outcome).toBe("error");
+    expect(mocks.addIssueComment).toHaveBeenCalledTimes(1);
+    expect(mocks.auditLogCreate).toHaveBeenCalledTimes(2);
+    const data = mocks.auditLogCreate.mock.calls.at(-1)![0].data;
+    expect(data.success).toBe(true);
+    expect(data.errorMessage).toContain("post-enqueue follow-up failed: audit down");
   });
 
   it("writes the failure audit even when the failure reply itself fails", async () => {
