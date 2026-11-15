@@ -181,6 +181,9 @@ export async function probePrFixPrPresence(repo: string, pr: number): Promise<Pr
   return "deleted";
 }
 
+/** Consecutive unknown/failed probes that abort one deleted-PR reap pass. */
+const DELETED_REAP_UNKNOWN_STREAK_LIMIT = 3;
+
 /**
  * Mark active pr-fix-queue items STALE when their upstream PR is confirmed
  * deleted (#1641). Driven by the items themselves, like the archived-repo
@@ -191,7 +194,11 @@ export async function probePrFixPrPresence(repo: string, pr: number): Promise<Pr
  * the missing fact; only a confirmed "deleted" reaps, through the same
  * generation-AND-status-pinned terminal write. One per-PR probe per active
  * item (no batch endpoint exists); a probe that throws counts as errored
- * and defers.
+ * and defers. A run of consecutive unknown/failed probes (outage or rate
+ * limit turning each probe into retried timeouts) aborts the pass early:
+ * a queue-wide fan-out against a flaky forge must not burn the whole sync
+ * window, and deferral is always safe — the confirmed deletion is still
+ * there for the next healthy pass.
  */
 export async function reconcileDeletedPrFixItems(
   client: PrFixQueueClient,
@@ -200,20 +207,37 @@ export async function reconcileDeletedPrFixItems(
   let checked = 0;
   let markedStale = 0;
   let errored = 0;
+  let unknownStreak = 0;
 
   const active = await client.prFixQueueItem.findMany({ where: { status: { in: [...ACTIVE_REAP_STATUSES] } } });
   for (const item of active) {
     checked++;
     try {
-      if ((await probePresence(item.repo, item.pr)) !== "deleted") continue;
-      const count = await markPrFixItemStale(
-        client,
-        item,
-        "Upstream PR deleted (404 at the per-PR endpoint, repo reachable) at reconcile time (#1641)",
-      );
-      if (count === 1) markedStale++;
+      const presence = await probePresence(item.repo, item.pr);
+      if (presence === "deleted") {
+        unknownStreak = 0;
+        const count = await markPrFixItemStale(
+          client,
+          item,
+          "Upstream PR deleted (404 at the per-PR endpoint, repo reachable) at reconcile time (#1641)",
+        );
+        if (count === 1) markedStale++;
+        continue;
+      }
+      if (presence === "present") {
+        unknownStreak = 0;
+        continue;
+      }
+      if (++unknownStreak >= DELETED_REAP_UNKNOWN_STREAK_LIMIT) {
+        console.warn(`[pr-fix-queue] deleted-PR reap stopped after ${unknownStreak} consecutive unknown probes; ${active.length - checked} active item(s) deferred to a later pass (#1641)`);
+        break;
+      }
     } catch (err) {
       errored++;
+      if (++unknownStreak >= DELETED_REAP_UNKNOWN_STREAK_LIMIT) {
+        console.warn(`[pr-fix-queue] deleted-PR reap stopped after ${unknownStreak} consecutive failed probes; ${active.length - checked} active item(s) deferred to a later pass (#1641)`);
+        break;
+      }
     }
   }
 

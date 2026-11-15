@@ -119,11 +119,53 @@ describe("deleted upstream PRs (#1641)", () => {
 
     const result = await reconcileDeletedPrFixItems(client, vi.fn(async () => {
       throw new Error("boom");
-    }));
+    }) as any);
 
     expect(result).toEqual({ checked: 1, markedStale: 0, errored: 1 });
     expect(client.items[0].status).toBe("QUEUED");
     expect(client.history).toHaveLength(0);
+  });
+
+  it("three consecutive unknown probes abort the pass and defer the rest (outage breaker)", async () => {
+    const client = makeClient([
+      item("a", "org/flaky", 1, "QUEUED"),
+      item("b", "org/flaky", 2, "QUEUED"),
+      item("c", "org/flaky", 3, "QUEUED"),
+      item("d", "org/gone", 4, "QUEUED"),
+    ]);
+    const probe = vi.fn(async (repo: string): Promise<PrFixPrPresence> =>
+      repo === "org/gone" ? "deleted" : "unknown",
+    );
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const result = await reconcileDeletedPrFixItems(client, probe);
+
+    expect(result).toEqual({ checked: 3, markedStale: 0, errored: 0 });
+    expect(probe).toHaveBeenCalledTimes(3);
+    expect(client.items[3].status).toBe("QUEUED");
+    expect(client.history).toHaveLength(0);
+    warnSpy.mockRestore();
+  });
+
+  it("a confirmed or present answer resets the unknown streak — a healthy queue still gets full coverage", async () => {
+    const client = makeClient([
+      item("a", "org/flaky", 1, "QUEUED"),
+      item("b", "org/flaky", 2, "QUEUED"),
+      item("c", "org/live", 3, "QUEUED"),
+      item("d", "org/flaky", 4, "QUEUED"),
+      item("e", "org/flaky", 5, "QUEUED"),
+      item("f", "org/gone", 6, "QUEUED"),
+    ]);
+    const probe = vi.fn(async (repo: string): Promise<PrFixPrPresence> =>
+      repo === "org/gone" ? "deleted" : repo === "org/live" ? "present" : "unknown",
+    );
+
+    const result = await reconcileDeletedPrFixItems(client, probe);
+
+    // Streak 2 → reset by "present" → streak 2 again → "deleted" reaps the
+    // last row; the breaker never fired.
+    expect(result).toEqual({ checked: 6, markedStale: 1, errored: 0 });
+    expect(client.items[5].status).toBe("STALE");
   });
 });
 
@@ -178,11 +220,21 @@ describe("probePrFixPrPresence (#1641)", () => {
   });
 
   it("a per-PR 404 at an unreadable repo stays 'unknown' — never reap on an unconfirmed fact", async () => {
+    // Realistic unreadable shape: the repo itself 404s (deleted/renamed-
+    // without-redirect/private-to-this-token), so the PR's 404 proves nothing.
     fetchMock.mockImplementation(async (url: string) =>
-      String(url).includes("/pulls/") ? res(404) : res(403, { message: "Forbidden" }),
+      String(url).includes("/pulls/") ? res(404) : res(404, { message: "Not Found" }),
     );
 
     expect(await probePrFixPrPresence("org/repo", 7)).toBe("unknown");
+  });
+
+  it("a per-PR 403 (rate limit / secondary limit) is 'unknown', not a deletion", async () => {
+    fetchMock.mockImplementation(async () => res(403, { message: "Forbidden" }));
+
+    expect(await probePrFixPrPresence("org/repo", 7)).toBe("unknown");
+    // No reachability gate follows a non-404 answer.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("a transport failure on the per-PR probe is 'unknown'", async () => {

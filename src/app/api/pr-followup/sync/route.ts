@@ -466,8 +466,11 @@ export async function POST(request: NextRequest) {
     // endpoint for each active item: a 404 at a reachable repo is a
     // confirmed deletion; present/transport-failure/unreadable-repo defer.
     const deletedResult = rateLimited
-      ? { markedStale: 0 }
+      ? { markedStale: 0, errored: 0 }
       : await reconcileDeletedPrFixItems(asPrFixQueueClient(prisma));
+    if (deletedResult.errored > 0) {
+      console.warn(`[pr-followup] deleted-PR reap errored on ${deletedResult.errored} item(s) (#1641)`);
+    }
 
     // #1253: bounded trigger reconciliation for structured external waits —
     // a recorded dependency that now satisfies its predicate reactivates the
@@ -500,6 +503,7 @@ export async function POST(request: NextRequest) {
       staleReaped: staleResult.markedStale,
       archivedReaped: archivedResult.markedStale,
       deletedReaped: deletedResult.markedStale,
+      deletedReapErrored: deletedResult.errored,
       externalWaitRechecked: waitTriggerResult.reactivated,
       rateLimited,
     });

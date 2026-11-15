@@ -420,6 +420,8 @@ describe("POST /api/pr-followup/sync", () => {
 
     // "other" should never have been fetched
     expect(fetchMock.mock.calls.some((call: [string]) => call[0].includes("other"))).toBe(false);
+    // #1641: a rate-limited pass must not add per-item existence probes.
+    expect(mocks.reconcileDeletedPrFixItems).not.toHaveBeenCalled();
 
     vi.unstubAllGlobals();
   });
@@ -446,6 +448,10 @@ describe("POST /api/pr-followup/sync", () => {
     const body = await res.json();
     expect(body.reposFailed).toBe(1);
     expect(body.rateLimited).toBe(true);
+    // #1641: same skip for the deleted-PR reap when rate-limited.
+    expect(mocks.reconcileDeletedPrFixItems).not.toHaveBeenCalled();
+    expect(body.deletedReaped).toBe(0);
+    expect(body.deletedReapErrored).toBe(0);
 
     vi.unstubAllGlobals();
   });
