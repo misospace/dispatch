@@ -201,11 +201,19 @@ export async function fetchCollaboratorPermission(
     const payload = (data && typeof data === "object" ? data : {}) as {
       permission?: unknown;
       role_name?: unknown;
+      user?: unknown;
     };
-    // The `permission` field reports the maintain role as "write" in common
-    // API responses; `role_name` carries the authoritative role ("maintain").
-    // Prefer role_name when GitHub returns a recognized value there, falling
-    // back to the legacy `permission` field (review round 4, M2).
+    // The legacy `permission` field reports the maintain role as "write" in
+    // common API responses; `role_name` carries the assigned role, and the
+    // `user.permissions` booleans are authoritative even under custom role
+    // names (review round 4, M2). Prefer the booleans, then a recognized
+    // role_name, then the legacy permission field. Everything unrecognized
+    // is an error — fail closed.
+    const userPermissions = (
+      payload.user && typeof payload.user === "object" && "permissions" in payload.user
+        ? (payload.user as { permissions?: unknown }).permissions
+        : undefined
+    ) as { admin?: unknown; maintain?: unknown } | undefined;
     const roleName =
       typeof payload.role_name === "string" &&
       COLLABORATOR_PERMISSIONS.has(payload.role_name as CollaboratorPermission)
@@ -216,7 +224,12 @@ export async function fetchCollaboratorPermission(
       COLLABORATOR_PERMISSIONS.has(payload.permission as CollaboratorPermission)
         ? (payload.permission as CollaboratorPermission)
         : undefined;
-    const resolved = roleName ?? permission;
+    const resolved: CollaboratorPermission | undefined =
+      userPermissions?.admin === true
+        ? "admin"
+        : userPermissions?.maintain === true
+          ? "maintain"
+          : (roleName ?? permission);
     if (resolved) {
       return { status: "ok", permission: resolved };
     }

@@ -209,8 +209,8 @@ describe("deriveBlockingReview", () => {
   it("reports stale only when every standing request is off the current head", () => {
     const blocking = deriveBlockingReview(
       [
-        review({ id: 1, submittedAt: "2026-11-12T00:00:00Z", commitId: "0000000" }),
-        review({ id: 2, submittedAt: "2026-11-13T00:00:00Z", commitId: "1111111" }),
+        review({ id: 1, user: "reviewer-a", submittedAt: "2026-11-12T00:00:00Z", commitId: "0000000" }),
+        review({ id: 2, user: "reviewer-b", submittedAt: "2026-11-13T00:00:00Z", commitId: "1111111" }),
       ],
       HEAD,
     );

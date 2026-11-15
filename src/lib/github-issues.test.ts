@@ -302,8 +302,56 @@ describe("fetchCollaboratorPermission", () => {
     });
   });
 
+  it("falls back to the permission field for a custom role_name (org with custom roles)", async () => {
+    fetchWithRetry.mockResolvedValue(okJson({ permission: "admin", role_name: "security_manager" }));
+
+    expect(await fetchCollaboratorPermission("acme/app", "admin")).toEqual({
+      status: "ok",
+      permission: "admin",
+    });
+  });
+
+  it("recognizes a custom-role maintainer through the user.permissions booleans", async () => {
+    fetchWithRetry.mockResolvedValue(
+      okJson({
+        permission: "write",
+        role_name: "security_manager",
+        user: { login: "maintainer", permissions: { admin: false, maintain: true } },
+      }),
+    );
+
+    expect(await fetchCollaboratorPermission("acme/app", "maintainer")).toEqual({
+      status: "ok",
+      permission: "maintain",
+    });
+  });
+
+  it("prefers user.permissions.admin over a lower role_name", async () => {
+    fetchWithRetry.mockResolvedValue(
+      okJson({
+        permission: "write",
+        role_name: "maintain",
+        user: { login: "owner", permissions: { admin: true, maintain: true } },
+      }),
+    );
+
+    expect(await fetchCollaboratorPermission("acme/app", "owner")).toEqual({
+      status: "ok",
+      permission: "admin",
+    });
+  });
+
   it("returns an error when neither field carries a recognized permission", async () => {
     fetchWithRetry.mockResolvedValue(okJson({ permission: "banana", role_name: 42 }));
+
+    const result = await fetchCollaboratorPermission("acme/app", "odd");
+    expect(result.status).toBe("error");
+  });
+
+  it("returns an error for an unrecognized custom role_name with an unparseable permission", async () => {
+    fetchWithRetry.mockResolvedValue(
+      okJson({ role_name: "security_manager", user: { permissions: { admin: false, maintain: false } } }),
+    );
 
     const result = await fetchCollaboratorPermission("acme/app", "odd");
     expect(result.status).toBe("error");
