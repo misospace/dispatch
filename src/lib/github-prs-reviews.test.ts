@@ -12,13 +12,7 @@ process.env.GITHUB_TOKEN = "test-token-for-review-tests";
 // github-prs-review-threads.test.ts).
 const fetchMock = vi.fn();
 
-interface MinimalResponseInit {
-  status: number;
-  value: unknown;
-  link?: string | null;
-}
-
-function jsonResponse({ status, value, link }: MinimalResponseInit) {
+function jsonResponse(status: number, value: unknown, link?: string) {
   const headers = new Map<string, string>();
   if (link) headers.set("link", link);
   return {
@@ -26,6 +20,7 @@ function jsonResponse({ status, value, link }: MinimalResponseInit) {
     status,
     headers: { get: (name: string) => headers.get(name.toLowerCase()) ?? null },
     json: async () => value,
+    text: async () => JSON.stringify(value),
   } as unknown as Response;
 }
 
@@ -48,6 +43,12 @@ describe("fetchPullRequestReviews", () => {
 
   beforeEach(() => {
     __resetGitHubAppState();
+    // Enforce the token-mode assumption above: a host exporting GitHub App
+    // credentials would route getHeadersAsync() through the installation-token
+    // POST on the same stubbed fetch and skew request-count assertions.
+    delete process.env.GITHUB_APP_ID;
+    delete process.env.GITHUB_APP_INSTALLATION_ID;
+    delete process.env.GITHUB_APP_PRIVATE_KEY;
     process.env.GITHUB_TOKEN = "test-token-for-review-tests";
     fetchMock.mockReset();
   });
@@ -62,7 +63,7 @@ describe("fetchPullRequestReviews", () => {
 
   it("projects each review's fields", async () => {
     fetchMock.mockImplementation(async () =>
-      jsonResponse({ status: 200, value: [review(1, { state: "APPROVED", user: { login: "a" } })] }),
+      jsonResponse(200, [review(1, { state: "APPROVED", user: { login: "a" } })]),
     );
 
     const reviews = await fetchPullRequestReviews("org/repo", 42);
@@ -85,15 +86,14 @@ describe("fetchPullRequestReviews", () => {
       submitted_at: new Date(Date.UTC(2026, 0, 2)).toISOString(),
       body: "the blocking review on the current head",
     });
+    const pageUrl = (page: number) =>
+      `https://api.github.com/repos/org/repo/pulls/42/reviews?per_page=100&page=${page}`;
     fetchMock.mockImplementation(async (url: string) => {
-      if (url.includes("page=1")) {
-        return jsonResponse({
-          status: 200,
-          value: firstPage,
-          link: `<${url.replace("page=1", "page=2")}>; rel="next"`,
-        });
+      const page = Number(new URL(url).searchParams.get("page") ?? "1");
+      if (page === 1) {
+        return jsonResponse(200, firstPage, `<${pageUrl(2)}>; rel="next"`);
       }
-      return jsonResponse({ status: 200, value: [latest], link: null });
+      return jsonResponse(200, [latest]);
     });
 
     const reviews = await fetchPullRequestReviews("org/repo", 42);
@@ -106,10 +106,31 @@ describe("fetchPullRequestReviews", () => {
     expect(reviews![100]!.body).toBe("the blocking review on the current head");
     // Two requests: the first page and the page its Link header pointed at.
     expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1]![0]).toBe(pageUrl(2));
+  });
+
+  it("returns null (not a partial list) when a later page fails mid-walk", async () => {
+    fetchMock.mockImplementation(async (url: string) => {
+      const page = Number(new URL(url).searchParams.get("page") ?? "1");
+      if (page === 1) {
+        return jsonResponse(
+          200,
+          [review(1)],
+          `<https://api.github.com/repos/org/repo/pulls/42/reviews?per_page=100&page=2>; rel="next"`,
+        );
+      }
+      // 403 is non-retryable (500 would back off and sleep for real).
+      return jsonResponse(403, { message: "rate limited" });
+    });
+
+    const reviews = await fetchPullRequestReviews("org/repo", 42);
+
+    expect(reviews).toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("returns null on a non-2xx response", async () => {
-    fetchMock.mockImplementation(async () => jsonResponse({ status: 500, value: null }));
+    fetchMock.mockImplementation(async () => jsonResponse(403, { message: "forbidden" }));
 
     const reviews = await fetchPullRequestReviews("org/repo", 42);
 
