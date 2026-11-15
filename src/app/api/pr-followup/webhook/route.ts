@@ -96,8 +96,10 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
       // No `headRepoFullName` either — the issue_comment payload never carries
       // the PR's head repository, so ingestion cannot prove the head repo is the
       // base repo and refuses this delivery fail-closed (#1637). Comment
-      // ingestion is not lost: the pull-based sync scan reads the PR object
-      // (head repo included) and ingests the same comments on its next cycle.
+      // ingestion is not lost while the PR is open: the pull-based sync scan
+      // reads the PR object (head repo included) and ingests the same comments
+      // on its next cycle. A PR that merges or closes before that cycle stops
+      // being fixable work anyway — that is the accepted cost of the gate.
       events.push({
         eventType: "comment",
         repoFullName: issueComment.repository?.full_name ?? null,

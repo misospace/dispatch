@@ -367,6 +367,21 @@ describe("POST /api/pr-followup/sync", () => {
           created_at: "2026-11-15T11:00:00Z", updated_at: "2026-11-15T11:00:00Z",
         }]);
       }
+      if (u.includes("/pulls/470/reviews")) {
+        return jsonRes([{
+          id: 21, body: "Use the right path", state: "CHANGES_REQUESTED",
+          user: { login: "reviewer" }, submitted_at: "2026-11-15T11:04:00Z", commit_id: "sha-470",
+        }]);
+      }
+      if (u.includes("/pulls/470/comments")) {
+        return jsonRes([{
+          id: 31, body: "nit: rename this", user: { login: "reviewer" },
+          path: "src/a.ts", line: 3, updated_at: "2026-11-15T11:05:00Z", commit_id: "sha-470",
+        }]);
+      }
+      if (u.includes("/check-runs")) {
+        return jsonRes({ check_runs: [{ id: 99, name: "lint", conclusion: "failure", html_url: "https://github.com/misospace/KubeTix/actions/runs/1/job/99", output: { summary: "boom" } }] });
+      }
       return jsonRes([]);
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -377,7 +392,12 @@ describe("POST /api/pr-followup/sync", () => {
     const events = mocks.processPrFollowupEvents.mock.calls.at(-1)?.[1] ?? [];
     const baseEvents = events.filter((e: { prNumber: number }) => e.prNumber === 470);
     const forkEvents = events.filter((e: { prNumber: number }) => e.prNumber === 471);
-    expect(baseEvents.length).toBeGreaterThan(0);
+    // Every event type the scan produces must carry the proof, not just
+    // comments: review, review_comment, check_run and merge_state ride the
+    // same gate.
+    expect(new Set(baseEvents.map((e: { eventType: string }) => e.eventType))).toEqual(
+      new Set(["comment", "review_comment", "review", "check_run", "merge_state"]),
+    );
     expect(forkEvents.length).toBeGreaterThan(0);
     for (const event of baseEvents) {
       expect(event.headRepoFullName).toBe("misospace/KubeTix");

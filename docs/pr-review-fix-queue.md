@@ -58,7 +58,8 @@ usually does not exist. A missing or unreadable head repository also fails
 (fail-closed). The webhook path reads the value from the event payload, so a
 payload shape that carries no head repository (for example `issue_comment`) is
 refused; the pull-based sync scan reads the full PR object and covers the same
-comments later. The `/dispatch-fix` command path enforces the same rule (#1622).
+comments later, while the PR is still open. The `/dispatch-fix` command path
+enforces the same rule (#1622).
 
 **Fail-closed default:** If `WEBHOOK_SECRET` is not configured, requests are
 rejected with a 503 response unless `WEBHOOK_GATEWAY_MODE` is explicitly set to

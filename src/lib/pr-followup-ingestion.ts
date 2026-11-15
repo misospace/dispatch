@@ -673,7 +673,10 @@ async function ingestEvent(client: PrFixQueueClient, event: PrFollowupEvent): Pr
     if (!isAllowedBotAuthor(event.author)) return null;
     if (!isAllowedBranchOwner(event.repoFullName)) return null;
     // #1637: an observation of a fork PR is not an observation of this queue's
-    // work either — the same eligibility filter as a work event.
+    // work either — the same eligibility filter as a work event. Consequence:
+    // a legacy fork row's actionable baseline stops advancing, so it can no
+    // longer be re-offered by evidence-driven recovery; conflict rows still
+    // drain through the ungated `clearResolvedConflictItems` settle path.
     if (!isHeadRepoOfBaseRepo(event.headRepoFullName, event.repoFullName)) return null;
     if (!descriptor.isIngestible(event)) return null;
     const { evidenceKey, ...evidence } = evidenceFieldsFor(event);

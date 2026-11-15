@@ -687,7 +687,7 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
             id: 9001,
             number: 42,
             url: "https://api.github.com/repos/org/repo/pulls/42",
-            head: { ref: "fix/issue-7", sha: "abc123", repo: { id: 1296269, url: "https://api.github.com/repos/org/repo", name: "repo", full_name: "org/repo" } },
+            head: { ref: "fix/issue-7", sha: "abc123", repo: { id: 1296269, url: "https://api.github.com/repos/org/repo", name: "repo" } },
             base: { ref: "main", sha: "def456", repo: { id: 1296269, url: "https://api.github.com/repos/org/repo", name: "repo" } },
           },
         ],
@@ -703,7 +703,10 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
         repoFullName: "org/repo",
         prNumber: 42,
         branch: "fix/issue-7",
-        headRepoFullName: "org/repo",
+        // #1637: GitHub's check_run pull-request-minimal object carries no
+        // full_name, so the projection is null and ingestion refuses the event
+        // fail-closed; the sync path covers failing checks with full proof.
+        headRepoFullName: null,
         url: "https://api.github.com/repos/org/repo/pulls/42",
         checkRunUrl: "https://github.com/org/repo/runs/321",
         title: "lint",
@@ -743,7 +746,7 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
           {
             id: 9001,
             number: 42,
-            head: { ref: "fix/issue-7", sha: "abc123", repo: { id: 1296269, url: "https://api.github.com/repos/org/repo", name: "repo", full_name: "org/repo" } },
+            head: { ref: "fix/issue-7", sha: "abc123", repo: { id: 1296269, url: "https://api.github.com/repos/org/repo", name: "repo" } },
             base: { ref: "main", sha: "def456", repo: { id: 1296269, url: "https://api.github.com/repos/org/repo", name: "repo" } },
           },
         ],
@@ -759,7 +762,9 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
         repoFullName: "org/repo",
         prNumber: 42,
         branch: "fix/issue-7",
-        headRepoFullName: "org/repo",
+        // #1637: no full_name in the real payload shape → null projection
+        // (see the check_run event test above).
+        headRepoFullName: null,
         url: "",
         checkRunUrl: "https://github.com/org/repo/runs/324",
         title: "lint",
@@ -884,6 +889,37 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
     expect(body.enqueued).toBe(0);
     expect(body.skipped).toBe(1);
     expect(client.$transaction).not.toHaveBeenCalled();
+  });
+
+  // Positive control for the gate above: the identical payload with a matching
+  // head repo must reach the real enqueue path — `$transaction` is called.
+  // The fake client only stubs `$transaction`/`issue.findFirst`, so the chain
+  // may stop past the gate (resolved to null); that is still proof the
+  // head-repo verification accepted the event.
+  it("accepts a CHANGES_REQUESTED review whose head repo matches the base repo (#1637 positive control)", async () => {
+    const client = await realIngestion();
+    client.$transaction.mockResolvedValue(null);
+
+    const res = await signedRequest("pull_request_review", {
+      action: "submitted",
+      review: {
+        id: 556,
+        body: "Please fix",
+        state: "CHANGES_REQUESTED",
+        user: { login: "reviewer" },
+        commit_id: "abc123",
+      },
+      pull_request: {
+        ...pullRequest,
+        user: { login: "github-actions[bot]" },
+        head: { ref: "fix/issue-7", sha: "abc123", repo: { full_name: "org/repo" } },
+      },
+      repository,
+      sender,
+    });
+
+    expect(res.status).toBe(200);
+    expect(client.$transaction).toHaveBeenCalled();
   });
 
   // #1637 fail-closed: a missing head.repo is no proof the head is the base

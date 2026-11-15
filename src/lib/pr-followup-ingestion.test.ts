@@ -2537,6 +2537,88 @@ describe("head-repo verification (#1637)", () => {
     expect(evidenceEnqueueInputs).toHaveLength(0);
   });
 
+  // Per-event-type refusal: every wrapper that reaches the work path carries
+  // the same head-repo proof, so each event type must refuse a fork PR the
+  // same way — payloads below would otherwise enqueue (matching-head cases
+  // live in each wrapper's own describe block).
+  it("refuses an actionable comment on a fork PR (head repo ≠ base repo)", async () => {
+    const client = makeClient();
+    const result = await ingestCommentEvent(client, {
+      repoFullName: "org/repo",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/org/repo/pull/42",
+      title: "Fix test",
+      author: "itsmiso-ai",
+      commentBody: "Test failed: expected 200 but got 404",
+      commentId: "c-head",
+      headRepoFullName: "outsider/repo-fork",
+    });
+
+    expect(result).toBeNull();
+    expect(client.items).toHaveLength(0);
+    expect(evidenceEnqueueInputs).toHaveLength(0);
+  });
+
+  it("refuses an inline review comment on a fork PR (head repo ≠ base repo)", async () => {
+    const client = makeClient();
+    const result = await ingestReviewCommentEvent(client, {
+      repoFullName: "org/repo",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/org/repo/pull/42",
+      title: "Fix test",
+      author: "itsmiso-ai",
+      commentBody: "Minor (bug): the owner gate reads the base repo only.",
+      commentId: "rc-head",
+      path: "src/lib/pr-followup-ingestion.ts",
+      line: 705,
+      headRepoFullName: "outsider/repo-fork",
+    });
+
+    expect(result).toBeNull();
+    expect(client.items).toHaveLength(0);
+    expect(evidenceEnqueueInputs).toHaveLength(0);
+  });
+
+  it("refuses a failing check run on a fork PR (head repo ≠ base repo)", async () => {
+    const client = makeClient();
+    const result = await ingestCheckRunEvent(client, {
+      repoFullName: "org/repo",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/org/repo/pull/42",
+      title: "Fix test",
+      author: "itsmiso-ai",
+      checkName: "lint",
+      conclusion: "failure",
+      checkRunId: "cr-head",
+      headRepoFullName: "outsider/repo-fork",
+    });
+
+    expect(result).toBeNull();
+    expect(client.items).toHaveLength(0);
+    expect(evidenceEnqueueInputs).toHaveLength(0);
+  });
+
+  it("refuses a problematic merge state on a fork PR (head repo ≠ base repo)", async () => {
+    const client = makeClient();
+    const result = await ingestMergeStateEvent(client, {
+      repoFullName: "org/repo",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/org/repo/pull/42",
+      title: "Fix test",
+      author: "itsmiso-ai",
+      mergeStateStatus: "dirty",
+      headRepoFullName: "outsider/repo-fork",
+    });
+
+    expect(result).toBeNull();
+    expect(client.items).toHaveLength(0);
+    expect(evidenceEnqueueInputs).toHaveLength(0);
+  });
+
   it("refuses when headRepoFullName is missing or null (fail-closed)", async () => {
     const client = makeClient();
     expect(await ingestReviewEvent(client, reviewOpts())).toBeNull();
