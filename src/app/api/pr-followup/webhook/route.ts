@@ -37,6 +37,9 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         repoFullName: pr.base?.repo?.full_name ?? null,
         prNumber: pr.number,
         branch: pr.head?.ref ?? null,
+        // #1637: ingestion refuses queue work unless the head repo is proven to
+        // be the base repo; project it from the payload, never re-derive it.
+        headRepoFullName: pr.head?.repo?.full_name ?? null,
         url: pr.html_url,
         title: pr.title,
         author: pr.user?.login ?? null,
@@ -65,6 +68,8 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         repoFullName: pr.base?.repo?.full_name ?? null,
         prNumber: pr.number,
         branch: pr.head?.ref ?? null,
+        // #1637: head-repo proof for the ingestion gate (see review case).
+        headRepoFullName: pr.head?.repo?.full_name ?? null,
         url: pr.html_url,
         title: pr.title,
         author: pr.user?.login ?? null,
@@ -88,6 +93,13 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
 
       // The issue object carries no repository or head ref; the repo is the
       // top-level `repository`, and the PR's branch/head are not in this payload.
+      // No `headRepoFullName` either — the issue_comment payload never carries
+      // the PR's head repository, so ingestion cannot prove the head repo is the
+      // base repo and refuses this delivery fail-closed (#1637). Comment
+      // ingestion is not lost while the PR is open: the pull-based sync scan
+      // reads the PR object (head repo included) and ingests the same comments
+      // on its next cycle. A PR that merges or closes before that cycle stops
+      // being fixable work anyway — that is the accepted cost of the gate.
       events.push({
         eventType: "comment",
         repoFullName: issueComment.repository?.full_name ?? null,
@@ -130,6 +142,11 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         repoFullName: checkRun.repository?.full_name ?? null,
         prNumber,
         branch: firstPr?.head?.ref ?? check.check_suite?.head_branch ?? null,
+        // #1637: the check_run pull-request-minimal object's head.repo carries
+        // id/url/name but no full_name, so this normally projects null and the
+        // event is refused fail-closed; the sync path covers failing checks
+        // with the real PR author and full head-repo proof anyway.
+        headRepoFullName: firstPr?.head?.repo?.full_name ?? null,
         // #1098: `url` is the item's identity and the queue guard is
         // write-once — a job-URL fallback would freeze it in place. The empty
         // string stays falsy, so the next sync enqueue backfills the real PR URL.
@@ -159,6 +176,8 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         repoFullName: pr.base?.repo?.full_name ?? null,
         prNumber: pr.number ?? 0,
         branch: pr.head?.ref ?? null,
+        // #1637: head-repo proof for the ingestion gate (see review case).
+        headRepoFullName: pr.head?.repo?.full_name ?? null,
         url: pr.html_url,
         title: pr.title,
         author: pr.user?.login ?? null,
