@@ -441,6 +441,7 @@ describe("POST /api/pr-followup/sync", () => {
     expect(body.archivedReaped).toBe(2);
     expect(mocks.reconcileArchivedRepoPrFixItems).toHaveBeenCalled();
     expect(body.deletedReaped).toBe(1);
+    expect(body.deletedReapChecked).toBe(1);
     expect(mocks.reconcileDeletedPrFixItems).toHaveBeenCalled();
 
     vi.unstubAllGlobals();

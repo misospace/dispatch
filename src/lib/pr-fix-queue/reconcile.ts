@@ -175,17 +175,43 @@ export async function probePrFixPrPresence(repo: string, pr: number): Promise<Pr
   if (presence !== "deleted") return presence;
   try {
     await fetchRepositoryMetadata(repo);
-  } catch {
+  } catch (error) {
+    // An unreadable repo proves nothing about the PR: the 404 above is the
+    // shape of an unreadable repo as well. Log it — a silent swallow here
+    // makes a forge outage indistinguishable from a healthy deferral.
+    console.warn(
+      `[pr-fix-queue] presence probe for ${repo}#${pr} could not confirm the repo is readable; treating the PR as unknown:`,
+      error instanceof Error ? error.message : error,
+    );
     return "unknown";
   }
   return "deleted";
 }
 
-/** Consecutive unknown/failed probes that stop probing a repo's remaining
- *  rows for one deleted-PR reap pass. Counted per repo: unknowns are mostly
- *  repo-shaped (unreadable/deleted repo), and a global streak would let a
- *  few permanently-unknown rows starve every later row on every pass. */
-const DELETED_REAP_REPO_STREAK_LIMIT = 3;
+/** Rows the deleted-PR reap reads per pass (bounds DB materialization). */
+const DELETED_REAP_PAGE_SIZE = 100;
+
+/** Per-PR probes one deleted-PR reap pass may issue (bounds forge reads). */
+const DELETED_REAP_MAX_PROBES = 50;
+
+/**
+ * Re-verify bound: how long a row the reap CONSIDERED stays out of the due
+ * set. Bounds how often one row is re-probed; the rotation (not this bound)
+ * is what guarantees every row is eventually reached.
+ */
+const DELETED_REAP_REVERIFY_MS = 60 * 60 * 1000;
+
+/** Per-pass knobs; defaults are the shipped bounds. */
+export interface DeletedPrFixReapOptions {
+  /** Maximum per-PR probes this pass may issue. */
+  maxProbes?: number;
+  /** Maximum queue rows this pass reads. */
+  pageSize?: number;
+  /** How long a considered row stays out of the due set (ms). */
+  reverifyMs?: number;
+  /** Clock injection for deterministic tests. */
+  now?: Date;
+}
 
 /**
  * Mark active pr-fix-queue items STALE when their upstream PR is confirmed
@@ -195,66 +221,110 @@ const DELETED_REAP_REPO_STREAK_LIMIT = 3;
  * QUEUED/BLOCKED/PARKED/WAITING_EXTERNAL forever while every null per-PR
  * probe correctly refused to act on the unknown. The per-PR probe supplies
  * the missing fact; only a confirmed "deleted" reaps, through the same
- * generation-AND-status-pinned terminal write. One per-PR probe per active
- * item (no batch endpoint exists); a probe that throws counts as errored
- * and defers. After `DELETED_REAP_REPO_STREAK_LIMIT` consecutive unknown or
- * failed probes for one repo (outage/rate-limit turning each probe into
- * retried timeouts, or an unreadable repo that answers that way forever),
- * that repo's remaining rows defer to a later pass, so a flaky forge
- * bounds the fan-out at a few probes per repo per pass without letting a
- * few permanently-unknown rows starve confirmed deletions behind them. A
- * reap-WRITE failure is not a probe unknown: it counts as errored only.
+ * generation-AND-status-pinned terminal write.
+ *
+ * Bounds and fairness (review): an unbounded pass turned a healthy queue of
+ * ordinary PRESENT PRs into one GitHub request per row on every sync, and a
+ * per-repo "three unknowns and stop" breaker let three permanently-unknown
+ * rows hide a confirmed deletion behind them in the SAME repo forever. Both
+ * are gone. This pass instead:
+ *
+ * - reads at most `pageSize` rows and issues at most `maxProbes` per-PR
+ *   probes — a hard bound on the pass's forge traffic;
+ * - orders the rows least-recently-considered first (explicit
+ *   `nulls: "first"` — Postgres ranks NULL above every value, so the default
+ *   ASC order would pin the most recently considered rows at the head), with
+ *   `id` as the deterministic tiebreak;
+ * - stamps EVERY row it considered — probed present, unknown, or failed — in
+ *   one bulk write at the end of the pass. The stamp is a rotation marker,
+ *   not a proof: an unknown row leaves the head instead of pinning it, so a
+ *   wall of permanently-unknown rows cannot hide a confirmed deletion behind
+ *   it, and repeated passes ADVANCE through the backlog;
+ * - leaves rows the probe bound cut off unstamped, so they lead the next
+ *   pass — the rotation never restarts at the same head.
+ *
+ * A confirmed deletion reaps through the same generation-AND-status-pinned
+ * terminal write every other reap uses; a probe that throws counts as
+ * errored and defers.
  */
 export async function reconcileDeletedPrFixItems(
   client: PrFixQueueClient,
   probePresence: (repo: string, pr: number) => Promise<PrFixPrPresence> = probePrFixPrPresence,
+  options: DeletedPrFixReapOptions = {},
 ): Promise<{ checked: number; markedStale: number; errored: number }> {
+  const maxProbes = options.maxProbes ?? DELETED_REAP_MAX_PROBES;
+  const pageSize = options.pageSize ?? DELETED_REAP_PAGE_SIZE;
+  const reverifyMs = options.reverifyMs ?? DELETED_REAP_REVERIFY_MS;
+  const now = options.now ?? new Date();
+  const reverifyCutoff = new Date(now.getTime() - reverifyMs);
+
   let checked = 0;
   let markedStale = 0;
   let errored = 0;
-  const unknownStreakByRepo = new Map<string, number>();
+  const considered: string[] = [];
 
-  const active = await client.prFixQueueItem.findMany({ where: { status: { in: [...ACTIVE_REAP_STATUSES] } } });
-  for (const item of active) {
-    const streak = unknownStreakByRepo.get(item.repo) ?? 0;
-    if (streak >= DELETED_REAP_REPO_STREAK_LIMIT) continue; // this repo tripped the breaker this pass
+  const due = await client.prFixQueueItem.findMany({
+    where: {
+      status: { in: [...ACTIVE_REAP_STATUSES] },
+      // A row the reap considered inside the re-verify window is not due
+      // again yet; a row it never considered (NULL) is due immediately.
+      OR: [{ prPresenceCheckedAt: null }, { prPresenceCheckedAt: { lte: reverifyCutoff } }],
+    },
+    orderBy: [{ prPresenceCheckedAt: { sort: "asc", nulls: "first" } }, { id: "asc" }],
+    take: pageSize,
+  });
+
+  for (const item of due) {
+    if (checked >= maxProbes) break; // forge-read bound reached
+    considered.push(item.id);
     checked++;
     let presence: PrFixPrPresence;
     try {
       presence = await probePresence(item.repo, item.pr);
     } catch (err) {
       errored++;
-      unknownStreakByRepo.set(item.repo, streak + 1);
-      if (streak + 1 >= DELETED_REAP_REPO_STREAK_LIMIT) {
-        console.warn(`[pr-fix-queue] deleted-PR reap deferring remaining items for ${item.repo} after ${streak + 1} consecutive unknown/failed probes (#1641)`);
-      }
-      continue;
+      continue; // considered → stamped below → the rotation advances past it
     }
-    if (presence === "deleted") {
-      unknownStreakByRepo.set(item.repo, 0);
-      try {
-        const count = await markPrFixItemStale(
-          client,
-          item,
-          "Upstream PR deleted (404 at the per-PR endpoint, repo reachable) at reconcile time (#1641)",
-        );
-        if (count === 1) markedStale++;
-      } catch (err) {
-        // The forge answered — a local write failure defers this row as
-        // errored without feeding the probe-unknown breaker.
-        errored++;
-      }
-      continue;
+    if (presence !== "deleted") continue;
+    try {
+      const count = await markPrFixItemStale(
+        client,
+        item,
+        "Upstream PR deleted (404 at the per-PR endpoint, repo reachable) at reconcile time (#1641)",
+      );
+      if (count === 1) markedStale++;
+    } catch (err) {
+      // The forge answered — a local write failure defers this row as
+      // errored. The row is still stamped below, so the rotation advances.
+      errored++;
     }
-    if (presence === "present") {
-      unknownStreakByRepo.set(item.repo, 0);
-      continue;
-    }
-    unknownStreakByRepo.set(item.repo, streak + 1);
-    if (streak + 1 >= DELETED_REAP_REPO_STREAK_LIMIT) {
-      console.warn(`[pr-fix-queue] deleted-PR reap deferring remaining items for ${item.repo} after ${streak + 1} consecutive unknown/failed probes (#1641)`);
+  }
+
+  // Rotate the scan head: stamp EVERY row this pass considered — probed
+  // present, unknown, or failed. Rows the probe bound cut off before the
+  // pass reached them stay unstamped and therefore lead the next pass.
+  // Scoped to the active statuses so a row this pass reaped (now STALE) is
+  // not stamped. One bulk write per pass; writing through the Prisma client
+  // also advances `updatedAt` (@updatedAt), which stays informational.
+  if (considered.length > 0) {
+    try {
+      await client.prFixQueueItem.updateMany({
+        where: { id: { in: considered }, status: { in: [...ACTIVE_REAP_STATUSES] } },
+        data: { prPresenceCheckedAt: now },
+      });
+    } catch (err) {
+      // A failed rotation stamp only costs the pass its ordering: the rows
+      // stay due and are considered again next pass. It is still counted as
+      // errored — a rotation that cannot advance is the pre-review defect,
+      // and it must not pass as a clean pass.
+      errored++;
+      console.warn(
+        "[pr-fix-queue] deleted-PR reap could not stamp the considered rows; the rotation restarts at the same head this pass:",
+        err instanceof Error ? err.message : err,
+      );
     }
   }
 
   return { checked, markedStale, errored };
 }
+

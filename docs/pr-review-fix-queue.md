@@ -363,16 +363,27 @@ as the `pr-fix-sweep` job:
   (`handoutAcks`, `dispatchedAt`, `dispatchedGeneration`) and a derived
   `idleReason`; the observability snapshot counts `overdueAcked`.
 - A **merged or closed** PR goes `STALE` (nothing left to fix).
-- A **hard-deleted** PR also goes `STALE` (#1641): the PR vanished from every
-  PR listing, so the merged/closed reap never sees the row. The pr-followup
-  sync runs an item-driven deleted-PR reap (`reconcileDeletedPrFixItems`):
-  one per-PR probe per active row; a `404` at a repo that reads fine is a
-  confirmed deletion and the row gets the same generation-AND-status-pinned
-  terminal write. A `404` at an unreadable repo, a transport failure, or a
-  rate limit is an unknown and defers — fail-open, like the archived-repo reap.
-  Per repo, three consecutive unknown/failed probes stop that repo's probes
-  for the pass (other repos keep theirs), so a dead or rate-limited forge
-  bounds the fan-out instead of turning every row into a retried timeout.
+- A **hard-deleted** PR also goes `STALE` (#1641). The PR is in no PR listing,
+  so the merged/closed reap never sees the row. Two routes run an item-driven
+  deleted-PR reap (`reconcileDeletedPrFixItems`): the pr-followup sync and the
+  issues reconcile route. The reap probes the per-PR endpoint for the rows it
+  reaches. A `404` at a repo that reads fine is a confirmed deletion, and the
+  row gets the same generation-AND-status-pinned terminal write. A `404` at an
+  unreadable repo, a transport failure, or a rate limit is an unknown and
+  defers. The reap fails open, like the archived-repo reap.
+- The deleted-PR reap is bounded and it rotates through the queue (#1641
+  review). The pass reads at most 100 queue rows and issues at most 50 per-PR
+  probes. It reads the rows that it considered least recently first. It stamps
+  every row that it considered, including the rows whose probe answered
+  unknown. The stamp is the column `prPresenceCheckedAt`. A stamped row leaves
+  the head of the order until the re-verify bound of one hour elapses. The
+  rows that the probe bound cut off stay unstamped, so they lead the next
+  pass. Two properties follow from this. The pass never restarts at the same
+  head, and rows that answer unknown forever can no longer hide a confirmed
+  deletion behind them. Both routes read the same stamp, so running both
+  routes one after the other does not probe the same row twice. Two routes
+  that run at the same time can still overlap by one pass, because each route
+  stamps the rows it considered only at the end of its pass.
 - **Unknown PR state** defers the item (`unknownState`): a possibly-closed PR is
   never reclaimed into a fresh attempt.
 - Past `PR_FIX_MAX_RECLAIMS` (default 3) the item parks as `PARKED` with
@@ -391,3 +402,12 @@ work, drain (or explicitly requeue) the queue first, or set
 `PR_FIX_HANDOUT_TIMEOUT_MS` to a value larger than the slowest worker's
 expected run time, so the pre-existing rows have a chance to ack through the
 new route.
+
+### Migration handling for the deleted-PR reap stamp
+
+The `20261116000000_add_pr_fix_presence_probe_stamp` migration adds the
+nullable column `prPresenceCheckedAt` and backfills no value. Every row that
+existed before the deploy therefore reads as never considered, so the whole
+active queue is due at once. The first pass after the deploy probes at most 50
+rows. The rotation then spreads the remaining rows over the following passes.
+No row is skipped and no row is probed twice because of the migration.

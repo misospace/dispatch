@@ -478,11 +478,23 @@ export async function POST(request: NextRequest) {
       : await reconcileArchivedRepoPrFixItems(asPrFixQueueClient(prisma));
     // #1641: a hard-deleted PR vanished from every listing, so the
     // merged/closed reap above can never see its rows. Probe the per-PR
-    // endpoint for each active item: a 404 at a reachable repo is a
+    // endpoint for the rows the reap reaches: a 404 at a reachable repo is a
     // confirmed deletion; present/transport-failure/unreadable-repo defer.
-    const deletedResult = rateLimited
-      ? { markedStale: 0, errored: 0 }
-      : await reconcileDeletedPrFixItems(asPrFixQueueClient(prisma));
+    // The pass is bounded (rows read + per-PR probes) and rotates through the
+    // queue, so a healthy queue of present PRs never turns into one GitHub
+    // request per row on every sync.
+    let deletedResult = { checked: 0, markedStale: 0, errored: 0 };
+    if (!rateLimited) {
+      try {
+        deletedResult = await reconcileDeletedPrFixItems(asPrFixQueueClient(prisma));
+      } catch (error) {
+        // A failed pass must never fail the sync; the next tick re-evaluates.
+        console.warn(
+          "[pr-followup] deleted-PR reap failed (best-effort):",
+          error instanceof Error ? error.message : error,
+        );
+      }
+    }
     if (deletedResult.errored > 0) {
       console.warn(`[pr-followup] deleted-PR reap errored on ${deletedResult.errored} item(s) (#1641)`);
     }
@@ -517,6 +529,7 @@ export async function POST(request: NextRequest) {
       skipped: totalSkipped + result.skipped,
       staleReaped: staleResult.markedStale,
       archivedReaped: archivedResult.markedStale,
+      deletedReapChecked: deletedResult.checked,
       deletedReaped: deletedResult.markedStale,
       deletedReapErrored: deletedResult.errored,
       externalWaitRechecked: waitTriggerResult.reactivated,

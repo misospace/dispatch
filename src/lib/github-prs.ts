@@ -406,7 +406,19 @@ export async function fetchPullRequestPresence(
     const resp = await fetchWithRetry(`${GITHUB_API}/repos/${repoFullName}/pulls/${prNumber}`, { headers });
     if (resp.ok) return "present";
     if (resp.status === 404) return "deleted";
-  } catch {
+    // Any other status is an unknown fact, but it is also the shape a
+    // rate-limited or degraded forge answers with — log it so an outage is
+    // distinguishable from a healthy deferral.
+    console.warn(
+      `[github-prs] presence probe for ${repoFullName}#${prNumber} answered ${resp.status}; treating the PR as unknown`,
+    );
+  } catch (error) {
+    // Transport failure: the probe never reached the forge. Logged like the
+    // sibling probes so a forge outage is visible instead of silent.
+    console.warn(
+      `[github-prs] presence probe for ${repoFullName}#${prNumber} failed:`,
+      error instanceof Error ? error.message : error,
+    );
   }
   return "unknown";
 }

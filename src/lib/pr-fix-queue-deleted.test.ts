@@ -8,7 +8,53 @@ vi.mock("./pr-fix-surfacing", () => ({
   extractUrlsFromText: vi.fn(() => []),
 }));
 
-function makeClient(items: any[]): PrFixQueueClient & { items: any[]; history: any[] } {
+type FakeItem = {
+  id: string;
+  repo: string;
+  pr: number;
+  status: string;
+  lane: string;
+  generation: number;
+  /** #1641 rotation stamp: NULL = never considered by the deleted-PR reap. */
+  prPresenceCheckedAt: Date | null;
+  attemptEvidenceWatermark?: number | null;
+};
+
+/** Minimal stand-in for the Prisma where-clause the reap uses. */
+function matches(item: FakeItem, where: any): boolean {
+  if (where?.status !== undefined) {
+    if (typeof where.status === "string") {
+      if (item.status !== where.status) return false;
+    } else {
+      const allowed = Array.isArray(where.status) ? where.status : (where.status?.in ?? []);
+      if (!allowed.includes(item.status)) return false;
+    }
+  }
+  if (where?.id !== undefined) {
+    if (typeof where.id === "string") {
+      if (item.id !== where.id) return false;
+    } else if (Array.isArray(where.id?.in) && !where.id.in.includes(item.id)) {
+      return false;
+    }
+  }
+  if (where?.generation !== undefined && item.generation !== where.generation) return false;
+  if (Array.isArray(where?.OR)) {
+    // The reap's due set: never considered (NULL) or considered long enough ago.
+    const matched = where.OR.some((cond: any) => {
+      if (!("prPresenceCheckedAt" in cond)) return true;
+      const bound = cond.prPresenceCheckedAt;
+      if (bound === null) return item.prPresenceCheckedAt === null;
+      if (bound?.lte instanceof Date) {
+        return item.prPresenceCheckedAt !== null && item.prPresenceCheckedAt.getTime() <= bound.lte.getTime();
+      }
+      return true;
+    });
+    if (!matched) return false;
+  }
+  return true;
+}
+
+function makeClient(items: FakeItem[]): PrFixQueueClient & { items: FakeItem[]; history: any[] } {
   const history: any[] = [];
   const client: any = {
     items,
@@ -18,21 +64,31 @@ function makeClient(items: any[]): PrFixQueueClient & { items: any[]; history: a
     prFixQueueItem: {
       findUnique: async ({ where }: any) =>
         items.find((i) => i.repo === where.repo_pr.repo && i.pr === where.repo_pr.pr) ?? null,
-      findMany: async ({ where }: any) => items.filter((i) => where.status.in.includes(i.status)),
+      // The reap reads least-recently-considered first with an explicit
+      // NULLS FIRST, then `id` as the deterministic tiebreak.
+      findMany: async ({ where, take }: any) => {
+        const selected = items.filter((i) => matches(i, where));
+        selected.sort((a, b) => {
+          const av = a.prPresenceCheckedAt ? a.prPresenceCheckedAt.getTime() : null;
+          const bv = b.prPresenceCheckedAt ? b.prPresenceCheckedAt.getTime() : null;
+          if (av === bv) return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+          if (av === null) return -1; // NULLS FIRST
+          if (bv === null) return 1;
+          return av - bv;
+        });
+        return typeof take === "number" ? selected.slice(0, take) : selected;
+      },
       create: async () => {
         throw new Error("unused");
       },
-      update: async ({ where, data }: any) => Object.assign(items.find((i) => i.id === where.id), data),
+      update: async ({ where, data }: any) =>
+        Object.assign(items.find((i) => i.id === where.id) as FakeItem, data),
       // #1253: the reap writes are generation-AND-status pinned updateMany
       // calls; the fake honors the where clause like the real client so a
-      // concurrent requeue in the read→write gap no-ops the reap.
+      // concurrent requeue in the read→write gap no-ops the reap. The #1641
+      // rotation stamp is a bulk write scoped to the active statuses.
       updateMany: async ({ where, data }: any) => {
-        const hits = items.filter(
-          (i) =>
-            (where.id === undefined || i.id === where.id) &&
-            (where.generation === undefined || i.generation === where.generation) &&
-            (where.status === undefined || i.status === where.status),
-        );
+        const hits = items.filter((i) => matches(i, where));
         for (const hit of hits) Object.assign(hit, data);
         return { count: hits.length };
       },
@@ -42,7 +98,17 @@ function makeClient(items: any[]): PrFixQueueClient & { items: any[]; history: a
   return client;
 }
 
-const item = (id: string, repo: string, pr: number, status: string) => ({ id, repo, pr, status, lane: "NORMAL", generation: 1 });
+const item = (id: string, repo: string, pr: number, status = "QUEUED"): FakeItem => ({
+  id,
+  repo,
+  pr,
+  status,
+  lane: "NORMAL",
+  generation: 1,
+  prPresenceCheckedAt: null,
+});
+
+const NOW = new Date("2026-11-16T12:00:00.000Z");
 
 describe("deleted upstream PRs (#1641)", () => {
   it("reaps confirmed-deleted rows to STALE, defers present and unknown, probes active rows only once each", async () => {
@@ -57,7 +123,7 @@ describe("deleted upstream PRs (#1641)", () => {
       repo === "org/gone" ? "deleted" : repo === "org/live" ? "present" : "unknown",
     );
 
-    const result = await reconcileDeletedPrFixItems(client, probe as any);
+    const result = await reconcileDeletedPrFixItems(client, probe as any, { now: NOW });
 
     expect(result).toEqual({ checked: 4, markedStale: 2, errored: 0 });
     expect(probe.mock.calls).toEqual([
@@ -79,6 +145,13 @@ describe("deleted upstream PRs (#1641)", () => {
       status: "STALE",
       note: "Upstream PR deleted (404 at the per-PR endpoint, repo reachable) at reconcile time (#1641)",
     });
+    // The rotation stamps every row the pass CONSIDERED, so the head moves on:
+    // the deferred rows carry the stamp, the reaped rows do not (they are
+    // terminal now and no longer part of the queue).
+    expect(client.items[2].prPresenceCheckedAt).toEqual(NOW);
+    expect(client.items[3].prPresenceCheckedAt).toEqual(NOW);
+    expect(client.items[0].prPresenceCheckedAt).toBeNull();
+    expect(client.items[1].prPresenceCheckedAt).toBeNull();
   });
 
   it("reaping to STALE retires the attempt's evidence snapshot (#1249)", async () => {
@@ -86,7 +159,7 @@ describe("deleted upstream PRs (#1641)", () => {
       { ...item("a", "org/gone", 1, "QUEUED"), attemptEvidenceWatermark: 4 },
     ]);
 
-    await reconcileDeletedPrFixItems(client, vi.fn(async (): Promise<PrFixPrPresence> => "deleted"));
+    await reconcileDeletedPrFixItems(client, vi.fn(async (): Promise<PrFixPrPresence> => "deleted"), { now: NOW });
 
     expect(client.items[0].attemptEvidenceWatermark).toBeNull();
   });
@@ -106,7 +179,7 @@ describe("deleted upstream PRs (#1641)", () => {
       return { count: hit ? 1 : 0 };
     };
 
-    const result = await reconcileDeletedPrFixItems(client, vi.fn(async (): Promise<PrFixPrPresence> => "deleted"));
+    const result = await reconcileDeletedPrFixItems(client, vi.fn(async (): Promise<PrFixPrPresence> => "deleted"), { now: NOW });
 
     expect(result.markedStale).toBe(0);
     expect(client.items[0].status).toBe("QUEUED");
@@ -117,85 +190,171 @@ describe("deleted upstream PRs (#1641)", () => {
   it("a probe that throws counts as errored and leaves the row untouched", async () => {
     const client = makeClient([item("a", "org/flaky", 1, "QUEUED")]);
 
-    const result = await reconcileDeletedPrFixItems(client, vi.fn(async () => {
-      throw new Error("boom");
-    }));
+    const result = await reconcileDeletedPrFixItems(
+      client,
+      vi.fn(async () => {
+        throw new Error("boom");
+      }),
+      { now: NOW },
+    );
 
     expect(result).toEqual({ checked: 1, markedStale: 0, errored: 1 });
     expect(client.items[0].status).toBe("QUEUED");
     expect(client.history).toHaveLength(0);
+    // A failed probe still CONSIDERED the row: the rotation stamps it, so the
+    // pass does not restart at the same head forever.
+    expect(client.items[0].prPresenceCheckedAt).toEqual(NOW);
   });
 
-  it("three consecutive unknown/failed probes for ONE repo defer that repo's remaining rows without starving other repos", async () => {
-    const client = makeClient([
-      item("a", "org/flaky", 1, "QUEUED"), // unknown → streak 1
-      item("b", "org/flaky", 2, "QUEUED"), // throws  → streak 2 (shared with unknowns)
-      item("c", "org/flaky", 3, "QUEUED"), // unknown → streak 3: repo defers
-      item("d", "org/flaky", 4, "QUEUED"), // never probed this pass
-      item("e", "org/gone", 5, "QUEUED"),  // other repo unaffected: reaped
-    ]);
-    const probe = vi.fn(async (repo: string, pr: number): Promise<PrFixPrPresence> => {
-      if (repo === "org/gone") return "deleted";
-      if (pr === 2) throw new Error("network");
-      return "unknown";
-    });
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+  it("bounds the pass: it probes at most maxProbes rows and leaves the rows it did not reach unstamped", async () => {
+    const client = makeClient(Array.from({ length: 10 }, (_, i) => item(`i${i}`, "org/live", i + 1)));
+    const probe = vi.fn(async (): Promise<PrFixPrPresence> => "present");
 
-    const result = await reconcileDeletedPrFixItems(client, probe);
+    const result = await reconcileDeletedPrFixItems(client, probe, { maxProbes: 3, pageSize: 5, now: NOW });
 
-    expect(result).toEqual({ checked: 4, markedStale: 1, errored: 1 });
-    expect(client.items[3].status).toBe("QUEUED");
-    expect(client.items[4].status).toBe("STALE");
-    expect(client.history).toHaveLength(1);
-    expect(warnSpy.mock.calls.some((call) => String(call[0]).includes("org/flaky"))).toBe(true);
-    warnSpy.mockRestore();
+    expect(result).toEqual({ checked: 3, markedStale: 0, errored: 0 });
+    expect(probe).toHaveBeenCalledTimes(3);
+    // The rows the probe bound cut off stay unstamped, so they LEAD the next
+    // pass — the rotation never restarts at the same head.
+    expect(client.items.slice(0, 3).every((i) => i.prPresenceCheckedAt !== null)).toBe(true);
+    expect(client.items.slice(3).every((i) => i.prPresenceCheckedAt === null)).toBe(true);
   });
 
-  it("a present or deleted answer resets the repo streak — confirmed deletions behind unknowns still reap", async () => {
+  it("advances across passes: a deleted PR behind healthy rows is reached and reaped", async () => {
     const client = makeClient([
-      item("a", "org/mix", 1, "QUEUED"), // unknown → 1
-      item("b", "org/mix", 2, "QUEUED"), // unknown → 2
-      item("c", "org/mix", 3, "QUEUED"), // deleted → reset (reaped)
-      item("d", "org/mix", 4, "QUEUED"), // unknown → 1
-      item("e", "org/mix", 5, "QUEUED"), // present → reset
-      item("f", "org/mix", 6, "QUEUED"), // unknown → 1
-      item("g", "org/mix", 7, "QUEUED"), // unknown → 2 — breaker fires only
-      item("h", "org/mix", 8, "QUEUED"), //   without the present-reset
+      ...Array.from({ length: 5 }, (_, i) => item(`h${i}`, "org/live", i + 1)),
+      item("z-gone", "org/live", 6),
     ]);
     const probe = vi.fn(async (_repo: string, pr: number): Promise<PrFixPrPresence> =>
-      pr === 3 ? "deleted" : pr === 5 ? "present" : "unknown",
+      pr === 6 ? "deleted" : "present",
     );
 
-    const result = await reconcileDeletedPrFixItems(client, probe);
+    // Pass 1 and 2 only reach the healthy rows.
+    const first = await reconcileDeletedPrFixItems(client, probe, { maxProbes: 2, pageSize: 2, now: NOW });
+    const second = await reconcileDeletedPrFixItems(client, probe, { maxProbes: 2, pageSize: 2, now: NOW });
+    expect(first.checked).toBe(2);
+    expect(second.checked).toBe(2);
+    expect(client.items[5].status).toBe("QUEUED");
 
-    // Both resets held: streak never reached 3, so every row got probed.
-    // Dropping either reset defers h (checked 7) — the pins are independent.
-    expect(result).toEqual({ checked: 8, markedStale: 1, errored: 0 });
-    expect(client.items[2].status).toBe("STALE");
-    expect(client.items[7].status).toBe("QUEUED");
+    // Pass 3 reaches the deleted row.
+    const third = await reconcileDeletedPrFixItems(client, probe, { maxProbes: 2, pageSize: 2, now: NOW });
+    expect(third).toEqual({ checked: 2, markedStale: 1, errored: 0 });
+    expect(client.items[5].status).toBe("STALE");
+    expect(probe.mock.calls.map((call) => call[1])).toEqual([1, 2, 3, 4, 5, 6]);
   });
 
-  it("a reap write failure counts as errored without feeding the probe breaker", async () => {
+  it("three permanently-unknown rows no longer hide a confirmed deletion behind them in the SAME repo", async () => {
     const client = makeClient([
-      item("a", "org/gone", 1, "QUEUED"),
-      item("b", "org/gone", 2, "QUEUED"),
-      item("c", "org/gone", 3, "QUEUED"),
-      item("d", "org/gone", 4, "QUEUED"),
+      item("a", "org/flaky", 1),
+      item("b", "org/flaky", 2),
+      item("c", "org/flaky", 3),
+      item("d", "org/flaky", 4),
+    ]);
+    const probe = vi.fn(async (_repo: string, pr: number): Promise<PrFixPrPresence> =>
+      pr === 4 ? "deleted" : "unknown",
+    );
+
+    // Pass 1: the three unknown rows. They are CONSIDERED, so they are
+    // stamped and leave the head of the order.
+    const first = await reconcileDeletedPrFixItems(client, probe, { maxProbes: 3, pageSize: 3, now: NOW });
+    expect(first).toEqual({ checked: 3, markedStale: 0, errored: 0 });
+    expect(client.items[3].status).toBe("QUEUED");
+    expect(client.items.slice(0, 3).every((i) => i.prPresenceCheckedAt !== null)).toBe(true);
+
+    // Pass 2: the confirmed deletion behind them is reached.
+    const second = await reconcileDeletedPrFixItems(client, probe, { maxProbes: 3, pageSize: 3, now: NOW });
+    expect(second).toEqual({ checked: 1, markedStale: 1, errored: 0 });
+    expect(client.items[3].status).toBe("STALE");
+    expect(probe.mock.calls.map((call) => call[1])).toEqual([1, 2, 3, 4]);
+  });
+
+  it("the rotation is not per-repo: another repo's row is not blocked by one repo's unknowns", async () => {
+    const client = makeClient([
+      item("a", "org/flaky", 1),
+      item("b", "org/flaky", 2),
+      item("c", "org/flaky", 3),
+      item("d", "org/gone", 4),
+    ]);
+    const probe = vi.fn(async (repo: string): Promise<PrFixPrPresence> =>
+      repo === "org/gone" ? "deleted" : "unknown",
+    );
+
+    const result = await reconcileDeletedPrFixItems(client, probe, { maxProbes: 10, pageSize: 10, now: NOW });
+
+    expect(result).toEqual({ checked: 4, markedStale: 1, errored: 0 });
+    expect(client.items[3].status).toBe("STALE");
+  });
+
+  it("three permanently-unknown rows do not skip the deletion behind them in the SAME repo inside one pass", async () => {
+    // The pre-review pass stopped a repo after three unknown/failed probes,
+    // so the fourth row of that repo was never probed. There is no per-repo
+    // breaker any more: the four rows of one repo are all probed, and the
+    // confirmed deletion behind the three unknowns is reaped in that pass.
+    const client = makeClient([
+      item("a", "org/flaky", 1),
+      item("b", "org/flaky", 2),
+      item("c", "org/flaky", 3),
+      item("d", "org/flaky", 4),
+    ]);
+    const probe = vi.fn(async (_repo: string, pr: number): Promise<PrFixPrPresence> =>
+      pr === 4 ? "deleted" : "unknown",
+    );
+
+    const result = await reconcileDeletedPrFixItems(client, probe, { maxProbes: 10, pageSize: 10, now: NOW });
+
+    expect(result).toEqual({ checked: 4, markedStale: 1, errored: 0 });
+    expect(client.items[3].status).toBe("STALE");
+    expect(probe.mock.calls.map((call) => call[1])).toEqual([1, 2, 3, 4]);
+  });
+
+  it("does not re-probe a row before the re-verify bound elapses, and re-probes it after", async () => {
+    const client = makeClient([item("a", "org/live", 1)]);
+    const probe = vi.fn(async (): Promise<PrFixPrPresence> => "present");
+
+    const first = await reconcileDeletedPrFixItems(client, probe, { now: NOW });
+    expect(first.checked).toBe(1);
+
+    // Same instant: the row is inside its re-verify window, so the pass
+    // spends no forge call on it.
+    const second = await reconcileDeletedPrFixItems(client, probe, { now: NOW });
+    expect(second.checked).toBe(0);
+    expect(probe).toHaveBeenCalledTimes(1);
+
+    // Past the bound it is due again.
+    const third = await reconcileDeletedPrFixItems(client, probe, { now: new Date(NOW.getTime() + 3_600_000) });
+    expect(third.checked).toBe(1);
+    expect(probe).toHaveBeenCalledTimes(2);
+  });
+
+  it("a reap write failure counts as errored and never fails the pass", async () => {
+    const client = makeClient([
+      item("a", "org/gone", 1),
+      item("b", "org/gone", 2),
+      item("c", "org/gone", 3),
+      item("d", "org/gone", 4),
     ]);
     client.prFixQueueItem.updateMany = async () => {
       throw new Error("db down");
     };
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
-    const result = await reconcileDeletedPrFixItems(client, vi.fn(async (): Promise<PrFixPrPresence> => "deleted"));
+    const result = await reconcileDeletedPrFixItems(client, vi.fn(async (): Promise<PrFixPrPresence> => "deleted"), {
+      now: NOW,
+    });
 
-    // All four rows keep being probed despite three write failures: the
-    // forge answered every probe, so nothing feeds the unknown breaker.
-    expect(result).toEqual({ checked: 4, markedStale: 0, errored: 4 });
+    // All four rows keep being probed despite the write failures: the forge
+    // answered every probe, so nothing is skipped because of a local error.
+    // The failed rotation stamp counts too — a rotation that cannot advance
+    // must not pass as a clean pass.
+    expect(result).toEqual({ checked: 4, markedStale: 0, errored: 5 });
+    expect(client.items.every((i) => i.status === "QUEUED")).toBe(true);
+    warnSpy.mockRestore();
   });
 });
 
 describe("probePrFixPrPresence (#1641)", () => {
   const fetchMock = vi.fn();
+  let warnSpy: ReturnType<typeof vi.spyOn>;
 
   beforeAll(() => {
     vi.stubGlobal("fetch", fetchMock);
@@ -205,10 +364,12 @@ describe("probePrFixPrPresence (#1641)", () => {
     __resetGitHubAppState();
     process.env.GITHUB_TOKEN = "test-token-for-presence-tests";
     fetchMock.mockReset();
+    warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
   });
 
   afterEach(() => {
     delete process.env.GITHUB_TOKEN;
+    warnSpy.mockRestore();
   });
 
   afterAll(() => {
@@ -252,6 +413,9 @@ describe("probePrFixPrPresence (#1641)", () => {
     );
 
     expect(await probePrFixPrPresence("org/repo", 7)).toBe("unknown");
+    // The unreadable repo is logged, not swallowed: an outage must be
+    // distinguishable from a healthy deferral.
+    expect(warnSpy).toHaveBeenCalled();
   });
 
   it("a per-PR 403 (rate limit / secondary limit) is 'unknown', not a deletion", async () => {
@@ -269,5 +433,6 @@ describe("probePrFixPrPresence (#1641)", () => {
     });
 
     expect(await probePrFixPrPresence("org/repo", 7)).toBe("unknown");
+    expect(warnSpy).toHaveBeenCalled();
   });
 });

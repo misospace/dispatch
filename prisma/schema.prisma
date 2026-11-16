@@ -411,6 +411,17 @@ model PrFixQueueItem {
   // cannot starve a later wait out of discovery. Audit only — never a
   // freshness or satisfaction predicate; NULL = never considered.
   triggerEvaluatedAt       DateTime?
+  // Rotation stamp for the bounded deleted-PR reap (#1641): the last time
+  // that pass CONSIDERED this row (probed it — present, unknown or failed).
+  // It is a fairness marker, NOT a proof: an unknown probe is stamped too, so
+  // a wall of permanently-unknown rows leaves the head of the order instead of
+  // pinning it and hiding a confirmed deletion behind it. The pass orders
+  // least-recently-considered first with an explicit `nulls: "first"`, and
+  // stamps every row it reached, so repeated passes ADVANCE through the
+  // backlog and a later row is never starved by an earlier one. Audit only —
+  // never a freshness or satisfaction predicate; NULL = never considered, so
+  // the row is due immediately.
+  prPresenceCheckedAt      DateTime?
   author                   String?
   // #1569: ORIGINAL CLAIMANT of the PR-fix work — the agent/owner identity
   // that owned the work when the row was ingested. Distinct boundaries:
@@ -483,6 +494,11 @@ model PrFixQueueItem {
   // FIRST is part of the index key order because it is part of the ORDER BY;
   // the trailing `id` matches the deterministic tiebreak.
   @@index([status, triggerEvaluatedAt(sort: Asc, nulls: First), id])
+  // Fair-eligibility read of the deleted-PR reap (#1641): the pass reads the
+  // active rows least-recently-considered first, so NULLS FIRST is part of the
+  // index key order because it is part of the ORDER BY; the trailing `id`
+  // matches the deterministic tiebreak.
+  @@index([status, prPresenceCheckedAt(sort: Asc, nulls: First), id])
   // #1183: the attempt-chain read fetches the queue items for one work
   // item's exact (repo, issue) coordinates.
   @@index([repo, issue])
