@@ -280,10 +280,26 @@ jobs:
       # and only a real PostgreSQL proves the NULL placement — a mock
       # re-implements the sort in JavaScript and cannot see it (#1641
       # review).
+      #
+      # The reap test runs in its OWN vitest invocation, FIRST, against the
+      # freshly migrated database. The pass reads every ACTIVE PrFixQueueItem
+      # row in the table (that is the point of it — it must find a deleted
+      # row in any repo), so inside the concurrent block below it would
+      # probe, stamp, and count other files' rows: the queue it asserts on is
+      # not its own, and its bulk rotation stamp mutates rows it does not
+      # own. A healthy queue of only its own rows is the pass's declared
+      # precondition, so it gets a queue with nothing else in it. Every
+      # other pass here filters on a column foreign rows do not carry
+      # (externalWaitUntil, lane, specific repo+pr), which is why they
+      # coexist and this one cannot (#1641 review follow-up).
+      - name: Deleted-PR reap rotation (whole-table scan, run alone)
+        env:
+          RUN_DB_INTEGRATION: "1"
+        run: npx vitest run src/lib/pr-fix-queue-deleted.integration.test.ts
       - name: Concurrency and idempotency against a real PostgreSQL
         env:
           RUN_DB_INTEGRATION: "1"
-        run: npx vitest run src/lib/sync-lock.integration.test.ts "src/app/api/agents/[agentName]/tasks/report/route.integration.test.ts" src/lib/groomer/apply.integration.test.ts src/lib/groomer/blocked-reconciliation.integration.test.ts src/lib/groomer/stale-replay.integration.test.ts src/lib/pr-fix-external-wait.integration.test.ts src/lib/pr-fix-queue-deleted.integration.test.ts src/lib/issue-mutation-guard.integration.test.ts src/lib/agent-work.integration.test.ts src/lib/pr-fix-rebase-type.integration.test.ts src/lib/lease-expiry-recovery.integration.test.ts src/lib/attempt-requeue-fence.integration.test.ts src/lib/pr-fix-handout-lane-fence.integration.test.ts src/lib/issue-sync-delete.integration.test.ts
+        run: npx vitest run src/lib/sync-lock.integration.test.ts "src/app/api/agents/[agentName]/tasks/report/route.integration.test.ts" src/lib/groomer/apply.integration.test.ts src/lib/groomer/blocked-reconciliation.integration.test.ts src/lib/groomer/stale-replay.integration.test.ts src/lib/pr-fix-external-wait.integration.test.ts src/lib/issue-mutation-guard.integration.test.ts src/lib/agent-work.integration.test.ts src/lib/pr-fix-rebase-type.integration.test.ts src/lib/lease-expiry-recovery.integration.test.ts src/lib/attempt-requeue-fence.integration.test.ts src/lib/pr-fix-handout-lane-fence.integration.test.ts src/lib/issue-sync-delete.integration.test.ts
 
   coverage:
     name: Coverage

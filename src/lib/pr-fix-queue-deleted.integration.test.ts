@@ -14,6 +14,14 @@
  * Opt-in via RUN_DB_INTEGRATION=1 (same gating as the other integration
  * tests). The database-integration CI job applies the migrations and opts in
  * explicitly.
+ *
+ * The pass under test reads EVERY active PrFixQueueItem row — it must find a
+ * deleted row whatever repo it sits in — so this file asserts on a queue that
+ * contains only its own rows. That precondition is why the CI job runs this
+ * file in its own vitest invocation, first, before the concurrent block
+ * creates any queue rows: inside that block, foreign rows would consume the
+ * probe budget, land in `checked`, and take the bulk rotation stamp. Keep it
+ * a solo invocation when editing the job.
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from "vitest";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
@@ -39,6 +47,10 @@ suite("deleted-PR reap rotation against a real PostgreSQL", () => {
   });
 
   afterAll(async () => {
+    // Leave the shared database as found: the reap test's rows are inert to
+    // the other passes in the job, but only because nothing else scans the
+    // queue by bare active status. Do not rely on that when adding passes.
+    await prisma.prFixQueueItem.deleteMany({ where: { repo: REPO } });
     await prisma.$disconnect();
   });
 
@@ -85,6 +97,16 @@ suite("deleted-PR reap rotation against a real PostgreSQL", () => {
       where: { repo_pr: { repo: REPO, pr: 2000 } },
     });
     expect(afterFirst?.status).toBe("QUEUED");
+    expect(afterFirst?.prPresenceCheckedAt).toBeNull();
+    // The rotation stamp is real state, not just a count: the LAST row the
+    // probe bound consumed is stamped; the first row it cut off is not, and
+    // therefore leads the next pass.
+    const [lastProbed, firstCut] = await Promise.all([
+      prisma.prFixQueueItem.findUnique({ where: { id: "a-deleted-pr-rot-019" } }),
+      prisma.prFixQueueItem.findUnique({ where: { id: "a-deleted-pr-rot-020" } }),
+    ]);
+    expect(lastProbed?.prPresenceCheckedAt).toBeInstanceOf(Date);
+    expect(firstCut?.prPresenceCheckedAt).toBeNull();
 
     // A later pass rotates past the stamped head and reaches it.
     const second = await reconcileDeletedPrFixItems(client, probe, { maxProbes: 20, pageSize: 100 });
@@ -93,6 +115,9 @@ suite("deleted-PR reap rotation against a real PostgreSQL", () => {
       where: { repo_pr: { repo: REPO, pr: 2000 } },
     });
     expect(target?.status).toBe("STALE");
+    // The stamp is scoped to ACTIVE statuses, so the row this pass reaped is
+    // considered but NOT stamped — a terminal row carries no rotation marker.
+    expect(target?.prPresenceCheckedAt).toBeNull();
     // The unknown rows stayed in the queue: an unknown fact never reaps.
     const unknownRows = await prisma.prFixQueueItem.findMany({
       where: { repo: REPO, pr: { gte: 1000, lt: 2000 } },
