@@ -3,6 +3,7 @@ import { errorResponse } from "@/lib/api-errors";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { processPrFollowupEvents, extractLinkedIssue, PrFollowupEvent } from "@/lib/pr-followup-ingestion";
 import { authenticateWebhookDelivery } from "@/lib/webhook-signature";
+import { handleDispatchFixCommand, parseDispatchFixCommand } from "@/lib/pr-fix-dispatch-command";
 
 /**
  * GitHub Webhook Handler for PR Follow-up Events
@@ -231,6 +232,46 @@ export async function POST(request: Request) {
     }
 
     const body = jsonPayload as Record<string, unknown>;
+
+    // /dispatch-fix PR comment command (#1622), gated BEFORE any ingestion
+    // work: an explicit, per-PR operator handoff of a human-authored PR
+    // into the pr-fix queue. The bot-author gate on ingestion must stay
+    // absolute — a human PR only ever becomes queue work through this
+    // command, so a command comment is intercepted here and never reaches
+    // processPrFollowupEvents (where it would be dropped as a human
+    // comment, or worse, ingested as ordinary comment feedback).
+    if (githubEvent === "issue_comment") {
+      const issueComment = body as Record<string, any>;
+      const pr = issueComment.issue?.pull_request;
+      const commentBody = issueComment.comment?.body;
+      // `created` only (review INFO-7): an edited or deleted command comment
+      // must not re-run the handoff.
+      if (issueComment.action === "created" && pr && typeof commentBody === "string" && parseDispatchFixCommand(commentBody)) {
+        const repoFullName = issueComment.repository?.full_name;
+        const prNumber = issueComment.issue?.number;
+        const commenter = issueComment.comment?.user?.login;
+        if (typeof repoFullName !== "string" || !repoFullName || typeof prNumber !== "number") {
+          return errorResponse("Missing repository.full_name or issue.number in payload", 400);
+        }
+        if (typeof commenter !== "string" || !commenter) {
+          return errorResponse("Missing comment.user.login in payload", 400);
+        }
+        const outcome = await handleDispatchFixCommand({
+          repoFullName,
+          prNumber,
+          commenter,
+          commentBody,
+        });
+        // The outcome detail can carry internal error text (review m12);
+        // only the coarse outcome is echoed back — the PR thread and the
+        // audit log are the operator-visible surfaces.
+        return NextResponse.json({
+          message: `/dispatch-fix command ${outcome.outcome}`,
+          outcome: outcome.outcome,
+        });
+      }
+    }
+
     const events = parseWebhookEvent(githubEvent, body);
 
     if (events.length === 0) {

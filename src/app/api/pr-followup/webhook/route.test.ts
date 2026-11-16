@@ -10,6 +10,7 @@ const { mocks } = vi.hoisted(() => ({
   mocks: {
     prFixQueueClient: vi.fn(),
     processPrFollowupEvents: vi.fn().mockResolvedValue({ enqueued: 1, skipped: 0 }),
+    handleDispatchFixCommand: vi.fn().mockResolvedValue({ handled: true, outcome: "enqueued", detail: "test" }),
   },
 }));
 
@@ -21,6 +22,14 @@ vi.mock("@/lib/prisma", () => ({
 vi.mock("@/lib/pr-followup-ingestion", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/pr-followup-ingestion")>()),
   processPrFollowupEvents: mocks.processPrFollowupEvents,
+}));
+
+// The command handler performs forge reads and Prisma writes the route-level
+// mock graph cannot satisfy; route tests assert the WIRING (interception
+// before ingestion), not the handler logic, which owns its own test file.
+vi.mock("@/lib/pr-fix-dispatch-command", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/pr-fix-dispatch-command")>()),
+  handleDispatchFixCommand: mocks.handleDispatchFixCommand,
 }));
 
 import { POST } from "./route";
@@ -1020,5 +1029,69 @@ describe("POST /api/pr-followup/webhook — rate limit", () => {
 
     const res = await signedRequest("pull_request_review", { action: "submitted" });
     expect(res.status).toBe(200);
+  });
+});
+
+describe("POST /api/pr-followup/webhook — /dispatch-fix command gate (#1622)", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    delete process.env.WEBHOOK_GATEWAY_MODE;
+    process.env.WEBHOOK_SECRET = "test-secret";
+    resetAuthCaches();
+    resetRateLimits();
+    vi.clearAllMocks();
+    mocks.prFixQueueClient.mockReturnValue({});
+    mocks.processPrFollowupEvents.mockResolvedValue({ enqueued: 1, skipped: 0 });
+    mocks.handleDispatchFixCommand.mockResolvedValue({ handled: true, outcome: "enqueued", detail: "test" });
+  });
+
+  const prComment = (body: string) => ({
+    action: "created",
+    issue: {
+      number: 42,
+      title: "Fix bug",
+      user: { login: "pr-author" },
+      pull_request: { html_url: "https://github.com/org/repo/pull/42" },
+    },
+    comment: { id: 7, user: { login: "pr-author" }, body, created_at: "2026-11-13T00:00:00Z" },
+    repository: {
+      id: 1296269,
+      name: "repo",
+      full_name: "org/repo",
+      owner: { login: "org" },
+    },
+    sender: { login: "pr-author", type: "User" },
+  });
+
+  it("intercepts a command comment before ingestion and returns the command outcome", async () => {
+    const res = await signedRequest("issue_comment", prComment("/dispatch-fix"));
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json.outcome).toBe("enqueued");
+    expect(mocks.handleDispatchFixCommand).toHaveBeenCalledTimes(1);
+    expect(mocks.handleDispatchFixCommand.mock.calls[0][0]).toMatchObject({
+      repoFullName: "org/repo",
+      prNumber: 42,
+      commenter: "pr-author",
+      commentBody: "/dispatch-fix",
+    });
+    expect(mocks.processPrFollowupEvents).not.toHaveBeenCalled();
+  });
+
+  it("lets non-command PR comments flow into ordinary ingestion", async () => {
+    const res = await signedRequest("issue_comment", prComment("Looks good to me"));
+    expect(res.status).toBe(200);
+    expect(mocks.handleDispatchFixCommand).not.toHaveBeenCalled();
+    expect(mocks.processPrFollowupEvents).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not intercept commands on plain issue comments", async () => {
+    const payload = prComment("/dispatch-fix");
+    delete (payload.issue as Record<string, unknown>).pull_request;
+    const res = await signedRequest("issue_comment", payload);
+    expect(res.status).toBe(200);
+    expect(mocks.handleDispatchFixCommand).not.toHaveBeenCalled();
+    // Non-PR issue comments produce no ingestion event today either.
+    expect(mocks.processPrFollowupEvents).not.toHaveBeenCalled();
   });
 });

@@ -198,15 +198,40 @@ export async function fetchCollaboratorPermission(
     }
 
     const data: unknown = await response.json();
-    const permission =
-      data && typeof data === "object" && "permission" in data
-        ? (data as { permission?: unknown }).permission
+    const payload = (data && typeof data === "object" ? data : {}) as {
+      permission?: unknown;
+      role_name?: unknown;
+      user?: unknown;
+    };
+    // The legacy `permission` field reports the maintain role as "write" in
+    // common API responses; `role_name` carries the assigned role, and the
+    // `user.permissions` booleans are authoritative even under custom role
+    // names (review round 4, M2). Prefer the booleans, then a recognized
+    // role_name, then the legacy permission field. Everything unrecognized
+    // is an error — fail closed.
+    const userPermissions = (
+      payload.user && typeof payload.user === "object" && "permissions" in payload.user
+        ? (payload.user as { permissions?: unknown }).permissions
+        : undefined
+    ) as { admin?: unknown; maintain?: unknown } | undefined;
+    const roleName =
+      typeof payload.role_name === "string" &&
+      COLLABORATOR_PERMISSIONS.has(payload.role_name as CollaboratorPermission)
+        ? (payload.role_name as CollaboratorPermission)
         : undefined;
-    if (
-      typeof permission === "string" &&
-      COLLABORATOR_PERMISSIONS.has(permission as CollaboratorPermission)
-    ) {
-      return { status: "ok", permission: permission as CollaboratorPermission };
+    const permission =
+      typeof payload.permission === "string" &&
+      COLLABORATOR_PERMISSIONS.has(payload.permission as CollaboratorPermission)
+        ? (payload.permission as CollaboratorPermission)
+        : undefined;
+    const resolved: CollaboratorPermission | undefined =
+      userPermissions?.admin === true
+        ? "admin"
+        : userPermissions?.maintain === true
+          ? "maintain"
+          : (roleName ?? permission);
+    if (resolved) {
+      return { status: "ok", permission: resolved };
     }
     return { status: "error", message: "GitHub API returned an invalid collaborator permission" };
   } catch (error) {
@@ -288,6 +313,29 @@ export async function updateIssueComment(
   }
 }
 
+/**
+ * Read an issue's (or PR's — the issues endpoint serves both) current
+ * labels from GitHub. Null means GitHub state was unavailable, so callers
+ * must treat every failure as untrusted rather than "no labels".
+ */
+export async function fetchIssueLabels(
+  repoFullName: string,
+  issueNumber: number,
+): Promise<string[] | null> {
+  try {
+    const [owner, repo] = repoFullName.split("/");
+    const url = `${GITHUB_API}/repos/${owner}/${repo}/issues/${issueNumber}/labels?per_page=100`;
+    // Paginate to the end: a first-100 read could miss the single agent label
+    // on a heavily labeled issue and break the enforced invariant (review
+    // round 4, M3). A non-OK page throws into the catch below → null.
+    const data = await fetchPaginated<{ name?: string }>(url);
+    return data.flatMap((label: { name?: string }) => typeof label.name === "string" ? [label.name] : []);
+  } catch (error) {
+    console.warn(`[github-issues] labels unavailable for ${repoFullName}#${issueNumber}:`, error instanceof Error ? error.message : error);
+    return null;
+  }
+}
+
 export async function addIssueLabel(
   repoFullName: string,
   issueNumber: number,
@@ -349,6 +397,31 @@ export async function removeIssueLabel(
   if (!response.ok && response.status !== 404) {
     const text = await response.text();
     throw new Error(`GitHub API error: ${response.status} ${text}`);
+  }
+}
+
+/**
+ * Whether a repository-level label exists. `null` means the check could not
+ * be read (network/API failure) — callers must treat that as unavailable,
+ * not as "missing": a false refusal and a false confirmation are both wrong.
+ */
+export async function repoLabelExists(
+  repoFullName: string,
+  label: string
+): Promise<boolean | null> {
+  try {
+    const [owner, repo] = repoFullName.split("/");
+    const url = `${GITHUB_API}/repos/${owner}/${repo}/labels/${encodeURIComponent(label)}`;
+    const response = await fetchWithRetry(url, { headers: await getHeadersAsync() });
+    if (response.status === 404) return false;
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`GitHub API error: ${response.status} ${text}`);
+    }
+    return true;
+  } catch (error) {
+    console.warn(`[github-issues] label check unavailable for ${repoFullName} (${label}):`, error instanceof Error ? error.message : error);
+    return null;
   }
 }
 

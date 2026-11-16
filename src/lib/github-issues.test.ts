@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { GitHubIssue } from "@/types";
-import { fetchIssue, fetchIssueNativeBlockers, fetchIssues } from "./github-issues";
+import { fetchCollaboratorPermission, fetchIssue, fetchIssueLabels, fetchIssueNativeBlockers, fetchIssues, repoLabelExists } from "./github-issues";
 
 const fetchWithRetry = vi.fn();
 const fetchPaginated = vi.fn();
@@ -246,5 +246,139 @@ describe("fetchIssue enrichment opt-in", () => {
 
     expect(issue.number).toBe(4);
     expect((issue as any).nativeBlockedBy).toBeUndefined();
+  });
+});
+
+describe("fetchIssueLabels", () => {
+  it("paginates to the end so a label past the first 100 is still seen", async () => {
+    // Regression (review round 4, M3): a first-100 read could miss the single
+    // agent label on a heavily labeled issue and break the enforced
+    // single-agent-label invariant.
+    fetchPaginated.mockResolvedValue(
+      Array.from({ length: 101 }, (_, i) => ({ name: i === 100 ? "agent/foo" : `filler/${i}` })),
+    );
+
+    const labels = await fetchIssueLabels("acme/app", 9);
+
+    expect(fetchPaginated).toHaveBeenCalledWith(
+      "https://api.github.com/repos/acme/app/issues/9/labels?per_page=100",
+    );
+    expect(labels).toHaveLength(101);
+    expect(labels?.at(-1)).toBe("agent/foo");
+  });
+
+  it("returns null when a page fetch throws", async () => {
+    fetchPaginated.mockRejectedValue(new Error("GitHub API error: 502"));
+
+    expect(await fetchIssueLabels("acme/app", 9)).toBeNull();
+  });
+
+  it("drops entries with a non-string name", async () => {
+    fetchPaginated.mockResolvedValue([{ name: "status/ready" }, {}, { name: 7 }]);
+
+    expect(await fetchIssueLabels("acme/app", 9)).toEqual(["status/ready"]);
+  });
+});
+
+describe("fetchCollaboratorPermission", () => {
+  it("prefers role_name when the permission field reports maintainers as write", async () => {
+    // Regression (review round 4, M2): GitHub's collaborator-permission API
+    // reports the maintain role through role_name while `permission` says
+    // "write", so requiring permission === "maintain" rejected real maintainers.
+    fetchWithRetry.mockResolvedValue(okJson({ permission: "write", role_name: "maintain" }));
+
+    expect(await fetchCollaboratorPermission("acme/app", "maintainer")).toEqual({
+      status: "ok",
+      permission: "maintain",
+    });
+  });
+
+  it("falls back to the permission field when role_name is absent", async () => {
+    fetchWithRetry.mockResolvedValue(okJson({ permission: "write" }));
+
+    expect(await fetchCollaboratorPermission("acme/app", "writer")).toEqual({
+      status: "ok",
+      permission: "write",
+    });
+  });
+
+  it("falls back to the permission field for a custom role_name (org with custom roles)", async () => {
+    fetchWithRetry.mockResolvedValue(okJson({ permission: "admin", role_name: "security_manager" }));
+
+    expect(await fetchCollaboratorPermission("acme/app", "admin")).toEqual({
+      status: "ok",
+      permission: "admin",
+    });
+  });
+
+  it("recognizes a custom-role maintainer through the user.permissions booleans", async () => {
+    fetchWithRetry.mockResolvedValue(
+      okJson({
+        permission: "write",
+        role_name: "security_manager",
+        user: { login: "maintainer", permissions: { admin: false, maintain: true } },
+      }),
+    );
+
+    expect(await fetchCollaboratorPermission("acme/app", "maintainer")).toEqual({
+      status: "ok",
+      permission: "maintain",
+    });
+  });
+
+  it("prefers user.permissions.admin over a lower role_name", async () => {
+    fetchWithRetry.mockResolvedValue(
+      okJson({
+        permission: "write",
+        role_name: "maintain",
+        user: { login: "owner", permissions: { admin: true, maintain: true } },
+      }),
+    );
+
+    expect(await fetchCollaboratorPermission("acme/app", "owner")).toEqual({
+      status: "ok",
+      permission: "admin",
+    });
+  });
+
+  it("returns an error when neither field carries a recognized permission", async () => {
+    fetchWithRetry.mockResolvedValue(okJson({ permission: "banana", role_name: 42 }));
+
+    const result = await fetchCollaboratorPermission("acme/app", "odd");
+    expect(result.status).toBe("error");
+  });
+
+  it("returns an error for an unrecognized custom role_name with an unparseable permission", async () => {
+    fetchWithRetry.mockResolvedValue(
+      okJson({ role_name: "security_manager", user: { permissions: { admin: false, maintain: false } } }),
+    );
+
+    const result = await fetchCollaboratorPermission("acme/app", "odd");
+    expect(result.status).toBe("error");
+  });
+});
+
+describe("repoLabelExists", () => {
+  it("returns true for an existing label (200)", async () => {
+    fetchWithRetry.mockResolvedValue(okJson({ name: "agent/courier-hyper" }));
+    await expect(repoLabelExists("acme/app", "agent/courier-hyper")).resolves.toBe(true);
+    expect(fetchWithRetry.mock.calls[0][0]).toBe(
+      "https://api.github.com/repos/acme/app/labels/agent%2Fcourier-hyper",
+    );
+  });
+
+  it("returns false for a missing label (404) — not an error", async () => {
+    fetchWithRetry.mockResolvedValue({ ok: false, status: 404, text: async () => "Not Found" });
+    await expect(repoLabelExists("acme/app", "agent/courier-missing")).resolves.toBe(false);
+  });
+
+  it("returns null (unavailable) on an API error — never false", async () => {
+    fetchWithRetry.mockResolvedValue({ ok: false, status: 403, text: async () => "Forbidden" });
+    await expect(repoLabelExists("acme/app", "agent/courier-hyper")).resolves.toBeNull();
+  });
+
+  it("returns null on a network failure", async () => {
+    fetchWithRetry.mockRejectedValue(new Error("socket hang up"));
+    await expect(repoLabelExists("acme/app", "agent/courier-hyper")).resolves.toBeNull();
   });
 });

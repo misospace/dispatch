@@ -11,6 +11,14 @@ import { normalizePrFixOutcome, type PrFixDecisionContext, type PrFixOutcome } f
 export const NEEDS_HUMAN_LABEL = "needs-human";
 export const NEEDS_HUMAN_COMMENT_MARKER = "<!-- dispatch-pr-fix-blocked -->";
 export const PARKED_COMMENT_MARKER = "<!-- dispatch-pr-fix-parked -->";
+/**
+ * Hidden marker on every `/dispatch-fix` command reply (#1622 review, minor):
+ * registers the bot's own confirmation/refusal comments as informational so
+ * the ingestion path never ingests them as ordinary comment feedback — on a
+ * bot-authored PR the reply is attributed to the (bot) PR author and would
+ * otherwise pass the bot-author gate as feedback against the same queue row.
+ */
+export const DISPATCH_FIX_REPLY_MARKER = "<!-- dispatch-fix-reply -->";
 
 export interface PrFixSurfaceContext {
   /**
