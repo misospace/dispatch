@@ -317,6 +317,18 @@ export interface PrHealthSignals {
   mergeStateStatus: string | null;
 }
 
+/**
+ * The PR's aggregate review decision, mirroring GitHub's own rule ("dismissed
+ * reviews are ignored; remaining requests still count"): a DISMISSED review is
+ * skipped entirely — it is neither a decision of its own nor a supersession
+ * of that reviewer's other reviews — and each reviewer's newest remaining
+ * review decides their state.
+ *
+ * The /dispatch-fix command's `deriveBlockingReview` follows the same rule
+ * (#1636): the health signals and the command must not disagree about
+ * dismissal semantics — a dismissed review is ignored by both, so a standing
+ * CHANGES_REQUESTED exists for the same reviewers in both places.
+ */
 function deriveReviewDecision(
   reviews: Array<{ user?: { login?: string } | null; state?: string; submitted_at?: string }>,
 ): string | null {

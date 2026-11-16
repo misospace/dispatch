@@ -116,13 +116,38 @@ export function parseDispatchFixCommand(
   return { ok: true, lane };
 }
 
-/** The aggregate review decision over a PR's reviews, in the shape of
- * `deriveReviewDecision` in github-prs.ts but with one deliberate divergence
- * (review round 5, M1): DISMISSED participates in the per-user supersession
- * here — a reviewer's newest APPROVED/CHANGES_REQUESTED/DISMISSED review
- * supersedes their earlier ones, and any standing CHANGES_REQUESTED blocks.
- * A dismissal recorded after a CHANGES_REQUESTED must unblock, or the
- * command would enqueue feedback from a review the reviewer withdrew. */
+/**
+ * A review's submission time as a sortable epoch. An unparseable timestamp
+ * sorts as "oldest" rather than poisoning the ordering with NaN: every NaN
+ * comparison is false, so a NaN timestamp would make the per-user selection
+ * keep the FIRST review seen for that user instead of their newest — the
+ * selection rule the standing-request decision depends on (#1636).
+ */
+function parseSubmittedAt(value: string | null | undefined): number {
+  if (!value) return 0;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/** The aggregate review decision over a PR's reviews — the same shape and the
+ * same dismissal semantics as `deriveReviewDecision` in github-prs.ts (#1636):
+ * a DISMISSED review is IGNORED outright, because GitHub's branch-protection
+ * rule is "dismissed reviews are ignored; remaining requests still count".
+ * Each reviewer's newest NON-dismissed review therefore decides their
+ * standing state, and a standing CHANGES_REQUESTED blocks.
+ *
+ * Two edges this settles, one in each direction:
+ * - A withdrawn request still unblocks: GitHub mutates a dismissed review IN
+ *   PLACE (state → DISMISSED, same submitted_at), so "the reviewer requested
+ *   changes and that request was withdrawn" is a SINGLE record. Ignored as
+ *   dismissed, it leaves that reviewer with nothing standing (#1622 review
+ *   round 5, M1) — and the withdrawn review's own feedback is never handed
+ *   off.
+ * - A dismissal of a reviewer's RE-REVIEW no longer masks their older
+ *   standing request (#1636): two CHANGES_REQUESTED reviews with the newer
+ *   one dismissed leave the older request standing, which is what GitHub
+ *   itself would enforce. Refusing that shape was a false refusal.
+ */
 export function deriveBlockingReview(
   reviews: PullRequestReview[],
   headSha: string | null,
@@ -130,8 +155,11 @@ export function deriveBlockingReview(
   const latestByUser = new Map<string, { review: PullRequestReview; submittedAt: number; blocking: boolean }>();
   for (const review of reviews) {
     const state = review.state?.toUpperCase();
-    if (!review.user || (state !== "APPROVED" && state !== "CHANGES_REQUESTED" && state !== "DISMISSED")) continue;
-    const submittedAt = review.submittedAt ? Date.parse(review.submittedAt) : 0;
+    // DISMISSED is ignored outright (#1636): a dismissed review is neither a
+    // standing request of its own nor a supersession of the reviewer's other
+    // reviews. COMMENTED never was one.
+    if (!review.user || (state !== "APPROVED" && state !== "CHANGES_REQUESTED")) continue;
+    const submittedAt = parseSubmittedAt(review.submittedAt);
     const prev = latestByUser.get(review.user);
     if (!prev || submittedAt >= prev.submittedAt) {
       latestByUser.set(review.user, { review, submittedAt, blocking: state === "CHANGES_REQUESTED" });
