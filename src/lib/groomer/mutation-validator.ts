@@ -28,7 +28,7 @@ import {
 import { evaluateReadiness, type ChildBrief, type GroomingPlan } from "./plan";
 import type { EvidenceCatalog } from "./plan-evidence";
 import { evaluateCloseGrounding, reopenRegressionReasons } from "./close-grounding";
-import { sanitizeModelText } from "./sanitize";
+import { errorMessage } from "./sanitize";
 
 // ─── Preconditions ────────────────────────────────────────────────────────────
 
@@ -132,12 +132,6 @@ export interface PreconditionInput {
   explorationToolCalls: ExplorationToolCallLike[];
   /** Clock for the search-index grace window; defaults to the real clock (#1116). */
   now?: () => Date;
-}
-
-function errorMessage(err: unknown): string {
-  // GitHub-authored failure text is foreign input into Postgres errorMessage
-  // columns (dispatch#1164): strip NUL and the other C0 controls (keep \n/\t).
-  return sanitizeModelText(err instanceof Error ? err.message : String(err));
 }
 
 function sortedLabels(labels: string[]): string[] {

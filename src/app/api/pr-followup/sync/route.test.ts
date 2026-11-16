@@ -230,7 +230,8 @@ describe("POST /api/pr-followup/sync", () => {
       if (u.includes("/pulls?state=open")) {
         return jsonRes([{
           id: 1, number: 263, url: "https://gh/pr/263", title: "dedup worker cap", body: "Fixes #229",
-          state: "open", user: { login: "itsmiso-ai" }, head: { ref: "foreman/x/issue-229" },
+          state: "open", user: { login: "itsmiso-ai" },
+          head: { ref: "foreman/x/issue-229", repo: { full_name: "misospace/windowstead" } },
           base: { ref: "main" }, merged_at: null, draft: false,
         }]);
       }
@@ -248,6 +249,8 @@ describe("POST /api/pr-followup/sync", () => {
     expect(mocks.ingestMergeConflict.mock.calls[0][1]).toMatchObject({
       prNumber: 263,
       mergeable: "CONFLICTING",
+      // #1637: the REBASE lane carries the head-repo proof the gate needs.
+      headRepoFullName: "misospace/windowstead",
     });
     expect(mocks.clearResolvedConflictItems).not.toHaveBeenCalled();
 
@@ -324,6 +327,89 @@ describe("POST /api/pr-followup/sync", () => {
       expect.anything(),
       expect.objectContaining({ repoFullName: "misospace/windowstead", prNumber: 265, headSha: "head-265" }),
     );
+
+    vi.unstubAllGlobals();
+  });
+
+  // #1637: the ingestion gate refuses queue work whose head repo is not the
+  // base repo, so the sync scan must project the list endpoint's
+  // head.repo.full_name into every event it produces — the route is a pure
+  // projector here; the refusal itself is pinned in the ingestion lib tests.
+  it("projects the PR head repository full name into every event (#1637)", async () => {
+    process.env.GITHUB_TOKEN = "gh_fake_token";
+    mocks.getTrackedRepos.mockResolvedValue(["misospace/KubeTix"]);
+    mocks.isAllowedBotAuthor.mockReturnValue(true);
+
+    const jsonRes = (data: unknown) => ({ ok: true, headers: new Headers(), json: async () => data, text: async () => "" });
+    const fetchMock = vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u.includes("/pulls?state=open")) {
+        return jsonRes([{
+          id: 1, number: 470, url: "https://gh/pr/470", title: "fix", body: "Fixes #1",
+          state: "open", user: { login: "itsmiso-ai" },
+          head: { ref: "fix/x", sha: "sha-470", repo: { full_name: "misospace/KubeTix" } },
+          base: { ref: "main" }, merged_at: null, draft: false, mergeable_state: "clean",
+        }, {
+          // Fork PR on the same tracked base repo: the sync must carry the FORK
+          // identity so ingestion can see the mismatch and refuse fail-closed.
+          id: 2, number: 471, url: "https://gh/pr/471", title: "fork fix", body: "Fixes #1",
+          state: "open", user: { login: "itsmiso-ai" },
+          head: { ref: "contrib/fix", sha: "sha-471", repo: { full_name: "contributor/KubeTix" } },
+          base: { ref: "main" }, merged_at: null, draft: false, mergeable_state: "clean",
+        }]);
+      }
+      if (u.includes("/issues/470/comments")) {
+        return jsonRes([{
+          id: 11, body: "Test failed: expected 200", user: { login: "reviewer" },
+          created_at: "2026-11-15T11:00:00Z", updated_at: "2026-11-15T11:00:00Z",
+        }]);
+      }
+      if (u.includes("/issues/471/comments")) {
+        return jsonRes([{
+          id: 12, body: "Test failed: expected 200", user: { login: "reviewer" },
+          created_at: "2026-11-15T11:00:00Z", updated_at: "2026-11-15T11:00:00Z",
+        }]);
+      }
+      if (u.includes("/pulls/470/reviews")) {
+        return jsonRes([{
+          id: 21, body: "Use the right path", state: "CHANGES_REQUESTED",
+          user: { login: "reviewer" }, submitted_at: "2026-11-15T11:04:00Z", commit_id: "sha-470",
+        }]);
+      }
+      if (u.includes("/pulls/470/comments")) {
+        return jsonRes([{
+          id: 31, body: "nit: rename this", user: { login: "reviewer" },
+          path: "src/a.ts", line: 3, updated_at: "2026-11-15T11:05:00Z", commit_id: "sha-470",
+        }]);
+      }
+      if (u.includes("/check-runs")) {
+        return jsonRes({ check_runs: [{ id: 99, name: "lint", conclusion: "failure", html_url: "https://github.com/misospace/KubeTix/actions/runs/1/job/99", output: { summary: "boom" } }] });
+      }
+      return jsonRes([]);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await postRequest(true);
+    expect(res.status).toBe(200);
+
+    const events = mocks.processPrFollowupEvents.mock.calls.at(-1)?.[1] ?? [];
+    const baseEvents = events.filter((e: { prNumber: number }) => e.prNumber === 470);
+    const forkEvents = events.filter((e: { prNumber: number }) => e.prNumber === 471);
+    // Every event type the scan produces must carry the proof, not just
+    // comments: review, review_comment, check_run and merge_state ride the
+    // same gate.
+    expect(new Set(baseEvents.map((e: { eventType: string }) => e.eventType))).toEqual(
+      new Set(["comment", "review_comment", "review", "check_run", "merge_state"]),
+    );
+    expect(forkEvents.length).toBeGreaterThan(0);
+    for (const event of baseEvents) {
+      expect(event.headRepoFullName).toBe("misospace/KubeTix");
+    }
+    // The fork's head repo is projected as-is — it must NOT be silently
+    // replaced with the tracked base repo, or the gate would never fire.
+    for (const event of forkEvents) {
+      expect(event.headRepoFullName).toBe("contributor/KubeTix");
+    }
 
     vi.unstubAllGlobals();
   });

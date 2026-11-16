@@ -33,10 +33,12 @@ interface GithubPR extends Omit<GithubPRBase, "head"> {
   /**
    * PR head ref + SHA from the list endpoint. `sha` is captured to populate
    * PrFixQueueItem.headSha at enqueue time so a later FIXED transition can
-   * verify the workload actually pushed something (#940). Both fields are
-   * optional here so legacy fixtures still type-check.
+   * verify the workload actually pushed something (#940). `repo.full_name` is
+   * the head repository identity — the ingestion gate refuses queue work whose
+   * head repo is not the base repo (#1637). Both fields are optional here so
+   * legacy fixtures still type-check.
    */
-  head?: { ref?: string; sha?: string };
+  head?: { ref?: string; sha?: string; repo?: { full_name?: string } };
 }
 
 interface GithubComment {
@@ -243,6 +245,9 @@ export async function POST(request: NextRequest) {
             repoFullName,
             prNumber: pr.number,
             branch: pr.head?.ref ?? null,
+            // #1637: head-repo proof for the ingestion gate on every event this
+            // scan produces — the list endpoint carries head.repo on every PR.
+            headRepoFullName: pr.head?.repo?.full_name ?? null,
             url: pr.url,
             title: pr.title,
             author: pr.user.login,
@@ -266,6 +271,8 @@ export async function POST(request: NextRequest) {
             repoFullName,
             prNumber: pr.number,
             branch: pr.head?.ref ?? null,
+            // #1637: head-repo proof for the ingestion gate (#1637).
+            headRepoFullName: pr.head?.repo?.full_name ?? null,
             url: pr.url,
             title: pr.title,
             author: pr.user.login,
@@ -301,6 +308,8 @@ export async function POST(request: NextRequest) {
             repoFullName,
             prNumber: pr.number,
             branch: pr.head?.ref ?? null,
+            // #1637: head-repo proof for the ingestion gate (#1637).
+            headRepoFullName: pr.head?.repo?.full_name ?? null,
             url: pr.url,
             title: pr.title,
             author: pr.user.login,
@@ -336,6 +345,8 @@ export async function POST(request: NextRequest) {
                 repoFullName,
                 prNumber: pr.number,
                 branch: pr.head?.ref ?? null,
+                // #1637: head-repo proof for the ingestion gate.
+                headRepoFullName: pr.head?.repo?.full_name ?? null,
                 url: pr.url,
                 checkRunUrl: checkRun.html_url,
                 title: checkRun.name,
@@ -371,6 +382,8 @@ export async function POST(request: NextRequest) {
               repoFullName,
               prNumber: pr.number,
               branch: pr.head?.ref ?? null,
+              // #1637: head-repo proof for the ingestion gate.
+              headRepoFullName: pr.head?.repo?.full_name ?? null,
               url: pr.url,
               title: pr.title,
               author: pr.user.login,
@@ -390,6 +403,8 @@ export async function POST(request: NextRequest) {
               repoFullName,
               prNumber: pr.number,
               branch: pr.head?.ref ?? null,
+              // #1637: the REBASE lane gate also needs head-repo proof.
+              headRepoFullName: pr.head?.repo?.full_name ?? null,
               url: pr.url,
               title: pr.title,
               author: pr.user.login,

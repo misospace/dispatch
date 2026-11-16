@@ -97,6 +97,16 @@ export function sanitizeModelText(text: string): string {
   return text.replace(CONTROL_CHARS, "");
 }
 
+/**
+ * A caught value's message, run through `sanitizeModelText`. GitHub-authored
+ * failure text is foreign input into Postgres errorMessage columns and warning
+ * arrays (dispatch#1164, dispatch#1214), so it gets the same control-strip as
+ * model text; non-Error values stringify.
+ */
+export function errorMessage(err: unknown): string {
+  return sanitizeModelText(err instanceof Error ? err.message : String(err));
+}
+
 export function sanitizeForStorage(text: string, maxChars: number = MAX_STORED_TEXT_CHARS): string {
   const clean = sanitizeModelText(text);
   return clean.length <= maxChars ? clean : `${clean.slice(0, maxChars - 1)}…`;

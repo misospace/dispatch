@@ -13,7 +13,7 @@ import { CONFLICTING_STATUSES, FAILURE_CONCLUSIONS } from "@/lib/linked-pr-healt
 import { rebaseWorkItem } from "@/lib/pr-fix-rebase";
 import { extractFailureMarker, extractFailureWorkflow, isScanFailure } from "@/lib/ci-failure-ingestion";
 import { getConfiguredLanes, getEscalationLane } from "@/lib/lane-config";
-import { PARKED_COMMENT_MARKER } from "@/lib/pr-fix-surfacing";
+import { PARKED_COMMENT_MARKER, DISPATCH_FIX_REPLY_MARKER } from "@/lib/pr-fix-surfacing";
 import {
   conditionEvidenceKey,
   computeEvidenceContentSignature,
@@ -72,12 +72,22 @@ function getConfig(): PrFollowupConfig {
 // ─── Author / Branch Allowlist ──────────────────────────────────────────────
 
 /**
- * Check if a PR author is an allowed bot identity.
+ * Check if PR author is allowed bot identity.
  */
 export function isAllowedBotAuthor(author: string | null | undefined): boolean {
   if (!author) return false;
-  const config = getConfig();
-  return config.botIdentities.includes(author);
+  return isBotIdentity(author);
+}
+
+/**
+ * Check if a login is one of the configured bot identities (the loop's own
+ * automation logins). The /dispatch-fix command uses this to stay silent
+ * toward bot commenters (#1622): replying to another bot's comment is how
+ * bot-to-bot reply loops start.
+ */
+export function isBotIdentity(login: string | null | undefined): boolean {
+  if (!login) return false;
+  return getConfig().botIdentities.includes(login);
 }
 
 /**
@@ -94,6 +104,30 @@ export function isAllowedBranchOwner(repoFullName: string | null | undefined): b
   }
   const [owner] = repoFullName.split("/");
   return config.branchOwnerAllowlist.includes(owner);
+}
+
+/**
+ * Verify the PR's head repository is the base repository (#1637).
+ *
+ * `isAllowedBranchOwner` reads the BASE repo's owner, so a fork PR passes the
+ * owner gate while its `branch` names a branch of the fork — the fix worker
+ * handed the row operates on the base repo, where that branch usually does not
+ * exist (or worse, exists with different content). Same-owner forks under a
+ * tracked-repo owner's namespace pass the owner check outright, so the head
+ * repo must be compared against the base repo itself, not just its owner.
+ *
+ * Fail closed on an unverifiable head repo (`head.repo.full_name` null — a
+ * deleted or inaccessible fork, or a payload shape that never carries it):
+ * no proof of head-repo ownership, no queue work. This mirrors the
+ * `/dispatch-fix` command gate (#1622/#1634), which refuses the same two
+ * cases outright. GitHub logins are case-insensitive, so the comparison is.
+ */
+export function isHeadRepoOfBaseRepo(
+  headRepoFullName: string | null | undefined,
+  baseRepoFullName: string | null | undefined,
+): boolean {
+  if (!headRepoFullName || !baseRepoFullName) return false;
+  return headRepoFullName.toLowerCase() === baseRepoFullName.toLowerCase();
 }
 
 // ─── Feedback Classification ────────────────────────────────────────────────
@@ -225,6 +259,7 @@ const INFORMATIONAL_COMMENT_MARKERS = [
   "<!-- Sticky Pull Request Comment",
   "<!-- dispatch-pr-fix-blocked -->",
   PARKED_COMMENT_MARKER,
+  DISPATCH_FIX_REPLY_MARKER,
 ];
 
 /**
@@ -358,8 +393,11 @@ function laneFor(feedback: string): "NORMAL" | "NEEDS_HUMAN" {
  * Without this, the reviewer's narrative prose matches no classifyFeedback
  * pattern and every AI review dead-ends at needs_human. Human prose reviews
  * (no structured payload) still fall back to the keyword classifier.
+ *
+ * Exported for the /dispatch-fix command (#1622), which enqueues through the
+ * same review evidence path and must not grow a diverging lane rule.
  */
-function reviewLane(body: string): "NORMAL" | "NEEDS_HUMAN" {
+export function reviewLane(body: string): "NORMAL" | "NEEDS_HUMAN" {
   // CHANGES_REQUESTED goes to the fix lane. Full stop.
   //
   // This used to run the review body through classifyFeedback's keyword list, so a
@@ -648,6 +686,12 @@ async function ingestEvent(client: PrFixQueueClient, event: PrFollowupEvent): Pr
     if (descriptor.filterTerminalPr && (event.prMergedAt || event.prState === "closed")) return null;
     if (!isAllowedBotAuthor(event.author)) return null;
     if (!isAllowedBranchOwner(event.repoFullName)) return null;
+    // #1637: an observation of a fork PR is not an observation of this queue's
+    // work either — the same eligibility filter as a work event. Consequence:
+    // a legacy fork row's actionable baseline stops advancing, so it can no
+    // longer be re-offered by evidence-driven recovery; conflict rows still
+    // drain through the ungated `clearResolvedConflictItems` settle path.
+    if (!isHeadRepoOfBaseRepo(event.headRepoFullName, event.repoFullName)) return null;
     if (!descriptor.isIngestible(event)) return null;
     const { evidenceKey, ...evidence } = evidenceFieldsFor(event);
     await recordPrFixEvidenceBaseline(client, {
@@ -669,6 +713,13 @@ async function ingestEvent(client: PrFixQueueClient, event: PrFollowupEvent): Pr
 
   // Check repo owner eligibility
   if (!isAllowedBranchOwner(event.repoFullName)) return null;
+
+  // #1637: the owner check above reads the BASE repo, so a fork PR passes it
+  // while its branch names a branch of the fork. Verify the head repo IS the
+  // base repo before accepting queue work; refuse when it is a different repo
+  // or cannot be verified at all (fail-closed, mirroring the /dispatch-fix
+  // gate in #1622/#1634).
+  if (!isHeadRepoOfBaseRepo(event.headRepoFullName, event.repoFullName)) return null;
 
   let { lane, type, reason, feedback } = descriptor.workItem(event);
   if (event.eventType === "check_run" && event.linkedIssue !== null && event.linkedIssue !== undefined) {
@@ -743,6 +794,8 @@ export async function ingestCommentEvent(
     author: string | null;
     commentBody: string;
     commentId: string;
+    /** PR head repository full name (#1637); required proof for queue work. */
+    headRepoFullName?: string | null;
     linkedIssue?: number | null;
     /** The comment author's login (drives the durable `actor=` slot). */
     actorLogin?: string | null;
@@ -761,6 +814,7 @@ export async function ingestCommentEvent(
     author: opts.author,
     body: opts.commentBody,
     id: opts.commentId,
+    headRepoFullName: opts.headRepoFullName ?? null,
     linkedIssue: opts.linkedIssue,
     actorLogin: opts.actorLogin,
     updatedAt: opts.updatedAt,
@@ -784,6 +838,8 @@ export async function ingestReviewEvent(
     reviewBody: string;
     reviewId: string;
     reviewState: string; // "APPROVED", "CHANGES_REQUESTED", "COMMENTED"
+    /** PR head repository full name (#1637); required proof for queue work. */
+    headRepoFullName?: string | null;
     prState?: string | null;
     prMergedAt?: string | null;
     linkedIssue?: number | null;
@@ -806,6 +862,7 @@ export async function ingestReviewEvent(
     body: opts.reviewBody,
     id: opts.reviewId,
     state: opts.reviewState,
+    headRepoFullName: opts.headRepoFullName ?? null,
     prState: opts.prState,
     prMergedAt: opts.prMergedAt,
     linkedIssue: opts.linkedIssue,
@@ -839,6 +896,8 @@ export async function ingestReviewCommentEvent(
     commentId: string;
     path?: string | null;
     line?: number | null;
+    /** PR head repository full name (#1637); required proof for queue work. */
+    headRepoFullName?: string | null;
     prState?: string | null;
     prMergedAt?: string | null;
     linkedIssue?: number | null;
@@ -864,6 +923,7 @@ export async function ingestReviewCommentEvent(
     id: opts.commentId,
     path: opts.path ?? null,
     line: opts.line ?? null,
+    headRepoFullName: opts.headRepoFullName ?? null,
     prState: opts.prState,
     prMergedAt: opts.prMergedAt,
     linkedIssue: opts.linkedIssue,
@@ -897,6 +957,8 @@ export async function ingestCheckRunEvent(
     checkRunId: string;
     checkRunUrl?: string | null;
     checkDetails?: string;
+    /** PR head repository full name (#1637); required proof for queue work. */
+    headRepoFullName?: string | null;
     linkedIssue?: number | null;
     checkStatus?: string | null;
     completedAt?: string | null;
@@ -917,6 +979,7 @@ export async function ingestCheckRunEvent(
     checkRunUrl: opts.checkRunUrl ?? null,
     conclusion: opts.conclusion,
     checkName: opts.checkName,
+    headRepoFullName: opts.headRepoFullName ?? null,
     linkedIssue: opts.linkedIssue,
     checkStatus: opts.checkStatus,
     completedAt: opts.completedAt,
@@ -938,6 +1001,8 @@ export async function ingestMergeStateEvent(
     title: string;
     author: string | null;
     mergeStateStatus: string; // "BEHIND", "DIRTY", "UNSTABLE", "HAS_HOOKS", etc.
+    /** PR head repository full name (#1637); required proof for queue work. */
+    headRepoFullName?: string | null;
     prState?: string | null;
     prMergedAt?: string | null;
     linkedIssue?: number | null;
@@ -955,6 +1020,7 @@ export async function ingestMergeStateEvent(
     author: opts.author,
     // The evidence key for merge_state events is now a stable per-PR identity.
     id: opts.mergeStateStatus,
+    headRepoFullName: opts.headRepoFullName ?? null,
     mergeStateStatus: opts.mergeStateStatus,
     prState: opts.prState,
     prMergedAt: opts.prMergedAt,
@@ -989,6 +1055,12 @@ export async function ingestMergeConflict(
     title: string;
     author: string | null;
     mergeable: string; // "CONFLICTING", "MERGEABLE", "UNKNOWN"
+    /**
+     * PR head repository full name (#1637). The conflict/REBASE work is only
+     * accepted when this matches the base repo (case-insensitive); null or a
+     * foreign repo refuses the row fail-closed.
+     */
+    headRepoFullName?: string | null;
     linkedIssue?: number | null;
     headSha?: string | null;
     source?: "sync" | "webhook";
@@ -1002,6 +1074,11 @@ export async function ingestMergeConflict(
 
   // Check repo owner eligibility
   if (!isAllowedBranchOwner(opts.repoFullName)) return null;
+
+  // #1637: a CONFLICTING fork PR must not enter the REBASE lane either — the
+  // rebase worker operates on the base repo, where the fork's branch does not
+  // exist. Fail closed when the head repo is unverifiable or foreign.
+  if (!isHeadRepoOfBaseRepo(opts.headRepoFullName, opts.repoFullName)) return null;
 
   // #1249: a stable per-PR identity (not state-derived) so repeated
   // conflicting observations on the same PR are not distinct work.
@@ -1143,6 +1220,16 @@ export interface PrFollowupEvent {
   repoFullName: string;
   prNumber: number;
   branch: string | null;
+  /**
+   * Full name of the PR's HEAD repository (#1637). Queue work is accepted
+   * only when this matches the base repo (case-insensitive): a fork PR's
+   * `branch` names a branch of the fork, where the fix worker never operates.
+   * Null/absent means unverifiable and is refused fail-closed — the payload
+   * projections (sync route, webhook route) carry it from the PR object;
+   * producers whose payload shape never does (webhook `issue_comment`) stop
+   * enqueuing on this path and fall back to the sync scan, which does.
+   */
+  headRepoFullName?: string | null;
   url: string;
   title: string;
   author: string | null;

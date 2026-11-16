@@ -238,6 +238,7 @@ describe("ingestCommentEvent", () => {
 
     await ingestCommentEvent(client, {
       repoFullName: "misospace/dispatch",
+      headRepoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/misospace/dispatch/pull/42",
@@ -262,6 +263,7 @@ describe("ingestCommentEvent", () => {
 
     await ingestReviewEvent(client, {
       repoFullName: "misospace/pr-reviewer-action",
+      headRepoFullName: "misospace/pr-reviewer-action",
       prNumber: 1359,
       branch: "courier/x/issue-737",
       url: "https://github.com/misospace/pr-reviewer-action/pull/1359",
@@ -285,6 +287,7 @@ describe("ingestCommentEvent", () => {
 
     await ingestReviewEvent(client, {
       repoFullName: "misospace/dispatch",
+      headRepoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/misospace/dispatch/pull/42",
@@ -312,6 +315,7 @@ describe("ingestCommentEvent", () => {
     };
     await ingestReviewEvent(client, {
       repoFullName: "misospace/pr-reviewer-action",
+      headRepoFullName: "misospace/pr-reviewer-action",
       prNumber: 1360,
       branch: "courier/x/issue-737",
       url: "https://github.com/misospace/pr-reviewer-action/pull/1360",
@@ -332,6 +336,7 @@ describe("ingestCommentEvent", () => {
 
     await ingestCommentEvent(client, {
       repoFullName: "misospace/dispatch",
+      headRepoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/misospace/dispatch/pull/42",
@@ -352,6 +357,7 @@ describe("ingestCommentEvent", () => {
 
     const result = await ingestCommentEvent(client, {
       repoFullName: "misospace/dispatch",
+      headRepoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/misospace/dispatch/pull/42",
@@ -377,6 +383,7 @@ describe("ingestReviewEvent", () => {
 
     await ingestReviewEvent(client, {
       repoFullName: "misospace/dispatch",
+      headRepoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/misospace/dispatch/pull/42",
@@ -415,6 +422,7 @@ describe("ingestReviewEvent", () => {
 
     await ingestReviewEvent(client, {
       repoFullName: "misospace/miso-chat",
+      headRepoFullName: "misospace/miso-chat",
       prNumber: 691,
       branch: "foreman/wl-misospace-miso-chat-687/issue-687",
       url: "https://github.com/misospace/miso-chat/pull/691",
@@ -439,6 +447,7 @@ describe("ingestReviewEvent", () => {
 
     await ingestMergeConflict(client, {
       repoFullName: "misospace/pr-reviewer-action",
+      headRepoFullName: "misospace/pr-reviewer-action",
       prNumber: 1359,
       branch: "courier/x/issue-737",
       url: "https://github.com/misospace/pr-reviewer-action/pull/1359",
@@ -462,6 +471,7 @@ describe("ingestReviewEvent", () => {
     const client = makeClient();
     await ingestReviewEvent(client, {
       repoFullName: "misospace/dispatch",
+      headRepoFullName: "misospace/dispatch",
       prNumber: 43,
       branch: "fix/x",
       url: "https://github.com/misospace/dispatch/pull/43",
@@ -482,6 +492,7 @@ describe("ingestReviewEvent", () => {
     const client = makeClient();
     await ingestReviewEvent(client, {
       repoFullName: "misospace/dispatch",
+      headRepoFullName: "misospace/dispatch",
       prNumber: 44,
       branch: "fix/x",
       url: "https://github.com/misospace/dispatch/pull/44",
@@ -501,6 +512,7 @@ describe("ingestReviewEvent", () => {
 
     const result = await ingestReviewEvent(client, {
       repoFullName: "misospace/dispatch",
+      headRepoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/misospace/dispatch/pull/42",
@@ -521,6 +533,7 @@ describe("ingestReviewEvent", () => {
 
     const result = await ingestReviewEvent(client, {
       repoFullName: "misospace/dispatch",
+      headRepoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/misospace/dispatch/pull/42",
@@ -541,6 +554,7 @@ describe("ingestReviewEvent", () => {
 
     const result = await ingestReviewEvent(client, {
       repoFullName: "misospace/dispatch",
+      headRepoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/misospace/dispatch/pull/42",
@@ -562,6 +576,7 @@ describe("ingestReviewEvent", () => {
 
     const result = await ingestReviewEvent(client, {
       repoFullName: "misospace/dispatch",
+      headRepoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/misospace/dispatch/pull/42",
@@ -598,6 +613,7 @@ describe("ingestCheckRunEvent", () => {
 
     await ingestCheckRunEvent(client, {
       repoFullName: "misospace/dispatch",
+      headRepoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/misospace/dispatch/actions/runs/123",
@@ -631,6 +647,7 @@ describe("ingestCheckRunEvent", () => {
 
     await ingestCheckRunEvent(client, {
       repoFullName: "misospace/dispatch",
+      headRepoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/misospace/dispatch/actions/runs/123",
@@ -656,6 +673,7 @@ describe("ingestCheckRunEvent", () => {
 
     await ingestCheckRunEvent(client, {
       repoFullName: "misospace/dispatch",
+      headRepoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/misospace/dispatch/actions/runs/123",
@@ -684,6 +702,7 @@ describe("ingestCheckRunEvent", () => {
 
     await ingestCheckRunEvent(client, {
       repoFullName: "misospace/dispatch",
+      headRepoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/misospace/dispatch/actions/runs/123",
@@ -716,6 +735,7 @@ describe("ingestCheckRunEvent", () => {
 
     await ingestCheckRunEvent(client, {
       repoFullName: "misospace/dispatch",
+      headRepoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/misospace/dispatch/actions/runs/123",
@@ -743,6 +763,7 @@ describe("ingestCheckRunEvent", () => {
     const noIssueClient = makeClient();
     await ingestCheckRunEvent(noIssueClient, {
       repoFullName: "misospace/dispatch",
+      headRepoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/misospace/dispatch/actions/runs/123",
@@ -757,6 +778,7 @@ describe("ingestCheckRunEvent", () => {
     const unmarkedClient = makeClient({ body: "ordinary issue", currentLane: "frontier" });
     await ingestCheckRunEvent(unmarkedClient, {
       repoFullName: "misospace/dispatch",
+      headRepoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/misospace/dispatch/actions/runs/123",
@@ -781,6 +803,7 @@ describe("ingestCheckRunEvent", () => {
 
     await ingestCheckRunEvent(client, {
       repoFullName: "misospace/dispatch",
+      headRepoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/misospace/dispatch/actions/runs/123",
@@ -806,6 +829,7 @@ describe("ingestCheckRunEvent", () => {
 
     await ingestCheckRunEvent(client, {
       repoFullName: "misospace/KubeTix",
+      headRepoFullName: "misospace/KubeTix",
       prNumber: 207,
       branch: "foreman/wl-misospace-kubetix-165/issue-165",
       url: "https://github.com/misospace/KubeTix/actions/runs/1",
@@ -830,6 +854,7 @@ describe("ingestCheckRunEvent", () => {
 
     await ingestCheckRunEvent(client, {
       repoFullName: "misospace/windowstead",
+      headRepoFullName: "misospace/windowstead",
       prNumber: 264,
       branch: "foreman/x/issue-254",
       url: "https://github.com/misospace/windowstead/actions/runs/28977045019/job/85986677458",
@@ -855,6 +880,7 @@ describe("ingestCheckRunEvent", () => {
 
     await ingestCheckRunEvent(client, {
       repoFullName: "misospace/windowstead",
+      headRepoFullName: "misospace/windowstead",
       prNumber: 266,
       branch: "foreman/x/issue-237",
       url: "https://github.com/misospace/windowstead/actions/runs/1/job/2",
@@ -878,6 +904,7 @@ describe("ingestCheckRunEvent", () => {
 
     await ingestCheckRunEvent(client, {
       repoFullName: "misospace/dispatch",
+      headRepoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/misospace/dispatch/actions/runs/123",
@@ -898,6 +925,7 @@ describe("ingestCheckRunEvent", () => {
 
     const result = await ingestCheckRunEvent(client, {
       repoFullName: "misospace/dispatch",
+      headRepoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/misospace/dispatch/actions/runs/123",
@@ -925,6 +953,7 @@ describe("ingestMergeStateEvent", () => {
 
     await ingestMergeStateEvent(client, {
       repoFullName: "misospace/dispatch",
+      headRepoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/misospace/dispatch/pull/42",
@@ -944,6 +973,7 @@ describe("ingestMergeStateEvent", () => {
 
     const result = await ingestMergeStateEvent(client, {
       repoFullName: "misospace/dispatch",
+      headRepoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/misospace/dispatch/pull/42",
@@ -962,6 +992,7 @@ describe("ingestMergeStateEvent", () => {
 
     const result = await ingestMergeStateEvent(client, {
       repoFullName: "misospace/dispatch",
+      headRepoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/misospace/dispatch/pull/42",
@@ -981,6 +1012,7 @@ describe("ingestMergeStateEvent", () => {
 
     const result = await ingestMergeStateEvent(client, {
       repoFullName: "misospace/dispatch",
+      headRepoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/misospace/dispatch/pull/42",
@@ -1000,6 +1032,7 @@ describe("ingestMergeStateEvent", () => {
 
     await ingestMergeStateEvent(client, {
       repoFullName: "misospace/dispatch",
+      headRepoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/misospace/dispatch/pull/42",
@@ -1023,6 +1056,7 @@ describe("ingestMergeStateEvent", () => {
 
     await ingestMergeStateEvent(client, {
       repoFullName: "misospace/dispatch",
+      headRepoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/misospace/dispatch/pull/42",
@@ -1053,6 +1087,7 @@ describe("processPrFollowupEvents", () => {
       {
         eventType: "comment",
         repoFullName: "org/repo",
+        headRepoFullName: "org/repo",
         prNumber: 1,
         branch: "fix/a",
         url: "https://github.com/org/repo/pull/1",
@@ -1064,6 +1099,7 @@ describe("processPrFollowupEvents", () => {
       {
         eventType: "review",
         repoFullName: "org/repo",
+        headRepoFullName: "org/repo",
         prNumber: 2,
         branch: "fix/b",
         url: "https://github.com/org/repo/pull/2",
@@ -1076,6 +1112,7 @@ describe("processPrFollowupEvents", () => {
       {
         eventType: "check_run",
         repoFullName: "org/repo",
+        headRepoFullName: "org/repo",
         prNumber: 3,
         branch: "fix/c",
         url: "https://github.com/org/repo/actions/runs/1",
@@ -1100,6 +1137,7 @@ describe("processPrFollowupEvents", () => {
       {
         eventType: "comment",
         repoFullName: "org/repo",
+        headRepoFullName: "org/repo",
         prNumber: 1,
         branch: "fix/a",
         url: "https://github.com/org/repo/pull/1",
@@ -1122,6 +1160,7 @@ describe("processPrFollowupEvents", () => {
       {
         eventType: "review",
         repoFullName: "org/repo",
+        headRepoFullName: "org/repo",
         prNumber: 1,
         branch: "fix/a",
         url: "https://github.com/org/repo/pull/1",
@@ -1173,6 +1212,7 @@ describe("processPrFollowupEvents", () => {
       {
         eventType: "check_run",
         repoFullName: "org/repo",
+        headRepoFullName: "org/repo",
         prNumber: 7,
         branch: "fix/c",
         url: "https://api.github.com/repos/org/repo/pulls/7",
@@ -1204,6 +1244,7 @@ describe("processPrFollowupEvents", () => {
       {
         eventType: "check_run",
         repoFullName: "org/repo",
+        headRepoFullName: "org/repo",
         prNumber: 7,
         branch: "fix/c",
         url: "https://github.com/org/repo/actions/runs/9/job/1",
@@ -1273,6 +1314,12 @@ describe("isInformationalComment", () => {
     expect(isInformationalComment("<!-- dispatch-pr-fix-parked -->\n> ⏸️ parked after repeated attempts")).toBe(true);
   });
 
+  it("flags the /dispatch-fix command's own reply (round-9 review minor)", () => {
+    expect(
+      isInformationalComment("`/dispatch-fix` enqueued: worker will address the CHANGES_REQUESTED review.\n\n<!-- dispatch-fix-reply -->"),
+    ).toBe(true);
+  });
+
   it("does NOT flag an ai-pr-reviewer comment even with a marker", () => {
     const body = `<!-- Sticky Pull Request Comment -->
 <!-- ai-pr-reviewer:${JSON.stringify({ review_result: "issues", open_findings: [{ severity: "blocker", message: "no upgrade performed" }] })} -->
@@ -1296,6 +1343,7 @@ describe("ingestCommentEvent — informational comments", () => {
 
     const key = await ingestCommentEvent(client, {
       repoFullName: "misospace/llmkube-images",
+      headRepoFullName: "misospace/llmkube-images",
       prNumber: 114,
       branch: "foreman/wl-misospace-llmkube-images-89/issue-89",
       url: "https://github.com/misospace/llmkube-images/pull/114",
@@ -1315,6 +1363,7 @@ describe("ingestCommentEvent — informational comments", () => {
 
     await ingestCommentEvent(client, {
       repoFullName: "misospace/llmkube-images",
+      headRepoFullName: "misospace/llmkube-images",
       prNumber: 115,
       branch: "foreman/x",
       url: "https://github.com/misospace/llmkube-images/pull/115",
@@ -1334,6 +1383,7 @@ describe("ingestCommentEvent — informational comments", () => {
 
     const key = await ingestCommentEvent(client, {
       repoFullName: "misospace/llmkube-images",
+      headRepoFullName: "misospace/llmkube-images",
       prNumber: 116,
       branch: "foreman/x",
       url: "https://github.com/misospace/llmkube-images/pull/116",
@@ -1380,6 +1430,7 @@ describe("ingestReviewCommentEvent", () => {
 
   const base = {
     repoFullName: "misospace/foreman-dispatch-bridge",
+    headRepoFullName: "misospace/foreman-dispatch-bridge",
     prNumber: 111,
     branch: "foreman/wl-x/issue-1",
     url: "https://github.com/misospace/foreman-dispatch-bridge/pull/111",
@@ -1475,6 +1526,7 @@ describe("comment ingestion requires actionable signal", () => {
     return {
       eventType: "comment" as const,
       repoFullName: "org/repo",
+      headRepoFullName: "org/repo",
       prNumber: 1,
       branch: "fix/a",
       url: "https://github.com/org/repo/pull/1",
@@ -1621,6 +1673,7 @@ describe("durable evidence fields (#1249)", () => {
     const client = makeClient();
     await ingestReviewEvent(client, {
       repoFullName: "org/repo",
+      headRepoFullName: "org/repo",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/org/repo/pull/42",
@@ -1652,6 +1705,7 @@ describe("durable evidence fields (#1249)", () => {
     const client = makeClient();
     await ingestCommentEvent(client, {
       repoFullName: "org/repo",
+      headRepoFullName: "org/repo",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/org/repo/pull/42",
@@ -1679,6 +1733,7 @@ describe("durable evidence fields (#1249)", () => {
     const client = makeClient();
     await ingestReviewCommentEvent(client, {
       repoFullName: "org/repo",
+      headRepoFullName: "org/repo",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/org/repo/pull/42",
@@ -1709,6 +1764,7 @@ describe("durable evidence fields (#1249)", () => {
     const client = makeClient();
     await ingestReviewCommentEvent(client, {
       repoFullName: "org/repo",
+      headRepoFullName: "org/repo",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/org/repo/pull/42",
@@ -1744,6 +1800,7 @@ describe("durable evidence fields (#1249)", () => {
     const client = makeClient();
     await ingestCheckRunEvent(client, {
       repoFullName: "org/repo",
+      headRepoFullName: "org/repo",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/org/repo/pull/42",
@@ -1774,6 +1831,7 @@ describe("durable evidence fields (#1249)", () => {
     const client = makeClient();
     await ingestMergeStateEvent(client, {
       repoFullName: "org/repo",
+      headRepoFullName: "org/repo",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/org/repo/pull/42",
@@ -1796,6 +1854,7 @@ describe("durable evidence fields (#1249)", () => {
     const client = makeClient();
     await ingestMergeConflict(client, {
       repoFullName: "org/repo",
+      headRepoFullName: "org/repo",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/org/repo/pull/42",
@@ -1820,6 +1879,7 @@ describe("durable evidence fields (#1249)", () => {
     const client = makeClient();
     const result = await ingestReviewEvent(client, {
       repoFullName: "org/repo",
+      headRepoFullName: "org/repo",
       prNumber: 42,
       branch: "fix/test",
       url: "https://github.com/org/repo/pull/42",
@@ -1945,6 +2005,7 @@ function makeLedgerClient() {
 /** The CHANGES_REQUESTED review that opens the item the transition lands on. */
 const REQUESTED_REVIEW = {
   repoFullName: "org/repo",
+  headRepoFullName: "org/repo",
   prNumber: 42,
   branch: "fix/test",
   url: "https://github.com/org/repo/pull/42",
@@ -2028,6 +2089,7 @@ describe("record-only review state transitions (#1276)", () => {
       {
         eventType: "review",
         repoFullName: "org/repo",
+        headRepoFullName: "org/repo",
         prNumber: 42,
         branch: "fix/test",
         url: "https://github.com/org/repo/pull/42",
@@ -2058,6 +2120,7 @@ describe("record-only review state transitions (#1276)", () => {
       {
         eventType: "review",
         repoFullName: "org/repo",
+        headRepoFullName: "org/repo",
         prNumber: 42,
         branch: "fix/test",
         url: "https://github.com/org/repo/pull/42",
@@ -2123,6 +2186,7 @@ describe("record-only merge_state observations (#1276 review)", () => {
 
   const DIRTY_STATE = {
     repoFullName: "org/repo",
+    headRepoFullName: "org/repo",
     prNumber: 42,
     branch: "fix/test",
     url: "https://github.com/org/repo/pull/42",
@@ -2198,6 +2262,7 @@ describe("record-only merge_state observations (#1276 review)", () => {
       {
         eventType: "merge_state",
         repoFullName: DIRTY_STATE.repoFullName,
+        headRepoFullName: DIRTY_STATE.repoFullName,
         prNumber: DIRTY_STATE.prNumber,
         branch: DIRTY_STATE.branch,
         url: DIRTY_STATE.url,
@@ -2281,6 +2346,7 @@ describe("clearResolvedConflictItems ledger baseline (#1276 review)", () => {
 
   const CONFLICT = {
     repoFullName: "org/repo",
+    headRepoFullName: "org/repo",
     prNumber: 42,
     branch: "fix/test",
     url: "https://github.com/org/repo/pull/42",
@@ -2434,5 +2500,195 @@ describe("clearResolvedConflictItems ledger baseline (#1276 review)", () => {
 
     expect(cleared).toBe(true);
     expect(item.status).toBe("FIXED");
+  });
+});
+
+// ─── Head-repo verification (#1637) ──────────────────────────────────────────
+//
+// `isAllowedBranchOwner` reads the BASE repo's owner, so a fork PR passes the
+// owner gate while its branch names a branch of the fork — where the fix
+// worker never operates. Ingestion now refuses (fail-closed) unless the PR's
+// head repo IS the base repo (case-insensitive), on both the work path and
+// the #1276 record-only path, and a missing/unverifiable head repo is refused
+// outright.
+describe("head-repo verification (#1637)", () => {
+  beforeEach(() => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    evidenceEnqueueInputs.length = 0;
+  });
+
+  afterEach(() => {
+    delete process.env.PR_FOLLOWUP_BOT_IDENTITIES;
+  });
+
+  const reviewOpts = (extra: Record<string, unknown> = {}) => ({
+    repoFullName: "org/repo",
+    prNumber: 42,
+    branch: "fix/test",
+    url: "https://github.com/org/repo/pull/42",
+    title: "Fix test",
+    author: "itsmiso-ai",
+    reviewBody: "Restore the validate job; ci.yaml:20 does not catch duplicate keys.",
+    reviewId: "r-head",
+    reviewState: "CHANGES_REQUESTED",
+    ...extra,
+  });
+
+  it("refuses a CHANGES_REQUESTED review on a fork PR (head repo ≠ base repo)", async () => {
+    const client = makeClient();
+    const result = await ingestReviewEvent(client, reviewOpts({ headRepoFullName: "outsider/repo-fork" }));
+
+    expect(result).toBeNull();
+    expect(client.items).toHaveLength(0);
+    expect(evidenceEnqueueInputs).toHaveLength(0);
+  });
+
+  // Per-event-type refusal: every wrapper that reaches the work path carries
+  // the same head-repo proof, so each event type must refuse a fork PR the
+  // same way — payloads below would otherwise enqueue (matching-head cases
+  // live in each wrapper's own describe block).
+  it("refuses an actionable comment on a fork PR (head repo ≠ base repo)", async () => {
+    const client = makeClient();
+    const result = await ingestCommentEvent(client, {
+      repoFullName: "org/repo",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/org/repo/pull/42",
+      title: "Fix test",
+      author: "itsmiso-ai",
+      commentBody: "Test failed: expected 200 but got 404",
+      commentId: "c-head",
+      headRepoFullName: "outsider/repo-fork",
+    });
+
+    expect(result).toBeNull();
+    expect(client.items).toHaveLength(0);
+    expect(evidenceEnqueueInputs).toHaveLength(0);
+  });
+
+  it("refuses an inline review comment on a fork PR (head repo ≠ base repo)", async () => {
+    const client = makeClient();
+    const result = await ingestReviewCommentEvent(client, {
+      repoFullName: "org/repo",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/org/repo/pull/42",
+      title: "Fix test",
+      author: "itsmiso-ai",
+      commentBody: "Minor (bug): the owner gate reads the base repo only.",
+      commentId: "rc-head",
+      path: "src/lib/pr-followup-ingestion.ts",
+      line: 705,
+      headRepoFullName: "outsider/repo-fork",
+    });
+
+    expect(result).toBeNull();
+    expect(client.items).toHaveLength(0);
+    expect(evidenceEnqueueInputs).toHaveLength(0);
+  });
+
+  it("refuses a failing check run on a fork PR (head repo ≠ base repo)", async () => {
+    const client = makeClient();
+    const result = await ingestCheckRunEvent(client, {
+      repoFullName: "org/repo",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/org/repo/pull/42",
+      title: "Fix test",
+      author: "itsmiso-ai",
+      checkName: "lint",
+      conclusion: "failure",
+      checkRunId: "cr-head",
+      headRepoFullName: "outsider/repo-fork",
+    });
+
+    expect(result).toBeNull();
+    expect(client.items).toHaveLength(0);
+    expect(evidenceEnqueueInputs).toHaveLength(0);
+  });
+
+  it("refuses a problematic merge state on a fork PR (head repo ≠ base repo)", async () => {
+    const client = makeClient();
+    const result = await ingestMergeStateEvent(client, {
+      repoFullName: "org/repo",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/org/repo/pull/42",
+      title: "Fix test",
+      author: "itsmiso-ai",
+      mergeStateStatus: "dirty",
+      headRepoFullName: "outsider/repo-fork",
+    });
+
+    expect(result).toBeNull();
+    expect(client.items).toHaveLength(0);
+    expect(evidenceEnqueueInputs).toHaveLength(0);
+  });
+
+  it("refuses when headRepoFullName is missing or null (fail-closed)", async () => {
+    const client = makeClient();
+    expect(await ingestReviewEvent(client, reviewOpts())).toBeNull();
+    expect(await ingestReviewEvent(client, reviewOpts({ headRepoFullName: null }))).toBeNull();
+    expect(client.items).toHaveLength(0);
+    expect(evidenceEnqueueInputs).toHaveLength(0);
+  });
+
+  it("enqueues on a case-insensitive head/base match (Org/Repo vs org/repo)", async () => {
+    const client = makeClient();
+    const result = await ingestReviewEvent(client, reviewOpts({ headRepoFullName: "Org/Repo" }));
+
+    expect(result).toBe("review:org/repo#42:r-head");
+    expect(client.items).toHaveLength(1);
+  });
+
+  it("a record-only observation with a foreign head repo returns null and writes no ledger row", async () => {
+    const client = makeLedgerClient();
+    await ingestReviewEvent(client, REQUESTED_REVIEW);
+    expect(client.ledger).toHaveLength(1);
+    const ledgerBefore = { ...client.ledger[0] };
+    const seqBefore = client.items[0].evidenceSequence;
+
+    const result = await ingestReviewEvent(client, {
+      ...REQUESTED_REVIEW,
+      reviewState: "APPROVED",
+      headRepoFullName: "outsider/repo-fork",
+    });
+
+    expect(result).toBeNull();
+    // The durable baseline is untouched: the APPROVED transition of a fork PR
+    // is not an observation of this queue's work, so nothing was recorded.
+    expect(client.ledger).toHaveLength(1);
+    expect(client.ledger[0]).toEqual(ledgerBefore);
+    expect(client.items[0].evidenceSequence).toBe(seqBefore);
+    expect(evidenceEnqueueInputs).toHaveLength(1); // only the initial CHANGES_REQUESTED enqueue
+  });
+
+  it("ingestMergeConflict accepts a matching head repo and refuses fork/missing fail-closed", async () => {
+    const conflictOpts = {
+      repoFullName: "org/repo",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/org/repo/pull/42",
+      title: "Fix test",
+      author: "itsmiso-ai",
+      mergeable: "CONFLICTING",
+    };
+
+    const matching = makeClient();
+    expect(await ingestMergeConflict(matching, { ...conflictOpts, headRepoFullName: "org/repo" })).toBe(
+      "merge_conflict:org/repo#42",
+    );
+    expect(matching.items).toHaveLength(1);
+
+    const fork = makeClient();
+    expect(
+      await ingestMergeConflict(fork, { ...conflictOpts, headRepoFullName: "outsider/repo-fork" }),
+    ).toBeNull();
+    expect(fork.items).toHaveLength(0);
+
+    const missing = makeClient();
+    expect(await ingestMergeConflict(missing, conflictOpts)).toBeNull();
+    expect(missing.items).toHaveLength(0);
+    expect(evidenceEnqueueInputs).toHaveLength(1); // only the matching-head enqueue
   });
 });

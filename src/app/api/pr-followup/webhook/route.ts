@@ -3,6 +3,7 @@ import { errorResponse } from "@/lib/api-errors";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { processPrFollowupEvents, extractLinkedIssue, PrFollowupEvent } from "@/lib/pr-followup-ingestion";
 import { authenticateWebhookDelivery } from "@/lib/webhook-signature";
+import { handleDispatchFixCommand, parseDispatchFixCommand } from "@/lib/pr-fix-dispatch-command";
 
 /**
  * GitHub Webhook Handler for PR Follow-up Events
@@ -37,6 +38,9 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         repoFullName: pr.base?.repo?.full_name ?? null,
         prNumber: pr.number,
         branch: pr.head?.ref ?? null,
+        // #1637: ingestion refuses queue work unless the head repo is proven to
+        // be the base repo; project it from the payload, never re-derive it.
+        headRepoFullName: pr.head?.repo?.full_name ?? null,
         url: pr.html_url,
         title: pr.title,
         author: pr.user?.login ?? null,
@@ -65,6 +69,8 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         repoFullName: pr.base?.repo?.full_name ?? null,
         prNumber: pr.number,
         branch: pr.head?.ref ?? null,
+        // #1637: head-repo proof for the ingestion gate (see review case).
+        headRepoFullName: pr.head?.repo?.full_name ?? null,
         url: pr.html_url,
         title: pr.title,
         author: pr.user?.login ?? null,
@@ -88,6 +94,13 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
 
       // The issue object carries no repository or head ref; the repo is the
       // top-level `repository`, and the PR's branch/head are not in this payload.
+      // No `headRepoFullName` either — the issue_comment payload never carries
+      // the PR's head repository, so ingestion cannot prove the head repo is the
+      // base repo and refuses this delivery fail-closed (#1637). Comment
+      // ingestion is not lost while the PR is open: the pull-based sync scan
+      // reads the PR object (head repo included) and ingests the same comments
+      // on its next cycle. A PR that merges or closes before that cycle stops
+      // being fixable work anyway — that is the accepted cost of the gate.
       events.push({
         eventType: "comment",
         repoFullName: issueComment.repository?.full_name ?? null,
@@ -130,6 +143,11 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         repoFullName: checkRun.repository?.full_name ?? null,
         prNumber,
         branch: firstPr?.head?.ref ?? check.check_suite?.head_branch ?? null,
+        // #1637: the check_run pull-request-minimal object's head.repo carries
+        // id/url/name but no full_name, so this normally projects null and the
+        // event is refused fail-closed; the sync path covers failing checks
+        // with the real PR author and full head-repo proof anyway.
+        headRepoFullName: firstPr?.head?.repo?.full_name ?? null,
         // #1098: `url` is the item's identity and the queue guard is
         // write-once — a job-URL fallback would freeze it in place. The empty
         // string stays falsy, so the next sync enqueue backfills the real PR URL.
@@ -159,6 +177,8 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         repoFullName: pr.base?.repo?.full_name ?? null,
         prNumber: pr.number ?? 0,
         branch: pr.head?.ref ?? null,
+        // #1637: head-repo proof for the ingestion gate (see review case).
+        headRepoFullName: pr.head?.repo?.full_name ?? null,
         url: pr.html_url,
         title: pr.title,
         author: pr.user?.login ?? null,
@@ -212,6 +232,46 @@ export async function POST(request: Request) {
     }
 
     const body = jsonPayload as Record<string, unknown>;
+
+    // /dispatch-fix PR comment command (#1622), gated BEFORE any ingestion
+    // work: an explicit, per-PR operator handoff of a human-authored PR
+    // into the pr-fix queue. The bot-author gate on ingestion must stay
+    // absolute — a human PR only ever becomes queue work through this
+    // command, so a command comment is intercepted here and never reaches
+    // processPrFollowupEvents (where it would be dropped as a human
+    // comment, or worse, ingested as ordinary comment feedback).
+    if (githubEvent === "issue_comment") {
+      const issueComment = body as Record<string, any>;
+      const pr = issueComment.issue?.pull_request;
+      const commentBody = issueComment.comment?.body;
+      // `created` only (review INFO-7): an edited or deleted command comment
+      // must not re-run the handoff.
+      if (issueComment.action === "created" && pr && typeof commentBody === "string" && parseDispatchFixCommand(commentBody)) {
+        const repoFullName = issueComment.repository?.full_name;
+        const prNumber = issueComment.issue?.number;
+        const commenter = issueComment.comment?.user?.login;
+        if (typeof repoFullName !== "string" || !repoFullName || typeof prNumber !== "number") {
+          return errorResponse("Missing repository.full_name or issue.number in payload", 400);
+        }
+        if (typeof commenter !== "string" || !commenter) {
+          return errorResponse("Missing comment.user.login in payload", 400);
+        }
+        const outcome = await handleDispatchFixCommand({
+          repoFullName,
+          prNumber,
+          commenter,
+          commentBody,
+        });
+        // The outcome detail can carry internal error text (review m12);
+        // only the coarse outcome is echoed back — the PR thread and the
+        // audit log are the operator-visible surfaces.
+        return NextResponse.json({
+          message: `/dispatch-fix command ${outcome.outcome}`,
+          outcome: outcome.outcome,
+        });
+      }
+    }
+
     const events = parseWebhookEvent(githubEvent, body);
 
     if (events.length === 0) {
