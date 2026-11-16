@@ -6,15 +6,7 @@ import type { PinnedRead } from "./close-grounding";
 import { fetchRepositoryMetadata as defaultFetchRepo } from "@/lib/github";
 import { searchRepositoryCode as defaultSearchCode } from "@/lib/github";
 import { fetchRepositoryFileText as defaultFetchFile } from "@/lib/github";
-import { sanitizeModelText } from "./sanitize";
-
-function errorMessage(err: unknown): string {
-  // GitHub-authored failure text is foreign input that flows into
-  // GroomingRun.contextWarnings (String[]); strip NUL and the other C0
-  // controls except \n/\t before it reaches Postgres, matching the
-  // #1130/#1157/#1164/#1214 source-sanitization sources (dispatch#1297).
-  return sanitizeModelText(err instanceof Error ? err.message : String(err));
-}
+import { errorMessage, sanitizeModelText } from "./sanitize";
 
 export interface RepositoryContextInput {
   repoFullName: string;

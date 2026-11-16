@@ -22,7 +22,7 @@ import {
   type ReleasePulseRepoInput,
   type ReleasePulseSnapshot,
 } from "@/lib/release-pulse";
-import type { LifecycleEventRecord } from "@/lib/issue-lifecycle-read";
+import { toLifecycleEventRecord } from "@/lib/issue-lifecycle-read";
 
 import type { ReleaseDeltaState } from "./automation-sync";
 
@@ -48,7 +48,7 @@ export function asReleaseDeltaState(value: string): ReleaseDeltaState {
   }
 }
 
-function toEventRecord(row: {
+function toReleasePulseEvent(row: {
   kind: string;
   source: string;
   actor: string;
@@ -61,22 +61,7 @@ function toEventRecord(row: {
   metadata: unknown;
   issueNumber: number;
 }): ReleasePulseEventInput {
-  const event: LifecycleEventRecord = {
-    kind: row.kind,
-    source: row.source,
-    actor: row.actor,
-    agentName: row.agentName,
-    fromStatus: row.fromStatus,
-    toStatus: row.toStatus,
-    sourceEventId: row.sourceEventId,
-    occurredAt: row.occurredAt,
-    observedAt: row.observedAt,
-    metadata:
-      typeof row.metadata === "object" && row.metadata !== null
-        ? (row.metadata as Record<string, unknown>)
-        : null,
-  };
-  return { ...event, issueNumber: row.issueNumber };
+  return { ...toLifecycleEventRecord(row), issueNumber: row.issueNumber };
 }
 
 export async function collectReleasePulse(
@@ -104,7 +89,7 @@ export async function collectReleasePulse(
     },
     orderBy: { occurredAt: "asc" },
   });
-  const events = eventRows.map(toEventRecord);
+  const events = eventRows.map(toReleasePulseEvent);
 
   const eventIssueNumbers = [...new Set(events.map((event) => event.issueNumber))];
 

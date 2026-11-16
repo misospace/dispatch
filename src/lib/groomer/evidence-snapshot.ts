@@ -5,7 +5,7 @@ import { fetchRepositoryMetadata } from "@/lib/github-code-search";
 import { fetchLatestCommit } from "@/lib/github-ci";
 import type { GitHubIssue } from "@/types";
 import { isAutomationAuthor } from "./context";
-import { sanitizeModelText } from "./sanitize";
+import { errorMessage } from "./sanitize";
 
 export type EvidenceProvenance =
   | "repository"
@@ -144,13 +144,6 @@ const MAX_PERSISTED_WARNINGS = 20;
 
 export function sha256Hex(value: string): string {
   return createHash("sha256").update(value).digest("hex");
-}
-
-function errorMessage(err: unknown): string {
-  // GitHub-authored failure text is foreign input into Postgres errorMessage
-  // text columns and the contextSummary jsonb (dispatch#1214); strip NUL and
-  // the other C0 controls except \n/\t, matching the #1130/#1157/#1164 sources.
-  return sanitizeModelText(err instanceof Error ? err.message : String(err));
 }
 
 /**

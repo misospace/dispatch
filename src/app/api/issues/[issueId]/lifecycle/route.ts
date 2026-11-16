@@ -4,7 +4,10 @@ import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { rejectAgentCaller } from "@/lib/operator-only";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { prisma } from "@/lib/prisma";
-import { buildIssueLifecycleTimeline, type LifecycleEventRecord } from "@/lib/issue-lifecycle-read";
+import {
+  buildIssueLifecycleTimeline,
+  toLifecycleEventRecord,
+} from "@/lib/issue-lifecycle-read";
 import {
   buildWorkItemDeliveryChain,
   type WorkAttemptPrFixItemRecord,
@@ -29,35 +32,6 @@ const MAX_EVENTS = 500;
  */
 const MAX_ATTEMPT_RUNS = 500;
 const MAX_ATTEMPT_HISTORY = 100;
-
-function toEventRecord(row: {
-  kind: string;
-  source: string;
-  actor: string;
-  agentName: string | null;
-  fromStatus: string | null;
-  toStatus: string | null;
-  sourceEventId: string | null;
-  occurredAt: Date;
-  observedAt: Date;
-  metadata: unknown;
-}): LifecycleEventRecord {
-  return {
-    kind: row.kind,
-    source: row.source,
-    actor: row.actor,
-    agentName: row.agentName,
-    fromStatus: row.fromStatus,
-    toStatus: row.toStatus,
-    sourceEventId: row.sourceEventId,
-    occurredAt: row.occurredAt,
-    observedAt: row.observedAt,
-    metadata:
-      typeof row.metadata === "object" && row.metadata !== null
-        ? (row.metadata as Record<string, unknown>)
-        : null,
-  };
-}
 
 /**
  * GET /api/issues/[issueId]/lifecycle — the source-neutral lifecycle read
@@ -102,7 +76,7 @@ export async function GET(request: NextRequest, context: { params: Promise<{ iss
       take: MAX_EVENTS + 1,
     });
     const truncated = rows.length > MAX_EVENTS;
-    const events = (truncated ? rows.slice(0, MAX_EVENTS) : rows).map(toEventRecord);
+    const events = (truncated ? rows.slice(0, MAX_EVENTS) : rows).map(toLifecycleEventRecord);
 
     const timeline = buildIssueLifecycleTimeline(
       {
