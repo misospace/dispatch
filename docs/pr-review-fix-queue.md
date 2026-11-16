@@ -380,10 +380,12 @@ as the `pr-fix-sweep` job:
 - The listing read is bounded and cached for one pass. The reap reads one
   listing per repository per pass, and it reads a listing only for a row whose
   per-PR endpoint already answered `404`. A queue of present PRs therefore
-  pays no listing traffic at all. The read stops after 500 PRs. A repository
-  with more PRs than that cannot prove an absence, so its rows defer. The
-  listing names the repository directly, so a row whose repository is no
-  longer tracked stays eligible.
+  pays no listing traffic at all. A pass reads at most 10 repositories'
+  listings. A row outside that budget defers, and the rotation brings it back
+  in a later pass. The read stops after 500 PRs. A repository with more PRs
+  than that cannot prove an absence, so its rows defer. The listing names the
+  repository directly, so a row whose repository is no longer tracked stays
+  eligible.
 - The deleted-PR reap is bounded and it rotates through the queue (#1641
   review). The pass reads at most 100 queue rows and issues at most 50 per-PR
   probes. It reads the rows that it considered least recently first. It stamps
