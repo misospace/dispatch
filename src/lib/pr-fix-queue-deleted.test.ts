@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { __resetGitHubAppState } from "./github-auth";
-import { probePrFixPrPresence, reconcileDeletedPrFixItems, type PrFixPrPresence, type PrFixQueueClient } from "./pr-fix-queue";
+import { createPrFixPrPresenceProbe, probePrFixPrPresence, reconcileDeletedPrFixItems, type PrFixPrPresence, type PrFixQueueClient } from "./pr-fix-queue";
 
 vi.mock("./pr-fix-surfacing", () => ({
   surfacePrFixBlocked: vi.fn(async () => null),
@@ -143,7 +143,7 @@ describe("deleted upstream PRs (#1641)", () => {
     expect(client.history[0]).toMatchObject({
       action: "mark",
       status: "STALE",
-      note: "Upstream PR deleted (404 at the per-PR endpoint, repo reachable) at reconcile time (#1641)",
+      note: "Upstream PR deleted (404 at the per-PR endpoint, repo reachable, absent from the PR listings) at reconcile time (#1641)",
     });
     // The rotation stamps every row the pass CONSIDERED, so the head moves on:
     // the deferred rows carry the stamp, the reaped rows do not (they are
@@ -385,17 +385,58 @@ describe("probePrFixPrPresence (#1641)", () => {
       text: async () => "",
     }) as unknown as Response;
 
-  it("a per-PR 404 at a readable repo is a confirmed deletion", async () => {
+  /** The per-PR endpoint: `/repos/<repo>/pulls/<n>`. */
+  const isPerPr = (url: string) => String(url).includes("/pulls/");
+  /** The PR listing endpoint: `/repos/<repo>/pulls?state=all...`. */
+  const isListing = (url: string) => String(url).includes("/pulls?");
+  const repoMeta = () => res(200, { full_name: "Org/Repo", default_branch: "main", archived: false });
+  const listing = (numbers: number[]) => res(200, numbers.map((number) => ({ number })));
+
+  it("a per-PR 404 at a readable repo, absent from the PR listings, is a confirmed deletion", async () => {
     fetchMock.mockImplementation(async (url: string) =>
-      String(url).includes("/pulls/")
-        ? res(404)
-        : res(200, { full_name: "Org/Repo", default_branch: "main", archived: false }),
+      isPerPr(url) ? res(404) : isListing(url) ? listing([1, 2, 3]) : repoMeta(),
     );
 
     expect(await probePrFixPrPresence("org/repo", 7)).toBe("deleted");
     expect(String(fetchMock.mock.calls[0][0])).toContain("/repos/org/repo/pulls/7");
-    // The reachability gate is only consulted when the PR actually 404s.
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // The reachability gate is only consulted when the PR actually 404s, and
+    // the listing is read only after the gate confirms the repo is readable.
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("a per-PR 404 whose PR is still in the PR listings is NOT a deletion (#1641)", async () => {
+    // The listing contradicts the 404: the PR exists and the per-PR answer
+    // was spurious. Reaping here would retire live work.
+    fetchMock.mockImplementation(async (url: string) =>
+      isPerPr(url) ? res(404) : isListing(url) ? listing([7, 8]) : repoMeta(),
+    );
+
+    expect(await probePrFixPrPresence("org/repo", 7)).toBe("present");
+    expect(warnSpy).toHaveBeenCalled();
+  });
+
+  it("a per-PR 404 with a listing too large to prove absence is 'unknown' (#1641)", async () => {
+    // A truncated listing makes a missing number merely unseen, so the
+    // absence is unproven and the row must defer.
+    fetchMock.mockImplementation(async (url: string) => {
+      if (isPerPr(url)) return res(404);
+      if (isListing(url)) {
+        return res(200, Array.from({ length: 500 }, (_, index) => ({ number: index + 1 })));
+      }
+      return repoMeta();
+    });
+
+    expect(await probePrFixPrPresence("org/repo", 7)).toBe("unknown");
+    expect(warnSpy).toHaveBeenCalled();
+  });
+
+  it("a per-PR 404 whose listing could not be read is 'unknown' (#1641)", async () => {
+    fetchMock.mockImplementation(async (url: string) =>
+      isPerPr(url) ? res(404) : isListing(url) ? res(500, { message: "boom" }) : repoMeta(),
+    );
+
+    expect(await probePrFixPrPresence("org/repo", 7)).toBe("unknown");
+    expect(warnSpy).toHaveBeenCalled();
   });
 
   it("a present PR is 'present' and never reaches the reachability gate", async () => {
@@ -409,7 +450,7 @@ describe("probePrFixPrPresence (#1641)", () => {
     // Realistic unreadable shape: the repo itself 404s (deleted/renamed-
     // without-redirect/private-to-this-token), so the PR's 404 proves nothing.
     fetchMock.mockImplementation(async (url: string) =>
-      String(url).includes("/pulls/") ? res(404) : res(404, { message: "Not Found" }),
+      isPerPr(url) ? res(404) : res(404, { message: "Not Found" }),
     );
 
     expect(await probePrFixPrPresence("org/repo", 7)).toBe("unknown");
@@ -428,11 +469,102 @@ describe("probePrFixPrPresence (#1641)", () => {
 
   it("a transport failure on the per-PR probe is 'unknown'", async () => {
     fetchMock.mockImplementation(async (url: string) => {
-      if (String(url).includes("/pulls/")) throw new Error("network down");
-      return res(200, { full_name: "Org/Repo", default_branch: "main" });
+      if (isPerPr(url)) throw new Error("network down");
+      return repoMeta();
     });
 
     expect(await probePrFixPrPresence("org/repo", 7)).toBe("unknown");
     expect(warnSpy).toHaveBeenCalled();
+  });
+
+  it("the per-pass probe reads one PR listing per repo, not one per row (#1641)", async () => {
+    fetchMock.mockImplementation(async (url: string) =>
+      isPerPr(url) ? res(404) : isListing(url) ? listing([1]) : repoMeta(),
+    );
+
+    const probe = createPrFixPrPresenceProbe();
+    expect(await probe("org/repo", 7)).toBe("deleted");
+    expect(await probe("org/repo", 8)).toBe("deleted");
+    expect(await probe("org/other", 7)).toBe("deleted");
+
+    const listingCalls = fetchMock.mock.calls.filter((call) => isListing(String(call[0])));
+    // One listing read per repository, shared by every row of that repo.
+    expect(listingCalls).toHaveLength(2);
+    expect(String(listingCalls[0][0])).toContain("/repos/org/repo/pulls?");
+    expect(String(listingCalls[1][0])).toContain("/repos/org/other/pulls?");
+  });
+
+  it("the per-pass probe bounds how many repositories' listings it reads (#1641)", async () => {
+    fetchMock.mockImplementation(async (url: string) =>
+      isPerPr(url) ? res(404) : isListing(url) ? listing([1]) : repoMeta(),
+    );
+
+    const probe = createPrFixPrPresenceProbe(1);
+    expect(await probe("org/first", 7)).toBe("deleted");
+    // The budget is spent, so the second repository's listing is never read
+    // and its row defers. The rotation brings it back in a later pass.
+    expect(await probe("org/second", 8)).toBe("unknown");
+
+    const listingCalls = fetchMock.mock.calls.filter((call) => isListing(String(call[0])));
+    expect(listingCalls).toHaveLength(1);
+    expect(String(listingCalls[0][0])).toContain("/repos/org/first/pulls?");
+  });
+});
+
+describe("deleted-PR reap with the real probe (#1641)", () => {
+  const fetchMock = vi.fn();
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeAll(() => {
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  beforeEach(() => {
+    __resetGitHubAppState();
+    process.env.GITHUB_TOKEN = "test-token-for-presence-tests";
+    fetchMock.mockReset();
+    warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    delete process.env.GITHUB_TOKEN;
+    warnSpy.mockRestore();
+  });
+
+  afterAll(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const res = (status: number, body: unknown = {}) =>
+    ({
+      ok: status >= 200 && status < 300,
+      status,
+      headers: new Headers(),
+      json: async () => body,
+      text: async () => "",
+    }) as unknown as Response;
+
+  it("reaps a row whose PR is absent from the listings and keeps a row the listings still show (#1641)", async () => {
+    const client = makeClient([item("a", "org/gone", 1), item("b", "org/live", 2)]);
+    fetchMock.mockImplementation(async (url: string) => {
+      const u = String(url);
+      if (u.includes("/pulls/")) return res(404);
+      if (u.includes("/repos/org/gone/pulls?")) {
+        return res(200, [{ number: 9 }, { number: 10 }]);
+      }
+      if (u.includes("/repos/org/live/pulls?")) {
+        // The listing still shows PR 2: the per-PR 404 was spurious, so the
+        // row must survive.
+        return res(200, [{ number: 2 }, { number: 3 }]);
+      }
+      return res(200, { full_name: "Org/Repo", default_branch: "main", archived: false });
+    });
+
+    const result = await reconcileDeletedPrFixItems(client, undefined, { now: NOW });
+
+    expect(result).toEqual({ checked: 2, markedStale: 1, errored: 0 });
+    expect(client.items[0].status).toBe("STALE");
+    expect(client.items[1].status).toBe("QUEUED");
+    expect(client.history).toHaveLength(1);
   });
 });

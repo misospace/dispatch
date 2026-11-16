@@ -630,9 +630,10 @@ export async function POST(request: Request) {
     // #1641: a hard-deleted PR vanished from every PR listing, so the
     // merged/closed reap above can never see its row and it lingered in the
     // queue forever. This pass probes the per-PR endpoint for the rows it
-    // reaches; a 404 at a readable repo reaps the row through the same
-    // generation-AND-status-pinned terminal write. It is bounded (rows read
-    // + per-PR probes) and rotates through the queue, so running it from
+    // reaches; a 404 at a readable repo whose PR listing does not show the PR
+    // reaps the row through the same generation-AND-status-pinned terminal
+    // write. It is bounded (rows read + per-PR probes) and rotates through
+    // the queue, so running it from
     // both reconcile entry points cannot double-probe the same rows: a row
     // the other pass considered is not due again until its re-verify bound
     // elapses. Two routes that run at the SAME time can still overlap by one

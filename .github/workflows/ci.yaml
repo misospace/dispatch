@@ -210,6 +210,54 @@ jobs:
           # compared against the structure snapshot taken before the
           # migration ran.
           npx prisma db execute --file scripts/verify-pr-fix-queue-item-structure.sql
+      # #1641 deleted-PR rotation-stamp migration against COPY OF THE
+      # PRODUCTION SCHEMA: the database already carries the production
+      # schema and production-shaped PrFixQueueItem rows, rewound to
+      # pre-migration state, so the migration is exercised the way a
+      # production instance would run it — real rows in the table, not an
+      # empty database. The verification proves the additive column and the
+      # rotation index landed, the pre-existing rows survived with their
+      # values intact, and the audit-only column back-fills nothing: a
+      # pre-existing row keeps a NULL stamp, so no row claims to have been
+      # considered by the deleted-PR reap before the deploy.
+      #
+      # Scope: the migration touches PrFixQueueItem only, so the structural
+      # comparison covers that table only.
+      - name: Create the production copy for the deleted-PR stamp migration
+        run: echo 'CREATE DATABASE dispatch_production_copy_prfix_stamp;' | npx prisma db execute --stdin
+      - name: Verify the deleted-PR stamp migration on a copy of the production schema
+        env:
+          DATABASE_URL: "postgresql://test:test@localhost:5432/dispatch_production_copy_prfix_stamp"
+        run: |
+          # Mark the stamp migration as applied WITHOUT running it: the
+          # deploy below then applies every OTHER migration and leaves
+          # PrFixQueueItem in its true pre-migration shape. The migration
+          # itself runs later, for the FIRST time, against the seeded
+          # production-shaped rows. A migration that damaged the table would
+          # otherwise do its damage before the "before" picture was taken.
+          #
+          # This requires the stamp migration to be the LAST migration that
+          # touches PrFixQueueItem: a later migration that reads or indexes
+          # the stamp column would fail here, because the marker says the
+          # migration ran while its column does not exist yet. Such a
+          # migration must move this exercise's marker to include it.
+          npx prisma migrate resolve --applied 20261116000000_add_pr_fix_presence_probe_stamp
+          npm run db:deploy
+          npx prisma db execute --file scripts/seed-production-copy-pr-fix-queue.sql
+          # Record the table's structure BEFORE the migration runs, so the
+          # verification can prove the migration changed nothing beyond
+          # adding its column and its index.
+          npx prisma db execute --file scripts/snapshot-pr-fix-queue-item-structure-presence-stamp.sql
+          # Remove the migration record so the next deploy runs the migration.
+          npx prisma db execute --file scripts/revert-add-pr-fix-presence-stamp-migration.sql
+          npm run db:deploy
+          npx prisma db execute --file scripts/verify-add-pr-fix-presence-stamp-migration.sql
+          # The verification above inspects the column and index the
+          # migration adds and the rows it must not touch. It cannot see a
+          # migration that damaged anything ELSE on the table, so the live
+          # table is also compared against the structure snapshot taken
+          # before the migration ran.
+          npx prisma db execute --file scripts/verify-pr-fix-queue-item-structure-presence-stamp.sql
 
   database-integration:
     name: Database integration

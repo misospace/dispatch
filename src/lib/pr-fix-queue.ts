@@ -19,8 +19,8 @@ export { enqueuePrFixItem, recordPrFixEvidenceBaseline, createLinkedPrFixItem } 
 export { listQueuedPrFixItems, hasInFlightRebaseHandout, assertPrHeadMovedForFix } from "./pr-fix-queue/queue-read";
 export { markPrFixItem } from "./pr-fix-queue/settlement";
 export type { MarkPrFixResult } from "./pr-fix-queue/settlement";
-export { reconcileStalePrFixItems, isPrFixRepoArchived, reconcileArchivedRepoPrFixItems, reconcileDeletedPrFixItems, probePrFixPrPresence } from "./pr-fix-queue/reconcile";
-export type { PrFixPrPresence } from "./pr-fix-queue/reconcile";
+export { reconcileStalePrFixItems, isPrFixRepoArchived, reconcileArchivedRepoPrFixItems, reconcileDeletedPrFixItems, probePrFixPrPresence, createPrFixPrPresenceProbe } from "./pr-fix-queue/reconcile";
+export type { PrFixPrPresence, PrFixListingLookup } from "./pr-fix-queue/reconcile";
 export { freshAttemptGeneration, agentHandoutToken, parseAgentHandoutToken, newHandoutToken, handoutReceipt, parseHandoutReceipt, findHandoutReceipt, agentAlreadyHanded, releaseAgentHandout, toAgentQueuePrFixItem } from "./pr-fix-queue/handout";
 export { requeuePrFixItem } from "./pr-fix-queue/requeue";
 export { resolvePrFixFromAgentReport } from "./pr-fix-queue/report-resolution";

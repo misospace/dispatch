@@ -423,6 +423,71 @@ export async function fetchPullRequestPresence(
   return "unknown";
 }
 
+/**
+ * The PR numbers a repository's PR listing shows (#1641).
+ *
+ * `complete` is the load-bearing field: it is true only when the listing was
+ * read to its END. A missing number proves the PR is absent from the listing
+ * only when the listing was complete — a truncated listing makes a missing
+ * number merely unseen, and a caller must not conclude "deleted" from it.
+ */
+export interface PullRequestListingEvidence {
+  /** PR numbers the listing shows. */
+  numbers: Set<number>;
+  /** True when the listing was read to its end. */
+  complete: boolean;
+}
+
+/**
+ * Records read from one PR listing before the read counts as truncated.
+ *
+ * The listing read only runs for a queue row whose per-PR endpoint already
+ * answered 404 — a rare, candidate-only path — so the bound is generous
+ * enough for a busy repository and still finite. A repository whose listing
+ * is larger than this is not a deletion candidate: the absence stays
+ * unproven and the row defers (fail-closed), because a truncated listing
+ * cannot distinguish "gone" from "older than the read window".
+ */
+const PR_LISTING_MAX_RECORDS = 500;
+
+/**
+ * Read a repository's PR listing and report the PR numbers it shows.
+ *
+ * `state=all` covers every PR of the repository — open, closed and merged —
+ * in ONE listing, so a number missing from it is missing from all of them.
+ * That is what makes the listing usable as the third confirmation fact of a
+ * deleted PR (#1641): the per-PR endpoint answers 404 for reasons other than
+ * deletion (a renamed repository, a token that cannot see the PR, a
+ * transient 404), and a listing that still shows the PR contradicts the
+ * deletion. Absence from a COMPLETE listing is the only absence that
+ * proves anything.
+ *
+ * Returns null when the listing could not be read at all: the caller then
+ * knows nothing and must defer.
+ */
+export async function fetchPullRequestListingEvidence(
+  repoFullName: string,
+  maxRecords = PR_LISTING_MAX_RECORDS,
+): Promise<PullRequestListingEvidence | null> {
+  const numbers = new Set<number>();
+  const url = `${GITHUB_API}/repos/${repoFullName}/pulls?state=all&sort=created&direction=desc&per_page=100`;
+  try {
+    const prs = await fetchPaginated<{ number?: number }>(url, maxRecords);
+    for (const pr of prs) {
+      if (typeof pr.number === "number") numbers.add(pr.number);
+    }
+    // `fetchPaginated` stops early only when it reached `maxRecords`; a
+    // shorter read means it followed the listing to its end.
+    return { numbers, complete: prs.length < maxRecords };
+  } catch (error) {
+    console.warn(
+      `[github-prs] PR listing unavailable for ${repoFullName}:`,
+      error instanceof Error ? error.message : error,
+    );
+    return null;
+  }
+}
+
 export async function fetchPullRequestMergeState(
   repoFullName: string,
   prNumber: number,

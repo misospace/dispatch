@@ -363,14 +363,27 @@ as the `pr-fix-sweep` job:
   (`handoutAcks`, `dispatchedAt`, `dispatchedGeneration`) and a derived
   `idleReason`; the observability snapshot counts `overdueAcked`.
 - A **merged or closed** PR goes `STALE` (nothing left to fix).
-- A **hard-deleted** PR also goes `STALE` (#1641). The PR is in no PR listing,
-  so the merged/closed reap never sees the row. Two routes run an item-driven
-  deleted-PR reap (`reconcileDeletedPrFixItems`): the pr-followup sync and the
-  issues reconcile route. The reap probes the per-PR endpoint for the rows it
-  reaches. A `404` at a repo that reads fine is a confirmed deletion, and the
-  row gets the same generation-AND-status-pinned terminal write. A `404` at an
-  unreadable repo, a transport failure, or a rate limit is an unknown and
-  defers. The reap fails open, like the archived-repo reap.
+- A **hard-deleted** PR also goes `STALE` (#1641). A hard-deleted PR is in no
+  PR listing, so the merged and closed reap never sees the row. Two routes run
+  an item-driven deleted-PR reap (`reconcileDeletedPrFixItems`): the
+  pr-followup sync and the issues reconcile route. The reap probes the per-PR
+  endpoint for the rows it reaches. A confirmation needs three facts:
+  - The per-PR endpoint answers `404`.
+  - The repository reads through the same credential.
+  - The repository's PR listing does not show the PR.
+
+  The row then gets the same generation-AND-status-pinned terminal write. Any
+  other answer defers the row and never reaps it. That includes a `404` at an
+  unreadable repository, a transport failure, a rate limit, a listing that
+  could not be read, a listing too large to prove the absence, and a listing
+  that still shows the PR. The reap fails open, like the archived-repo reap.
+- The listing read is bounded and cached for one pass. The reap reads one
+  listing per repository per pass, and it reads a listing only for a row whose
+  per-PR endpoint already answered `404`. A queue of present PRs therefore
+  pays no listing traffic at all. The read stops after 500 PRs. A repository
+  with more PRs than that cannot prove an absence, so its rows defer. The
+  listing names the repository directly, so a row whose repository is no
+  longer tracked stays eligible.
 - The deleted-PR reap is bounded and it rotates through the queue (#1641
   review). The pass reads at most 100 queue rows and issues at most 50 per-PR
   probes. It reads the rows that it considered least recently first. It stamps
@@ -411,3 +424,8 @@ existed before the deploy therefore reads as never considered, so the whole
 active queue is due at once. The first pass after the deploy probes at most 50
 rows. The rotation then spreads the remaining rows over the following passes.
 No row is skipped and no row is probed twice because of the migration.
+
+The CI job applies this migration to a copy of the production schema that
+carries production-shaped rows. The check proves the additive column and the
+rotation index landed, the pre-existing rows survived with their values
+intact, and the column back-fills nothing.

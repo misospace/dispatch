@@ -57,6 +57,8 @@ export {
   fetchPullRequestHealthSignals,
   fetchPullRequestState,
   fetchPullRequestPresence,
+  type PullRequestListingEvidence,
+  fetchPullRequestListingEvidence,
   fetchPullRequestMergeState,
   fetchPullRequestHeadSha,
   fetchPullRequestCheckFailures,

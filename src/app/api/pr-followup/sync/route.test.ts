@@ -447,6 +447,27 @@ describe("POST /api/pr-followup/sync", () => {
     vi.unstubAllGlobals();
   });
 
+  it("reports a failed deleted-PR reap pass as errored without failing the sync (#1641 review)", async () => {
+    process.env.GITHUB_TOKEN = "gh_fake_token";
+    mocks.getTrackedRepos.mockResolvedValue(["misospace/windowstead"]);
+    mocks.isAllowedBotAuthor.mockReturnValue(true);
+    mocks.reconcileDeletedPrFixItems.mockRejectedValueOnce(new Error("db down"));
+
+    const jsonRes = (data: unknown) => ({ ok: true, headers: new Headers(), json: async () => data, text: async () => "" });
+    const fetchMock = vi.fn(async () => jsonRes([]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await postRequest(true);
+    // A failed pass never fails the sync — but it IS a failed pass, so the
+    // response must say so instead of reporting a clean zero.
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.deletedReapErrored).toBe(1);
+    expect(body.deletedReaped).toBe(0);
+
+    vi.unstubAllGlobals();
+  });
+
   it("includes reposFailed in response when a repo fetch fails (non-rate-limit)", async () => {
     process.env.GITHUB_TOKEN = "gh_fake_token";
     mocks.getTrackedRepos.mockResolvedValue(["misospace/KubeTix", "misospace/windowstead"]);

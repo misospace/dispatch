@@ -1,5 +1,9 @@
 import { fetchRepositoryMetadata } from "../github-code-search";
-import { fetchPullRequestPresence } from "../github-prs";
+import {
+  fetchPullRequestListingEvidence,
+  fetchPullRequestPresence,
+  type PullRequestListingEvidence,
+} from "../github-prs";
 import { type PrFixQueueClient } from "./client";
 import { normalizeQueueRepo } from "./shared";
 
@@ -159,18 +163,49 @@ export async function reconcileArchivedRepoPrFixItems(
 export type PrFixPrPresence = "present" | "deleted" | "unknown";
 
 /**
+ * The listing read the confirmation consults: the PR numbers the repo's PR
+ * listing shows. Null means the listing could not be read at all.
+ */
+export type PrFixListingLookup = (repo: string) => Promise<PullRequestListingEvidence | null>;
+
+/**
+ * Per-PR listing reads one deleted-PR reap pass may issue (bounds forge
+ * reads). A listing read only runs for a row whose per-PR endpoint already
+ * answered 404, so a healthy queue never reaches this bound. A row outside
+ * the budget defers and the rotation brings it back in a later pass.
+ */
+const DELETED_REAP_MAX_LISTING_READS = 10;
+
+/**
  * Probe whether the upstream PR of a queue row still exists.
  *
  * A hard-deleted PR answers 404 on the per-PR endpoint and appears in no
  * listing, so no list-driven reap can see it. But 404 is also the shape of
- * an unreadable repo (deleted/renamed/private-to-another-token), so the
- * confirmation requires both facts: the per-PR fetch answered 404 AND the
- * repo itself is readable through the same capability. Anything else —
- * present, transport failure, rate limit, unreadable repo — stays "unknown"
- * and defers, keeping the archived-reap fail-open shape: an unconfirmed
- * fact never reaps.
+ * an unreadable repo (deleted/renamed/private-to-another-token) and of a
+ * PR that still exists behind a stale answer, so the confirmation requires
+ * three independent facts:
+ *
+ *  1. the per-PR fetch answered 404;
+ *  2. the repo itself is readable through the same capability — otherwise
+ *     the 404 above is the shape of an unreadable repo as well;
+ *  3. the repo's PR listing does NOT show the PR (#1641). A listing that
+ *     still shows it contradicts the deletion: the PR exists and the per-PR
+ *     answer was spurious, and reaping on that shape would retire live work.
+ *
+ * Anything else — present, transport failure, rate limit, unreadable repo,
+ * an unreadable listing, a listing too large to prove absence, or a listing
+ * that still shows the PR — stays "unknown" or "present" and defers,
+ * keeping the archived-reap fail-open shape: an unconfirmed fact never
+ * reaps.
+ *
+ * The listing read is direct (it names the repo, not the tracked-repo set),
+ * so a row whose repository is no longer tracked is still eligible.
  */
-export async function probePrFixPrPresence(repo: string, pr: number): Promise<PrFixPrPresence> {
+export async function probePrFixPrPresence(
+  repo: string,
+  pr: number,
+  listPrs: PrFixListingLookup = fetchPullRequestListingEvidence,
+): Promise<PrFixPrPresence> {
   const presence = await fetchPullRequestPresence(repo, pr);
   if (presence !== "deleted") return presence;
   try {
@@ -185,7 +220,66 @@ export async function probePrFixPrPresence(repo: string, pr: number): Promise<Pr
     );
     return "unknown";
   }
+  // Third fact (#1641): the PR must be absent from the repo's PR listings.
+  const listing = await listPrs(repo);
+  if (!listing) {
+    console.warn(
+      `[pr-fix-queue] presence probe for ${repo}#${pr} could not read the repo's PR listing; treating the PR as unknown`,
+    );
+    return "unknown";
+  }
+  if (!listing.complete) {
+    // The listing was cut short by the record bound, so a missing number is
+    // merely unseen: absence is unproven and the row must defer.
+    console.warn(
+      `[pr-fix-queue] presence probe for ${repo}#${pr} read a truncated PR listing; absence is unproven, treating the PR as unknown`,
+    );
+    return "unknown";
+  }
+  if (listing.numbers.has(pr)) {
+    // The listing contradicts the 404 — the PR is still listed, so it exists
+    // and the per-PR answer was spurious. Never reap on that shape.
+    console.warn(
+      `[pr-fix-queue] presence probe for ${repo}#${pr} answered 404 but the repo's PR listing still shows it; treating the PR as present`,
+    );
+    return "present";
+  }
   return "deleted";
+}
+
+/**
+ * Per-pass presence probe. The listing read is memoized per repository, so a
+ * pass that probes many rows of one repository pays for ONE listing read, not
+ * one per row. The memo lives for one pass only: a later pass re-reads the
+ * listing, so a stale listing can never pin a confirmation forever.
+ *
+ * The memo is also the pass's listing-read budget: a pass reads at most
+ * `maxListingReads` repositories' listings. A row whose repository falls
+ * outside the budget defers, and the rotation brings it back in a later
+ * pass, so the bound costs latency, never a reap.
+ */
+export function createPrFixPrPresenceProbe(
+  maxListingReads = DELETED_REAP_MAX_LISTING_READS,
+): (repo: string, pr: number) => Promise<PrFixPrPresence> {
+  const listings = new Map<string, Promise<PullRequestListingEvidence | null>>();
+  let budgetWarned = false;
+  const listPrs: PrFixListingLookup = (repo) => {
+    const pending = listings.get(repo);
+    if (pending) return pending;
+    if (listings.size >= maxListingReads) {
+      if (!budgetWarned) {
+        budgetWarned = true;
+        console.warn(
+          `[pr-fix-queue] deleted-PR reap reached its listing-read budget (${maxListingReads}); the remaining rows defer until a later pass`,
+        );
+      }
+      return Promise.resolve(null);
+    }
+    const read = fetchPullRequestListingEvidence(repo);
+    listings.set(repo, read);
+    return read;
+  };
+  return (repo, pr) => probePrFixPrPresence(repo, pr, listPrs);
 }
 
 /** Rows the deleted-PR reap reads per pass (bounds DB materialization). */
@@ -219,9 +313,17 @@ export interface DeletedPrFixReapOptions {
  * reap — the merged/closed reap consults per-repo PR listings, and a deleted
  * PR vanished from every listing, so its row lingered in
  * QUEUED/BLOCKED/PARKED/WAITING_EXTERNAL forever while every null per-PR
- * probe correctly refused to act on the unknown. The per-PR probe supplies
- * the missing fact; only a confirmed "deleted" reaps, through the same
+ * probe correctly refused to act on the unknown. The probe supplies the
+ * missing facts: only a confirmed "deleted" reaps, through the same
  * generation-AND-status-pinned terminal write.
+ *
+ * A confirmation needs three independent facts (#1641): the per-PR endpoint
+ * answers 404, the repo reads through the same credential, and the repo's PR
+ * listing does not show the PR. The third fact is what keeps a spurious 404
+ * (a renamed repo, a token that cannot see the PR, a transient answer) from
+ * retiring a live row. The listing read is memoized per repository for the
+ * length of one pass, and it only runs for a row that already answered 404 —
+ * a healthy queue of present PRs pays no listing traffic at all.
  *
  * Bounds and fairness (review): an unbounded pass turned a healthy queue of
  * ordinary PRESENT PRs into one GitHub request per row on every sync, and a
@@ -232,9 +334,10 @@ export interface DeletedPrFixReapOptions {
  * - reads at most `pageSize` rows and issues at most `maxProbes` per-PR
  *   probes — a hard bound on the pass's forge traffic;
  * - orders the rows least-recently-considered first (explicit
- *   `nulls: "first"` — Postgres ranks NULL above every value, so the default
- *   ASC order would pin the most recently considered rows at the head), with
- *   `id` as the deterministic tiebreak;
+ *   `nulls: "first"` — PostgreSQL ranks NULL LAST by default, so the default
+ *   ASC order would sort the never-considered rows to the END and pin the
+ *   most recently considered rows at the head), with `id` as the deterministic
+ *   tiebreak;
  * - stamps EVERY row it considered — probed present, unknown, or failed — in
  *   one bulk write at the end of the pass. The stamp is a rotation marker,
  *   not a proof: an unknown row leaves the head instead of pinning it, so a
@@ -249,7 +352,7 @@ export interface DeletedPrFixReapOptions {
  */
 export async function reconcileDeletedPrFixItems(
   client: PrFixQueueClient,
-  probePresence: (repo: string, pr: number) => Promise<PrFixPrPresence> = probePrFixPrPresence,
+  probePresence: (repo: string, pr: number) => Promise<PrFixPrPresence> = createPrFixPrPresenceProbe(),
   options: DeletedPrFixReapOptions = {},
 ): Promise<{ checked: number; markedStale: number; errored: number }> {
   const maxProbes = options.maxProbes ?? DELETED_REAP_MAX_PROBES;
@@ -290,7 +393,7 @@ export async function reconcileDeletedPrFixItems(
       const count = await markPrFixItemStale(
         client,
         item,
-        "Upstream PR deleted (404 at the per-PR endpoint, repo reachable) at reconcile time (#1641)",
+        "Upstream PR deleted (404 at the per-PR endpoint, repo reachable, absent from the PR listings) at reconcile time (#1641)",
       );
       if (count === 1) markedStale++;
     } catch (err) {
