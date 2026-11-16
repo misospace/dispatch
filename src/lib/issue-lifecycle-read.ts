@@ -141,6 +141,42 @@ export function resolvePrNumber(row: LifecycleEventRecord): number | null {
   return match ? Number(match[1]) : null;
 }
 
+/**
+ * Narrow a raw lifecycle row — a Prisma result, a webhook payload, or a test
+ * fixture — into a `LifecycleEventRecord`: unknown metadata becomes null and
+ * every other field passes through. The read-side collectors (the issue
+ * timeline route, delivery cohorts, release pulse) share this so their event
+ * projections cannot drift apart.
+ */
+export function toLifecycleEventRecord(row: {
+  kind: string;
+  source: string;
+  actor: string;
+  agentName: string | null;
+  fromStatus: string | null;
+  toStatus: string | null;
+  sourceEventId: string | null;
+  occurredAt: Date | string;
+  observedAt: Date | string;
+  metadata: unknown;
+}): LifecycleEventRecord {
+  return {
+    kind: row.kind,
+    source: row.source,
+    actor: row.actor,
+    agentName: row.agentName,
+    fromStatus: row.fromStatus,
+    toStatus: row.toStatus,
+    sourceEventId: row.sourceEventId,
+    occurredAt: row.occurredAt,
+    observedAt: row.observedAt,
+    metadata:
+      typeof row.metadata === "object" && row.metadata !== null
+        ? (row.metadata as Record<string, unknown>)
+        : null,
+  };
+}
+
 interface NormalizedEvent {
   row: LifecycleEventRecord;
   occurredAtMs: number;

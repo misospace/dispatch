@@ -4,7 +4,7 @@ import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { parseListLimit } from "@/lib/query-limit";
 import { normalizeQueueRepo } from "@/lib/pr-fix-queue";
-import type { LifecycleEventRecord } from "@/lib/issue-lifecycle-read";
+import { toLifecycleEventRecord, type LifecycleEventRecord } from "@/lib/issue-lifecycle-read";
 import type {
   WorkAttemptPrFixItemRecord,
   WorkAttemptRunRecord,
@@ -83,35 +83,6 @@ function parseWindow(
     days = parsed;
   }
   return { sinceMs: untilMs - days * 86400000, untilMs };
-}
-
-function toEventRecord(row: {
-  kind: string;
-  source: string;
-  actor: string;
-  agentName: string | null;
-  fromStatus: string | null;
-  toStatus: string | null;
-  sourceEventId: string | null;
-  occurredAt: Date;
-  observedAt: Date;
-  metadata: unknown;
-}): LifecycleEventRecord {
-  return {
-    kind: row.kind,
-    source: row.source,
-    actor: row.actor,
-    agentName: row.agentName,
-    fromStatus: row.fromStatus,
-    toStatus: row.toStatus,
-    sourceEventId: row.sourceEventId,
-    occurredAt: row.occurredAt,
-    observedAt: row.observedAt,
-    metadata:
-      typeof row.metadata === "object" && row.metadata !== null
-        ? (row.metadata as Record<string, unknown>)
-        : null,
-  };
 }
 
 export async function GET(request: NextRequest) {
@@ -310,7 +281,7 @@ export async function GET(request: NextRequest) {
     const eventsByIssue = new Map<string, LifecycleEventRecord[]>();
     for (const row of eventRows) {
       const list = eventsByIssue.get(row.issueId) ?? [];
-      list.push(toEventRecord(row));
+      list.push(toLifecycleEventRecord(row));
       eventsByIssue.set(row.issueId, list);
     }
 
