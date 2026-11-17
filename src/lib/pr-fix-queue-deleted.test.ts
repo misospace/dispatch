@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { __resetGitHubAppState } from "./github-auth";
+import { fetchPullRequestListingEvidence } from "./github-prs";
 import { createPrFixPrPresenceProbe, probePrFixPrPresence, reconcileDeletedPrFixItems, type PrFixPrPresence, type PrFixQueueClient } from "./pr-fix-queue";
 
 vi.mock("./pr-fix-surfacing", () => ({
@@ -444,16 +445,16 @@ describe("probePrFixPrPresence (#1641)", () => {
     vi.unstubAllGlobals();
   });
 
-  const res = (status: number, body: unknown = {}) =>
+  const res = (status: number, body: unknown = {}, headers: Headers = new Headers()) =>
     ({
       ok: status >= 200 && status < 300,
       status,
-      headers: new Headers(),
+      headers,
       json: async () => body,
       text: async () => "",
     }) as unknown as Response;
 
-  /** The per-PR endpoint: `/repos/<repo>/pulls/<n>`. */
+  /** per-PR endpoint: `/repos/<repo>/pulls/<n>`. */
   const isPerPr = (url: string) => String(url).includes("/pulls/");
   /** The PR listing endpoint: `/repos/<repo>/pulls?state=all...`. */
   const isListing = (url: string) => String(url).includes("/pulls?");
@@ -485,11 +486,28 @@ describe("probePrFixPrPresence (#1641)", () => {
 
   it("a per-PR 404 with a listing too large to prove absence is 'unknown' (#1641)", async () => {
     // A truncated listing makes a missing number merely unseen, so the
-    // absence is unproven and the row must defer.
+    // absence is unproven and the row must defer. The listing holds 600 PRs
+    // (six pages), so the read stops at its 500-record bound with the
+    // candidate (7) far below everything it reached. A candidate the
+    // listing still SHOWS is a different fact ("present": the listing
+    // contradicts the 404), not an unproven absence (#1648).
     fetchMock.mockImplementation(async (url: string) => {
       if (isPerPr(url)) return res(404);
       if (isListing(url)) {
-        return res(200, Array.from({ length: 500 }, (_, index) => ({ number: index + 1 })));
+        const page = Number(new URL(String(url)).searchParams.get("page") ?? "1");
+        const start = (page - 1) * 100;
+        const headers = new Headers();
+        if (start + 100 < 600) {
+          headers.set(
+            "Link",
+            `<https://api.github.com/repos/org/repo/pulls?state=all&sort=created&direction=desc&per_page=100&page=${page + 1}>; rel="next"`,
+          );
+        }
+        return res(
+          200,
+          Array.from({ length: 100 }, (_, index) => ({ number: 1000 - (start + index) })),
+          headers,
+        );
       }
       return repoMeta();
     });
@@ -593,6 +611,256 @@ describe("probePrFixPrPresence (#1641)", () => {
     // band. The public result stays the tri-state "unknown".
     expect(await probe("org/second", 8)).toBe("unknown");
     expect(onBudget).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("the deleted-PR listing read stops once it passes the candidate (#1648)", () => {
+  const fetchMock = vi.fn();
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeAll(() => {
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  beforeEach(() => {
+    __resetGitHubAppState();
+    process.env.GITHUB_TOKEN = "test-token-for-presence-tests";
+    fetchMock.mockReset();
+    warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    delete process.env.GITHUB_TOKEN;
+    warnSpy.mockRestore();
+  });
+
+  afterAll(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const res = (status: number, body: unknown = {}, headers: Headers = new Headers()) =>
+    ({
+      ok: status >= 200 && status < 300,
+      status,
+      headers,
+      json: async () => body,
+      text: async () => "",
+    }) as unknown as Response;
+
+  const isPerPr = (url: string) => String(url).includes("/pulls/");
+  const isListing = (url: string) => String(url).includes("/pulls?");
+  const repoMeta = () => res(200, { full_name: "Org/Repo", default_branch: "main", archived: false });
+
+  /** One listing record: a PR number and (optionally) its creation instant. */
+  type ListingRecord = { number?: number; created_at?: string };
+
+  /** The newest instant of the synthetic listings. */
+  const BASE = Date.parse("2026-01-01T00:00:00.000Z");
+  const at = (offsetSeconds: number) => new Date(BASE - offsetSeconds * 1000).toISOString();
+
+  /** A newest-first listing of one PR per second. */
+  const listingOf = (numbers: number[]): ListingRecord[] =>
+    numbers.map((number, index) => ({ number, created_at: at(index) }));
+
+  /**
+   * Serve the listing page by page (100 records per page), in listing
+   * order, with the `rel="next"` link GitHub sends while more pages
+   * remain. A response without that link is the END of the listing.
+   */
+  const stubListing = (records: ListingRecord[]) => {
+    fetchMock.mockImplementation(async (url: string) => {
+      const u = String(url);
+      if (isPerPr(u)) return res(404);
+      if (isListing(u)) {
+        const page = Number(new URL(u).searchParams.get("page") ?? "1");
+        const start = (page - 1) * 100;
+        const headers = new Headers();
+        if (start + 100 < records.length) {
+          headers.set(
+            "Link",
+            `<https://api.github.com/repos/org/repo/pulls?state=all&sort=created&direction=desc&per_page=100&page=${page + 1}>; rel="next"`,
+          );
+        }
+        return res(200, records.slice(start, start + 100), headers);
+      }
+      return repoMeta();
+    });
+  };
+
+  const listingCalls = () => fetchMock.mock.calls.filter((call) => isListing(String(call[0])));
+
+  it("proves a deleted PR in a repository with more than 500 PRs, and stops the read early (#1648)", async () => {
+    // 999 PRs are still listed: 1000, then 998 down to 1. PR 999 was
+    // hard-deleted, so it is in NO listing.
+    stubListing(listingOf([1000, ...Array.from({ length: 998 }, (_, i) => 998 - i)]));
+
+    expect(await probePrFixPrPresence("org/repo", 999)).toBe("deleted");
+    // The read stopped as soon as it had passed the candidate's number: one
+    // page, not the five a bound-limited read would need.
+    expect(listingCalls().length).toBeLessThanOrEqual(2);
+  });
+
+  it("a candidate the huge listing still shows is 'present' and never reaps (#1648)", async () => {
+    stubListing(listingOf([1000, ...Array.from({ length: 999 }, (_, i) => 999 - i)]));
+
+    expect(await probePrFixPrPresence("org/repo", 999)).toBe("present");
+    expect(listingCalls().length).toBeLessThanOrEqual(2);
+  });
+
+  it("a candidate that shares its second with a smaller number is proven absent only after that second was read (#1648)", async () => {
+    // The smaller number comes FIRST and shares the candidate's second, so
+    // the candidate sits BEHIND it in the same second: "the first record
+    // with a smaller number" proves nothing. The read must stay inside the
+    // second — and once the second is closed, every PR created at or after
+    // that second's oldest member was read, so the candidate's absence IS
+    // proven.
+    stubListing([
+      { number: 1000, created_at: at(0) },
+      { number: 50, created_at: at(0) },
+      ...Array.from({ length: 600 }, (_, i) => ({ number: 900 - i, created_at: at(i + 1) })),
+    ]);
+
+    expect(await probePrFixPrPresence("org/repo", 60)).toBe("deleted");
+    // One page: the read consumed the whole second before it judged the
+    // candidate.
+    expect(listingCalls().length).toBe(1);
+  });
+
+  it("a candidate that shares its second with a smaller number and IS listed is 'present' (#1648)", async () => {
+    stubListing([
+      { number: 1000, created_at: at(0) },
+      { number: 50, created_at: at(0) },
+      { number: 60, created_at: at(0) },
+      ...Array.from({ length: 600 }, (_, i) => ({ number: 900 - i, created_at: at(i + 1) })),
+    ]);
+
+    expect(await probePrFixPrPresence("org/repo", 60)).toBe("present");
+  });
+
+  it("a listing without a usable created_at proves no absence and stops at the record bound (#1648)", async () => {
+    // The records carry no created_at, so the read cannot order them: it
+    // proves no absence beyond the numbers it saw, and it reads to the
+    // bound (500 records = five pages). A listing read to its END would
+    // still prove an absence — that proof needs no order — but this listing
+    // is longer than the bound, so the read never reaches its end.
+    stubListing(Array.from({ length: 600 }, (_, i) => ({ number: 1000 - i })));
+
+    expect(await probePrFixPrPresence("org/repo", 300)).toBe("unknown");
+    expect(listingCalls().length).toBe(5);
+  });
+
+  it("a record without a usable number proves nothing at all (#1648)", async () => {
+    // One record carries no number. The listing then does not faithfully
+    // enumerate the repository's PRs — that record could BE the candidate,
+    // with a number the read never learned — so the read proves no absence,
+    // not even the candidate's, and not even though the listing was read to
+    // its end.
+    stubListing([
+      { number: 1000, created_at: at(0) },
+      { created_at: at(1) },
+      { number: 998, created_at: at(2) },
+    ]);
+
+    expect(await probePrFixPrPresence("org/repo", 999)).toBe("unknown");
+  });
+
+  it("a listing that arrives out of created-at order proves nothing (#1648)", async () => {
+    // The second record is NEWER than the first: the listing's order cannot
+    // be trusted, so the read cannot tell which PRs are older than which.
+    stubListing([
+      { number: 1000, created_at: at(5) },
+      { number: 999, created_at: at(0) },
+      ...Array.from({ length: 600 }, (_, i) => ({ number: 900 - i, created_at: at(i + 6) })),
+    ]);
+
+    expect(await probePrFixPrPresence("org/repo", 998)).toBe("unknown");
+  });
+
+  it("the per-pass probe reads one listing for a repository, and a later row the read did not reach defers (#1648)", async () => {
+    stubListing(listingOf([1000, ...Array.from({ length: 998 }, (_, i) => 998 - i)]));
+
+    const probe = createPrFixPrPresenceProbe();
+    // The first candidate decides the repository's read: it stops as soon
+    // as it has passed 999, and that proves the absence.
+    expect(await probe("org/repo", 999)).toBe("deleted");
+    // The second row's number lies outside the range the memoized read
+    // reached, so it defers and is re-probed in a later pass.
+    expect(await probe("org/repo", 500)).toBe("unknown");
+    // One listing read served both rows.
+    expect(listingCalls().length).toBe(1);
+  });
+
+  it("a candidate the read never reached defers even in a full-size listing (#1648)", async () => {
+    // 600 records, newest first: the read stops at the bound with the
+    // candidate's number far below everything it reached.
+    stubListing(listingOf(Array.from({ length: 600 }, (_, i) => 1000 - i)));
+
+    expect(await probePrFixPrPresence("org/repo", 5)).toBe("unknown");
+    expect(listingCalls().length).toBe(5);
+  });
+
+  it("a listing the record bound cut short is not 'complete' (#1648)", async () => {
+    // 50 records, but the bound (30) cuts the page short: the listing was NOT
+    // read to its end, so the read proves absence only for the numbers it
+    // reached — never for a candidate below them.
+    stubListing(listingOf(Array.from({ length: 50 }, (_, i) => 100 - i)));
+    const lookup = (repo: string, candidate: number) =>
+      fetchPullRequestListingEvidence(repo, candidate, 30);
+
+    expect(await probePrFixPrPresence("org/repo", 5, lookup)).toBe("unknown");
+  });
+
+  it("reports what the read established: the numbers, the anchor and the completeness (#1648)", async () => {
+    stubListing(listingOf([1000, ...Array.from({ length: 998 }, (_, i) => 998 - i)]));
+
+    const evidence = await fetchPullRequestListingEvidence("org/repo", 999);
+    // The read stopped after the group {998} closed, so every PR with a
+    // number at or above 998 was read: 999 is absent, and the listing was
+    // not read to its end.
+    expect(evidence?.numbers.has(999)).toBe(false);
+    expect(evidence?.numbers.has(998)).toBe(true);
+    expect(evidence?.absentProvenFrom).toBe(998);
+    expect(evidence?.complete).toBe(false);
+    expect(evidence?.numbersUsable).toBe(true);
+  });
+
+  it("reports a listing read to its end as complete (#1648)", async () => {
+    // The candidate's number is BELOW every number the listing shows, so
+    // the read never stops early and follows the listing to its end.
+    stubListing(listingOf([30, 20, 10]));
+
+    const evidence = await fetchPullRequestListingEvidence("org/repo", 5);
+    expect(evidence?.complete).toBe(true);
+    expect(evidence?.numbersUsable).toBe(true);
+    expect([...(evidence?.numbers ?? [])].sort()).toEqual([10, 20, 30]);
+    // A complete listing proves the absence of any number it does not show.
+    expect(await probePrFixPrPresence("org/repo", 5)).toBe("deleted");
+  });
+
+  it("a short last page is still a listing read to its end (#1648)", async () => {
+    // 99 records, no `rel="next"` link: the end of the listing is the
+    // missing link, not the record count of the page. The candidate's
+    // number stays below the anchor the read reaches, so the read never
+    // stops early.
+    stubListing(listingOf(Array.from({ length: 99 }, (_, i) => 100 - i)));
+
+    const evidence = await fetchPullRequestListingEvidence("org/repo", 1);
+    expect(evidence?.complete).toBe(true);
+    expect(evidence?.numbersUsable).toBe(true);
+  });
+
+  it("the memoized read of a PRESENT candidate still proves a higher candidate absent (#1648)", async () => {
+    stubListing(listingOf([1000, 998, 997, 996]));
+
+    const probe = createPrFixPrPresenceProbe();
+    // The first candidate is listed, so the read stops on it — but it had
+    // already closed the group {1000}, whose smallest number anchors the
+    // proof that every PR at or above 1000 was read.
+    expect(await probe("org/repo", 998)).toBe("present");
+    // A later candidate at or above that anchor is therefore proven absent
+    // from the same memoized read.
+    expect(await probe("org/repo", 1001)).toBe("deleted");
+    expect(listingCalls().length).toBe(1);
   });
 });
 

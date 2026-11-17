@@ -1,5 +1,5 @@
 import type { CheckFailure, PrHealthInput } from "./linked-pr-health";
-import { GITHUB_API, getHeadersAsync, fetchPaginated, fetchWithRetry } from "./github-auth";
+import { GITHUB_API, getHeadersAsync, getNextLink, fetchPaginated, fetchWithRetry } from "./github-auth";
 
 /**
  * GraphQL read of a PR's review threads: for each thread, whether it is
@@ -465,16 +465,44 @@ export async function fetchPullRequestPresence(
 /**
  * The PR numbers a repository's PR listing shows (#1641).
  *
- * `complete` is the load-bearing field: it is true only when the listing was
- * read to its END. A missing number proves the PR is absent from the listing
- * only when the listing was complete — a truncated listing makes a missing
- * number merely unseen, and a caller must not conclude "deleted" from it.
+ * `complete` is the load-bearing field of a listing read to its END: it is
+ * true only when the listing was read to its END. A missing number proves
+ * the PR is absent from the listing only when the listing was complete AND
+ * every record it showed carried a number (`numbersUsable`) — a truncated
+ * listing makes a missing number merely unseen, and a caller must not
+ * conclude "deleted" from it.
+ *
+ * `absentProvenFrom` is what lets a TRUNCATED listing prove an absence at
+ * all (#1648): it names the lowest PR number whose absence the read can
+ * still prove, so a repository with far more PRs than the record bound can
+ * still prove a recent PR's absence.
+ *
+ * A caller may prove an absence from this evidence only when the listing was
+ * complete or the candidate's number is at or above `absentProvenFrom` — and
+ * never when `numbersUsable` is false.
  */
 export interface PullRequestListingEvidence {
   /** PR numbers the listing shows. */
   numbers: Set<number>;
   /** True when the listing was read to its end. */
   complete: boolean;
+  /**
+   * True when every record the read consumed carried a usable PR number.
+   * A record without one means the listing does not faithfully enumerate
+   * the repository's PRs — the record could BE the candidate, with a number
+   * the read never learned — so the read proves no absence at all, not even
+   * from a listing it read to its end.
+   */
+  numbersUsable: boolean;
+  /**
+   * Lowest candidate PR number whose absence this read proves: every PR of
+   * the repository with a number at or above this value was read, so a
+   * candidate with a number at or above it that is missing from `numbers` is
+   * proven absent. Null when the read proves nothing beyond `numbers` — a
+   * listing cut short by the record bound that never crossed a created-at
+   * group boundary, or one whose created-at order could not be trusted.
+   */
+  absentProvenFrom: number | null;
 }
 
 /**
@@ -482,10 +510,15 @@ export interface PullRequestListingEvidence {
  *
  * The listing read only runs for a queue row whose per-PR endpoint already
  * answered 404 — a rare, candidate-only path — so the bound is generous
- * enough for a busy repository and still finite. A repository whose listing
- * is larger than this is not a deletion candidate: the absence stays
- * unproven and the row defers (fail-closed), because a truncated listing
- * cannot distinguish "gone" from "older than the read window".
+ * enough for a busy repository and still finite. A read the bound cuts
+ * short proves nothing about a candidate it never reached: the absence
+ * stays unproven and the row defers (fail-closed), because a truncated
+ * listing cannot distinguish "gone" from "older than the read window".
+ *
+ * The bound is a CEILING, not the stop condition (#1648): a read that is
+ * given a candidate PR number stops as soon as it has passed that number,
+ * so a repository with far more PRs than this still proves a recent PR's
+ * absence.
  */
 const PR_LISTING_MAX_RECORDS = 500;
 
@@ -498,26 +531,174 @@ const PR_LISTING_MAX_RECORDS = 500;
  * deleted PR (#1641): the per-PR endpoint answers 404 for reasons other than
  * deletion (a renamed repository, a token that cannot see the PR, a
  * transient 404), and a listing that still shows the PR contradicts the
- * deletion. Absence from a COMPLETE listing is the only absence that
- * proves anything.
+ * deletion. Absence from a COMPLETE listing proves an absence; a truncated
+ * listing proves it only for a candidate the read has passed (#1648).
+ *
+ * The early stop (#1648). The listing is sorted newest-first, and GitHub
+ * assigns PR numbers in creation order, so an earlier PR always carries a
+ * smaller number. A read that is given a candidate number therefore only
+ * has to read UNTIL IT HAS PASSED that number: everything still unread was
+ * created strictly earlier and carries a strictly smaller number, so the
+ * candidate cannot be hiding in the unread tail. Without this, a repository
+ * with more than `PR_LISTING_MAX_RECORDS` PRs could never prove ANY
+ * absence, and its deleted-PR rows deferred forever.
+ *
+ * The soundness rule: records that share a `created_at` second are ordered
+ * arbitrarily by GitHub, so "the first record with a smaller number" does
+ * NOT prove absence — the candidate can sit in the same second BEHIND that
+ * record. The read therefore groups the records by their created-at instant
+ * and only closes a group when a record with a DIFFERENT instant arrives:
+ * a closed group was read in full, and everything after it was created
+ * strictly earlier, hence carries a strictly smaller number. The group's
+ * SMALLEST number is the anchor of that proof: PR numbers grow with
+ * creation time, so a PR created at or after the group's creation instant
+ * carries a number at or above that smallest number, and a PR created
+ * before that instant carries a number below it. Every PR at or above the
+ * anchor therefore sat at or after the group's instant, so it was read
+ * with the group or before it.
+ *
+ * Fail-closed: a record without a usable `created_at`, or one that arrives
+ * out of created-at order, means the order cannot be trusted — the read
+ * then proves no absence beyond `numbers` (`absentProvenFrom` stays null).
+ * A record without a usable PR number is worse: the listing then does not
+ * faithfully enumerate the repository's PRs, so the read proves nothing at
+ * all (`numbersUsable` goes false). `complete` stays truthful either way:
+ * a listing read to its end proves absence without needing the order — as
+ * long as every record carried a number.
  *
  * Returns null when the listing could not be read at all: the caller then
  * knows nothing and must defer.
  */
 export async function fetchPullRequestListingEvidence(
   repoFullName: string,
+  candidatePr: number | null,
   maxRecords = PR_LISTING_MAX_RECORDS,
 ): Promise<PullRequestListingEvidence | null> {
   const numbers = new Set<number>();
-  const url = `${GITHUB_API}/repos/${repoFullName}/pulls?state=all&sort=created&direction=desc&per_page=100`;
+  // The absence proof the read accumulates: the lowest PR number whose
+  // absence this read can still prove.
+  let absentProvenFrom: number | null = null;
+  // Whether every record the read consumed carried a usable PR number.
+  let numbersUsable = true;
+  // Whether the listing's created-at order can be trusted. A record without
+  // a usable created_at, or one that arrives out of order, voids the proof.
+  let orderTrusted = true;
+  // The open created-at group and the smallest PR number seen in it.
+  let currentGroupMin: number | null = null;
+  let previousCreatedAt: number | null = null;
+  let read = 0;
+  let complete = false;
+
   try {
-    const prs = await fetchPaginated<{ number?: number }>(url, maxRecords);
-    for (const pr of prs) {
-      if (typeof pr.number === "number") numbers.add(pr.number);
+    let url: string | null = `${GITHUB_API}/repos/${repoFullName}/pulls?state=all&sort=created&direction=desc&per_page=100`;
+    while (url !== null && read < maxRecords) {
+      const response = await fetchWithRetry(url, { headers: await getHeadersAsync() });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`GitHub API error: ${response.status} ${text}`);
+      }
+      // The `rel="next"` link is the END-OF-LISTING signal: a response
+      // without one is the last page. The record count of a page is not that
+      // signal — a concurrent change can shorten a page that still has more
+      // behind it.
+      const nextUrl = getNextLink(response);
+      const data = await response.json();
+      if (!Array.isArray(data)) {
+        throw new Error(`GitHub API error: expected array response from ${url}`);
+      }
+      const records = data as Array<{ number?: number; created_at?: string }>;
+      // A page with no records makes no progress: following its link would
+      // read the same nothing forever, so the read stops there.
+      if (records.length === 0) break;
+      const pageRecords = records.slice(0, maxRecords - read);
+      let stopped = false;
+
+      for (const record of pageRecords) {
+        const number = typeof record.number === "number" ? record.number : null;
+        if (number === null) {
+          // A record without a usable number: the listing does not
+          // faithfully enumerate the repository's PRs, and the record could
+          // BE the candidate with a number the read never learned. The read
+          // proves nothing at all — neither from the anchor nor from a
+          // listing it read to its end. Nothing more can be proven, so the
+          // read stops instead of spending the rest of the bound.
+          numbersUsable = false;
+          orderTrusted = false;
+          absentProvenFrom = null;
+          currentGroupMin = null;
+          previousCreatedAt = null;
+          stopped = true;
+          break;
+        }
+        numbers.add(number);
+
+        const createdAt = record.created_at ? Date.parse(record.created_at) : Number.NaN;
+        if (!Number.isFinite(createdAt)) {
+          // No usable created_at: the listing's order cannot be trusted, so
+          // the read can no longer tell which PRs are older than which and
+          // proves no absence beyond `numbers`.
+          orderTrusted = false;
+          absentProvenFrom = null;
+          currentGroupMin = null;
+          previousCreatedAt = null;
+        } else if (orderTrusted) {
+          if (previousCreatedAt === null) {
+            // The first record opens the first group.
+            currentGroupMin = number;
+          } else if (createdAt === previousCreatedAt) {
+            // The same instant: the record belongs to the open group. GitHub
+            // orders records that share a second arbitrarily, so the group's
+            // SMALLEST number is the anchor of the absence proof: PR numbers
+            // grow with creation time, so a PR created at or after the
+            // group's instant carries a number at or above that smallest
+            // number, and such a PR was read with the group or before it.
+            currentGroupMin = currentGroupMin === null ? number : Math.min(currentGroupMin, number);
+          } else if (createdAt > previousCreatedAt) {
+            // Out-of-order listing: the created-at order cannot be trusted.
+            orderTrusted = false;
+            absentProvenFrom = null;
+            currentGroupMin = null;
+          } else {
+            // The open group closed: it was read in full, and everything
+            // still unread was created strictly earlier, hence carries a
+            // SMALLER number. So every PR with a number at or above this
+            // group's smallest number was read, and a candidate at or above
+            // it that the listing does not show is proven absent.
+            if (currentGroupMin !== null) absentProvenFrom = currentGroupMin;
+            currentGroupMin = number;
+          }
+          previousCreatedAt = createdAt;
+        }
+
+        if (candidatePr == null) continue;
+        // The listing shows the candidate: the caller treats the row as
+        // present, so there is nothing left to prove.
+        if (numbers.has(candidatePr)) {
+          stopped = true;
+          break;
+        }
+        // The read has passed the candidate's number: everything still
+        // unread carries a smaller number, so the candidate's absence is
+        // proven.
+        if (absentProvenFrom !== null && candidatePr >= absentProvenFrom) {
+          stopped = true;
+          break;
+        }
+      }
+
+      read += pageRecords.length;
+      if (stopped) break;
+      // The record bound cut this page short: the listing was not read to
+      // its end, so the read proves absence only for the numbers it reached.
+      if (pageRecords.length < records.length) break;
+      if (nextUrl === null) {
+        complete = true;
+        break;
+      }
+      url = nextUrl;
     }
-    // `fetchPaginated` stops early only when it reached `maxRecords`; a
-    // shorter read means it followed the listing to its end.
-    return { numbers, complete: prs.length < maxRecords };
+
+    return { numbers, complete, numbersUsable, absentProvenFrom };
   } catch (error) {
     console.warn(
       `[github-prs] PR listing unavailable for ${repoFullName}:`,

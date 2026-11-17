@@ -431,15 +431,27 @@ as the `pr-fix-sweep` job:
   The row then gets the same generation-AND-status-pinned terminal write. Any
   other answer defers the row and never reaps it. That includes a `404` at an
   unreadable repository, a transport failure, a rate limit, a listing that
-  could not be read, a listing too large to prove the absence, and a listing
+  could not be read, a listing that cannot prove the absence, and a listing
   that still shows the PR. The reap fails open, like the archived-repo reap.
 - The listing read is bounded and cached for one pass. The reap reads one
   listing per repository per pass, and it reads a listing only for a row whose
   per-PR endpoint already answered `404`. A queue of present PRs therefore
   pays no listing traffic at all. A pass reads at most 10 repositories'
-  listings. The read stops after 500 PRs. A repository with more PRs than that
-  cannot prove an absence, so its rows defer. The listing names the repository
-  directly, so a row whose repository is no longer tracked stays eligible.
+  listings. A row outside that budget defers, and the rotation brings it back
+  in a later pass. The read stops as soon as it can prove the candidate's
+  absence: the listing is sorted newest-first and PR numbers grow with
+  creation time, so a read that has passed the candidate's number has seen
+  every PR that could be it, and a repository with more than 500 PRs can
+  still prove a recent PR's absence. The proof rests on the listing's
+  `created_at` order: records that share a second are ordered arbitrarily, so
+  the read closes a second only when the next record carries another one, and
+  a candidate that shares a second with a smaller number is judged only once
+  that whole second has been read. A listing the read cannot order — or
+  cannot enumerate, because a record carries no number — proves nothing at
+  all. The read stops after 500 records at the latest, and a candidate whose
+  number the read never reached still defers. The listing names the
+  repository directly, so a row whose repository is no longer tracked stays
+  eligible.
 - The listing budget is a deferral, not an error. When a pass exhausts the
   budget of 10 repository listings, the row whose listing read the budget
   refused was never considered. The pass stops at that row, so the deferred

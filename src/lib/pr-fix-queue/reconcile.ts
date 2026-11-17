@@ -46,6 +46,14 @@ async function markPrFixItemStale(
   });
 }
 
+/**
+ * Stamp the rows this pass CONSIDERED with the rotation marker.
+ *
+ * The stamp moves `prPresenceCheckedAt` and nothing else, so the
+ * `updatedAt` that observability reads as the human-decision age is not
+ * reset by a reap pass. A modeled write would advance it, so the stamp goes
+ * through the raw write surface.
+ */
 async function stampConsideredRows(
   client: PrFixQueueClient,
   considered: string[],
@@ -334,9 +342,18 @@ export type PrFixPrPresence = "present" | "deleted" | "unknown";
 
 /**
  * The listing read the confirmation consults: the PR numbers the repo's PR
- * listing shows. Null means the listing could not be read at all.
+ * listing shows, plus the absence the read can prove (#1648). Null means the
+ * listing could not be read at all.
+ *
+ * The candidate PR is part of the read because it decides the read's STOP
+ * POINT: the read stops as soon as it has passed the candidate's number, so
+ * a repository with more PRs than the record bound can still prove the
+ * candidate's absence (#1648).
  */
-export type PrFixListingLookup = (repo: string) => Promise<PullRequestListingEvidence | null>;
+export type PrFixListingLookup = (
+  repo: string,
+  candidatePr: number,
+) => Promise<PullRequestListingEvidence | null>;
 
 /**
  * The signal the presence probe raises when the per-pass listing-read budget
@@ -365,6 +382,30 @@ export type PrFixListingBudgetSignal = () => void;
 const DELETED_REAP_MAX_LISTING_READS = 10;
 
 /**
+ * Whether the listing proves the candidate PR is absent (#1648).
+ *
+ * A COMPLETE listing proves the absence of any number it does not show. A
+ * truncated listing proves it only for a candidate whose number the read has
+ * PASSED: the read reached `absentProvenFrom`, so every PR of the repository
+ * at or above that number was read, and a candidate at or above it that the
+ * listing does not show is gone. A candidate the read never reached stays
+ * unproven — the row defers and is re-probed in a later pass.
+ *
+ * A listing that did not faithfully enumerate the repository's PRs (a record
+ * without a usable number) proves nothing at all: the record could BE the
+ * candidate, with a number the read never learned.
+ *
+ * A candidate the listing DOES show is never absent, complete or not: the
+ * listing contradicts the per-PR 404, and the row stays.
+ */
+function listingProvesAbsence(listing: PullRequestListingEvidence, pr: number): boolean {
+  if (!listing.numbersUsable) return false;
+  if (listing.numbers.has(pr)) return false;
+  if (listing.complete) return true;
+  return listing.absentProvenFrom !== null && pr >= listing.absentProvenFrom;
+}
+
+/**
  * Probe whether the upstream PR of a queue row still exists.
  *
  * A hard-deleted PR answers 404 on the per-PR endpoint and appears in no
@@ -388,10 +429,10 @@ const DELETED_REAP_MAX_LISTING_READS = 10;
  * for.
  *
  * Anything else — present, transport failure, rate limit, unreadable repo,
- * an unreadable listing, a listing too large to prove absence, or a listing
- * that still shows the PR — stays "unknown" or "present" and defers,
- * keeping the archived-reap fail-open shape: an unconfirmed fact never
- * reaps.
+ * an unreadable listing, a listing read that could not prove the absence,
+ * or a listing that still shows the PR — stays "unknown" or "present" and
+ * defers, keeping the archived-reap fail-open shape: an unconfirmed fact
+ * never reaps.
  *
  * The listing read is direct (it names the repo, not the tracked-repo set),
  * so a row whose repository is no longer tracked is still eligible.
@@ -416,18 +457,12 @@ export async function probePrFixPrPresence(
     return "unknown";
   }
   // Third fact (#1641): the PR must be absent from the repo's PR listings.
-  const listing = await listPrs(repo);
+  // The read is given the candidate number so it can stop as soon as it has
+  // passed it (#1648) instead of reading the whole listing to the bound.
+  const listing = await listPrs(repo, pr);
   if (!listing) {
     console.warn(
       `[pr-fix-queue] presence probe for ${repo}#${pr} could not read the repo's PR listing; treating the PR as unknown`,
-    );
-    return "unknown";
-  }
-  if (!listing.complete) {
-    // The listing was cut short by the record bound, so a missing number is
-    // merely unseen: absence is unproven and the row must defer.
-    console.warn(
-      `[pr-fix-queue] presence probe for ${repo}#${pr} read a truncated PR listing; absence is unproven, treating the PR as unknown`,
     );
     return "unknown";
   }
@@ -439,6 +474,17 @@ export async function probePrFixPrPresence(
     );
     return "present";
   }
+  if (!listingProvesAbsence(listing, pr)) {
+    // The read did not establish that the PR is gone: it stopped before it
+    // passed the candidate's number, or the listing could not be ordered
+    // (or could not be enumerated) well enough to prove anything. A missing
+    // number is then merely unseen: the absence is unproven and the row must
+    // defer.
+    console.warn(
+      `[pr-fix-queue] presence probe for ${repo}#${pr} could not prove the PR's absence — the PR listing read did not establish that the PR is missing from the listing; treating the PR as unknown`,
+    );
+    return "unknown";
+  }
   return "deleted";
 }
 
@@ -447,6 +493,14 @@ export async function probePrFixPrPresence(
  * pass that probes many rows of one repository pays for ONE listing read, not
  * one per row. The memo lives for one pass only: a later pass re-reads the
  * listing, so a stale listing can never pin a confirmation forever.
+ *
+ * The memo also fixes the read's STOP POINT (#1648): the FIRST candidate of
+ * a repository decides that repository's read — the read stops as soon as it
+ * has passed THAT candidate's number. A later candidate of the same
+ * repository reuses the memoized evidence; when that evidence does not
+ * cover the later candidate (its number lies outside the range the read
+ * reached), the row defers as "unknown" and is re-probed in a later pass,
+ * when the rotation may lead with it.
  *
  * The memo is also the pass's listing-read budget: a pass reads at most
  * `maxListingReads` repositories' listings. When the budget is exhausted the
@@ -461,7 +515,7 @@ export function createPrFixPrPresenceProbe(
 ): (repo: string, pr: number) => Promise<PrFixPrPresence> {
   const listings = new Map<string, Promise<PullRequestListingEvidence | null>>();
   let budgetWarned = false;
-  const listPrs: PrFixListingLookup = (repo) => {
+  const listPrs: PrFixListingLookup = (repo, candidatePr) => {
     const pending = listings.get(repo);
     if (pending) return pending;
     if (listings.size >= maxListingReads) {
@@ -476,7 +530,7 @@ export function createPrFixPrPresenceProbe(
       onListingBudgetExhausted?.();
       return Promise.resolve(null);
     }
-    const read = fetchPullRequestListingEvidence(repo);
+    const read = fetchPullRequestListingEvidence(repo, candidatePr);
     listings.set(repo, read);
     return read;
   };
@@ -524,7 +578,10 @@ export interface DeletedPrFixReapOptions {
  * (a renamed repo, a token that cannot see the PR, a transient answer) from
  * retiring a live row. The listing read is memoized per repository for the
  * length of one pass, and it only runs for a row that already answered 404 —
- * a healthy queue of present PRs pays no listing traffic at all.
+ * a healthy queue of present PRs pays no listing traffic at all. The read
+ * stops as soon as it has passed the candidate's number (#1648), so a
+ * repository with far more PRs than the read's record bound still proves a
+ * recent PR's absence.
  *
  * Bounds and fairness (review): an unbounded pass turned a healthy queue of
  * ordinary PRESENT PRs into one GitHub request per row on every sync, and a
