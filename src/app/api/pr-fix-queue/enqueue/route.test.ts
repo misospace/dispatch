@@ -10,6 +10,7 @@ const { mocks } = vi.hoisted(() => ({
     prFixQueueClient: vi.fn(),
     parseEnqueuePrFixInput: vi.fn(),
     enqueuePrFixItem: vi.fn().mockResolvedValue({ id: "fix-1" }),
+    fetchPullRequestHeadRepo: vi.fn(),
     auditLogCreate: vi.fn().mockResolvedValue({ id: "log-1" }),
   },
 }));
@@ -24,6 +25,10 @@ vi.mock("@/lib/prisma", () => ({
 vi.mock("@/lib/pr-fix-queue", () => ({
   parseEnqueuePrFixInput: mocks.parseEnqueuePrFixInput,
   enqueuePrFixItem: mocks.enqueuePrFixItem,
+}));
+
+vi.mock("@/lib/github-prs", () => ({
+  fetchPullRequestHeadRepo: mocks.fetchPullRequestHeadRepo,
 }));
 
 import { POST } from "./route";
@@ -41,6 +46,10 @@ describe("POST /api/pr-fix-queue/enqueue", () => {
     mocks.prFixQueueClient.mockReturnValue({});
     mocks.parseEnqueuePrFixInput.mockReturnValue({ repo: "org/repo", pr: 42 });
     mocks.enqueuePrFixItem.mockResolvedValue({ id: "fix-1", lane: "NORMAL" });
+    // #1638: the route verifies the PR head repo against the base repo before
+    // enqueueing; default to the proven same-repo answer so the pre-existing
+    // cases keep their behavior. Fork/unverifiable cases override per test.
+    mocks.fetchPullRequestHeadRepo.mockResolvedValue("org/repo");
     mocks.auditLogCreate.mockResolvedValue({ id: "log-1" });
   });
 
@@ -118,5 +127,52 @@ describe("POST /api/pr-fix-queue/enqueue", () => {
 
     expect(mocks.enqueuePrFixItem).not.toHaveBeenCalled();
     expect(mocks.auditLogCreate).not.toHaveBeenCalled();
+  });
+
+  // ── #1638: the queue-wide head-repo invariant at the direct writer ──────
+
+  it("refuses a fork PR head repo with 409 and never enqueues", async () => {
+    mocks.fetchPullRequestHeadRepo.mockResolvedValue("contributor/repo");
+
+    const res = await postRequest({ repo: "org/repo", pr: 42, reason: "test" });
+
+    expect(res.status).toBe(409);
+    expect(mocks.enqueuePrFixItem).not.toHaveBeenCalled();
+    expect(mocks.auditLogCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          action: "pr_fix_enqueue",
+          success: false,
+          notes: expect.stringContaining("refusal=fork-head-repo"),
+        }),
+      }),
+    );
+  });
+
+  it("refuses an unverifiable PR head repo fail-closed with 503 and never enqueues", async () => {
+    mocks.fetchPullRequestHeadRepo.mockResolvedValue(null);
+
+    const res = await postRequest({ repo: "org/repo", pr: 42, reason: "test" });
+
+    expect(res.status).toBe(503);
+    expect(mocks.enqueuePrFixItem).not.toHaveBeenCalled();
+    expect(mocks.auditLogCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          action: "pr_fix_enqueue",
+          success: false,
+          notes: expect.stringContaining("refusal=head-repo-unverifiable"),
+        }),
+      }),
+    );
+  });
+
+  it("enqueues when the head repo matches case-insensitively (#1637 semantics)", async () => {
+    mocks.fetchPullRequestHeadRepo.mockResolvedValue("Org/Repo");
+
+    const res = await postRequest({ repo: "org/repo", pr: 42, reason: "test" });
+
+    expect(res.status).toBe(200);
+    expect(mocks.enqueuePrFixItem).toHaveBeenCalled();
   });
 });

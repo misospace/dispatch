@@ -70,6 +70,62 @@ A related endpoint, `POST /api/issues/webhook`, ingests GitHub `issues`
 `labeled`/`unlabeled` events directly into the issue label cache using the same
 signature-verification model (see the `WEBHOOK_SECRET` row in the README).
 
+### Head-repository eligibility (#1637/#1638)
+
+Fix workers operate on the base repository, but a fork PR's head branch lives
+on the fork. A queue row for a fork PR can therefore never be done. The rule
+(pinned in #1637, shared as `isHeadRepoOfBaseRepo` in
+`src/lib/pr-fix-queue/head-repo.ts`): a writer refuses a PR whose head
+repository is not the base repository (case-insensitive), and refuses outright
+when the head repository cannot be verified.
+
+Producers gated at the time of writing:
+
+- `POST /api/pr-fix-queue/enqueue` verifies the coordinates against GitHub
+  before writing: a confirmed fork answers 409, an unverifiable head repo
+  answers 503, and neither enqueues (#1638).
+- linked-PR materialization at next-task (which mints a queue row and can hand
+  it out in the same request) refuses the materialization outright when the
+  head repository is a fork or cannot be verified — no row is created (#1638).
+
+Two more producers carry their gates in their own open changes, not in this
+tree:
+
+- pr-followup ingestion (pull-scan and webhook) is wired through the ingestion
+  call sites by #1637's own PR. Until that merges, ingestion can still create
+  a fork row, and a worker may be handed it before a later sync cycle drains
+  it; the drain below then reaps the row.
+- the `/dispatch-fix` PR comment command (#1622, added in #1634) enforces the
+  same rule at its eligibility gate. That command is not a writer until the
+  #1634 change lands.
+
+The CI park/reserve/repair routes (`cipark`, `cireserve`, `cirepair`) are not
+producers and carry no head-repo gate: they resolve an existing row through
+its hand-out marker and write only the `ciPark*` columns through a
+generation-pinned CAS. They cannot create a row, change its status, or revive
+a retired one — a retired fork row stays retired through the whole CI
+lifecycle — so they can neither mint nor un-gate work.
+
+Any row from a producer that is not gated — including rows enqueued before
+this rule existed — drains through the sync cycle: `reconcileForkPrFixItems`
+probes each UNPROVEN active row's PR (bounded page budget, pages advancing by
+a plain `id` keyset seek so pages never skip or re-read) and marks a confirmed
+fork row `STALE`. An unverifiable probe defers the row to the next
+cycle — an unknown fact never authorizes a terminal transition, and it earns
+no proof. A confirmed match stamps the row (`headRepoVerifiedAt`): a PR's
+head repository is fixed at PR creation, so the proof is durable and the
+stamped row leaves the probe set until a slow re-verify bound (30 days)
+re-probes it for the PR-number-reuse corner. That stamp is what keeps the
+scan fair: a per-cycle scan that restarts at the oldest row only starves the
+tail if rows it has already proven stay in the probe set, and every probe
+outcome except an unverifiable one takes a row out of it (STALE or stamped).
+Steady-state probe cost therefore tracks newly-arriving and unverifiable
+rows, not the whole active population.
+
+Operator paths stay explicit acts: an operator requeue (`POST
+/api/pr-fix-queue/requeue`) or a maintainer mark is an auditable decision that
+can restore any retired row.
+
 ## Feedback classification
 
 Incoming feedback is classified as **actionable** or **needs_human**:

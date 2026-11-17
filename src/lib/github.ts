@@ -61,6 +61,7 @@ export {
   fetchPullRequestListingEvidence,
   fetchPullRequestMergeState,
   fetchPullRequestHeadSha,
+  fetchPullRequestHeadRepo,
   fetchPullRequestCheckFailures,
   fetchLinkedPrHealthInput,
   fetchPullRequestCommitMessages,

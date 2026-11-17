@@ -9,6 +9,7 @@ import {
   computeEvidenceKey,
   isAllowedBotAuthor,
   isAllowedBranchOwner,
+  isHeadRepoOfBaseRepo,
   ingestCommentEvent,
   ingestReviewEvent,
   ingestReviewCommentEvent,
@@ -2500,6 +2501,30 @@ describe("clearResolvedConflictItems ledger baseline (#1276 review)", () => {
 
     expect(cleared).toBe(true);
     expect(item.status).toBe("FIXED");
+  });
+});
+
+describe("isHeadRepoOfBaseRepo (#1637 shared predicate)", () => {
+  it("accepts an exact head/base match", () => {
+    expect(isHeadRepoOfBaseRepo("org/repo", "org/repo")).toBe(true);
+  });
+
+  it("folds case — GitHub logins are case-insensitive", () => {
+    expect(isHeadRepoOfBaseRepo("Org/Repo", "org/repo")).toBe(true);
+    expect(isHeadRepoOfBaseRepo("org/repo", "ORG/REPO")).toBe(true);
+  });
+
+  it("refuses a fork head repo, including a same-owner fork", () => {
+    expect(isHeadRepoOfBaseRepo("contributor/repo", "org/repo")).toBe(false);
+    expect(isHeadRepoOfBaseRepo("org/repo-fork", "org/repo")).toBe(false);
+  });
+
+  it("refuses a missing or unverifiable head repo fail-closed", () => {
+    expect(isHeadRepoOfBaseRepo(null, "org/repo")).toBe(false);
+    expect(isHeadRepoOfBaseRepo(undefined, "org/repo")).toBe(false);
+    expect(isHeadRepoOfBaseRepo("", "org/repo")).toBe(false);
+    expect(isHeadRepoOfBaseRepo("org/repo", null)).toBe(false);
+    expect(isHeadRepoOfBaseRepo("org/repo", undefined)).toBe(false);
   });
 });
 

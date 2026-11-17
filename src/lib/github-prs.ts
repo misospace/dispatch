@@ -401,6 +401,33 @@ export async function fetchPullRequestState(
 }
 
 /**
+ * Fetch the PR's HEAD repository full name from the per-PR detail endpoint
+ * (#1638). The head repo is the queue's fork-eligibility proof: a fork PR's
+ * head repo differs from the base repo, and the fix worker operates on the
+ * base repo. Returns null when GitHub is unreachable, the response is not
+ * 2xx, the shape is unknown, or `head.repo.full_name` is absent (deleted or
+ * inaccessible fork) — callers treat null as *unverifiable* and fail closed,
+ * never as "same repo".
+ */
+export async function fetchPullRequestHeadRepo(
+  repoFullName: string,
+  prNumber: number,
+): Promise<string | null> {
+  try {
+    const headers = await getHeadersAsync();
+    const resp = await fetchWithRetry(`${GITHUB_API}/repos/${repoFullName}/pulls/${prNumber}`, { headers });
+    if (resp.ok) {
+      const detail = (await resp.json()) as { head?: { repo?: { full_name?: string | null } | null } | null };
+      const fullName = detail.head?.repo?.full_name;
+      return typeof fullName === "string" && fullName.trim() !== "" ? fullName.trim() : null;
+    }
+  } catch {
+    // Unverifiable: the caller's fail-closed posture decides, never a guess.
+  }
+  return null;
+}
+
+/**
  * Existence probe for a single PR (#1641). Tri-state by design:
  * "present" (2xx), "deleted" (404), and "unknown" (any other status or a
  * transport failure). Every other per-PR probe collapses 404 into its

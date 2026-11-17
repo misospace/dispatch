@@ -1,10 +1,12 @@
 import { Prisma } from "@prisma/client";
 import { fetchRepositoryMetadata } from "../github-code-search";
 import {
+  fetchPullRequestHeadRepo,
   fetchPullRequestListingEvidence,
   fetchPullRequestPresence,
   type PullRequestListingEvidence,
 } from "../github-prs";
+import { isHeadRepoOfBaseRepo } from "./head-repo";
 import { type PrFixQueueClient } from "./client";
 import { normalizeQueueRepo } from "./shared";
 
@@ -133,6 +135,154 @@ export async function isPrFixRepoArchived(repo: string): Promise<boolean> {
     console.warn(`[pr-fix-queue] archived check failed for ${repo}:`, error instanceof Error ? error.message : error);
     return false;
   }
+}
+
+// Slow re-verify bound for a proven head-repo match (#1638 review): a PR's
+// head repository is fixed at PR creation, so the proof is durable for the PR's
+// life — but a PR number CAN be reused by a deleted-and-recreated PR, and only
+// a fresh probe catches that. Re-probing every proven row every cycle was the
+// self-amplifying forge cost the review flagged; this bound amortizes it so
+// steady-state cost tracks newly-arriving rows, not the whole active set.
+export const HEAD_REPO_REVERIFY_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * Mark pr-fix items STALE when their PR's head repository is a fork of the
+ * base repo (#1638). Rows can come from fork PRs when their producer's gate
+ * is not in place yet — legacy rows predating the rule, and (until the
+ * ingestion gate from #1637 merges) rows ingestion created — and the fix
+ * worker operates on the base repo, where the fork's head branch does not
+ * exist, so such a row is undispatchable work that would otherwise linger
+ * until its PR merged or closed.
+ *
+ * Deterministic, one forge probe per UNPROVEN row within a bounded page
+ * budget (the `(repo, pr)` unique key makes row and PR 1:1). Semantics mirror
+ * the ingestion gate but the fail direction is the reap posture, not the
+ * acceptance posture:
+ * - head repo confirmed different (case-insensitive) → STALE, pinned on the
+ *   same generation-AND-status CAS as the other reaps (#1253);
+ * - probe returns null (GitHub unreachable, PR unreadable, shape unknown) →
+ *   DEFERRED (`unverifiable`), never reaped and never stamped: an unknown fact
+ *   must not authorize a terminal transition, the next sync cycle retries;
+ * - head repo confirmed equal → stamped (`headRepoVerifiedAt`) and left
+ *   alone; a PR's head repository is fixed at PR creation, so the proof is
+ *   durable and the row leaves the probe set until the slow re-verify bound
+ *   re-probes it.
+ *
+ * A reaped row is inert everywhere: next-task offers only QUEUED rows,
+ * attempt-requeue answers `item-closed` for STALE, and the CI-park lifecycle
+ * fails its QUEUED/generation pins — the same "server-side state verdicts
+ * settle through the reap, connector-facing 409 vocabularies stay pinned"
+ * rule the closed/merged reap is built on.
+ */
+export async function reconcileForkPrFixItems(
+  client: PrFixQueueClient,
+  fetchHeadRepo: (repo: string, pr: number) => Promise<string | null> = fetchPullRequestHeadRepo,
+  options: { batchSize?: number; maxPages?: number } = {},
+): Promise<{ checked: number; markedStale: number; unverifiable: number; errored: number }> {
+  let checked = 0;
+  let markedStale = 0;
+  let unverifiable = 0;
+  let errored = 0;
+
+  // Bounded per-cycle cost, mirroring the hand-out reclaimer (#1211): this is
+  // the only reap that probes the forge once per ROW (fork-ness is per-PR, not
+  // per-repo), so a runaway population must not turn the sync cycle into an
+  // unbounded request loop. Pages advance by a plain `id > cursor` keyset seek
+  // on the unique, immutable column: `updatedAt` is `@updatedAt`, so ordering
+  // by it while the filtered set churns (this pass's reaps, the CAS pins,
+  // concurrent settlements) would move rows across page boundaries and re-read
+  // or skip them. A page under the batch size means the filter is drained.
+  //
+  // The seek rides the WHERE clause, NOT `cursor`+`skip`: Prisma compiles
+  // `cursor: { id }, skip: 1` to `id >= (SELECT id ... ) ... OFFSET 1`, and the
+  // cursor row leaves the filter the moment this pass stamps or reaps it (the
+  // normal case at every page boundary HERE) — the OFFSET then drops a still
+  // matching row right behind the cursor. `id: { gt }` drops nothing.
+  //
+  // The filter is the UNPROVEN set, and every probe outcome except
+  // `unverifiable` REMOVES the row from it: a confirmed fork leaves the active
+  // statuses (STALE), a confirmed match earns the durable `headRepoVerifiedAt`
+  // proof (a PR's head repository is fixed at PR creation — the fact cannot
+  // flip under the row). So an id-ordered scan that restarts at the smallest
+  // id each cycle cannot starve the tail behind a wall of already-proven rows
+  // (the review finding): each cycle advances a bounded slice of the genuinely
+  // unproven backlog and converges. UNVERIFIABLE rows stay in the set for
+  // retry — honest limit: a row the forge can never answer (a deleted PR, a
+  // permanently inaccessible fork) never leaves it either, so more than a full
+  // page budget of those sorting before a fork row keeps that fork waiting
+  // every cycle. That wall is bounded by how many rows the forge cannot
+  // answer, and the retry posture is the one the reap was built on: an unknown
+  // fact defers, it never reaps.
+  const batchSize = options.batchSize ?? 50;
+  const maxPages = options.maxPages ?? 20;
+  const now = new Date();
+  const reverifyCutoff = new Date(now.getTime() - HEAD_REPO_REVERIFY_MS);
+  let cursorId: string | undefined;
+  for (let page = 0; page < maxPages; page++) {
+    const active = await client.prFixQueueItem.findMany({
+      where: {
+        status: { in: ["QUEUED", "BLOCKED", "PARKED", "WAITING_EXTERNAL"] },
+        OR: [{ headRepoVerifiedAt: null }, { headRepoVerifiedAt: { lt: reverifyCutoff } }],
+        ...(cursorId ? { id: { gt: cursorId } } : {}),
+      },
+      take: batchSize,
+      orderBy: { id: "asc" },
+    });
+    if (active.length === 0) break;
+
+    for (const item of active) {
+      try {
+        checked++;
+        const headRepo = await fetchHeadRepo(item.repo, item.pr);
+        if (headRepo === null) {
+          unverifiable++;
+          continue;
+        }
+        if (isHeadRepoOfBaseRepo(headRepo, item.repo)) {
+          // Durable proof: stamp the confirmation so the row leaves the probe
+          // set (review finding — proven-same-repo rows must not be re-probed
+          // every cycle, and must not pin the head of the id-ordered scan
+          // forever). Pinned on the same id+status+generation CAS as every
+          // other write in this pass: a concurrent requeue/settlement that
+          // moved the row in the read→write gap simply leaves it unproven and
+          // the next cycle re-probes it. No history row: the stamp is an
+          // audit-style marker (like `triggerEvaluatedAt`), not a state
+          // transition; `updatedAt` rides the write and stays informational.
+          await client.prFixQueueItem.updateMany({
+            where: { id: item.id, status: item.status, generation: item.generation },
+            data: { headRepoVerifiedAt: now },
+          });
+          continue;
+        }
+        const count = await client.$transaction(async (tx) => {
+          const result = await tx.prFixQueueItem.updateMany({
+            where: { id: item.id, status: item.status, generation: item.generation },
+            data: { status: "STALE", attemptEvidenceWatermark: null, staleDisposition: false },
+          });
+          if (result.count === 1) {
+            await tx.prFixHistory.create({
+              data: {
+                itemId: item.id,
+                action: "mark",
+                status: "STALE",
+                lane: item.lane,
+                note: `PR head repository ${headRepo} is not the base repository at reconcile time (#1638)`,
+              },
+            });
+          }
+          return result.count;
+        });
+        if (count === 1) markedStale++;
+      } catch (err) {
+        errored++;
+      }
+    }
+
+    cursorId = active[active.length - 1].id;
+    if (active.length < batchSize) break;
+  }
+
+  return { checked, markedStale, unverifiable, errored };
 }
 
 /**

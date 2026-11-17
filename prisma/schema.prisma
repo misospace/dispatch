@@ -411,6 +411,14 @@ model PrFixQueueItem {
   // cannot starve a later wait out of discovery. Audit only — never a
   // freshness or satisfaction predicate; NULL = never considered.
   triggerEvaluatedAt       DateTime?
+  // Head-repo proof stamp for the fork drain (#1638): when the drain's probe
+  // last CONFIRMED this row's PR head repository is the base repository. A PR's
+  // head repository is fixed when the PR is created, so a confirmed match is a
+  // durable fact: the stamped row leaves the drain's probe set until the slow
+  // re-verify bound re-probes it (covering the deleted-and-recreated PR that
+  // reuses a PR number). NULL = never proven — legacy rows, fresh rows, and
+  // rows whose probe was unverifiable (an unknown fact never earns the stamp).
+  headRepoVerifiedAt       DateTime?
   // Rotation stamp for the bounded deleted-PR reap (#1641): the last time
   // that pass CONSIDERED this row (probed it — present, unknown or failed).
   // It is a fairness marker, NOT a proof: an unknown probe is stamped too, so
