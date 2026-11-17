@@ -252,6 +252,18 @@ function nextUtcDay(iso: string): string {
   return date.toISOString().slice(0, 10);
 }
 
+function isRealCalendarDate(value: string): boolean {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return false;
+  const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  const daysInMonth = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return day <= daysInMonth[month - 1];
+}
+
 // The shape the live feed actually returns for the picomatch advisory: the
 // vulnerable leaf carries the advisory object, every dependent lists only
 // strings naming the packages below it.
@@ -295,7 +307,7 @@ describe("site audit gate advisory exception (#1653)", () => {
     expect(ADMITTED_ADVISORIES).toHaveLength(1);
     const [exception] = ADMITTED_ADVISORIES;
     expect(exception.id).toBe("GHSA-fc5q-39xc-vjpf");
-    expect(exception.expiresOn).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    expect(isRealCalendarDate(exception.expiresOn)).toBe(true);
     // Same inclusive semantics as the gate: the exception must still lie in
     // the future-or-today, and the day it expires the gate still admits —
     // the suite only goes red after the window itself has closed.
@@ -428,5 +440,133 @@ describe("site audit gate advisory exception (#1653)", () => {
       TODAY,
     );
     expect(verdict.ok).toBe(false);
+  });
+});
+
+const IMPOSSIBLE_EXPIRY_DATES = [
+  "2027-02-29",
+  "2027-02-30",
+  "2027-02-31",
+  "2028-02-30",
+  "2027-04-31",
+  "2027-06-31",
+  "2027-09-31",
+  "2027-11-31",
+  "2027-13-01",
+  "2027-00-10",
+  "2027-01-00",
+  "2027-01-32",
+  "1900-02-29",
+  "2100-02-29",
+];
+
+const VALID_EXPIRY_DATES = [
+  "2028-02-29",
+  "2027-02-28",
+  "2027-12-31",
+  "2027-01-31",
+  "2028-04-30",
+  "2028-06-30",
+  "2028-09-30",
+  "2028-11-30",
+];
+
+function exceptionWithExpiry(expiresOn: string) {
+  return {
+    id: "GHSA-fc5q-39xc-vjpf",
+    expiresOn,
+    reason: "test fixture",
+  };
+}
+
+describe("site audit gate exception expiry dates (#1654)", () => {
+  const TODAY = "2026-11-17";
+
+  it("fails closed on an impossible expiry date instead of admitting it", () => {
+    for (const expiresOn of IMPOSSIBLE_EXPIRY_DATES) {
+      const verdict = evaluateAuditReport(
+        picomatchReport(),
+        [exceptionWithExpiry(expiresOn)],
+        TODAY,
+      );
+      expect(verdict.ok, expiresOn).toBe(false);
+      expect(
+        verdict.failures.some(
+          (f: { kind: string }) => f.kind === "malformed-exception",
+        ),
+        expiresOn,
+      ).toBe(true);
+      expect(
+        verdict.failures.some((f: { kind: string }) => f.kind === "expired"),
+        expiresOn,
+      ).toBe(false);
+      expect(verdict.admitted, expiresOn).toHaveLength(0);
+    }
+  });
+
+  it("admits an exception whose expiry is a real calendar date", () => {
+    for (const expiresOn of VALID_EXPIRY_DATES) {
+      const verdict = evaluateAuditReport(
+        picomatchReport(),
+        [exceptionWithExpiry(expiresOn)],
+        TODAY,
+      );
+      expect(verdict.failures, expiresOn).toEqual([]);
+      expect(verdict.ok, expiresOn).toBe(true);
+      expect(verdict.admitted, expiresOn).toHaveLength(1);
+    }
+  });
+
+  it("treats a real past leap day as expired, not malformed", () => {
+    const verdict = evaluateAuditReport(
+      picomatchReport(),
+      [exceptionWithExpiry("2000-02-29")],
+      TODAY,
+    );
+    expect(verdict.ok).toBe(false);
+    expect(verdict.failures.some((f: { kind: string }) => f.kind === "expired")).toBe(
+      true,
+    );
+    expect(
+      verdict.failures.some(
+        (f: { kind: string }) => f.kind === "malformed-exception",
+      ),
+    ).toBe(false);
+  });
+
+  it("admits on the leap-day expiry and refuses the next day", () => {
+    const expiresOn = "2028-02-29";
+    expect(
+      evaluateAuditReport(
+        picomatchReport(),
+        [exceptionWithExpiry(expiresOn)],
+        expiresOn,
+      ).ok,
+    ).toBe(true);
+    const nextDay = nextUtcDay(expiresOn);
+    expect(nextDay).toBe("2028-03-01");
+    const verdict = evaluateAuditReport(
+      picomatchReport(),
+      [exceptionWithExpiry(expiresOn)],
+      nextDay,
+    );
+    expect(verdict.ok).toBe(false);
+    expect(verdict.failures.some((f: { kind: string }) => f.kind === "expired")).toBe(
+      true,
+    );
+  });
+
+  it("keeps the shipped exception record free of a malformed failure", () => {
+    const verdict = evaluateAuditReport(
+      picomatchReport(),
+      ADMITTED_ADVISORIES,
+      TODAY,
+    );
+    expect(
+      verdict.failures.some(
+        (f: { kind: string }) => f.kind === "malformed-exception",
+      ),
+    ).toBe(false);
+    expect(verdict.ok).toBe(true);
   });
 });

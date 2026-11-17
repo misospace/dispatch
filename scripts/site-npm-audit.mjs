@@ -57,11 +57,29 @@ export const NPM_AUDIT_ARGS = [
 
 const BLOCKING_SEVERITIES = new Set(["high", "critical"]);
 const KNOWN_SEVERITIES = new Set(["info", "low", "moderate", "high", "critical"]);
-const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+const ISO_DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
 const GHSA_IN_URL = /advisories\/(GHSA-[0-9a-z]+-[0-9a-z]+-[0-9a-z]+)/i;
+const MONTH_LENGTHS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
 function blocking(severity) {
   return BLOCKING_SEVERITIES.has(String(severity ?? "").toLowerCase());
+}
+
+function isLeapYear(year) {
+  return (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+}
+
+function isRealCalendarDate(value) {
+  if (typeof value !== "string") return false;
+  const match = value.match(ISO_DATE);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (month < 1 || month > 12) return false;
+  const daysInMonth =
+    month === 2 && isLeapYear(year) ? 29 : MONTH_LENGTHS[month - 1];
+  return day >= 1 && day <= daysInMonth;
 }
 
 // Follow one vulnerable package entry to the advisory objects it resolves to.
@@ -132,13 +150,12 @@ export function evaluateAuditReport(report, admitted, todayIso) {
     const valid =
       typeof exception?.id === "string" &&
       /^GHSA-[0-9a-z]+-[0-9a-z]+-[0-9a-z]+$/i.test(exception.id) &&
-      typeof exception?.expiresOn === "string" &&
-      ISO_DATE.test(exception.expiresOn);
+      isRealCalendarDate(exception.expiresOn);
     if (!valid) {
       // A malformed exception record is never load-bearing: fail closed.
       failures.push({
         kind: "malformed-exception",
-        note: `exception record for ${JSON.stringify(exception?.id)} is malformed (need a GHSA id and a YYYY-MM-DD expiresOn)`,
+        note: `exception record for ${JSON.stringify(exception?.id)} is malformed (need a GHSA id and a YYYY-MM-DD expiresOn that is a real calendar date)`,
       });
       continue;
     }
