@@ -430,4 +430,3 @@ export async function reconcileDeletedPrFixItems(
 
   return { checked, markedStale, errored };
 }
-
