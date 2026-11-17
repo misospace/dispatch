@@ -189,10 +189,28 @@ export type PrFixPrPresence = "present" | "deleted" | "unknown";
 export type PrFixListingLookup = (repo: string) => Promise<PullRequestListingEvidence | null>;
 
 /**
+ * The signal the presence probe raises when the per-pass listing-read budget
+ * is exhausted (#1641).
+ *
+ * The budget is a deliberate bound on forge traffic, so reaching it is an
+ * intentional deferral and never an error. The probe keeps its public
+ * tri-state result (`present | deleted | unknown`), and this signal carries
+ * the reason for the deferral out of band. That is what lets the reap tell
+ * an exhausted budget apart from an unreadable listing: the exhausted budget
+ * must not consume the row's rotation position, while an unreadable listing
+ * is an ordinary considered row.
+ */
+export type PrFixListingBudgetSignal = () => void;
+
+/**
  * Per-PR listing reads one deleted-PR reap pass may issue (bounds forge
  * reads). A listing read only runs for a row whose per-PR endpoint already
- * answered 404, so a healthy queue never reaches this bound. A row outside
- * the budget defers and the rotation brings it back in a later pass.
+ * answered 404, so a healthy queue never reaches this bound.
+ *
+ * Reaching the bound is an intentional deferral, not an error. The row whose
+ * listing read the budget refused was NOT considered: the pass stops there,
+ * so that row and every row after it keep their rotation position and lead
+ * the next pass. The rows considered before the bound remain stamped.
  */
 const DELETED_REAP_MAX_LISTING_READS = 10;
 
@@ -211,6 +229,13 @@ const DELETED_REAP_MAX_LISTING_READS = 10;
  *  3. the repo's PR listing does NOT show the PR (#1641). A listing that
  *     still shows it contradicts the deletion: the PR exists and the per-PR
  *     answer was spurious, and reaping on that shape would retire live work.
+ *
+ * The reachability read in (2) stays an explicit fact even though a
+ * successful listing read in (3) also proves the repository is readable: the
+ * confirmation contract names three independent facts, and reading each of
+ * them on its own keeps every fact visible when one of them fails. It costs
+ * one extra request per 404, which the per-pass request ceiling accounts
+ * for.
  *
  * Anything else — present, transport failure, rate limit, unreadable repo,
  * an unreadable listing, a listing too large to prove absence, or a listing
@@ -274,12 +299,15 @@ export async function probePrFixPrPresence(
  * listing, so a stale listing can never pin a confirmation forever.
  *
  * The memo is also the pass's listing-read budget: a pass reads at most
- * `maxListingReads` repositories' listings. A row whose repository falls
- * outside the budget defers, and the rotation brings it back in a later
- * pass, so the bound costs latency, never a reap.
+ * `maxListingReads` repositories' listings. When the budget is exhausted the
+ * probe raises `onListingBudgetExhausted` and answers "unknown", and the reap
+ * stops its pass there. The row that hit the budget and every row after it
+ * keep their rotation position and lead the next pass, so the bound costs
+ * latency, never a reap.
  */
 export function createPrFixPrPresenceProbe(
   maxListingReads = DELETED_REAP_MAX_LISTING_READS,
+  onListingBudgetExhausted?: PrFixListingBudgetSignal,
 ): (repo: string, pr: number) => Promise<PrFixPrPresence> {
   const listings = new Map<string, Promise<PullRequestListingEvidence | null>>();
   let budgetWarned = false;
@@ -290,9 +318,12 @@ export function createPrFixPrPresenceProbe(
       if (!budgetWarned) {
         budgetWarned = true;
         console.warn(
-          `[pr-fix-queue] deleted-PR reap reached its listing-read budget (${maxListingReads}); the remaining rows defer until a later pass`,
+          `[pr-fix-queue] deleted-PR reap reached its listing-read budget (${maxListingReads}); the row that hit it and every row after it stay unstamped and lead the next pass`,
         );
       }
+      // The budget is exhausted. This is an intentional deferral, so the
+      // signal is raised instead of an error. The row stays unstamped.
+      onListingBudgetExhausted?.();
       return Promise.resolve(null);
     }
     const read = fetchPullRequestListingEvidence(repo);
@@ -352,19 +383,34 @@ export interface DeletedPrFixReapOptions {
  * are gone. This pass instead:
  *
  * - reads at most `pageSize` rows and issues at most `maxProbes` per-PR
- *   probes — a hard bound on the pass's forge traffic;
+ *   probes (a hard bound on the pass's forge traffic);
  * - orders the rows least-recently-considered first (explicit
  *   `nulls: "first"` — PostgreSQL ranks NULL LAST by default, so the default
  *   ASC order would sort the never-considered rows to the END and pin the
  *   most recently considered rows at the head), with `id` as the deterministic
  *   tiebreak;
- * - stamps EVERY row it considered — probed present, unknown, or failed — in
+ * - stamps every row it CONSIDERED (probed present, unknown, or failed) in
  *   one bulk write at the end of the pass. The stamp is a rotation marker,
  *   not a proof: an unknown row leaves the head instead of pinning it, so a
  *   wall of permanently-unknown rows cannot hide a confirmed deletion behind
  *   it, and repeated passes ADVANCE through the backlog;
- * - leaves rows the probe bound cut off unstamped, so they lead the next
- *   pass — the rotation never restarts at the same head.
+ * - leaves every row it did NOT consider unstamped, so those rows lead the
+ *   next pass (the rotation never restarts at the same head). Two bounds cut
+ *   a pass short and both leave the rows they cut off unstamped: the probe
+ *   bound (the rows the pass never reached) and the listing-read budget (the
+ *   row whose listing read the budget refused, together with every row after
+ *   it).
+ *
+ * The listing-read budget is the one bound that can cut a pass short in the
+ * middle of a healthy backlog, so it carries an explicit rule. When the
+ * budget is exhausted the row that hit it was NOT considered, the pass stops
+ * there, and the deferred row plus every row after it keep their rotation
+ * position and lead the next pass. Reaching the budget is an intentional
+ * deferral and never counts as an error.
+ *
+ * Worst case for one pass: at most 50 per-PR probes, at most 50 repository
+ * reachability reads (only after a 404), and at most 10 repository listings
+ * of at most 5 pages each, so at most 150 HTTP requests.
  *
  * A confirmed deletion reaps through the same generation-AND-status-pinned
  * terminal write every other reap uses; a probe that throws counts as
@@ -372,7 +418,7 @@ export interface DeletedPrFixReapOptions {
  */
 export async function reconcileDeletedPrFixItems(
   client: PrFixQueueClient,
-  probePresence: (repo: string, pr: number) => Promise<PrFixPrPresence> = createPrFixPrPresenceProbe(),
+  probePresence?: (repo: string, pr: number) => Promise<PrFixPrPresence>,
   options: DeletedPrFixReapOptions = {},
 ): Promise<{ checked: number; markedStale: number; errored: number }> {
   const maxProbes = options.maxProbes ?? DELETED_REAP_MAX_PROBES;
@@ -385,6 +431,19 @@ export async function reconcileDeletedPrFixItems(
   let markedStale = 0;
   let errored = 0;
   const considered: string[] = [];
+
+  // The listing-read budget is the pass's cross-repository bound, and it is
+  // the one bound that can stop the pass in the middle of a healthy backlog.
+  // When it runs out the row that hit it was NOT considered: the pass stops
+  // there, so that row and every row after it keep their rotation position
+  // and lead the next pass. The bound is an intentional deferral, so it never
+  // counts as an error.
+  let listingBudgetExhausted = false;
+  const probe =
+    probePresence ??
+    createPrFixPrPresenceProbe(DELETED_REAP_MAX_LISTING_READS, () => {
+      listingBudgetExhausted = true;
+    });
 
   const due = await client.prFixQueueItem.findMany({
     where: {
@@ -399,15 +458,26 @@ export async function reconcileDeletedPrFixItems(
 
   for (const item of due) {
     if (checked >= maxProbes) break; // forge-read bound reached
-    considered.push(item.id);
-    checked++;
     let presence: PrFixPrPresence;
     try {
-      presence = await probePresence(item.repo, item.pr);
+      presence = await probe(item.repo, item.pr);
     } catch (err) {
+      if (listingBudgetExhausted) break; // the row was never considered
       errored++;
+      considered.push(item.id);
+      checked++;
       continue; // considered → stamped below → the rotation advances past it
     }
+    if (listingBudgetExhausted) {
+      // The listing-read budget ran out on this row, so the row was NOT
+      // considered: it stays unstamped, it is not counted as checked, and
+      // the pass stops here. The deferred row and every row after it keep
+      // their rotation position and lead the next pass, so a confirmed
+      // deletion behind the budget is reached instead of starved forever.
+      break;
+    }
+    considered.push(item.id);
+    checked++;
     if (presence !== "deleted") continue;
     try {
       const count = await markPrFixItemStale(
@@ -423,11 +493,13 @@ export async function reconcileDeletedPrFixItems(
     }
   }
 
-  // Rotate the scan head: stamp EVERY row this pass considered — probed
-  // present, unknown, or failed. Rows the probe bound cut off before the
-  // pass reached them stay unstamped and therefore lead the next pass.
-  // Scoped to the active statuses so a row this pass reaped (now STALE) is
-  // not stamped. One bulk write per pass; it moves `prPresenceCheckedAt`
+  // Rotate the scan head: stamp every row this pass CONSIDERED (probed
+  // present, unknown, or failed). A row the pass did NOT consider stays
+  // unstamped and therefore leads the next pass. That holds for the rows
+  // the probe bound cut off before the pass reached them and for the row the
+  // listing-read budget stopped the pass on, together with every row after
+  // it. Scoped to the active statuses so a row this pass reaped (now STALE)
+  // is not stamped. One bulk write per pass; it moves `prPresenceCheckedAt`
   // only, so `updatedAt` — which observability reads as the human-decision
   // age — is not reset by the stamp.
   if (considered.length > 0) {

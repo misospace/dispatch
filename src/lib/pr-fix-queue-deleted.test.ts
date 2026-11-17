@@ -577,6 +577,23 @@ describe("probePrFixPrPresence (#1641)", () => {
     expect(listingCalls).toHaveLength(1);
     expect(String(listingCalls[0][0])).toContain("/repos/org/first/pulls?");
   });
+
+  it("the per-pass probe raises the listing-budget signal when the budget runs out (#1641)", async () => {
+    fetchMock.mockImplementation(async (url: string) =>
+      isPerPr(url) ? res(404) : isListing(url) ? listing([1]) : repoMeta(),
+    );
+
+    const onBudget = vi.fn();
+    const probe = createPrFixPrPresenceProbe(1, onBudget);
+    expect(await probe("org/first", 7)).toBe("deleted");
+    // A repository that fits inside the budget never raises the signal.
+    expect(onBudget).not.toHaveBeenCalled();
+    // The budget is spent: the second repository's listing is never read, the
+    // row defers, and the signal carries the reason for that deferral out of
+    // band. The public result stays the tri-state "unknown".
+    expect(await probe("org/second", 8)).toBe("unknown");
+    expect(onBudget).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("deleted-PR reap with the real probe (#1641)", () => {
@@ -634,5 +651,60 @@ describe("deleted-PR reap with the real probe (#1641)", () => {
     expect(client.items[0].status).toBe("STALE");
     expect(client.items[1].status).toBe("QUEUED");
     expect(client.history).toHaveLength(1);
+  });
+
+  it("a confirmed deletion behind ten unconfirmable repositories is reached in the next pass (#1641)", async () => {
+    // The cross-repository starvation defect: a pass reads the PR listings of
+    // at most 10 repositories, and the rows behind that budget used to be
+    // stamped anyway. The same first 10 repositories then consumed the whole
+    // budget on every pass, so a confirmed deletion in a later repository was
+    // never confirmed and never reaped, no matter how many passes ran.
+    const unconfirmable = Array.from({ length: 10 }, (_, index) =>
+      item(`u${String(index).padStart(2, "0")}`, `org/unconfirmable-${index}`, index + 1),
+    );
+    const target = item("z-target", "org/target", 99);
+    const client = makeClient([...unconfirmable, target]);
+
+    fetchMock.mockImplementation(async (url: string) => {
+      const u = String(url);
+      if (u.includes("/pulls/")) return res(404);
+      if (u.includes("/pulls?")) {
+        // Every unconfirmable repository's listing still shows its own PR, so
+        // the 404 is spurious and the row is not a deletion. The target's
+        // listing is complete and does not show the target PR.
+        const repo = /\/repos\/([^/]+\/[^/]+)\/pulls\?/.exec(u)?.[1] ?? "";
+        if (repo === "org/target") return res(200, [{ number: 1 }]);
+        const index = Number(/unconfirmable-(\d+)/.exec(repo)?.[1] ?? "-1");
+        return res(200, [{ number: index + 1 }]);
+      }
+      return res(200, { full_name: "Org/Repo", default_branch: "main", archived: false });
+    });
+
+    // Pass 1: the ten unconfirmable repositories consume the whole listing
+    // budget. The target's listing read is refused, so the target was never
+    // considered: it stays QUEUED and unstamped, and the pass stops there.
+    const first = await reconcileDeletedPrFixItems(client, undefined, { now: NOW });
+    expect(first).toEqual({ checked: 10, markedStale: 0, errored: 0 });
+    expect(unconfirmable.every((row) => row.prPresenceCheckedAt === NOW)).toBe(true);
+    expect(target.status).toBe("QUEUED");
+    expect(target.prPresenceCheckedAt).toBeNull();
+    // The budget refused the target's listing, so the target's repository was
+    // never listed at all.
+    const listingCalls = fetchMock.mock.calls.filter((call) => String(call[0]).includes("/pulls?"));
+    expect(listingCalls).toHaveLength(10);
+
+    // Pass 2: the target still leads the rotation because it is unstamped, so
+    // its listing is read inside a fresh budget and the confirmed deletion is
+    // reaped.
+    const second = await reconcileDeletedPrFixItems(client, undefined, { now: NOW });
+    expect(second).toEqual({ checked: 1, markedStale: 1, errored: 0 });
+    expect(target.status).toBe("STALE");
+    expect(client.history).toHaveLength(1);
+
+    // Pass 3: the target is terminal and the unconfirmable rows are inside
+    // their re-verify window, so nothing of that row is left to starve.
+    const third = await reconcileDeletedPrFixItems(client, undefined, { now: NOW });
+    expect(third).toEqual({ checked: 0, markedStale: 0, errored: 0 });
+    expect(target.status).toBe("STALE");
   });
 });

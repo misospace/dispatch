@@ -381,24 +381,39 @@ as the `pr-fix-sweep` job:
   listing per repository per pass, and it reads a listing only for a row whose
   per-PR endpoint already answered `404`. A queue of present PRs therefore
   pays no listing traffic at all. A pass reads at most 10 repositories'
-  listings. A row outside that budget defers, and the rotation brings it back
-  in a later pass. The read stops after 500 PRs. A repository with more PRs
-  than that cannot prove an absence, so its rows defer. The listing names the
-  repository directly, so a row whose repository is no longer tracked stays
-  eligible.
+  listings. The read stops after 500 PRs. A repository with more PRs than that
+  cannot prove an absence, so its rows defer. The listing names the repository
+  directly, so a row whose repository is no longer tracked stays eligible.
+- The listing budget is a deferral, not an error. When a pass exhausts the
+  budget of 10 repository listings, the row whose listing read the budget
+  refused was never considered. The pass stops at that row, so the deferred
+  row and every row after it keep their rotation position and lead the next
+  pass. The rows the pass considered before the budget ran out stay stamped.
+  Reaching the budget never counts as an error. Without this rule the same
+  first 10 repositories consumed the budget on every pass, and a confirmed
+  deletion in a later repository stayed unconfirmed and unreaped forever.
 - The deleted-PR reap is bounded and it rotates through the queue (#1641
   review). The pass reads at most 100 queue rows and issues at most 50 per-PR
   probes. It reads the rows that it considered least recently first. It stamps
-  every row that it considered, including the rows whose probe answered
-  unknown. The stamp is the column `prPresenceCheckedAt`. A stamped row leaves
-  the head of the order until the re-verify bound of one hour elapses. The
-  rows that the probe bound cut off stay unstamped, so they lead the next
-  pass. Two properties follow from this. The pass never restarts at the same
-  head, and rows that answer unknown forever can no longer hide a confirmed
-  deletion behind them. Both routes read the same stamp, so running both
-  routes one after the other does not probe the same row twice. Two routes
-  that run at the same time can still overlap by one pass, because each route
-  stamps the rows it considered only at the end of its pass.
+  every row that it actually considered, including the rows whose probe
+  answered unknown. The stamp is the column `prPresenceCheckedAt`. A stamped
+  row leaves the head of the order until the re-verify bound of one hour
+  elapses. Every row the pass did not consider stays unstamped, so it leads
+  the next pass. Two bounds cut a pass short and both leave the rows they cut
+  off unstamped. The probe bound leaves the rows the pass never reached
+  unstamped, and the listing budget leaves the row that hit the budget
+  unstamped together with every row after it. Two properties follow from
+  this. The pass never restarts at the same head, and rows that answer
+  unknown forever can no longer hide a confirmed deletion behind them. Both
+  routes read the same stamp, so running both routes one after the other does
+  not probe the same row twice. Two routes that run at the same time can
+  still overlap by one pass, because each route stamps the rows it considered
+  only at the end of its pass.
+- The worst case for one pass is 150 HTTP requests. A pass issues at most 50
+  per-PR probes. It issues at most 50 repository reachability reads, and only
+  after a `404`. It reads at most 10 repository listings, and each listing
+  costs at most 5 pages. A healthy queue of present PRs spends far less,
+  because the reachability read and the listing read only follow a `404`.
 - **Unknown PR state** defers the item (`unknownState`): a possibly-closed PR is
   never reclaimed into a fresh attempt.
 - Past `PR_FIX_MAX_RECLAIMS` (default 3) the item parks as `PARKED` with
