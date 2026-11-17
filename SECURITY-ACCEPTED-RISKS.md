@@ -1,8 +1,8 @@
 # Accepted Security Risks
 
-**Last updated: 2026-11-06**
+**Last updated: 2026-11-17**
 
-There are currently no accepted npm runtime advisories.
+There are currently no accepted npm advisories in the app dependency tree; the `site/` tree carries exactly one, recorded under [Site Dependency Tree](#site-dependency-tree).
 
 `npm audit --omit=dev --include=prod` reports **0 vulnerabilities** (at every severity) across the production dependency tree (17 direct production dependencies plus optional/native deps such as the Next.js platform binaries). The blocking gate runs the same query with `--audit-level=high`; the vulnerable version ranges of the advisories remediated in #1386 are pinned by `package-advisory-ranges.test.ts`, so a later lock refresh cannot silently reintroduce a vulnerable build. Those pins hold the **union of every advisory the npm feed lists for the five packages**, across all major lines they publish, not only the advisories #1386 named: `fast-uri` for example is flagged on 2.x, 3.x **and** 4.x, so the guard pins all three boundaries.
 
@@ -10,13 +10,21 @@ There are currently no accepted npm runtime advisories.
 
 `site/` is a separate Astro project with its own `package-lock.json`, and it ships publicly to GitHub Pages. The app-level gate described above reads the root lockfile, so until #1566 no workflow audited the site's dependency tree at all: the Pages workflow installed it with `npm ci --no-audit`, and Renovate bumps the site's `astro` dependency regularly.
 
-- **Mitigation:** `npm audit --include=dev --audit-level=high` runs against `site/` (working directory `site/`) in two places, and fails the build on high/critical vulnerabilities:
+- **Mitigation:** the audit gate runs against `site/` (working directory `site/`) in two places, and fails the build on high/critical vulnerabilities:
   - the `audit-site` job in `.github/workflows/security-audit.yaml` — every push to `main` and every pull request targeting `main`;
   - the validate job in `.github/workflows/pages.yaml` — every push or pull request that touches `site/**`, which also covers pull requests that target a branch other than `main`. The Pages build and deploy depend on that job, so a red gate stops the publish instead of only turning the workflow red.
+- Both call sites run the one gate script `scripts/site-npm-audit.mjs`, which invokes `npm audit --include=dev --audit-level=high` (plus the fetch-retry flags) and adjudicates the JSON report against a reviewed exception list. `site-package-audit.test.ts` pins both call sites to the identical script command, pins the script's audit scope and threshold, and pins the exception list and its expiry against this document, so neither the gate nor the exception can drift silently.
 - The dev-inclusive scope covers the whole site tree today: the site declares no `devDependencies` and its lockfile flags no package as dev-only, so the gate resolves to exactly the tree the build installs. A future site `devDependency` would widen the blocking scope past the app's prod-only gate (`#1166`) — deliberate, because a build-time dependency still shapes the published artifact.
 - The `--audit-level=high` threshold keeps moderate advisories non-fatal, the same severity policy the app gate uses.
 - `npm audit` reads the lockfile, so the gate needs no install of its own; the fetch-retry flags mirror the app gate and reduce transient registry failures — a sustained advisory-endpoint outage still fails the gate closed.
-- Both call sites are pinned to the identical command by `site-package-audit.test.ts`.
+
+### Accepted site advisory: picomatch ReDoS (GHSA-fc5q-39xc-vjpf) — expires 2027-02-17
+
+- **Advisory:** [GHSA-fc5q-39xc-vjpf](https://github.com/advisories/GHSA-fc5q-39xc-vjpf) — regular expression denial of service in `picomatch`, high severity, CVSS 7.5. GitHub updated it on 2026-11-17, widening the vulnerable range to `<= 4.0.7`. `4.0.7` is the latest published release, so **every published version of `picomatch` is affected and no patched release exists**.
+- **Exposure:** `site/` resolves `picomatch` 4.0.7, directly under `astro` and through `@astrojs/internal-helpers`, `@astrojs/vite-plugin-astro`, `vite`, `tinyglobby`, `fdir`, and `unstorage` (10 high findings, all this one advisory). The vulnerable code parses glob patterns; a site build passes its own patterns, never a pattern supplied by a reader of the published site, and the published artifact is a static site. Exposure is therefore low.
+- **Why no fix is available:** the advisory lists no patched version, and `astro` (7.4.12, the latest release) requires `picomatch@^4.0.7` directly. npm's suggested remediation — `astro` 5.3.0 — is a major downgrade of the site framework and was rejected.
+- **Accepted exception:** the gate admits `GHSA-fc5q-39xc-vjpf` and nothing else, **through 2027-02-17 (UTC, inclusive)**. The exception lives in `scripts/site-npm-audit.mjs` (`ADMITTED_ADVISORIES`); from the following day the gate fails again until a human renews it (a fresh accepted-risk record here) or removes it. Any advisory not on the list fails the gate unchanged.
+- **Re-review triggers (before the expiry, if any arrive first):** a patched `picomatch` release lands (then remove the exception and bump); the advisory's severity or exploitability changes; the site ever evaluates glob patterns supplied by an external input.
 
 ## Non-NPM Risks
 
