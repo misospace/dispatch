@@ -126,6 +126,48 @@ suite("deleted-PR reap rotation against a real PostgreSQL", () => {
     expect(unknownRows.every((row) => row.status === "QUEUED")).toBe(true);
   });
 
+  it("advances the rotation stamp without advancing updatedAt, byte for byte (#1642 review)", async () => {
+    const id = "w-deleted-pr-updated-at";
+    await prisma.prFixQueueItem.create({
+      data: {
+        id,
+        repo: REPO,
+        pr: 4000,
+        lane: "NORMAL",
+        reason: "review changes requested",
+        status: "QUEUED",
+      },
+    });
+
+    const readColumns = async () => {
+      const rows = await prisma.$queryRaw<{ updatedAt: string; prPresenceCheckedAt: string | null }[]>`
+        SELECT "updatedAt"::text AS "updatedAt",
+               "prPresenceCheckedAt"::text AS "prPresenceCheckedAt"
+        FROM "PrFixQueueItem" WHERE "id" = ${id}`;
+      return rows[0];
+    };
+
+    const preWrite = new Date("2026-01-02T03:04:05.678Z");
+    await prisma.$executeRaw`
+      UPDATE "PrFixQueueItem"
+      SET "updatedAt" = ${preWrite}
+      WHERE "id" = ${id}`;
+    const before = await readColumns();
+    expect(before?.updatedAt).toBe("2026-01-02 03:04:05.678");
+    expect(before?.prPresenceCheckedAt).toBeNull();
+
+    const client = asPrFixQueueClient(prisma);
+    const stamp = new Date("2026-02-03T04:05:06.789Z");
+    const probe = vi.fn(async (): Promise<PrFixPrPresence> => "present");
+
+    const result = await reconcileDeletedPrFixItems(client, probe, { now: stamp });
+    expect(result.checked).toBeGreaterThanOrEqual(1);
+
+    const after = await readColumns();
+    expect(after?.prPresenceCheckedAt).toBe("2026-02-03 04:05:06.789");
+    expect(after?.updatedAt).toBe("2026-01-02 03:04:05.678");
+  });
+
   it("persists the rotation stamp as a real timestamp column and honours the due filter (#1641 review)", async () => {
     // Existence proof, loud on a missing column: the exact regression class
     // of "column PrFixQueueItem.prPresenceCheckedAt does not exist" — Prisma

@@ -1,3 +1,4 @@
+import { Prisma } from "@prisma/client";
 import { fetchRepositoryMetadata } from "../github-code-search";
 import {
   fetchPullRequestListingEvidence,
@@ -41,6 +42,25 @@ async function markPrFixItemStale(
     }
     return result.count;
   });
+}
+
+async function stampConsideredRows(
+  client: PrFixQueueClient,
+  considered: string[],
+  now: Date,
+): Promise<void> {
+  if (considered.length === 0) return;
+  if (typeof client.$executeRaw !== "function") {
+    throw new Error(
+      "[pr-fix-queue] deleted-PR reap rotation stamp needs the raw write surface ($executeRaw): a modeled write would advance `updatedAt` and reset the human-decision age observability derives from it",
+    );
+  }
+  await client.$executeRaw(Prisma.sql`
+      UPDATE "PrFixQueueItem"
+      SET "prPresenceCheckedAt" = ${now}
+      WHERE "id" IN (${Prisma.join(considered)})
+        AND "status" IN (${Prisma.join([...ACTIVE_REAP_STATUSES])})
+    `);
 }
 
 /**
@@ -407,14 +427,12 @@ export async function reconcileDeletedPrFixItems(
   // present, unknown, or failed. Rows the probe bound cut off before the
   // pass reached them stay unstamped and therefore lead the next pass.
   // Scoped to the active statuses so a row this pass reaped (now STALE) is
-  // not stamped. One bulk write per pass; writing through the Prisma client
-  // also advances `updatedAt` (@updatedAt), which stays informational.
+  // not stamped. One bulk write per pass; it moves `prPresenceCheckedAt`
+  // only, so `updatedAt` — which observability reads as the human-decision
+  // age — is not reset by the stamp.
   if (considered.length > 0) {
     try {
-      await client.prFixQueueItem.updateMany({
-        where: { id: { in: considered }, status: { in: [...ACTIVE_REAP_STATUSES] } },
-        data: { prPresenceCheckedAt: now },
-      });
+      await stampConsideredRows(client, considered, now);
     } catch (err) {
       // A failed rotation stamp only costs the pass its ordering: the rows
       // stay due and are considered again next pass. It is still counted as

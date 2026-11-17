@@ -54,12 +54,30 @@ function matches(item: FakeItem, where: any): boolean {
   return true;
 }
 
-function makeClient(items: FakeItem[]): PrFixQueueClient & { items: FakeItem[]; history: any[] } {
+function makeClient(items: FakeItem[]): PrFixQueueClient & { items: FakeItem[]; history: any[]; rawQueries: any[] } {
   const history: any[] = [];
+  const rawQueries: any[] = [];
   const client: any = {
     items,
     history,
+    rawQueries,
     $transaction: async (fn: any) => fn(client),
+    $executeRaw: async (query: any) => {
+      rawQueries.push(query);
+      const values: unknown[] = query.values ?? [];
+      const stamp = values.find((value) => value instanceof Date) as Date | undefined;
+      const ids = new Set(items.map((item) => item.id));
+      const bound = values.filter((value): value is string => typeof value === "string");
+      const rowIds = new Set(bound.filter((value) => ids.has(value)));
+      const statuses = new Set(bound.filter((value) => !ids.has(value)));
+      let count = 0;
+      for (const row of items) {
+        if (!rowIds.has(row.id) || !statuses.has(row.status)) continue;
+        row.prPresenceCheckedAt = stamp ?? null;
+        count++;
+      }
+      return count;
+    },
     issue: { findFirst: async () => null },
     prFixQueueItem: {
       findUnique: async ({ where }: any) =>
@@ -326,6 +344,53 @@ describe("deleted upstream PRs (#1641)", () => {
     expect(probe).toHaveBeenCalledTimes(2);
   });
 
+  it("stamps the rotation marker through the raw surface, so `updatedAt` is not advanced (#1642)", async () => {
+    const client = makeClient([item("raw-stamp-row", "org/live", 1)]);
+    const updateMany = vi.spyOn(client.prFixQueueItem, "updateMany");
+
+    const result = await reconcileDeletedPrFixItems(
+      client,
+      vi.fn(async (): Promise<PrFixPrPresence> => "present"),
+      { now: NOW },
+    );
+
+    expect(result).toEqual({ checked: 1, markedStale: 0, errored: 0 });
+    expect(updateMany).not.toHaveBeenCalled();
+    expect(client.items[0].prPresenceCheckedAt).toEqual(NOW);
+    expect(client.rawQueries).toHaveLength(1);
+    const query = client.rawQueries[0];
+    expect(query.text).toContain('UPDATE "PrFixQueueItem"');
+    expect(query.text).toContain('SET "prPresenceCheckedAt" =');
+    expect(query.values).toEqual([
+      NOW,
+      "raw-stamp-row",
+      "QUEUED",
+      "BLOCKED",
+      "PARKED",
+      "WAITING_EXTERNAL",
+    ]);
+    expect(query.text).not.toContain("raw-stamp-row");
+  });
+
+  it("a client without the raw surface is errored, never falls back to a modeled write (#1642)", async () => {
+    const client = makeClient([item("a", "org/live", 1)]);
+    delete (client as any).$executeRaw;
+    const updateMany = vi.spyOn(client.prFixQueueItem, "updateMany");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const result = await reconcileDeletedPrFixItems(
+      client,
+      vi.fn(async (): Promise<PrFixPrPresence> => "present"),
+      { now: NOW },
+    );
+
+    expect(result).toEqual({ checked: 1, markedStale: 0, errored: 1 });
+    expect(updateMany).not.toHaveBeenCalled();
+    expect(client.items[0].prPresenceCheckedAt).toBeNull();
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
   it("a reap write failure counts as errored and never fails the pass", async () => {
     const client = makeClient([
       item("a", "org/gone", 1),
@@ -334,6 +399,9 @@ describe("deleted upstream PRs (#1641)", () => {
       item("d", "org/gone", 4),
     ]);
     client.prFixQueueItem.updateMany = async () => {
+      throw new Error("db down");
+    };
+    client.$executeRaw = async () => {
       throw new Error("db down");
     };
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
