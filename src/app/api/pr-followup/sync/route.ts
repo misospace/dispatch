@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
-import { reconcileStalePrFixItems, reconcileArchivedRepoPrFixItems, reconcileDeletedPrFixItems, reconcileExternalWaitTriggers } from "@/lib/pr-fix-queue";
+import { reconcileStalePrFixItems, reconcileForkPrFixItems, reconcileArchivedRepoPrFixItems, reconcileDeletedPrFixItems, reconcileExternalWaitTriggers } from "@/lib/pr-fix-queue";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { getTrackedRepos } from "@/lib/config";
 import { getGitHubToken, fetchPaginated, fetchPullRequests, fetchPullRequestMergeState, fetchFailedJobLogExcerpt, fetchClosedPullRequests, jobIdFromCheckRunUrl, type GithubPR as GithubPRBase } from "@/lib/github";
@@ -517,6 +517,20 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // #1638: fork rows drain here — one probe per unproven row within a
+    // bounded page budget (a confirmed same-repo match earns a durable stamp
+    // and leaves the probe set), a confirmed fork retires to STALE, and an
+    // unverifiable probe defers to the next cycle. Runs AFTER the external-wait recheck so
+    // a row reactivated this pass is still seen this cycle. Producers gated
+    // in this change: the direct enqueue writer and linked-PR materialization
+    // at next-task. Producers whose gates land in sibling PRs — ingestion
+    // (#1637) and the `/dispatch-fix` command (#1622/#1634) — are covered
+    // here until those merges land: their fork rows (including legacy rows)
+    // drain on a later cycle.
+    const forkResult = rateLimited
+      ? { markedStale: 0 }
+      : await reconcileForkPrFixItems(asPrFixQueueClient(prisma));
+
     if (reposFailed > 0) {
       console.warn(
         `[pr-followup] Sync completed with ${reposFailed} repo failure(s). ` +
@@ -533,6 +547,7 @@ export async function POST(request: NextRequest) {
       skipped: totalSkipped + result.skipped,
       staleReaped: staleResult.markedStale,
       archivedReaped: archivedResult.markedStale,
+      forkReaped: forkResult.markedStale,
       deletedReapChecked: deletedResult.checked,
       deletedReaped: deletedResult.markedStale,
       deletedReapErrored: deletedResult.errored,

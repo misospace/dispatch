@@ -3,6 +3,7 @@
 
 export type { PrFixQueueClient } from "./pr-fix-queue/client";
 export { MAX_EVIDENCE_LENGTH, nonEmpty, resolvePrFixOutcome, normalizeQueueRepo, DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS, DEFAULT_PR_FIX_MAX_RECLAIMS, prFixHandoutTimeoutMs, maxPrFixReclaims, DEFAULT_PR_FIX_ACK_LIVENESS_MS, prFixAckLivenessMs } from "./pr-fix-queue/shared";
+export { isHeadRepoOfBaseRepo } from "./pr-fix-queue/head-repo";
 export { REBASE_LANE_ADVISORY_LOCK_KEY, parseRebaseAgentPool, isRebaseLaneAgent, rebaseExecutorAgentNames, rebaseExecutorClaimantExclusion, withRebaseLaneAdmission, withHandoutLaneExclusivityFence } from "./pr-fix-queue/lane-admission";
 export { prFixOwnershipMode, prFixWorkerAgentIdentitySet, evaluatePrFixHandoutOwnership, backfillPrFixClaimant, setPrFixClaimant } from "./pr-fix-queue/handout-ownership";
 export type { PrFixOwnershipMode, PrFixOwnershipRow, PrFixOwnershipRefusal } from "./pr-fix-queue/handout-ownership";
@@ -19,7 +20,7 @@ export { enqueuePrFixItem, recordPrFixEvidenceBaseline, createLinkedPrFixItem } 
 export { listQueuedPrFixItems, hasInFlightRebaseHandout, assertPrHeadMovedForFix } from "./pr-fix-queue/queue-read";
 export { markPrFixItem } from "./pr-fix-queue/settlement";
 export type { MarkPrFixResult } from "./pr-fix-queue/settlement";
-export { reconcileStalePrFixItems, isPrFixRepoArchived, reconcileArchivedRepoPrFixItems, reconcileDeletedPrFixItems, probePrFixPrPresence, createPrFixPrPresenceProbe } from "./pr-fix-queue/reconcile";
+export { reconcileStalePrFixItems, reconcileForkPrFixItems, isPrFixRepoArchived, reconcileArchivedRepoPrFixItems, reconcileDeletedPrFixItems, probePrFixPrPresence, createPrFixPrPresenceProbe } from "./pr-fix-queue/reconcile";
 export type { PrFixPrPresence, PrFixListingLookup } from "./pr-fix-queue/reconcile";
 export { freshAttemptGeneration, agentHandoutToken, parseAgentHandoutToken, newHandoutToken, handoutReceipt, parseHandoutReceipt, findHandoutReceipt, agentAlreadyHanded, releaseAgentHandout, toAgentQueuePrFixItem } from "./pr-fix-queue/handout";
 export { requeuePrFixItem } from "./pr-fix-queue/requeue";

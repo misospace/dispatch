@@ -27,6 +27,8 @@ const { mocks } = vi.hoisted(() => ({
     prFixRows: [] as any[],
     fetchPullRequestLabels: vi.fn(),
     fetchPullRequestHeadSha: vi.fn(),
+    // #1638: materialization head-repo proof — echo the base repo by default.
+    fetchPullRequestHeadRepo: vi.fn(),
     findLeasedIssueIds: vi.fn(),
     // #1506: the terminal no-PR conclusion park ledger read/cleanup.
     noPrConclusionFindMany: vi.fn().mockResolvedValue([]),
@@ -93,6 +95,7 @@ vi.mock("@/lib/github", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/github")>()),
   fetchPullRequestLabels: mocks.fetchPullRequestLabels,
   fetchPullRequestHeadSha: mocks.fetchPullRequestHeadSha,
+  fetchPullRequestHeadRepo: mocks.fetchPullRequestHeadRepo,
 }));
 
 vi.mock("@/lib/lease", () => ({ findLeasedIssueIds: mocks.findLeasedIssueIds }));
@@ -276,6 +279,7 @@ beforeEach(() => {
   mocks.prFixHistoryCreate.mockResolvedValue({});
   mocks.fetchPullRequestLabels.mockResolvedValue([]);
   mocks.fetchPullRequestHeadSha.mockResolvedValue(null);
+  mocks.fetchPullRequestHeadRepo.mockImplementation(async (repo: string) => repo);
   mocks.findLeasedIssueIds.mockResolvedValue([]);
   mocks.noPrConclusionFindMany.mockResolvedValue([]);
   mocks.noPrConclusionDeleteMany.mockResolvedValue({ count: 0 });

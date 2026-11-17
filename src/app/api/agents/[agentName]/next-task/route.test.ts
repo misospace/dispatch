@@ -32,6 +32,9 @@ const { mocks } = vi.hoisted(() => ({
     linkedRows: [] as any[],
     fetchPullRequestLabels: vi.fn().mockResolvedValue([]),
     fetchPullRequestHeadSha: vi.fn().mockResolvedValue(null),
+    // #1638: the materialization gate proves the head repo against the base
+    // repo; echo the requested repo so fixtures keep their behavior.
+    fetchPullRequestHeadRepo: vi.fn(async (repo: string): Promise<string | null> => repo),
     capacityHandoffFindMany: vi.fn().mockResolvedValue([]),
     capacityHandoffDeleteMany: vi.fn().mockResolvedValue({ count: 0 }),
     // #1327 review: when set, the REBASE admission transaction fails
@@ -166,6 +169,7 @@ vi.mock("@/lib/prisma", () => {
 vi.mock("@/lib/github", () => ({
   fetchPullRequestLabels: mocks.fetchPullRequestLabels,
   fetchPullRequestHeadSha: mocks.fetchPullRequestHeadSha,
+  fetchPullRequestHeadRepo: mocks.fetchPullRequestHeadRepo,
 }));
 
 vi.mock("@/lib/lease", () => ({
@@ -3360,6 +3364,49 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(materialized.feedback).toEqual(["merge_state_behind"]);
     // No conflict, no contract: the health reasons stand unchanged.
     expect(body.reasons).toEqual(["merge_state_behind"]);
+  });
+
+  it("refuses to materialize a linked PR from a fork (#1638)", async () => {
+    // This path mints a fresh QUEUED row AND hands it out in the same request,
+    // so the reconcile drain cannot gate it — the head-repo check must refuse
+    // at creation. No row, no hand-out, and the attempt skips even the
+    // head-sha capture because the fork refusal comes first.
+    mocks.issueFindMany.mockResolvedValue([
+      linkedIssue(42, 15, {
+        linkedPrMergeState: "behind",
+        linkedPrFollowupReasons: ["merge_state_behind"],
+      }),
+    ]);
+    mocks.fetchPullRequestHeadRepo.mockResolvedValueOnce("contributor/windowstead");
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    expect(body.shouldRun).toBe(false);
+    expect(mocks.prFixCreate).not.toHaveBeenCalled();
+    expect(mocks.fetchPullRequestHeadSha).not.toHaveBeenCalled();
+  });
+
+  it("refuses an unverifiable linked-PR head repo fail-closed at materialization (#1638)", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      linkedIssue(42, 15, {
+        linkedPrMergeState: "behind",
+        linkedPrFollowupReasons: ["merge_state_behind"],
+      }),
+    ]);
+    mocks.fetchPullRequestHeadRepo.mockResolvedValueOnce(null);
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    expect(body.shouldRun).toBe(false);
+    expect(mocks.prFixCreate).not.toHaveBeenCalled();
   });
 
   it("normal issue still returns implement when no follow-up exists", async () => {

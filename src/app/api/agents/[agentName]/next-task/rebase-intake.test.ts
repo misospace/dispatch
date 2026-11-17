@@ -94,6 +94,8 @@ const { mocks, matchRow, applyData } = vi.hoisted(() => {
       prFixUpdateMany: vi.fn(),
       fetchPullRequestLabels: vi.fn(),
       fetchPullRequestHeadSha: vi.fn(),
+      // #1638: materialization gate proof — echo the base repo by default.
+      fetchPullRequestHeadRepo: vi.fn(),
       findLeasedIssueIds: vi.fn(),
       capacityHandoffFindMany: vi.fn(),
       capacityHandoffDeleteMany: vi.fn(),
@@ -179,6 +181,7 @@ vi.mock("@/lib/prisma", () => {
 vi.mock("@/lib/github", () => ({
   fetchPullRequestLabels: mocks.fetchPullRequestLabels,
   fetchPullRequestHeadSha: mocks.fetchPullRequestHeadSha,
+  fetchPullRequestHeadRepo: mocks.fetchPullRequestHeadRepo,
 }));
 
 vi.mock("@/lib/lease", () => ({ findLeasedIssueIds: mocks.findLeasedIssueIds }));
@@ -302,6 +305,7 @@ beforeEach(() => {
   mocks.noPrConclusionDeleteMany.mockResolvedValue({ count: 0 });
   mocks.fetchPullRequestLabels.mockResolvedValue([]);
   mocks.fetchPullRequestHeadSha.mockResolvedValue(null);
+  mocks.fetchPullRequestHeadRepo.mockImplementation(async (repo: string) => repo);
   mocks.prFixCreate.mockImplementation(async ({ data }: any) => {
     const item = { id: "materialized-prfix", generation: 1, status: "QUEUED", agentHandouts: [], ...data };
     mocks.prFixRows.push(item);

@@ -10,9 +10,9 @@ import {
 } from "@/lib/agent-task";
 import { isBacklogLane, prFixLaneForRequest } from "@/lib/lane-config";
 import { fetchAgentQueueData } from "@/lib/agent-queue-fetch";
-import { agentAlreadyHanded, agentHandoutToken, backfillPrFixClaimant, createLinkedPrFixItem, enforcePrFixHandoutLaneExclusivity, evaluatePrFixHandoutOwnership, handoutReceipt, hasInFlightRebaseHandout, isRebaseLaneAgent, linkedIssueEscalationClassified, newHandoutToken, normalizeQueueRepo, prFixOwnershipMode, withHandoutLaneExclusivityFence, withRebaseLaneAdmission, type PrFixQueueClient } from "@/lib/pr-fix-queue";
+import { agentAlreadyHanded, agentHandoutToken, backfillPrFixClaimant, createLinkedPrFixItem, enforcePrFixHandoutLaneExclusivity, evaluatePrFixHandoutOwnership, handoutReceipt, hasInFlightRebaseHandout, isHeadRepoOfBaseRepo, isRebaseLaneAgent, linkedIssueEscalationClassified, newHandoutToken, normalizeQueueRepo, prFixOwnershipMode, withHandoutLaneExclusivityFence, withRebaseLaneAdmission, type PrFixQueueClient } from "@/lib/pr-fix-queue";
 import { prFixOwnershipEvidence } from "@/lib/pr-fix-ownership";
-import { fetchPullRequestLabels, fetchPullRequestHeadSha } from "@/lib/github";
+import { fetchPullRequestLabels, fetchPullRequestHeadSha, fetchPullRequestHeadRepo } from "@/lib/github";
 import { NEEDS_HUMAN_LABEL } from "@/lib/pr-fix-surfacing";
 import { CONFLICTING_STATUSES } from "@/lib/linked-pr-health";
 import { rebaseWorkItem } from "@/lib/pr-fix-rebase";
@@ -1013,6 +1013,20 @@ export async function GET(
       // to the next candidate.
       let materialized: Awaited<ReturnType<typeof createLinkedPrFixItem>>;
       try {
+        // #1638: this path MINTS a fresh QUEUED row and can hand it to the
+        // polling agent in the same request, so the sync-time fork drain
+        // cannot be its gate — materialization must refuse at creation. A
+        // fork PR's head branch is unreachable by the fix worker (which
+        // operates on the base repo), and an unverifiable head repo is
+        // refused too (fail closed): the candidate is simply not
+        // materialized this poll; nothing is enqueued and nothing handed out.
+        const headRepo = await fetchPullRequestHeadRepo(repo, pr);
+        if (!isHeadRepoOfBaseRepo(headRepo, repo)) {
+          console.info(
+            `[next-task] refusing linked-PR materialization for ${repo}#${pr}: head repository unverifiable or not the base repo (#1638)`,
+          );
+          continue;
+        }
         // Capture the head the follow-up attempt starts from (#1074), so the
         // #940 no-progress guard can refuse a FIXED tombstone for a worker that
         // pushed nothing — the same protection queue-enqueued rows get.

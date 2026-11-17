@@ -1,0 +1,12 @@
+-- #1638 (review): the fork drain re-ran its id-ordered scan from the smallest
+-- id every sync cycle, and only fork rows ever left the scanned set. Once the
+-- active population exceeded the page budget, a wall of confirmed-same-repo
+-- rows consumed the whole budget every cycle and tail fork rows starved — and
+-- the same rows were re-probed at the forge every cycle. A PR's head
+-- repository is fixed when the PR is created, so a confirmed match is durable:
+-- persist the proof and the row leaves the drain's probe set until the slow
+-- re-verify bound re-probes it.
+--
+-- Additive only: new nullable column, no existing column drop or type change.
+-- AlterTable
+ALTER TABLE "PrFixQueueItem" ADD COLUMN     "headRepoVerifiedAt" TIMESTAMP(3);
