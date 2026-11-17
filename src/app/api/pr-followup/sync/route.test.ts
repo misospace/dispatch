@@ -114,6 +114,51 @@ describe("POST /api/pr-followup/sync", () => {
     expect(body.message).toBe("No tracked repos configured");
   });
 
+  it("runs the deleted-PR reap even with no tracked repos (#1651)", async () => {
+    // The reap is item-driven: it names each row's own repository directly,
+    // so the no-tracked-repos early return must not skip it — a row whose PR
+    // was deleted upstream stays dispatchable forever if it does.
+    process.env.GITHUB_TOKEN = "gh_fake_token";
+    mocks.getTrackedRepos.mockResolvedValue([]);
+    mocks.reconcileDeletedPrFixItems.mockResolvedValue({ checked: 3, markedStale: 1, errored: 0 });
+    const fetchMock = vi.fn(async () => {
+      throw new Error("no GitHub scan expected with an empty tracked-repo list");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await postRequest(true);
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.message).toBe("No tracked repos configured");
+    expect(mocks.reconcileDeletedPrFixItems).toHaveBeenCalledTimes(1);
+    expect(body.deletedReapChecked).toBe(3);
+    expect(body.deletedReaped).toBe(1);
+    expect(body.deletedReapErrored).toBe(0);
+    expect(fetchMock).not.toHaveBeenCalled();
+    // The repo-list-driven reaps stay skipped on this path.
+    expect(mocks.reconcileStalePrFixItems).not.toHaveBeenCalled();
+    expect(mocks.reconcileArchivedRepoPrFixItems).not.toHaveBeenCalled();
+
+    vi.unstubAllGlobals();
+  });
+
+  it("reports a failed deleted-PR reap on the no-tracked-repos path without failing the sync (#1651)", async () => {
+    process.env.GITHUB_TOKEN = "gh_fake_token";
+    mocks.getTrackedRepos.mockResolvedValue([]);
+    mocks.reconcileDeletedPrFixItems.mockRejectedValueOnce(new Error("db down"));
+
+    const res = await postRequest(true);
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.message).toBe("No tracked repos configured");
+    expect(mocks.reconcileDeletedPrFixItems).toHaveBeenCalledTimes(1);
+    expect(body.deletedReapChecked).toBe(0);
+    expect(body.deletedReaped).toBe(0);
+    expect(body.deletedReapErrored).toBe(1);
+  });
+
   it("returns 409 when another pr-followup sync holds the lock", async () => {
     mocks.acquireLock.mockResolvedValue({ locked: false });
 

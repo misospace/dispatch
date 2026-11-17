@@ -30,6 +30,24 @@ import { acquireLock, releaseLock, type AcquiredLock, type LockConflict } from "
 const RATE_LIMIT = { limit: 10, windowMs: 60_000 };
 
 /**
+ * Best-effort deleted-PR reap (#1641): a transient forge failure is reported,
+ * never fatal — the response keeps `success` about the issues this route
+ * reconciled. Shared by both exit paths, including the no-tracked-repos
+ * early return (#1651): the reap is item-driven and needs no tracked-repo
+ * list, so rows whose PR was deleted upstream must be reaped even when the
+ * instance tracks no repository.
+ */
+async function runDeletedPrFixReap(): Promise<{ checked: number; markedStale: number; errored: number }> {
+  try {
+    return await reconcileDeletedPrFixItems(prisma);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[pr-fix-queue] deleted-PR reap failed: ${message}`);
+    return { checked: 0, markedStale: 0, errored: 1 };
+  }
+}
+
+/**
  * Record the lifecycle evidence for one executed reconciliation action.
  *
  * The reconciler reacts to what it observed on GitHub, so its events carry
@@ -278,14 +296,21 @@ export async function POST(request: Request) {
       : syncRepos;
 
     if (repos.length === 0) {
+      // #1651: the deleted-PR reap reads queue rows and names each row's own
+      // repository directly, so it never needed the tracked-repo list. Run it
+      // before this early return, or an instance tracking no repository (or
+      // a `repo` filter matching nothing) leaves rows whose PR was deleted
+      // upstream dispatchable forever. The 404 itself is unchanged.
+      const deletedResult = await runDeletedPrFixReap();
+      if (deletedResult.errored > 0) {
+        console.warn(`[pr-fix-queue] deleted-PR reap errored on ${deletedResult.errored} item(s) (#1641)`);
+      }
       return errorResponse("No tracked repos found", 404);
     }
 
     let totalIssuesReconciled = 0;
     let totalPrFixStaleChecked = 0;
     let totalPrFixStaleMarked = 0;
-    let totalPrFixDeletedChecked = 0;
-    let totalPrFixDeletedMarked = 0;
     let totalMergedPrsFound = 0;
     let totalOpenPrsChecked = 0;
     let totalIssuesClosed = 0;
@@ -639,22 +664,12 @@ export async function POST(request: Request) {
     // elapses. Two routes that run at the SAME time can still overlap by one
     // pass, because each stamps the rows it considered only at the end of
     // its pass. Queue-wide, so it runs once — not per repo.
-    let totalPrFixDeletedErrored = 0;
-    try {
-      const deletedResult = await reconcileDeletedPrFixItems(prisma);
-      totalPrFixDeletedChecked += deletedResult.checked;
-      totalPrFixDeletedMarked += deletedResult.markedStale;
-      totalPrFixDeletedErrored += deletedResult.errored;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown error";
-      totalPrFixDeletedErrored++;
-      console.warn(`[pr-fix-queue] deleted-PR reap failed: ${message}`);
-    }
-    if (totalPrFixDeletedErrored > 0) {
+    const deletedResult = await runDeletedPrFixReap();
+    if (deletedResult.errored > 0) {
       // Reported, not fatal: a transient forge failure is not an issue
       // reconciliation failure, and the response keeps `success` about the
       // issues it reconciled.
-      console.warn(`[pr-fix-queue] deleted-PR reap errored on ${totalPrFixDeletedErrored} item(s) (#1641)`);
+      console.warn(`[pr-fix-queue] deleted-PR reap errored on ${deletedResult.errored} item(s) (#1641)`);
     }
 
     return NextResponse.json({
@@ -668,9 +683,9 @@ export async function POST(request: Request) {
       lanesClassified: totalLaneClassified,
       prFixQueueStaleChecked: totalPrFixStaleChecked,
       prFixQueueStaleMarked: totalPrFixStaleMarked,
-      prFixQueueDeletedChecked: totalPrFixDeletedChecked,
-      prFixQueueDeletedMarked: totalPrFixDeletedMarked,
-      prFixQueueDeletedErrored: totalPrFixDeletedErrored,
+      prFixQueueDeletedChecked: deletedResult.checked,
+      prFixQueueDeletedMarked: deletedResult.markedStale,
+      prFixQueueDeletedErrored: deletedResult.errored,
       errors,
     });
   } catch (error) {

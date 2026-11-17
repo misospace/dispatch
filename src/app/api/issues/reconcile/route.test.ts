@@ -117,6 +117,39 @@ describe("POST /api/issues/reconcile", () => {
     expect(mocks.acquireLock).toHaveBeenCalledWith("reconcile");
     expect(mocks.releaseLock).not.toHaveBeenCalled();
   });
+
+  it("runs the deleted-PR reap even with no tracked repos (#1651)", async () => {
+    // The reap is item-driven: it names each row's own repository directly,
+    // so the no-tracked-repos early return must not skip it. The 404 itself
+    // is unchanged, but a row whose PR was deleted upstream must not stay
+    // dispatchable because the instance (or the `repo` filter) tracks nothing.
+    configMocks.getSyncRepos.mockResolvedValue([]);
+    mocks.reconcileDeletedPrFixItems.mockResolvedValue({ checked: 2, markedStale: 1, errored: 0 });
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toMatchObject({ error: "No tracked repos found" });
+    expect(mocks.reconcileDeletedPrFixItems).toHaveBeenCalledTimes(1);
+    // The repo-list-driven work stays skipped on this path.
+    expect(githubMocks.fetchPullRequests).not.toHaveBeenCalled();
+    expect(githubMocks.fetchClosedPullRequests).not.toHaveBeenCalled();
+  });
+
+  it("still returns the 404 when the deleted-PR reap fails on the no-tracked-repos path (#1651)", async () => {
+    // A failed reap is reported in the logs, never in the 404's shape, and
+    // never turns the "no repos" answer into a 500.
+    configMocks.getSyncRepos.mockResolvedValue([]);
+    mocks.reconcileDeletedPrFixItems.mockRejectedValueOnce(new Error("forge unreachable"));
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toMatchObject({ error: "No tracked repos found" });
+    expect(mocks.reconcileDeletedPrFixItems).toHaveBeenCalledTimes(1);
+    expect(githubMocks.fetchPullRequests).not.toHaveBeenCalled();
+    expect(githubMocks.fetchClosedPullRequests).not.toHaveBeenCalled();
+  });
 });
 
 describe("GET /api/issues/reconcile", () => {

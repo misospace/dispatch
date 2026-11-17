@@ -77,6 +77,25 @@ interface GithubReviewComment {
   commit_id?: string;
 }
 
+/**
+ * Best-effort deleted-PR reap (#1641): a failed pass must never fail the
+ * sync — the next tick re-evaluates — but it IS a failed pass: the response
+ * must report it, or an operator reads "0 errors" for a reap that never ran.
+ * Shared by both exit paths, including the no-tracked-repos early return
+ * (#1651): the reap is item-driven and needs no tracked-repo list.
+ */
+async function runDeletedPrFixReap(): Promise<{ checked: number; markedStale: number; errored: number }> {
+  try {
+    return await reconcileDeletedPrFixItems(asPrFixQueueClient(prisma));
+  } catch (error) {
+    console.warn(
+      "[pr-followup] deleted-PR reap failed (best-effort):",
+      error instanceof Error ? error.message : error,
+    );
+    return { checked: 0, markedStale: 0, errored: 1 };
+  }
+}
+
 interface GithubCheckRun {
   id: number;
   name: string;
@@ -117,7 +136,23 @@ export async function POST(request: NextRequest) {
     const repoFullNames = await getTrackedRepos();
 
     if (repoFullNames.length === 0) {
-      return NextResponse.json({ message: "No tracked repos configured", enqueued: 0, skipped: 0 });
+      // #1651: the deleted-PR reap reads queue rows and names each row's own
+      // repository directly, so it never needed the tracked-repo list. An
+      // instance tracking no repos must still reap rows whose PR was deleted
+      // upstream, or they stay dispatchable forever. Everything else in this
+      // route is repo-list driven and stays skipped.
+      const deletedResult = await runDeletedPrFixReap();
+      if (deletedResult.errored > 0) {
+        console.warn(`[pr-followup] deleted-PR reap errored on ${deletedResult.errored} item(s) (#1641)`);
+      }
+      return NextResponse.json({
+        message: "No tracked repos configured",
+        enqueued: 0,
+        skipped: 0,
+        deletedReapChecked: deletedResult.checked,
+        deletedReaped: deletedResult.markedStale,
+        deletedReapErrored: deletedResult.errored,
+      });
     }
 
     let totalEnqueued = 0;
@@ -483,22 +518,11 @@ export async function POST(request: NextRequest) {
     // present/transport-failure/unreadable-repo/unreadable-listing defer.
     // The pass is bounded (rows read + per-PR probes) and rotates through the
     // queue, so a healthy queue of present PRs never turns into one GitHub
-    // request per row on every sync.
-    let deletedResult = { checked: 0, markedStale: 0, errored: 0 };
-    if (!rateLimited) {
-      try {
-        deletedResult = await reconcileDeletedPrFixItems(asPrFixQueueClient(prisma));
-      } catch (error) {
-        // A failed pass must never fail the sync; the next tick re-evaluates.
-        // It IS a failed pass though: the response must report it, or an
-        // operator reads "0 errors" for a reap that never ran.
-        deletedResult = { ...deletedResult, errored: deletedResult.errored + 1 };
-        console.warn(
-          "[pr-followup] deleted-PR reap failed (best-effort):",
-          error instanceof Error ? error.message : error,
-        );
-      }
-    }
+    // request per row on every sync. A rate-limited cycle skips it, same as
+    // the archived-repo reap above.
+    const deletedResult = rateLimited
+      ? { checked: 0, markedStale: 0, errored: 0 }
+      : await runDeletedPrFixReap();
     if (deletedResult.errored > 0) {
       console.warn(`[pr-followup] deleted-PR reap errored on ${deletedResult.errored} item(s) (#1641)`);
     }
