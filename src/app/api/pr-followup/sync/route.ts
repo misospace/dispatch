@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
-import { reconcileStalePrFixItems, reconcileArchivedRepoPrFixItems, reconcileExternalWaitTriggers } from "@/lib/pr-fix-queue";
+import { reconcileStalePrFixItems, reconcileArchivedRepoPrFixItems, reconcileDeletedPrFixItems, reconcileExternalWaitTriggers } from "@/lib/pr-fix-queue";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { getTrackedRepos } from "@/lib/config";
 import { getGitHubToken, fetchPaginated, fetchPullRequests, fetchPullRequestMergeState, fetchFailedJobLogExcerpt, fetchClosedPullRequests, jobIdFromCheckRunUrl, type GithubPR as GithubPRBase } from "@/lib/github";
@@ -476,6 +476,32 @@ export async function POST(request: NextRequest) {
     const archivedResult = rateLimited
       ? { markedStale: 0 }
       : await reconcileArchivedRepoPrFixItems(asPrFixQueueClient(prisma));
+    // #1641: a hard-deleted PR vanished from every listing, so the
+    // merged/closed reap above can never see its rows. Probe the per-PR
+    // endpoint for the rows the reap reaches: a 404 at a reachable repo
+    // whose PR listing does not show the PR is a confirmed deletion;
+    // present/transport-failure/unreadable-repo/unreadable-listing defer.
+    // The pass is bounded (rows read + per-PR probes) and rotates through the
+    // queue, so a healthy queue of present PRs never turns into one GitHub
+    // request per row on every sync.
+    let deletedResult = { checked: 0, markedStale: 0, errored: 0 };
+    if (!rateLimited) {
+      try {
+        deletedResult = await reconcileDeletedPrFixItems(asPrFixQueueClient(prisma));
+      } catch (error) {
+        // A failed pass must never fail the sync; the next tick re-evaluates.
+        // It IS a failed pass though: the response must report it, or an
+        // operator reads "0 errors" for a reap that never ran.
+        deletedResult = { ...deletedResult, errored: deletedResult.errored + 1 };
+        console.warn(
+          "[pr-followup] deleted-PR reap failed (best-effort):",
+          error instanceof Error ? error.message : error,
+        );
+      }
+    }
+    if (deletedResult.errored > 0) {
+      console.warn(`[pr-followup] deleted-PR reap errored on ${deletedResult.errored} item(s) (#1641)`);
+    }
 
     // #1253: bounded trigger reconciliation for structured external waits —
     // a recorded dependency that now satisfies its predicate reactivates the
@@ -507,6 +533,9 @@ export async function POST(request: NextRequest) {
       skipped: totalSkipped + result.skipped,
       staleReaped: staleResult.markedStale,
       archivedReaped: archivedResult.markedStale,
+      deletedReapChecked: deletedResult.checked,
+      deletedReaped: deletedResult.markedStale,
+      deletedReapErrored: deletedResult.errored,
       externalWaitRechecked: waitTriggerResult.reactivated,
       rateLimited,
     });

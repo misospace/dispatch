@@ -23,7 +23,7 @@ import {
 import { isBacklogLane, assertValidLaneForWrite } from "@/lib/lane-config";
 import { computeLinkedPrHealth, toPersistedLinkedPrHealth, type LinkedPrHealth } from "@/lib/linked-pr-health";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
-import { reconcileStalePrFixItems } from "@/lib/pr-fix-queue";
+import { reconcileStalePrFixItems, reconcileDeletedPrFixItems } from "@/lib/pr-fix-queue";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { acquireLock, releaseLock, type AcquiredLock, type LockConflict } from "@/lib/sync-lock";
 
@@ -284,6 +284,8 @@ export async function POST(request: Request) {
     let totalIssuesReconciled = 0;
     let totalPrFixStaleChecked = 0;
     let totalPrFixStaleMarked = 0;
+    let totalPrFixDeletedChecked = 0;
+    let totalPrFixDeletedMarked = 0;
     let totalMergedPrsFound = 0;
     let totalOpenPrsChecked = 0;
     let totalIssuesClosed = 0;
@@ -625,6 +627,36 @@ export async function POST(request: Request) {
       }
     }
 
+    // #1641: a hard-deleted PR vanished from every PR listing, so the
+    // merged/closed reap above can never see its row and it lingered in the
+    // queue forever. This pass probes the per-PR endpoint for the rows it
+    // reaches; a 404 at a readable repo whose PR listing does not show the PR
+    // reaps the row through the same generation-AND-status-pinned terminal
+    // write. It is bounded (rows read + per-PR probes) and rotates through
+    // the queue, so running it from
+    // both reconcile entry points cannot double-probe the same rows: a row
+    // the other pass considered is not due again until its re-verify bound
+    // elapses. Two routes that run at the SAME time can still overlap by one
+    // pass, because each stamps the rows it considered only at the end of
+    // its pass. Queue-wide, so it runs once — not per repo.
+    let totalPrFixDeletedErrored = 0;
+    try {
+      const deletedResult = await reconcileDeletedPrFixItems(prisma);
+      totalPrFixDeletedChecked += deletedResult.checked;
+      totalPrFixDeletedMarked += deletedResult.markedStale;
+      totalPrFixDeletedErrored += deletedResult.errored;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error";
+      totalPrFixDeletedErrored++;
+      console.warn(`[pr-fix-queue] deleted-PR reap failed: ${message}`);
+    }
+    if (totalPrFixDeletedErrored > 0) {
+      // Reported, not fatal: a transient forge failure is not an issue
+      // reconciliation failure, and the response keeps `success` about the
+      // issues it reconciled.
+      console.warn(`[pr-fix-queue] deleted-PR reap errored on ${totalPrFixDeletedErrored} item(s) (#1641)`);
+    }
+
     return NextResponse.json({
       success: errors.length === 0,
       reposProcessed: repos.length,
@@ -636,6 +668,9 @@ export async function POST(request: Request) {
       lanesClassified: totalLaneClassified,
       prFixQueueStaleChecked: totalPrFixStaleChecked,
       prFixQueueStaleMarked: totalPrFixStaleMarked,
+      prFixQueueDeletedChecked: totalPrFixDeletedChecked,
+      prFixQueueDeletedMarked: totalPrFixDeletedMarked,
+      prFixQueueDeletedErrored: totalPrFixDeletedErrored,
       errors,
     });
   } catch (error) {

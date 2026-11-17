@@ -17,6 +17,7 @@ const { mocks } = vi.hoisted(() => ({
     isAllowedBotAuthor: vi.fn(() => false),
     reconcileStalePrFixItems: vi.fn().mockResolvedValue({ checked: 0, markedStale: 0, errored: 0 }),
     reconcileArchivedRepoPrFixItems: vi.fn().mockResolvedValue({ checked: 0, markedStale: 0, errored: 0 }),
+    reconcileDeletedPrFixItems: vi.fn().mockResolvedValue({ checked: 0, markedStale: 0, errored: 0 }),
   },
 }));
 
@@ -45,6 +46,7 @@ vi.mock("@/lib/config", () => ({
 vi.mock("@/lib/pr-fix-queue", () => ({
   reconcileStalePrFixItems: mocks.reconcileStalePrFixItems,
   reconcileArchivedRepoPrFixItems: mocks.reconcileArchivedRepoPrFixItems,
+  reconcileDeletedPrFixItems: mocks.reconcileDeletedPrFixItems,
 }));
 
 import { POST } from "./route";
@@ -70,6 +72,7 @@ describe("POST /api/pr-followup/sync", () => {
     mocks.getTrackedRepos.mockResolvedValue([]);
     mocks.reconcileStalePrFixItems.mockResolvedValue({ checked: 0, markedStale: 0, errored: 0 });
     mocks.reconcileArchivedRepoPrFixItems.mockResolvedValue({ checked: 0, markedStale: 0, errored: 0 });
+    mocks.reconcileDeletedPrFixItems.mockResolvedValue({ checked: 0, markedStale: 0, errored: 0 });
   });
 
   it("returns 401 when no auth header is present", async () => {
@@ -417,6 +420,7 @@ describe("POST /api/pr-followup/sync", () => {
     mocks.isAllowedBotAuthor.mockReturnValue(true);
     mocks.reconcileStalePrFixItems.mockResolvedValue({ checked: 5, markedStale: 3, errored: 0 });
     mocks.reconcileArchivedRepoPrFixItems.mockResolvedValue({ checked: 2, markedStale: 2, errored: 0 });
+    mocks.reconcileDeletedPrFixItems.mockResolvedValue({ checked: 1, markedStale: 1, errored: 0 });
 
     const jsonRes = (data: unknown) => ({ ok: true, headers: new Headers(), json: async () => data, text: async () => "" });
     const fetchMock = vi.fn(async (url: string) => {
@@ -436,6 +440,30 @@ describe("POST /api/pr-followup/sync", () => {
     expect(mocks.reconcileStalePrFixItems).toHaveBeenCalled();
     expect(body.archivedReaped).toBe(2);
     expect(mocks.reconcileArchivedRepoPrFixItems).toHaveBeenCalled();
+    expect(body.deletedReaped).toBe(1);
+    expect(body.deletedReapChecked).toBe(1);
+    expect(mocks.reconcileDeletedPrFixItems).toHaveBeenCalled();
+
+    vi.unstubAllGlobals();
+  });
+
+  it("reports a failed deleted-PR reap pass as errored without failing the sync (#1641 review)", async () => {
+    process.env.GITHUB_TOKEN = "gh_fake_token";
+    mocks.getTrackedRepos.mockResolvedValue(["misospace/windowstead"]);
+    mocks.isAllowedBotAuthor.mockReturnValue(true);
+    mocks.reconcileDeletedPrFixItems.mockRejectedValueOnce(new Error("db down"));
+
+    const jsonRes = (data: unknown) => ({ ok: true, headers: new Headers(), json: async () => data, text: async () => "" });
+    const fetchMock = vi.fn(async () => jsonRes([]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await postRequest(true);
+    // A failed pass never fails the sync — but it IS a failed pass, so the
+    // response must say so instead of reporting a clean zero.
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.deletedReapErrored).toBe(1);
+    expect(body.deletedReaped).toBe(0);
 
     vi.unstubAllGlobals();
   });
@@ -500,6 +528,8 @@ describe("POST /api/pr-followup/sync", () => {
 
     // "other" should never have been fetched
     expect(fetchMock.mock.calls.some((call: [string]) => call[0].includes("other"))).toBe(false);
+    // #1641: a rate-limited pass must not add per-item existence probes.
+    expect(mocks.reconcileDeletedPrFixItems).not.toHaveBeenCalled();
 
     vi.unstubAllGlobals();
   });
@@ -526,6 +556,10 @@ describe("POST /api/pr-followup/sync", () => {
     const body = await res.json();
     expect(body.reposFailed).toBe(1);
     expect(body.rateLimited).toBe(true);
+    // #1641: same skip for the deleted-PR reap when rate-limited.
+    expect(mocks.reconcileDeletedPrFixItems).not.toHaveBeenCalled();
+    expect(body.deletedReaped).toBe(0);
+    expect(body.deletedReapErrored).toBe(0);
 
     vi.unstubAllGlobals();
   });

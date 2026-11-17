@@ -363,6 +363,57 @@ as the `pr-fix-sweep` job:
   (`handoutAcks`, `dispatchedAt`, `dispatchedGeneration`) and a derived
   `idleReason`; the observability snapshot counts `overdueAcked`.
 - A **merged or closed** PR goes `STALE` (nothing left to fix).
+- A **hard-deleted** PR also goes `STALE` (#1641). A hard-deleted PR is in no
+  PR listing, so the merged and closed reap never sees the row. Two routes run
+  an item-driven deleted-PR reap (`reconcileDeletedPrFixItems`): the
+  pr-followup sync and the issues reconcile route. The reap probes the per-PR
+  endpoint for the rows it reaches. A confirmation needs three facts:
+  - The per-PR endpoint answers `404`.
+  - The repository reads through the same credential.
+  - The repository's PR listing does not show the PR.
+
+  The row then gets the same generation-AND-status-pinned terminal write. Any
+  other answer defers the row and never reaps it. That includes a `404` at an
+  unreadable repository, a transport failure, a rate limit, a listing that
+  could not be read, a listing too large to prove the absence, and a listing
+  that still shows the PR. The reap fails open, like the archived-repo reap.
+- The listing read is bounded and cached for one pass. The reap reads one
+  listing per repository per pass, and it reads a listing only for a row whose
+  per-PR endpoint already answered `404`. A queue of present PRs therefore
+  pays no listing traffic at all. A pass reads at most 10 repositories'
+  listings. The read stops after 500 PRs. A repository with more PRs than that
+  cannot prove an absence, so its rows defer. The listing names the repository
+  directly, so a row whose repository is no longer tracked stays eligible.
+- The listing budget is a deferral, not an error. When a pass exhausts the
+  budget of 10 repository listings, the row whose listing read the budget
+  refused was never considered. The pass stops at that row, so the deferred
+  row and every row after it keep their rotation position and lead the next
+  pass. The rows the pass considered before the budget ran out stay stamped.
+  Reaching the budget never counts as an error. Without this rule the same
+  first 10 repositories consumed the budget on every pass, and a confirmed
+  deletion in a later repository stayed unconfirmed and unreaped forever.
+- The deleted-PR reap is bounded and it rotates through the queue (#1641
+  review). The pass reads at most 100 queue rows and issues at most 50 per-PR
+  probes. It reads the rows that it considered least recently first. It stamps
+  every row that it actually considered, including the rows whose probe
+  answered unknown. The stamp is the column `prPresenceCheckedAt`. A stamped
+  row leaves the head of the order until the re-verify bound of one hour
+  elapses. Every row the pass did not consider stays unstamped, so it leads
+  the next pass. Two bounds cut a pass short and both leave the rows they cut
+  off unstamped. The probe bound leaves the rows the pass never reached
+  unstamped, and the listing budget leaves the row that hit the budget
+  unstamped together with every row after it. Two properties follow from
+  this. The pass never restarts at the same head, and rows that answer
+  unknown forever can no longer hide a confirmed deletion behind them. Both
+  routes read the same stamp, so running both routes one after the other does
+  not probe the same row twice. Two routes that run at the same time can
+  still overlap by one pass, because each route stamps the rows it considered
+  only at the end of its pass.
+- The worst case for one pass is 150 HTTP requests. A pass issues at most 50
+  per-PR probes. It issues at most 50 repository reachability reads, and only
+  after a `404`. It reads at most 10 repository listings, and each listing
+  costs at most 5 pages. A healthy queue of present PRs spends far less,
+  because the reachability read and the listing read only follow a `404`.
 - **Unknown PR state** defers the item (`unknownState`): a possibly-closed PR is
   never reclaimed into a fresh attempt.
 - Past `PR_FIX_MAX_RECLAIMS` (default 3) the item parks as `PARKED` with
@@ -381,3 +432,17 @@ work, drain (or explicitly requeue) the queue first, or set
 `PR_FIX_HANDOUT_TIMEOUT_MS` to a value larger than the slowest worker's
 expected run time, so the pre-existing rows have a chance to ack through the
 new route.
+
+### Migration handling for the deleted-PR reap stamp
+
+The `20261116000000_add_pr_fix_presence_probe_stamp` migration adds the
+nullable column `prPresenceCheckedAt` and backfills no value. Every row that
+existed before the deploy therefore reads as never considered, so the whole
+active queue is due at once. The first pass after the deploy probes at most 50
+rows. The rotation then spreads the remaining rows over the following passes.
+No row is skipped and no row is probed twice because of the migration.
+
+The CI job applies this migration to a copy of the production schema that
+carries production-shaped rows. The check proves the additive column and the
+rotation index landed, the pre-existing rows survived with their values
+intact, and the column back-fills nothing.

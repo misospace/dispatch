@@ -1,0 +1,39 @@
+-- #1641 rotation stamp for the bounded deleted-PR reap: the reap probes the
+-- per-PR endpoint for every active queue row it reaches, and an unbounded
+-- scan turned a healthy queue of ordinary present PRs into one GitHub
+-- request per row on every sync. The stamp is what lets the pass rotate: a
+-- row it CONSIDERED (probed present, unknown or failed — it is a fairness
+-- marker, not a proof) leaves the head of the least-recently-considered
+-- order, so repeated passes advance through the backlog instead of re-probing
+-- the same head rows, and a wall of permanently-unknown rows cannot hide a
+-- confirmed deletion behind it.
+--
+-- Additive only: new nullable column, no existing column drop or type
+-- change, so `prisma migrate deploy` is safe against a database already at
+-- 20261107000000_add_blocked_external_park.
+ALTER TABLE "PrFixQueueItem" ADD COLUMN "prPresenceCheckedAt" TIMESTAMP(3);
+
+-- Serves the fairness read of `reconcileDeletedPrFixItems`
+-- (WHERE status IN (...) AND ("prPresenceCheckedAt" IS NULL OR
+--  "prPresenceCheckedAt" <= $cutoff)
+--  ORDER BY "prPresenceCheckedAt" ASC NULLS FIRST, "id" ASC LIMIT $page).
+-- The index narrows the read to the active statuses and carries the
+-- tiebreak column. The OR over the stamp column means PostgreSQL still
+-- sorts the matching rows before it applies the LIMIT, so the index does not
+-- remove the sort.
+--
+-- The NULLS FIRST placement is written out by hand on purpose. `prisma
+-- migrate dev` prints the same index without it, because the generator
+-- cannot express the NULL placement. Do not "fix" this line to match the
+-- generator: only ASC NULLS FIRST lets the btree deliver the ORDER BY, and
+-- the ASC default of PostgreSQL ranks NULL last.
+--
+-- Built with ordinary CREATE INDEX, not CREATE INDEX CONCURRENTLY: Prisma
+-- Migrate runs each migration as one transaction, and CONCURRENTLY is
+-- forbidden inside a transaction block. The build therefore takes a lock
+-- that blocks writes on "PrFixQueueItem" for its duration, but
+-- docker-entrypoint.sh runs `prisma migrate deploy` before the server
+-- starts, so on an instance being started there is no application traffic
+-- to block; only other replicas writing during a rolling deploy are
+-- affected, and the build is short on this bounded dispatch queue.
+CREATE INDEX "PrFixQueueItem_status_prPresenceCheckedAt_id_idx" ON "PrFixQueueItem"("status", "prPresenceCheckedAt" ASC NULLS FIRST, "id" ASC);

@@ -203,7 +203,7 @@ function asPrFixQueueTx(tx: Prisma.TransactionClient): PrFixQueueClient {
 }
 
 export function asPrFixQueueClient(client: PrismaClient): PrFixQueueClient {
-  return {
+  const queueClient: PrFixQueueClient = {
     issue: client.issue,
     prFixQueueItem: client.prFixQueueItem,
     prFixHistory: client.prFixHistory,
@@ -218,6 +218,11 @@ export function asPrFixQueueClient(client: PrismaClient): PrFixQueueClient {
     $transaction: <T>(fn: (tx: PrFixQueueClient) => Promise<T>): Promise<T> =>
       client.$transaction((tx) => fn(asPrFixQueueTx(tx))),
   };
+  if (typeof client.$executeRaw === "function") {
+    queueClient.$executeRaw = (query: Prisma.Sql, ...values: unknown[]) =>
+      client.$executeRaw(query, ...values);
+  }
+  return queueClient;
 }
 
 export function asAgentWorkClient(client: PrismaClient): AgentWorkClient {

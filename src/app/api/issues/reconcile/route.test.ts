@@ -10,6 +10,10 @@ const { mocks, prismaMocks, githubMocks, configMocks, reconciliationMocks } = vi
     acquireLock: vi.fn().mockResolvedValue({ locked: true, runId: "test-run" }),
     releaseLock: vi.fn().mockResolvedValue(undefined),
     auditLogFindMany: vi.fn().mockResolvedValue([]),
+    // #1641: the deleted-PR reap is stubbed here so the route test never
+    // calls the forge. The real reap is covered by the unit suite and by the
+    // real-PostgreSQL integration test.
+    reconcileDeletedPrFixItems: vi.fn(async () => ({ checked: 0, markedStale: 0, errored: 0 })),
   },
   prismaMocks: {
     issueFindMany: vi.fn((_args?: unknown) => Promise.resolve([] as any)),
@@ -18,6 +22,7 @@ const { mocks, prismaMocks, githubMocks, configMocks, reconciliationMocks } = vi
     transaction: vi.fn(async (ops: unknown[]) => Promise.all(ops as Promise<unknown>[])),
     auditLogCreate: vi.fn(() => Promise.resolve({} as any)),
     prFixQueueItemFindMany: vi.fn(() => Promise.resolve([] as any)),
+    prFixQueueItemUpdateMany: vi.fn(() => Promise.resolve({ count: 0 } as any)),
     lifecycleRows: [] as Array<Record<string, any>>,
   },
   githubMocks: {
@@ -40,7 +45,7 @@ vi.mock("@/lib/prisma", () => ({
         issue: { findMany: prismaMocks.issueFindMany, update: prismaMocks.issueUpdate },
         issueLane: { create: prismaMocks.issueLaneCreate },
         $transaction: prismaMocks.transaction,
-    prFixQueueItem: { findMany: prismaMocks.prFixQueueItemFindMany },
+    prFixQueueItem: { findMany: prismaMocks.prFixQueueItemFindMany, updateMany: prismaMocks.prFixQueueItemUpdateMany },
     issueLifecycleEvent: {
       create: vi.fn(async ({ data }: any) => {
         prismaMocks.lifecycleRows.push({ ...data });
@@ -62,6 +67,11 @@ vi.mock("@/lib/github", async (importOriginal) => ({
   fetchClosedPullRequests: githubMocks.fetchClosedPullRequests,
   fetchIssues: githubMocks.fetchIssues,
   fetchLinkedPrHealthInput: githubMocks.fetchLinkedPrHealthInput,
+}));
+
+vi.mock("@/lib/pr-fix-queue", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/pr-fix-queue")>()),
+  reconcileDeletedPrFixItems: mocks.reconcileDeletedPrFixItems,
 }));
 
 vi.mock("@/lib/config", async (importOriginal) => ({
@@ -94,6 +104,7 @@ describe("POST /api/issues/reconcile", () => {
     vi.clearAllMocks();
     mocks.acquireLock.mockResolvedValue({ locked: true, runId: "test-run" });
     mocks.releaseLock.mockResolvedValue(undefined);
+    mocks.reconcileDeletedPrFixItems.mockResolvedValue({ checked: 0, markedStale: 0, errored: 0 });
   });
 
   it("returns 409 when another reconciliation holds the lock", async () => {
@@ -870,6 +881,37 @@ describe("POST — lane history rows (#1598)", () => {
       where: { repositoryId_number: { repositoryId: "repo-1", number: 5 } },
       data: { currentLane: expected.lane },
     });
+  });
+
+  it("runs the deleted-PR reap and reports its counts (#1641)", async () => {
+    // #1641: the deleted-PR reap is queue-wide, so it runs once after the
+    // per-repo loop. Its counts reach the response, and a transient forge
+    // failure stays a reported number instead of failing the whole
+    // reconciliation.
+    mocks.reconcileDeletedPrFixItems.mockResolvedValue({ checked: 4, markedStale: 1, errored: 0 });
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(mocks.reconcileDeletedPrFixItems).toHaveBeenCalledTimes(1);
+    expect(body.prFixQueueDeletedChecked).toBe(4);
+    expect(body.prFixQueueDeletedMarked).toBe(1);
+    expect(body.prFixQueueDeletedErrored).toBe(0);
+    expect(body.success).toBe(true);
+  });
+
+  it("keeps a transient deleted-PR reap failure out of the reconciliation result (#1641)", async () => {
+    mocks.reconcileDeletedPrFixItems.mockResolvedValue({ checked: 4, markedStale: 0, errored: 1 });
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    // The reap error is reported, but the issues this route reconciled were
+    // reconciled: `success` stays about the issues.
+    expect(body.prFixQueueDeletedErrored).toBe(1);
+    expect(body.success).toBe(true);
   });
 
   it("creates an IssueLane history row for stale-backlog reclassification", async () => {

@@ -113,6 +113,32 @@ describe("asPrFixQueueClient delegate surface (#1249)", () => {
   });
 });
 
+describe("asPrFixQueueClient raw surface (#1642)", () => {
+  it("forwards $executeRaw with the exact arguments when the client has one", async () => {
+    const mod = await import("./prisma");
+    const executeRaw = vi.fn(async () => 1);
+    const client = mod.asPrFixQueueClient({
+      $executeRaw: executeRaw,
+      $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn({}),
+    } as any);
+    const query = { text: "SELECT 1" } as any;
+
+    await (client as any).$executeRaw(query, "a", 1);
+
+    expect(executeRaw).toHaveBeenCalledTimes(1);
+    expect(executeRaw.mock.calls[0]).toEqual([query, "a", 1]);
+  });
+
+  it("omits $executeRaw when the client has none", async () => {
+    const mod = await import("./prisma");
+    const client = mod.asPrFixQueueClient({
+      $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn({}),
+    } as any);
+
+    expect((client as any).$executeRaw).toBeUndefined();
+  });
+});
+
 describe("prisma DATABASE_URL sslmode handling", () => {
   let adapterCtor: ReturnType<typeof vi.fn<(...args: unknown[]) => void>>;
   let PrismaPgMock: any;

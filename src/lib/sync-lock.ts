@@ -8,7 +8,11 @@
  *     share the `issue-sync` key — same full-sync write path over the same rows.
  *   - Automation sync (`/api/automation/sync`) — disjoint tables.
  *   - PR follow-up sync (`/api/pr-followup/sync`) — PrFixQueueItem only.
- *   - Issue reconciliation (`/api/issues/reconcile`) — column-disjoint writes.
+ *   - Issue reconciliation (`/api/issues/reconcile`) — PrFixQueueItem rows too
+ *     (the stale reap and, since #1641, the deleted-PR reap). The two jobs
+ *     hold different keys, so they can run at the same time; the deleted-PR
+ *     reap's rotation stamp keeps sequential runs from probing the same row
+ *     twice, and a concurrent pair can overlap by one pass.
  *   - Stale-work sweep (`/api/agent-work/sweep`) — conditional transitions.
  *
  * This used to be one `"global"` row shared by all six. That made every job
