@@ -184,15 +184,96 @@ describe("deriveBlockingReview", () => {
     expect(blocking).toBeNull();
   });
 
-  it("supersession: the reviewer's later DISMISSED clears the block (review round 5, M1)", () => {
+  it("supersession: a DISMISSED review leaves the reviewer with no standing request (review round 5, M1)", () => {
+    // GitHub mutates a dismissed review IN PLACE (state → DISMISSED, same
+    // submitted_at), so "the reviewer requested changes and that request was
+    // withdrawn" is a SINGLE record: ignored as dismissed, it leaves the
+    // reviewer with nothing standing and the withdrawal unblocks.
+    const blocking = deriveBlockingReview(
+      [review({ id: 1, state: "DISMISSED", submittedAt: "2026-11-13T00:00:00Z", body: "same review, dismissed" })],
+      HEAD,
+    );
+    expect(blocking).toBeNull();
+  });
+
+  it("dismissal of a re-review does not mask the reviewer's older standing request (#1636)", () => {
+    // Two CHANGES_REQUESTED reviews with the newer one dismissed. GitHub's
+    // branch-protection rule keeps the older request standing ("dismissed
+    // reviews are ignored; remaining requests still count"), so the command
+    // must not refuse with "no pending CHANGES_REQUESTED review" — the
+    // STANDING review's feedback is what gets handed off, never the
+    // dismissed one.
     const blocking = deriveBlockingReview(
       [
-        review({ id: 1, submittedAt: "2026-11-12T00:00:00Z" }),
-        review({ id: 2, state: "DISMISSED", submittedAt: "2026-11-13T00:00:00Z", body: "same review, dismissed" }),
+        review({ id: 1, submittedAt: "2026-11-12T00:00:00Z", body: "older request" }),
+        review({ id: 2, state: "DISMISSED", submittedAt: "2026-11-13T00:00:00Z", body: "re-review, dismissed" }),
+      ],
+      HEAD,
+    );
+    expect(blocking?.review.id).toBe(1);
+    expect(blocking?.review.body).toBe("older request");
+    expect(blocking?.stale).toBe(false);
+  });
+
+  it("a dismissed re-review does not resurrect a stale older request", () => {
+    // The older standing request was written against an earlier head: it
+    // still blocks, but it is reported stale so the operator is told to
+    // re-review rather than handed off feedback for a head that is gone.
+    const blocking = deriveBlockingReview(
+      [
+        review({ id: 1, submittedAt: "2026-11-12T00:00:00Z", commitId: "0000000", body: "older request" }),
+        review({ id: 2, state: "DISMISSED", submittedAt: "2026-11-13T00:00:00Z", body: "re-review, dismissed" }),
+      ],
+      HEAD,
+    );
+    expect(blocking?.review.id).toBe(1);
+    expect(blocking?.stale).toBe(true);
+  });
+
+  it("dismissing a review leaves the reviewer's older request standing", () => {
+    // The API never says what a dismissed record said BEFORE it was
+    // dismissed (the dismissal mutates it in place), so a dismissed APPROVAL
+    // lands on the same shape as a dismissed re-review: the older request is
+    // a remaining request and still stands.
+    const blocking = deriveBlockingReview(
+      [
+        review({ id: 1, submittedAt: "2026-11-12T00:00:00Z", body: "older request" }),
+        review({ id: 2, state: "DISMISSED", submittedAt: "2026-11-13T00:00:00Z", body: "dismissed, originally an approval" }),
+      ],
+      HEAD,
+    );
+    expect(blocking?.review.id).toBe(1);
+    expect(blocking?.stale).toBe(false);
+  });
+
+  it("an ignored dismissal does not resurrect a request a newer approval cleared", () => {
+    // The dismissal is ignored, so the reviewer's newest REMAINING review
+    // decides: the approval stands, and the older request stays cleared.
+    const blocking = deriveBlockingReview(
+      [
+        review({ id: 1, submittedAt: "2026-11-12T00:00:00Z", body: "older request" }),
+        review({ id: 2, state: "APPROVED", submittedAt: "2026-11-13T00:00:00Z", body: "approved" }),
+        review({ id: 3, state: "DISMISSED", submittedAt: "2026-11-14T00:00:00Z", body: "dismissed" }),
       ],
       HEAD,
     );
     expect(blocking).toBeNull();
+  });
+
+  it("an unparseable submittedAt does not decide which review stands", () => {
+    // A NaN timestamp compares false against everything, so it must not be
+    // allowed to keep the FIRST review seen for a reviewer instead of their
+    // newest: the unparseable one sorts as oldest and the parseable one
+    // wins.
+    const blocking = deriveBlockingReview(
+      [
+        review({ id: 1, submittedAt: "not-a-date", body: "unparseable" }),
+        review({ id: 2, submittedAt: "2026-11-13T00:00:00Z", body: "newest" }),
+      ],
+      HEAD,
+    );
+    expect(blocking?.review.id).toBe(2);
+    expect(blocking?.review.body).toBe("newest");
   });
 
   it("supersession: a DISMISSED review does not clear a NEWER CHANGES_REQUESTED", () => {
@@ -295,6 +376,38 @@ describe("handleDispatchFixCommand", () => {
     mocks.fetchPullRequestReviews.mockResolvedValue([review({ body: "" })]);
     const outcome = await handleDispatchFixCommand(baseCommand());
     expect(outcome.outcome).toBe("refused");
+    expect(mocks.enqueuePrFixItem).not.toHaveBeenCalled();
+  });
+
+  it("enqueues the STANDING request when the reviewer's re-review was dismissed (#1636)", async () => {
+    // Two CHANGES_REQUESTED reviews, the newer one dismissed: GitHub keeps
+    // the older request standing, so the command must hand that feedback off
+    // instead of refusing with "no pending CHANGES_REQUESTED review".
+    mocks.fetchPullRequestReviews.mockResolvedValue([
+      review({ id: 1, submittedAt: "2026-11-12T00:00:00Z", body: "older standing feedback" }),
+      review({ id: 2, state: "DISMISSED", submittedAt: "2026-11-13T00:00:00Z", commitId: "0000000", body: "dismissed feedback" }),
+    ]);
+    const outcome = await handleDispatchFixCommand(baseCommand());
+    expect(outcome.outcome).toBe("enqueued");
+    expect(mocks.enqueuePrFixItem).toHaveBeenCalledTimes(1);
+    const input = mocks.enqueuePrFixItem.mock.calls[0][1];
+    // The standing review's feedback is handed off — never the dismissed one.
+    expect(input.feedback).toBe("older standing feedback");
+    // The evidence fields describe the STANDING review too: its commit and
+    // its submission time, not the dismissed review's.
+    expect(input.evidenceVersion).toBe(`state=changes_requested|commit=${HEAD}`);
+    expect(input.evidenceObservedAt).toBe("2026-11-12T00:00:00Z");
+  });
+
+  it("still refuses when the reviewer's only request was withdrawn (dismissed in place)", async () => {
+    // A dismissal mutates the review in place, so a withdrawn request is one
+    // DISMISSED record and leaves nothing standing.
+    mocks.fetchPullRequestReviews.mockResolvedValue([
+      review({ id: 1, state: "DISMISSED", submittedAt: "2026-11-13T00:00:00Z", body: "withdrawn feedback" }),
+    ]);
+    const outcome = await handleDispatchFixCommand(baseCommand());
+    expect(outcome.outcome).toBe("refused");
+    expect(mocks.addIssueComment.mock.calls[0][2]).toContain("no pending CHANGES_REQUESTED review");
     expect(mocks.enqueuePrFixItem).not.toHaveBeenCalled();
   });
 
