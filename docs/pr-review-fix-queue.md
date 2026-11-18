@@ -422,8 +422,20 @@ as the `pr-fix-sweep` job:
 - A **hard-deleted** PR also goes `STALE` (#1641). A hard-deleted PR is in no
   PR listing, so the merged and closed reap never sees the row. Two routes run
   an item-driven deleted-PR reap (`reconcileDeletedPrFixItems`): the
-  pr-followup sync and the issues reconcile route. The reap probes the per-PR
-  endpoint for the rows it reaches. A confirmation needs three facts:
+  pr-followup sync and the issues reconcile route. The reap is item-driven, so
+  it needs no tracked repository: both routes run it even when the tracked
+  repository list is empty, before their no-tracked-repos early return (#1651).
+  Both empty paths sit behind a GitHub-credential check: no credential, no
+  probes. Without one, every presence probe answers `unknown` before it
+  reaches the forge, each due row still counts as considered and is stamped,
+  and a doomed pass rotates the one-hour re-verify window on clean-looking
+  zero-error counts without reaping anything. The pr-followup sync fails the
+  whole request with 500 in that case. The issues reconcile route keeps its
+  404, and its body reports
+  `prFixQueueDeletedReapSkipped: "no-github-credential"` instead of reap
+  counts (#1652 review).
+  The reap probes the per-PR endpoint for the rows it reaches. A confirmation
+  needs three facts:
   - The per-PR endpoint answers `404`.
   - The repository reads through the same credential.
   - The repository's PR listing does not show the PR.

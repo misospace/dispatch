@@ -30,6 +30,9 @@ const { mocks, prismaMocks, githubMocks, configMocks, reconciliationMocks } = vi
     fetchClosedPullRequests: vi.fn(() => Promise.resolve([] as any)),
     fetchIssues: vi.fn(() => Promise.resolve([] as any)),
     fetchLinkedPrHealthInput: vi.fn(),
+    // The credential check in front of the no-tracked-repos reap (#1652
+    // review): resolves by default so the reap runs; the skip test rejects it.
+    getGitHubToken: vi.fn(async () => "test-token"),
   },
   configMocks: {
     getSyncRepos: vi.fn(() => Promise.resolve([] as any)),
@@ -67,6 +70,7 @@ vi.mock("@/lib/github", async (importOriginal) => ({
   fetchClosedPullRequests: githubMocks.fetchClosedPullRequests,
   fetchIssues: githubMocks.fetchIssues,
   fetchLinkedPrHealthInput: githubMocks.fetchLinkedPrHealthInput,
+  getGitHubToken: githubMocks.getGitHubToken,
 }));
 
 vi.mock("@/lib/pr-fix-queue", async (importOriginal) => ({
@@ -101,6 +105,8 @@ describe("POST /api/issues/reconcile", () => {
   beforeEach(() => {
     delete process.env.DISPATCH_AUTH_MODE;
     resetAuthCaches();
+    // Reset process-global per-actor rate-limit windows per test (see claim suite).
+    resetRateLimits();
     vi.clearAllMocks();
     mocks.acquireLock.mockResolvedValue({ locked: true, runId: "test-run" });
     mocks.releaseLock.mockResolvedValue(undefined);
@@ -116,6 +122,72 @@ describe("POST /api/issues/reconcile", () => {
     expect(await res.json()).toMatchObject({ locked: true });
     expect(mocks.acquireLock).toHaveBeenCalledWith("reconcile");
     expect(mocks.releaseLock).not.toHaveBeenCalled();
+  });
+
+  it("runs the deleted-PR reap even with no tracked repos (#1651)", async () => {
+    // The reap is item-driven: it names each row's own repository directly,
+    // so the no-tracked-repos early return must not skip it. A row whose PR
+    // was deleted upstream must not stay dispatchable because the instance
+    // (or the `repo` filter) tracks nothing. The 404 stays the answer, and
+    // it reports the reap counts (#1652 review).
+    configMocks.getSyncRepos.mockResolvedValue([]);
+    mocks.reconcileDeletedPrFixItems.mockResolvedValue({ checked: 2, markedStale: 1, errored: 0 });
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toMatchObject({
+      error: "No tracked repos found",
+      prFixQueueDeletedChecked: 2,
+      prFixQueueDeletedMarked: 1,
+      prFixQueueDeletedErrored: 0,
+    });
+    expect(mocks.reconcileDeletedPrFixItems).toHaveBeenCalledTimes(1);
+    // The repo-list-driven work stays skipped on this path.
+    expect(githubMocks.fetchPullRequests).not.toHaveBeenCalled();
+    expect(githubMocks.fetchClosedPullRequests).not.toHaveBeenCalled();
+  });
+
+  it("still returns the 404 when the deleted-PR reap fails on the no-tracked-repos path (#1651)", async () => {
+    // A failed reap is reported in the logs and in the counts, and never
+    // turns the "no repos" answer into a 500.
+    configMocks.getSyncRepos.mockResolvedValue([]);
+    mocks.reconcileDeletedPrFixItems.mockRejectedValueOnce(new Error("forge unreachable"));
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toMatchObject({
+      error: "No tracked repos found",
+      prFixQueueDeletedChecked: 0,
+      prFixQueueDeletedMarked: 0,
+      prFixQueueDeletedErrored: 1,
+    });
+    expect(mocks.reconcileDeletedPrFixItems).toHaveBeenCalledTimes(1);
+    expect(githubMocks.fetchPullRequests).not.toHaveBeenCalled();
+    expect(githubMocks.fetchClosedPullRequests).not.toHaveBeenCalled();
+  });
+
+  it("skips the deleted-PR reap when no GitHub credential is configured (#1652 review)", async () => {
+    // Without a credential every presence probe answers `unknown` before it
+    // reaches the forge, each due row still counts as considered and is
+    // stamped, and a doomed pass rotates the 1-hour re-verify window on
+    // clean-looking zero-error counts without reaping anything. Skip the reap
+    // and say so in the body instead.
+    configMocks.getSyncRepos.mockResolvedValue([]);
+    githubMocks.getGitHubToken.mockRejectedValueOnce(new Error("GITHUB_TOKEN environment variable is not set"));
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toMatchObject({
+      error: "No tracked repos found",
+      prFixQueueDeletedChecked: 0,
+      prFixQueueDeletedMarked: 0,
+      prFixQueueDeletedErrored: 0,
+      prFixQueueDeletedReapSkipped: "no-github-credential",
+    });
+    expect(mocks.reconcileDeletedPrFixItems).not.toHaveBeenCalled();
   });
 });
 
@@ -559,6 +631,8 @@ describe("POST — merge evidence after close (#1203)", () => {
   beforeEach(() => {
     delete process.env.DISPATCH_AUTH_MODE;
     resetAuthCaches();
+    // Reset process-global per-actor rate-limit windows per test (see claim suite).
+    resetRateLimits();
     vi.clearAllMocks();
     prismaMocks.lifecycleRows.length = 0;
     mocks.acquireLock.mockResolvedValue({ locked: true, runId: "test-run" });
