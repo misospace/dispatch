@@ -34,8 +34,11 @@ jobs:
       # separate from that workflow on purpose: this one is scoped to
       # site/** paths, so it also covers pull requests that target a branch
       # other than main, which the Security Audit workflow does not run for.
+      # Same script the Security Audit workflow runs (#1566), including the
+      # one reviewed, time-boxed advisory exception (#1653). The gate stays
+      # blocking for every advisory that is not on its admitted list.
       - name: npm audit (site/ dependency tree)
-        run: npm audit --include=dev --audit-level=high --fetch-retries=5 --fetch-timeout=120000 --fetch-retry-mintimeout=20000 --fetch-retry-maxtimeout=120000
+        run: node ../scripts/site-npm-audit.mjs
         working-directory: site
       - name: Install and production-build site/
         run: npm ci --no-audit --no-fund && npm run build
