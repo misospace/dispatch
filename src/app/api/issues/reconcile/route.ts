@@ -301,11 +301,12 @@ export async function POST(request: Request) {
       // before this early return, or an instance tracking no repository (or
       // a `repo` filter matching nothing) leaves rows whose PR was deleted
       // upstream dispatchable forever. Like the pr-followup empty path, the
-      // reap sits behind a credential check: without one, every probe throws,
-      // each due row still counts as considered, and the pass rotates the
-      // 1-hour re-verify window without reaping anything. The 404 stays the
-      // answer for "no repos"; it now also reports what the reap did (#1652
-      // review).
+      // reap sits behind a credential check: without one, every presence
+      // probe answers `unknown` before it reaches the forge, each due row
+      // still counts as considered and gets stamped, and the pass rotates the
+      // 1-hour re-verify window on clean-looking zero-error counts without
+      // reaping anything. The 404 stays the answer for "no repos"; it now
+      // also reports what the reap did (#1652 review).
       let deletedResult = { checked: 0, markedStale: 0, errored: 0 };
       let reapSkipped: string | undefined;
       try {

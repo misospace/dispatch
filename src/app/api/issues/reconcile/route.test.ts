@@ -105,6 +105,8 @@ describe("POST /api/issues/reconcile", () => {
   beforeEach(() => {
     delete process.env.DISPATCH_AUTH_MODE;
     resetAuthCaches();
+    // Reset process-global per-actor rate-limit windows per test (see claim suite).
+    resetRateLimits();
     vi.clearAllMocks();
     mocks.acquireLock.mockResolvedValue({ locked: true, runId: "test-run" });
     mocks.releaseLock.mockResolvedValue(undefined);
@@ -167,9 +169,11 @@ describe("POST /api/issues/reconcile", () => {
   });
 
   it("skips the deleted-PR reap when no GitHub credential is configured (#1652 review)", async () => {
-    // Without a credential every probe throws, each due row still counts as
-    // considered, and a doomed pass rotates the 1-hour re-verify window
-    // without reaping anything. Skip the reap and say so in the body instead.
+    // Without a credential every presence probe answers `unknown` before it
+    // reaches the forge, each due row still counts as considered and is
+    // stamped, and a doomed pass rotates the 1-hour re-verify window on
+    // clean-looking zero-error counts without reaping anything. Skip the reap
+    // and say so in the body instead.
     configMocks.getSyncRepos.mockResolvedValue([]);
     githubMocks.getGitHubToken.mockRejectedValueOnce(new Error("GITHUB_TOKEN environment variable is not set"));
 
