@@ -385,7 +385,17 @@ export function __resetGitHubAppState(): void {
   inFlightTokenFetch = null;
 }
 
-function getNextLink(response: Response): string | null {
+/**
+ * The `rel="next"` URL of a paginated GitHub response, or null when the
+ * response is the last page.
+ *
+ * Exported for readers that must stop EARLY: `fetchPaginated` collects
+ * every page before it returns, so a caller that has to decide per page
+ * (the deleted-PR listing read, #1648) follows the link itself. A page
+ * without a `rel="next"` link is the END of the listing — an exact signal,
+ * unlike the record count of a page, which a concurrent change can shorten.
+ */
+export function getNextLink(response: Response): string | null {
   const link = response.headers.get("Link");
   if (!link) return null;
   const match = link.match(/<([^>]+)>;\s*rel="next"/);
