@@ -425,10 +425,15 @@ as the `pr-fix-sweep` job:
   pr-followup sync and the issues reconcile route. The reap is item-driven, so
   it needs no tracked repository: both routes run it even when the tracked
   repository list is empty, before their no-tracked-repos early return (#1651).
-  On the pr-followup sync it still sits behind the route's GitHub-credential
-  fail-fast: no credential, no probes.
-  The reap probes the per-PR
-  endpoint for the rows it reaches. A confirmation needs three facts:
+  Both empty paths sit behind a GitHub-credential check: no credential, no
+  probes. Without one, every probe throws, each due row still counts as
+  considered, and a doomed pass rotates the one-hour re-verify window without
+  reaping anything. The pr-followup sync fails the whole request with 500 in
+  that case. The issues reconcile route keeps its 404, and its body reports
+  `prFixQueueDeletedReapSkipped: "no-github-credential"` instead of reap
+  counts (#1652 review).
+  The reap probes the per-PR endpoint for the rows it reaches. A confirmation
+  needs three facts:
   - The per-PR endpoint answers `404`.
   - The repository reads through the same credential.
   - The repository's PR listing does not show the PR.

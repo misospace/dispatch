@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
-import { fetchPullRequests, fetchClosedPullRequests, fetchIssues, fetchLinkedPrHealthInput } from "@/lib/github";
+import { fetchPullRequests, fetchClosedPullRequests, fetchIssues, fetchLinkedPrHealthInput, getGitHubToken } from "@/lib/github";
 import { getSyncRepos } from "@/lib/config";
 import {
   extractFixingIssueNumbers,
@@ -300,12 +300,32 @@ export async function POST(request: Request) {
       // repository directly, so it never needed the tracked-repo list. Run it
       // before this early return, or an instance tracking no repository (or
       // a `repo` filter matching nothing) leaves rows whose PR was deleted
-      // upstream dispatchable forever. The 404 itself is unchanged.
-      const deletedResult = await runDeletedPrFixReap();
+      // upstream dispatchable forever. Like the pr-followup empty path, the
+      // reap sits behind a credential check: without one, every probe throws,
+      // each due row still counts as considered, and the pass rotates the
+      // 1-hour re-verify window without reaping anything. The 404 stays the
+      // answer for "no repos"; it now also reports what the reap did (#1652
+      // review).
+      let deletedResult = { checked: 0, markedStale: 0, errored: 0 };
+      let reapSkipped: string | undefined;
+      try {
+        await getGitHubToken();
+      } catch {
+        reapSkipped = "no-github-credential";
+      }
+      if (!reapSkipped) {
+        deletedResult = await runDeletedPrFixReap();
+      }
       if (deletedResult.errored > 0) {
         console.warn(`[pr-fix-queue] deleted-PR reap errored on ${deletedResult.errored} item(s) (#1641)`);
       }
-      return errorResponse("No tracked repos found", 404);
+      return NextResponse.json({
+        error: "No tracked repos found",
+        prFixQueueDeletedChecked: deletedResult.checked,
+        prFixQueueDeletedMarked: deletedResult.markedStale,
+        prFixQueueDeletedErrored: deletedResult.errored,
+        ...(reapSkipped ? { prFixQueueDeletedReapSkipped: reapSkipped } : {}),
+      }, { status: 404 });
     }
 
     let totalIssuesReconciled = 0;
