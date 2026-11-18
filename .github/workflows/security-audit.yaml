@@ -51,6 +51,13 @@ jobs:
       # Moderate advisories stay non-fatal because the threshold is high.
       #
       # `npm audit` reads the lockfile, so no install is needed before it.
+      #
+      # The command is a script, not a bare `npm audit`, so the one reviewed,
+      # time-boxed advisory exception (#1653: GHSA-fc5q-39xc-vjpf, picomatch
+      # ReDoS, no fixed release) is applied identically from this and the
+      # Pages call site. Every advisory not on the script's admitted list —
+      # and that one after its expiry — still fails this gate; see
+      # SECURITY-ACCEPTED-RISKS.md.
       - name: npm audit (site/ dependency tree)
-        run: npm audit --include=dev --audit-level=high --fetch-retries=5 --fetch-timeout=120000 --fetch-retry-mintimeout=20000 --fetch-retry-maxtimeout=120000
+        run: node ../scripts/site-npm-audit.mjs
         working-directory: site
