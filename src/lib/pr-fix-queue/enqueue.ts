@@ -8,6 +8,7 @@ import { ingestionClaimantPatch, resolveIngestionClaimant } from "../pr-fix-owne
 import { type PrFixQueueClient } from "./client";
 import { maxPrFixReclaims, normalizeQueueRepo, uniqueAppend } from "./shared";
 import { rebaseExecutorClaimantExclusion } from "./lane-admission";
+import { rebaseEpisodeIdentity } from "./rebase-transfer";
 import { type CreateLinkedPrFixInput, type EnqueuePrFixInput } from "./inputs";
 import { linkedIssueEscalationClassified } from "./escalation-lane";
 import { appendPostDispatchEvidenceEntry, buildPrFixBlockedContext, carriesLedgerFields, encodePostDispatchEvidenceKey, readEvidenceLedgerView, recordEvidenceTransition, type EvidenceLedgerView, type EvidenceObservation } from "./evidence";
@@ -215,6 +216,39 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           snapshot.status === "FIXED" &&
           input.evidenceActionable === true;
 
+        // #1675: a conflict episode that already TRANSFERRED onto the ordinary
+        // fix lane must never be bounced back onto the mechanical REBASE lane
+        // by a repeat observation of the SAME conflict — that is exactly the
+        // resync/restart/re-read loop the transfer exists to end. The
+        // comparison keys on the stable episode identity
+        // (`rebaseEpisodeIdentity`, authoritative repo/PR/ref/head state):
+        // the transferred record's id vs the id of the conflict this enqueue
+        // observes. Same id → the observation is the SAME episode → the
+        // `type` write below is suppressed (the row keeps the fix lane it was
+        // transferred to) and a note records why. A new head derives a
+        // DIFFERENT id (a new DIRTY episode, #1327), which releases the gate
+        // and lets the rebase lane run again. The row's own branch folds in
+        // when the observation carries none, so a partially-observed resync
+        // still derives the SAME identity the transfer stored (fail toward
+        // no-bounce, never toward a rebase re-entry).
+        const transferredEpisodeId =
+          snapshot.rebaseEpisodeTransferred === true && typeof snapshot.rebaseEpisodeId === "string"
+            ? snapshot.rebaseEpisodeId
+            : null;
+        const observedRebaseEpisodeId =
+          type === "REBASE"
+            ? rebaseEpisodeIdentity(
+                snapshot.repo ?? normalizeQueueRepo(input.repo),
+                snapshot.pr ?? input.pr,
+                input.branch ?? snapshot.branch ?? null,
+                input.headSha ?? null,
+              )
+            : null;
+        const transferredEpisodeReobserved =
+          type === "REBASE" &&
+          transferredEpisodeId !== null &&
+          transferredEpisodeId === observedRebaseEpisodeId;
+
         // STALE/IGNORED stay sticky inline (#1000): terminal states never
         // reactivate on evidence and are operator-only, so they are kept OUT
         // of the recovery module's decision path entirely. The three
@@ -404,10 +438,21 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
 
         const data = {
           lane: resolvedLane,
-          type,
+          // #1675: when the observed conflict is the SAME episode already
+          // transferred onto the fix lane, the REBASE type write is
+          // suppressed — the row keeps the lane the transfer gave it, so the
+          // mechanical rebase lane cannot re-enter a transferred episode. The
+          // rebase work item's reason/instruction wall are suppressed with it
+          // (they are the REBASE lane's worker contract; writing them onto a
+          // fix-lane attempt would hand the next fix hand-out mechanical
+          // rebase instructions). Any other type/reason/feedback write
+          // (non-REBASE observations, new episodes) is unchanged.
+          ...(transferredEpisodeReobserved ? {} : { type }),
           status: resolvedStatus,
-          reason: input.reason,
-          feedback: uniqueAppend(snapshot.feedback ?? [], input.feedback, 12),
+          reason: transferredEpisodeReobserved ? snapshot.reason ?? input.reason : input.reason,
+          feedback: transferredEpisodeReobserved
+            ? snapshot.feedback ?? []
+            : uniqueAppend(snapshot.feedback ?? [], input.feedback, 12),
           evidenceKeys: nextEvidenceKeys,
           // #1098: the item URL is identity — write-once. Backfill it only
           // while empty; never overwrite an existing URL with a re-enqueue's
@@ -523,6 +568,11 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           isNewLedgerTransition,
           assignedEvidenceSequence,
           recoveryNote,
+          // #1675: the observation named the REBASE lane but the row's
+          // transferred episode matched, so the type write was suppressed.
+          // Audit-only fields for the history note below.
+          transferredEpisodeReobserved,
+          observedRebaseEpisodeId,
           // #1134: the append above is computed from THIS snapshot's key list,
           // so the write must be pinned on exactly that list. The
           // isFreshAttempt reset-to-[] is mutually exclusive with the append
@@ -660,7 +710,12 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
         evidenceKey: input.evidenceKey,
       };
       if (decided.outcome) historyData.outcome = decided.outcome;
-      if (decided.reopenFixStale) {
+      if (decided.transferredEpisodeReobserved) {
+        // #1675: the audit trail must say WHY the rebase lane was not
+        // (re-)entered — otherwise a repeat observation looks like it
+        // silently ignored the mechanical lane.
+        historyData.note = `Repeat observation of conflict episode ${decided.observedRebaseEpisodeId ?? "unknown"}: the episode is already transferred onto the fix lane, so the REBASE type write was suppressed (#1675).`;
+      } else if (decided.reopenFixStale) {
         historyData.note = `Reopened: PR head SHA unchanged since FIXED (${snapshot.headSha}); re-detected evidence on a no-progress tombstone (#940).`;
       } else if (decided.statusNote && decided.recoveryNote) {
         // #1253: a cap-flipped reactivation carries BOTH notes — the

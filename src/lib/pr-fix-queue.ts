@@ -27,3 +27,5 @@ export { freshAttemptGeneration, agentHandoutToken, parseAgentHandoutToken, newH
 export { requeuePrFixItem } from "./pr-fix-queue/requeue";
 export { resolvePrFixFromAgentReport } from "./pr-fix-queue/report-resolution";
 export type { AgentReportOutcome, PrFixReportAttempt, ResolvePrFixFromAgentReportInput, ResolvePrFixFromAgentReportResult } from "./pr-fix-queue/report-resolution";
+export { parseRebaseRefusal, isTransferEligibleRefusal, rebaseEpisodeIdentity, transferRebaseEpisodeToFix, NONMECHANICAL_CONFLICT_KIND } from "./pr-fix-queue/rebase-transfer";
+export type { RebaseRefusalContext, RebaseTransferResult, TransferRebaseEpisodeInput } from "./pr-fix-queue/rebase-transfer";

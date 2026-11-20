@@ -11,6 +11,7 @@ import { buildPrFixBlockedContext } from "./evidence";
 import { attemptHeadAdvanced, maxPrFixStagnation } from "./external-wait";
 import { markPrFixItem } from "./settlement";
 import { agentHandoutToken, findHandoutReceipt, freshAttemptGeneration, handoutReceipt, releaseAgentHandout } from "./handout";
+import { isTransferEligibleRefusal, parseRebaseRefusal, transferRebaseEpisodeToFix } from "./rebase-transfer";
 
 /**
  * Outcome shape used by `tasks/report`. Mirrors the `tasks/report` route's
@@ -66,6 +67,13 @@ export interface ResolvePrFixFromAgentReportInput {
   // report. Without a valid contract the attempt fails closed to
   // PARKED/`invalid_wait` instead of a cooldown wait.
   externalWait?: unknown;
+  // #1675: the structured nonmechanical-conflict refusal carried by a
+  // `blocked` report from the mechanical rebase executor. Parsed and bounded
+  // by rebase-transfer.ts; only an explicit `nonmechanical_conflict` kind on a
+  // verifiable, exclusively-owned, unchanged-head REBASE attempt authorizes
+  // the one-way REBASE→fix episode transfer — every other shape (and every
+  // other failure kind) keeps the ordinary blocked treatment below.
+  rebaseRefusal?: unknown;
   // #1256: opaque worker-declared capacity identifier, required (with an
   // attempt token) by the `capacity-exhausted` outcome.
   capacity?: string | null;
@@ -438,11 +446,95 @@ export async function resolvePrFixFromAgentReport(
     // needs-human.
     const resolved = normalizePrFixOutcome(input.blockReason) ?? "no_progress";
     const isHumanDecision = resolved === "human_decision";
+
+    // #1675: the structured nonmechanical-conflict refusal from the mechanical
+    // rebase executor is the ONLY thing that may transfer the conflict
+    // episode onto one authorized ordinary fix attempt. Everything else — a
+    // legacy report without the refusal (old client), a refusal of any other
+    // kind (auth/deletion/infra/ambiguous workspace), a refusal that fails
+    // its bounds, or a refusal the transfer module refuses for lost
+    // preconditions (changed remote head, stale receipt, non-REBASE
+    // dispatched lane, exhausted stagnation budget is handled INSIDE the
+    // transfer as its own park) — falls through to the ordinary blocked
+    // treatment below, unchanged.
+    const refusal = parseRebaseRefusal(input.rebaseRefusal);
+    let declinedTransferReason: string | null = null;
+    // The pre-transfer status snapshot: the transfer writes may mutate the
+    // row the resolver's read points at, and the surfacing guard below must
+    // decide on the status the row had BEFORE this report acted (mirrors the
+    // failed-report cap park's first-transition guard).
+    const preTransferStatus = existing.status;
+    if (
+      isHumanDecision &&
+      attempt &&
+      refusal.ok &&
+      isTransferEligibleRefusal(refusal.refusal)
+    ) {
+      const transfer = await transferRebaseEpisodeToFix(client as PrFixQueueClient, {
+        itemId: existing.id,
+        generation: attempt.generation,
+        agentName: input.agentName,
+        handoutToken: attempt.handoutToken,
+        refusal: refusal.refusal,
+      });
+      if (transfer.action === "skipped") {
+        return {
+          matched: true,
+          action: "skipped",
+          itemId: existing.id ?? null,
+          reason: transfer.reason,
+          attemptGeneration: attempt.generation,
+        };
+      }
+      if (transfer.action === "parked") {
+        // Bounded attempt exhaustion on the transfer (#1675/#1543): the
+        // surface mirrors the other cap parks so operators see why the row
+        // stopped.
+        if (preTransferStatus !== "BLOCKED" && preTransferStatus !== "PARKED") {
+          const context = await buildPrFixBlockedContext(client, transfer.item as any);
+          await surfacePrFixParked({
+            repo,
+            pr,
+            reason: (transfer.item as any).reason,
+            outcome: "no_progress",
+            latestNote: input.summary ?? null,
+            context,
+          });
+        }
+        return {
+          matched: true,
+          action: "parked",
+          itemId: existing.id ?? null,
+          reason: transfer.reason,
+          attemptGeneration: attempt.generation,
+        };
+      }
+      if (transfer.action === "transferred") {
+        return {
+          matched: true,
+          // Not "blocked": the episode left the mechanical lane for one
+          // authorized ordinary fix attempt — the report re-queued the work
+          // rather than holding it for a human.
+          action: "requeued",
+          itemId: existing.id ?? null,
+          reason: transfer.reason,
+          attemptGeneration: attempt.generation,
+        };
+      }
+      // transfer.action === "declined": fail closed to the ordinary blocked
+      // treatment below — the pre-#1675 safe hold with a clear explanation.
+      // The decline reason rides on the settlement note so the audit trail
+      // says why the transfer did not happen.
+      declinedTransferReason = transfer.reason;
+    }
+
     const markResult = await markPrFixItem(client as PrFixQueueClient, {
       repo,
       pr,
       status: isHumanDecision ? "BLOCKED" : "PARKED",
-      note: input.summary ?? null,
+      note: declinedTransferReason
+        ? [input.summary ?? null, `[#1675] ${declinedTransferReason}`].filter(Boolean).join(" ")
+        : input.summary ?? null,
       expectedGeneration,
       ...(isHumanDecision
         ? { outcome: "human_decision", ...(input.decision ? { decision: input.decision } : {}) }
