@@ -10,7 +10,7 @@
     "build": "NODE_ENV=production next build",
     "start": "next start",
     "audit": "npm audit --omit=dev --include=prod --audit-level=high --fetch-retries=5 --fetch-timeout=120000 --fetch-retry-mintimeout=20000 --fetch-retry-maxtimeout=120000",
-    "lint": "NODE_ENV=development eslint .",
+    "lint": "NODE_ENV=development eslint . --max-warnings=0",
     "test": "NODE_ENV=development vitest run",
     "test:watch": "NODE_ENV=development vitest",
     "test:coverage": "NODE_ENV=development vitest run --coverage",
