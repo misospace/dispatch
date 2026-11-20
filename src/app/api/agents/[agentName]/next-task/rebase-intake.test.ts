@@ -583,3 +583,201 @@ describe("rebase-only intake — hand-out races (#1532)", () => {
     expect(row.agentHandouts).toEqual([]);
   });
 });
+
+// ─── #1674: the model-assisted rebase capability ─────────────────────────────
+
+// Old Courier's EXACT declaration bytes (courier internal/source/dispatch
+// client.go): the rebase-executor capability, then the ownership-evidence
+// capability, with the rebase-only scope on the dedicated worker's polls.
+const OLD_COURIER_REBASE_ONLY =
+  "?work_scope=rebase-only&work_scope_version=1&capabilities=rebase-executor:1,pr-ownership-evidence:1";
+// New Courier's declaration adds the model-assisted executor (#1674).
+const NEW_COURIER_REBASE_ONLY =
+  "?work_scope=rebase-only&work_scope_version=1&capabilities=rebase-executor:1,pr-ownership-evidence:1,rebase-model-executor:1";
+const MODEL_DECLARATION = "?capabilities=rebase-model-executor:1";
+
+/** A REBASE row carrying a bounded semantic-conflict context (model-required). */
+function modelRequiredRebaseRow(pr = 77) {
+  return {
+    ...rebaseRow(pr),
+    semanticConflict: {
+      base: "main",
+      files: ["src/enrich_flux.go"],
+      reason: "two-sided code edit outside the mechanical rules",
+    },
+  };
+}
+
+describe("model-assisted rebase negotiation (#1674)", () => {
+  it("NEW DISPATCH / OLD COURIER: the old client's exact declaration hands out deterministic REBASE work, byte-compatible", async () => {
+    const row = rebaseRow();
+    mocks.prFixRows.push(row);
+
+    const response = await poll(OLD_COURIER_REBASE_ONLY);
+    expect(response.status).toBe(200);
+    const body = await response.json();
+
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem.fixType).toBe("REBASE");
+    // The mechanical instruction wall rides the hand-out unchanged: the old
+    // client's contract is exactly what it was before #1674 — the row's
+    // persisted feedback (the mechanical wall, stubbed here as the harness
+    // row carries it) is the shipped reasons, NOT the model wall.
+    expect(body.reasons).toEqual([
+      "Mechanical rebase: PR dirty against base (#1327)",
+      "MECHANICALLY ONLY",
+    ]);
+    expect(JSON.stringify(body.reasons)).not.toContain("CONFIGURED MODEL COORDINATOR");
+    // NO model transport: the field did not exist in the old contract and the
+    // old client must never receive it.
+    expect("rebaseModel" in body).toBe(false);
+    // The acknowledgment carries exactly the two verdicts the old client
+    // declared — nothing more.
+    expect(body.intake.capabilities).toEqual([
+      { name: "rebase-executor", requested: 1, granted: true },
+      { name: "pr-ownership-evidence", requested: 1, granted: true },
+    ]);
+    expect(row.agentHandouts).toEqual([`${AGENT}@1`]);
+  });
+
+  it("NEW DISPATCH / OLD COURIER: a model-required item is never handed to the deterministic-only client", async () => {
+    const row = modelRequiredRebaseRow();
+    mocks.prFixRows.push(row);
+
+    const body = await (await poll(OLD_COURIER_REBASE_ONLY)).json();
+
+    // Fail closed with a clear disposition: deferred, not handed out, not
+    // silently executed by a deterministic consumer.
+    expect(body.type).toBe("idle");
+    expect(body.prFixItem).toBeUndefined();
+    expect(row.agentHandouts).toEqual([]);
+    expect(row.dispatchedGeneration).toBeNull();
+    expect(body.reason).toContain("model-required rebase candidate");
+    expect(body.reason).toContain("rebase-model-executor:1");
+    expect(body.reason).toContain("DISPATCH_REBASE_MODEL_AGENTS");
+  });
+
+  it("NEW COURIER / OLD DISPATCH: this server grants the exact model capability, and an unknown one would fail closed", async () => {
+    // The new client's declaration is granted on this server…
+    const grantedPoll = await poll(NEW_COURIER_REBASE_ONLY);
+    expect(grantedPoll.status).toBe(200);
+    const granted = await grantedPoll.json();
+    expect(granted.intake.capabilities).toContainEqual({
+      name: "rebase-model-executor",
+      requested: 1,
+      granted: true,
+    });
+    // …and the OLD-Dispatch verdict for the same declaration is pinned by the
+    // negotiation-layer contract test (unknown-capability, poll not failed).
+    // Here the route-level fail-closed half: a NEWER model version is
+    // unsupported and grants nothing.
+    const badVersion = await poll("?work_scope=rebase-only&work_scope_version=1&capabilities=rebase-executor:1,rebase-model-executor:2");
+    expect(badVersion.status).toBe(200);
+    const body = await badVersion.json();
+    expect(body.intake.capabilities).toEqual([
+      { name: "rebase-executor", requested: 1, granted: true },
+      { name: "rebase-model-executor", requested: 2, granted: false, reason: "unsupported-version" },
+    ]);
+  });
+
+  it("model-required item defers when the capability is granted but the agent is outside the model worker pool", async () => {
+    process.env.DISPATCH_REBASE_MODEL_AGENTS = "the-27b-worker";
+    const row = modelRequiredRebaseRow();
+    mocks.prFixRows.push(row);
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+
+    const body = await (await poll(NEW_COURIER_REBASE_ONLY)).json();
+
+    expect(body.type).toBe("idle");
+    expect(row.agentHandouts).toEqual([]);
+    expect(body.reason).toContain("not authorized for model-assisted rebase");
+    expect(info.mock.calls.flat().join(" ")).toContain("model worker pool DISPATCH_REBASE_MODEL_AGENTS");
+    info.mockRestore();
+  });
+
+  it("model-required item defers when the model worker pool is unset (fail closed)", async () => {
+    delete process.env.DISPATCH_REBASE_MODEL_AGENTS;
+    const row = modelRequiredRebaseRow();
+    mocks.prFixRows.push(row);
+
+    const body = await (await poll(NEW_COURIER_REBASE_ONLY)).json();
+
+    expect(body.type).toBe("idle");
+    expect(row.agentHandouts).toEqual([]);
+    expect(body.reason).toContain("model-required rebase candidate");
+  });
+
+  it("asserts a REAL model call is possible for a semantic case: the authorized poll receives the model wall and the transport block", async () => {
+    process.env.DISPATCH_REBASE_MODEL_AGENTS = AGENT;
+    const row = modelRequiredRebaseRow();
+    mocks.prFixRows.push(row);
+
+    const body = await (await poll(NEW_COURIER_REBASE_ONLY)).json();
+
+    // The hand-out happens (the deterministic refusal is not what made this
+    // possible — the negotiation did).
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem.fixType).toBe("REBASE");
+    expect(row.agentHandouts).toEqual([`${AGENT}@1`]);
+    // The versioned transport block carries the exact granted capability and
+    // the item's bounded semantic-conflict context.
+    expect(body.rebaseModel).toEqual({
+      capability: "rebase-model-executor",
+      version: 1,
+      semanticConflict: {
+        base: "main",
+        files: ["src/enrich_flux.go"],
+        reason: "two-sided code edit outside the mechanical rules",
+      },
+    });
+    // The instruction wall is the MODEL contract: it authorizes the one
+    // configured coordinator and does NOT carry the mechanical refusal that
+    // would forbid resolving a semantic conflict.
+    const reasons = body.reasons.join("\n");
+    expect(reasons).toContain("CONFIGURED MODEL COORDINATOR");
+    expect(reasons).toContain("no delegation");
+    expect(reasons).not.toContain("do NOT resolve it yourself");
+  });
+
+  it("the granted poll's transport block carries a null context on a mechanical row, and the mechanical lane stays usable", async () => {
+    process.env.DISPATCH_REBASE_MODEL_AGENTS = AGENT;
+    const mechanical = rebaseRow(88);
+    mocks.prFixRows.push(mechanical);
+
+    const body = await (await poll(NEW_COURIER_REBASE_ONLY)).json();
+
+    expect(body.type).toBe("followup-pr");
+    expect(body.rebaseModel).toEqual({
+      capability: "rebase-model-executor",
+      version: 1,
+      semanticConflict: null,
+    });
+    expect(mechanical.agentHandouts).toEqual([`${AGENT}@1`]);
+  });
+
+  it("a poll that declared the model capability without the executor contract still receives no REBASE work", async () => {
+    const row = rebaseRow();
+    mocks.prFixRows.push(row);
+
+    const body = await (await poll(MODEL_DECLARATION)).json();
+
+    // Capability-only poll: ordinary queue, no scope. The REBASE item needs
+    // the rebase-executor declaration, which the poll did not make.
+    expect(body.type).toBe("idle");
+    expect(body.prFixItem).toBeUndefined();
+    expect(row.agentHandouts).toEqual([]);
+    expect(body.intake.capabilities).toEqual([
+      { name: "rebase-model-executor", requested: 1, granted: true },
+    ]);
+  });
+
+  it("an ordinary poll that is not authorized for model work sees the model-required hold in its idle reason", async () => {
+    const row = modelRequiredRebaseRow();
+    mocks.prFixRows.push(row);
+
+    const body = await (await poll(OLD_COURIER_REBASE_ONLY)).json();
+
+    expect(body.type).toBe("idle");
+    expect(body.reason).toContain("1 model-required rebase candidate deferred");
+  });
+});

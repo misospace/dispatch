@@ -1,6 +1,7 @@
 import type { PrFixType } from "@/types";
 import type { IntakeAck } from "@/lib/rebase-intake";
 import type { PrFixOwnershipEvidence } from "@/lib/pr-fix-ownership";
+import type { RebaseModelAssist } from "@/lib/pr-fix-rebase";
 
 export interface IssueRef {
   id?: string;
@@ -106,6 +107,14 @@ export interface FollowupPrTask {
   issue?: OptionalIssueRef;
   pullRequest: PullRequestRef;
   prFixItem?: PrFixItemIdentity;
+  /**
+   * #1674: the versioned model-assist transport block, shipped only on a
+   * REBASE hand-out to a poll granted the `rebase-model-executor:1`
+   * capability whose agent is in the operator model-worker pool. Carries the
+   * granted capability identity and the item's bounded semantic-conflict
+   * context. Every other hand-out stays byte-identical without it.
+   */
+  rebaseModel?: RebaseModelAssist;
   reasons: string[];
   instructions: string;
   stopAfter: string;
@@ -182,6 +191,8 @@ export interface FollowupPrTaskInput {
   issue?: OptionalIssueRef;
   pullRequest: PullRequestRef;
   prFixItem?: PrFixItemIdentity;
+  /** #1674: versioned model-assist transport block (see `FollowupPrTask.rebaseModel`). */
+  rebaseModel?: RebaseModelAssist;
   reasons: string[];
   instructions?: string;
   stopAfter?: string;
@@ -204,6 +215,7 @@ export function createFollowupPrTask(input: FollowupPrTaskInput): FollowupPrTask
     stopAfter: input.stopAfter ?? FOLLOWUP_PR_STOP_AFTER,
     forbiddenActions: input.forbiddenActions ? [...input.forbiddenActions] : [...FOLLOWUP_PR_FORBIDDEN],
     ...(input.ownership ? { ownership: input.ownership } : {}),
+    ...(input.rebaseModel ? { rebaseModel: input.rebaseModel } : {}),
     ...(input.intake ? { intake: input.intake } : {}),
   };
 }

@@ -10,17 +10,19 @@ import {
 } from "@/lib/agent-task";
 import { isBacklogLane, prFixLaneForRequest } from "@/lib/lane-config";
 import { fetchAgentQueueData } from "@/lib/agent-queue-fetch";
-import { agentAlreadyHanded, agentHandoutToken, backfillPrFixClaimant, createLinkedPrFixItem, enforcePrFixHandoutLaneExclusivity, evaluatePrFixHandoutOwnership, handoutReceipt, hasInFlightRebaseHandout, isHeadRepoOfBaseRepo, isRebaseLaneAgent, linkedIssueEscalationClassified, newHandoutToken, normalizeQueueRepo, prFixOwnershipMode, withHandoutLaneExclusivityFence, withRebaseLaneAdmission, type PrFixQueueClient } from "@/lib/pr-fix-queue";
+import { agentAlreadyHanded, agentHandoutToken, backfillPrFixClaimant, createLinkedPrFixItem, enforcePrFixHandoutLaneExclusivity, evaluatePrFixHandoutOwnership, handoutReceipt, hasInFlightRebaseHandout, isHeadRepoOfBaseRepo, isRebaseLaneAgent, isRebaseModelLaneAgent, linkedIssueEscalationClassified, newHandoutToken, normalizeQueueRepo, prFixOwnershipMode, withHandoutLaneExclusivityFence, withRebaseLaneAdmission, type PrFixQueueClient } from "@/lib/pr-fix-queue";
 import { prFixOwnershipEvidence } from "@/lib/pr-fix-ownership";
 import { fetchPullRequestLabels, fetchPullRequestHeadSha, fetchPullRequestHeadRepo } from "@/lib/github";
 import { NEEDS_HUMAN_LABEL } from "@/lib/pr-fix-surfacing";
 import { CONFLICTING_STATUSES } from "@/lib/linked-pr-health";
-import { rebaseWorkItem } from "@/lib/pr-fix-rebase";
+import { rebaseModelAssistFeedback, rebaseModelTransport, rebaseWorkItem, type RebaseSemanticConflictContext } from "@/lib/pr-fix-rebase";
 import {
   buildIntakeAck,
   parseIntakeRequest,
   REBASE_EXECUTOR_CAPABILITY,
   REBASE_EXECUTOR_CAPABILITY_VERSION,
+  REBASE_MODEL_EXECUTOR_CAPABILITY,
+  REBASE_MODEL_EXECUTOR_CAPABILITY_VERSION,
   REBASE_ONLY_SCOPE,
 } from "@/lib/rebase-intake";
 import { buildCapacitySkip, loadActiveCapacityHandoffs, normalizeCapacity } from "@/lib/capacity-handoff";
@@ -63,6 +65,14 @@ type PrFixCandidate = {
    */
   claimant?: string | null;
   claimantSource?: string | null;
+  /**
+   * #1674: the item's bounded semantic-conflict context (null on rows
+   * without one). Presence marks the REBASE row MODEL-REQUIRED: only a poll
+   * granted `rebase-model-executor:1` whose agent is in the operator
+   * model-worker pool (`DISPATCH_REBASE_MODEL_AGENTS`) may receive it, and
+   * the granted hand-out transports the context to the model worker.
+   */
+  semanticConflict?: RebaseSemanticConflictContext | null;
 };
 
 /**
@@ -472,6 +482,14 @@ export async function GET(
     // contract must not see the lane stop dispatching without a trace.
     let rebaseDeferredCount = 0;
     let rebaseCapabilityDeferredCount = 0;
+    // #1674: how many REBASE candidates were withheld because they are
+    // MODEL-REQUIRED (they carry a bounded semantic-conflict context) and
+    // this poll is not authorized for model-assisted rebase — the capability
+    // was not declared/granted at v1, or the agent is outside the
+    // operator-declared model-worker pool. The count reaches the operator
+    // through the idle reason: a deterministic-only consumer must see the
+    // lane hold model-required work rather than silently receive it.
+    let rebaseModelDeferredCount = 0;
 
     // The caller's lane decides whether it may consume PR-fix work at all
     // (#1046): `null` means a configured lane with no PR-fix equivalent (e.g.
@@ -746,6 +764,25 @@ export async function GET(
          }
 
          const reasons = [...new Set([confirmed.reason, ...confirmed.feedback].filter(Boolean))];
+         // #1674: a REBASE hand-out to a poll granted the
+         // `rebase-model-executor:1` capability (whose agent is in the
+         // operator model-worker pool — the gate below defers every other
+         // model-required item) ships the MODEL-ASSIST instruction wall in
+         // place of the mechanical refusal wall: the mechanical rules stay
+         // the fast path, and a conflict outside them runs one bounded
+         // model-assisted resolution attempt on the lane's configured
+         // coordinator. The persisted row (and every deterministic-only
+         // consumer's task) keeps the mechanical wall unchanged. The versioned
+         // transport block carries the granted capability identity and the
+         // item's bounded semantic-conflict context, so a real model call is
+         // possible for a semantic case.
+         const modelAssistRebase =
+           dispatchedLane === "REBASE" &&
+           negotiation.rebaseModelExecutorGranted &&
+           isRebaseModelLaneAgent(agentName);
+         const taskReasons = modelAssistRebase
+           ? [confirmed.reason, ...rebaseModelAssistFeedback()]
+           : reasons;
           return createFollowupPrTask({
             agentName,
             lane: confirmed.lane ?? undefined,
@@ -756,6 +793,12 @@ export async function GET(
             // negotiation), so an un-negotiated consumer's task stays
             // byte-identical to the pre-contract shape.
             ownership: negotiation.prOwnershipEvidenceGranted ? liveOwnership.evidence : undefined,
+            // #1674: the versioned model-assist transport block — granted
+            // REBASE hand-outs only. Every other hand-out stays
+            // byte-identical to the pre-#1674 shape.
+            ...(modelAssistRebase
+              ? { rebaseModel: rebaseModelTransport(candidate.semanticConflict ?? null) }
+              : {}),
             pullRequest: {
              repoFullName: candidate.repo,
              number: candidate.pr,
@@ -769,7 +812,7 @@ export async function GET(
            // type — a mid-attempt re-observation flip must not change the
            // lane identity the worker and the server agree on.
            prFixItem: { id: candidate.id, generation: confirmed.generation, handoutToken, fixType: confirmed.attemptType ?? candidate.fixType },
-           reasons,
+           reasons: taskReasons,
             intake: intakeAck,
           });
        };
@@ -823,6 +866,23 @@ export async function GET(
           // is the explicit unrestricted opt-in.
           if (!isRebaseLaneAgent(agentName)) {
             console.info(`[next-task-pr-fix] deferring REBASE ${candidate.repo}#${candidate.pr}: agent ${agentName} is not in the rebase worker pool (DISPATCH_REBASE_AGENTS, #1327)`);
+            return null;
+          }
+          // #1674: a model-REQUIRED item (it carries a bounded
+          // semantic-conflict context) is never offered to a consumer that is
+          // not authorized for model-assisted rebase — the poll must have
+          // declared AND been granted `rebase-model-executor:1`, and the
+          // agent must be in the operator-declared model-worker pool
+          // (`DISPATCH_REBASE_MODEL_AGENTS`: the lane configured for the one
+          // coordinator model, concurrency one, no delegation). Missing or
+          // ambiguous support fails CLOSED with a clear disposition: the
+          // candidate defers (stays QUEUED for an authorized poll), the
+          // count reaches the idle reason, and nothing pretends a configured
+          // model ran. A deterministic-only consumer keeps receiving ordinary
+          // mechanical REBASE items unchanged.
+          if (candidate.semanticConflict != null && !(negotiation.rebaseModelExecutorGranted && isRebaseModelLaneAgent(agentName))) {
+            rebaseModelDeferredCount += 1;
+            console.info(`[next-task-pr-fix] deferring model-required REBASE ${candidate.repo}#${candidate.pr}: this poll is not authorized for model-assisted rebase (${REBASE_MODEL_EXECUTOR_CAPABILITY}:${REBASE_MODEL_EXECUTOR_CAPABILITY_VERSION} not granted, or agent ${agentName} is not in the model worker pool DISPATCH_REBASE_MODEL_AGENTS, #1674)`);
             return null;
           }
           try {
@@ -910,13 +970,18 @@ export async function GET(
       }
       // A deferred candidate is not "no work": the lane held an eligible item
       // and did not hand it out (the concurrency-1 gate, a CI park, a capacity
-      // cooldown, or a hand-out this agent already holds). The count keeps
-      // that distinction visible to the client and to the operator.
+      // cooldown, a hand-out this agent already holds, or a model-required
+      // item this poll is not authorized for). The count keeps that
+      // distinction visible to the client and to the operator.
       const deferredNote = rebaseDeferredCount > 0
         ? `${rebaseDeferredCount} rebase candidate${rebaseDeferredCount === 1 ? "" : "s"} deferred`
         : null;
+      const modelNote = rebaseModelDeferredCount > 0
+        ? `${rebaseModelDeferredCount} model-required rebase candidate${rebaseModelDeferredCount === 1 ? "" : "s"} deferred: this poll is not authorized for model-assisted rebase (${REBASE_MODEL_EXECUTOR_CAPABILITY}:${REBASE_MODEL_EXECUTOR_CAPABILITY_VERSION} + DISPATCH_REBASE_MODEL_AGENTS, #1674)`
+        : null;
+      const notes = [deferredNote, modelNote].filter(Boolean).join("; ");
       return respond(createIdleTask(
-        `No rebase work available (rebase-only intake${deferredNote ? `; ${deferredNote}` : ""})`,
+        `No rebase work available (rebase-only intake${notes ? `; ${notes}` : ""})`,
         { intake: intakeAck },
       ));
     }
@@ -1156,6 +1221,14 @@ export async function GET(
     const rebaseNote = rebaseCapabilityDeferredCount > 0
       ? `${rebaseCapabilityDeferredCount} rebase candidate${rebaseCapabilityDeferredCount === 1 ? "" : "s"} deferred: this client did not declare the ${REBASE_EXECUTOR_CAPABILITY}:${REBASE_EXECUTOR_CAPABILITY_VERSION} capability`
       : null;
+    // #1674: model-required REBASE items (rows carrying a bounded
+    // semantic-conflict context) held back from a poll that is not authorized
+    // for model-assisted rebase. The item stays QUEUED for an authorized
+    // poll; the note keeps the hold visible instead of pretending the
+    // candidate did not exist.
+    const rebaseModelNote = rebaseModelDeferredCount > 0
+      ? `${rebaseModelDeferredCount} model-required rebase candidate${rebaseModelDeferredCount === 1 ? "" : "s"} deferred: this poll is not authorized for model-assisted rebase (${REBASE_MODEL_EXECUTOR_CAPABILITY}:${REBASE_MODEL_EXECUTOR_CAPABILITY_VERSION} + DISPATCH_REBASE_MODEL_AGENTS)`
+      : null;
 
     if (withheldQueue.length > 0) {
       // #1506/#1562: tell a grooming-admission hold apart from a park — an
@@ -1179,12 +1252,12 @@ export async function GET(
         .filter(Boolean)
         .join(" and ");
       return respond(
-        createIdleTask(`No work available (${[withheldNote, deferredNote, excludedNote, capacityNote, rebaseNote].filter(Boolean).join("; ")})`, { intake: intakeAck }),
+        createIdleTask(`No work available (${[withheldNote, deferredNote, excludedNote, capacityNote, rebaseNote, rebaseModelNote].filter(Boolean).join("; ")})`, { intake: intakeAck }),
       );
     }
 
-    if (deferredNote || excludedNote || capacityNote || rebaseNote) {
-      return respond(createIdleTask(`No work available (${[deferredNote, excludedNote, capacityNote, rebaseNote].filter(Boolean).join("; ")})`, { intake: intakeAck }));
+    if (deferredNote || excludedNote || capacityNote || rebaseNote || rebaseModelNote) {
+      return respond(createIdleTask(`No work available (${[deferredNote, excludedNote, capacityNote, rebaseNote, rebaseModelNote].filter(Boolean).join("; ")})`, { intake: intakeAck }));
     }
 
     if (deferredNote || excludedNote || capacityNote) {
