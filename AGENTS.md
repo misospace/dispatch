@@ -28,6 +28,11 @@ npm run db:push      # Push schema (dev)
 npm run db:deploy    # Deploy migrations (prod)
 ```
 
+`npm run lint` runs `eslint . --max-warnings=0` (dispatch#1671): any new warning fails CI.
+Keep the source tree warning-free; suppress an intentional pattern with a narrowly-scoped
+`eslint-disable-next-line` and a one-line justification. Generated `coverage/` artifacts are
+ignored by `eslint.config.mjs` so a local coverage run cannot break lint.
+
 `.mise/config.toml` + `.mise/mise.lock` are the repository development-bootstrap contract
 (Courier #414): Node is the pinned runtime tool, `bootstrap`/`check`/`test` are the shared task
 names, and `check`/`test` delegate to the authoritative `npm run` commands. Do not add
