@@ -230,6 +230,389 @@ describe("isAllowedBranchOwner", () => {
   });
 });
 
+// ─── Scoped bot identities (#1665) ──────────────────────────────────────────
+//
+// One automation identity can open PRs for several unrelated workflows, so an
+// operator may narrow automatic follow-up for a configured identity to PRs
+// from the base repository whose head branch carries one of the scope's
+// prefixes. Every login, repo, and prefix below is synthetic operator
+// configuration: Dispatch ships no default scopes and never assumes which
+// agent or tool created a PR.
+
+const SCOPED_IDENTITIES_ENV = JSON.stringify({
+  "acme-release-bot": ["release/"],
+  "acme-task-bot": ["task/"],
+});
+
+describe("scoped bot identities (#1665)", () => {
+  describe("isAllowedBotAuthor (predicate)", () => {
+    it("qualifies a PR from the configured identity, base repository, and matching branch prefix", () => {
+      process.env.PR_FOLLOWUP_BOT_IDENTITY_SCOPES = SCOPED_IDENTITIES_ENV;
+      expect(
+        isAllowedBotAuthor("acme-release-bot", {
+          baseRepoFullName: "acme/widgets",
+          headRepoFullName: "acme/widgets",
+          headBranch: "release/1.2.0",
+        }),
+      ).toBe(true);
+    });
+
+    it("does not qualify the same identity on an unrelated branch", () => {
+      process.env.PR_FOLLOWUP_BOT_IDENTITY_SCOPES = SCOPED_IDENTITIES_ENV;
+      expect(
+        isAllowedBotAuthor("acme-release-bot", {
+          baseRepoFullName: "acme/widgets",
+          headRepoFullName: "acme/widgets",
+          headBranch: "chore/cleanup",
+        }),
+      ).toBe(false);
+    });
+
+    it("does not qualify a fork whose head branch matches the prefix", () => {
+      process.env.PR_FOLLOWUP_BOT_IDENTITY_SCOPES = SCOPED_IDENTITIES_ENV;
+      expect(
+        isAllowedBotAuthor("acme-release-bot", {
+          baseRepoFullName: "acme/widgets",
+          headRepoFullName: "forker/widgets",
+          headBranch: "release/1.2.0",
+        }),
+      ).toBe(false);
+    });
+
+    it("fails closed when the scoped rule's head data is missing", () => {
+      process.env.PR_FOLLOWUP_BOT_IDENTITY_SCOPES = SCOPED_IDENTITIES_ENV;
+      // Missing head repository (unverifiable fork / payload without it).
+      expect(
+        isAllowedBotAuthor("acme-release-bot", {
+          baseRepoFullName: "acme/widgets",
+          headRepoFullName: null,
+          headBranch: "release/1.2.0",
+        }),
+      ).toBe(false);
+      // Missing head branch.
+      expect(
+        isAllowedBotAuthor("acme-release-bot", {
+          baseRepoFullName: "acme/widgets",
+          headRepoFullName: "acme/widgets",
+          headBranch: null,
+        }),
+      ).toBe(false);
+      // No head context supplied at all (legacy single-argument caller).
+      expect(isAllowedBotAuthor("acme-release-bot")).toBe(false);
+    });
+
+    it("keeps unscoped allowlist entries on the legacy membership-only behavior", () => {
+      process.env.PR_FOLLOWUP_BOT_IDENTITIES = "acme-legacy-bot";
+      // No scope for this login: branch and head-repo facts are irrelevant to
+      // the predicate (the pre-existing #1637 head-repo gate still applies
+      // downstream, at ingestion).
+      expect(
+        isAllowedBotAuthor("acme-legacy-bot", {
+          baseRepoFullName: "acme/widgets",
+          headRepoFullName: "forker/widgets",
+          headBranch: "anything/else",
+        }),
+      ).toBe(true);
+      expect(isAllowedBotAuthor("acme-legacy-bot")).toBe(true);
+      expect(isAllowedBotAuthor("not-configured-human")).toBe(false);
+    });
+
+    it("supports a migration mix of scoped and unscoped identities", () => {
+      process.env.PR_FOLLOWUP_BOT_IDENTITIES = "acme-legacy-bot";
+      process.env.PR_FOLLOWUP_BOT_IDENTITY_SCOPES = SCOPED_IDENTITIES_ENV;
+      // Unscoped: any branch qualifies.
+      expect(
+        isAllowedBotAuthor("acme-legacy-bot", {
+          baseRepoFullName: "acme/widgets",
+          headRepoFullName: "acme/widgets",
+          headBranch: "unrelated",
+        }),
+      ).toBe(true);
+      // Scoped: only the configured prefix qualifies.
+      expect(
+        isAllowedBotAuthor("acme-release-bot", {
+          baseRepoFullName: "acme/widgets",
+          headRepoFullName: "acme/widgets",
+          headBranch: "release/9",
+        }),
+      ).toBe(true);
+      expect(
+        isAllowedBotAuthor("acme-task-bot", {
+          baseRepoFullName: "acme/widgets",
+          headRepoFullName: "acme/widgets",
+          headBranch: "release/9",
+        }),
+      ).toBe(false);
+      // A human login outside both lists stays excluded.
+      expect(isAllowedBotAuthor("some-human")).toBe(false);
+    });
+
+    afterEach(() => {
+      delete process.env.PR_FOLLOWUP_BOT_IDENTITIES;
+      delete process.env.PR_FOLLOWUP_BOT_IDENTITY_SCOPES;
+    });
+  });
+
+  describe("scheduled-scan ingestion (source: sync)", () => {
+    it("enqueues a CHANGES_REQUESTED review under a matching scope", async () => {
+      process.env.PR_FOLLOWUP_BOT_IDENTITY_SCOPES = SCOPED_IDENTITIES_ENV;
+      const client = makeClient();
+
+      await ingestReviewEvent(client, {
+        repoFullName: "acme/widgets",
+        headRepoFullName: "acme/widgets",
+        prNumber: 7,
+        branch: "release/1.2.0",
+        url: "https://github.com/acme/widgets/pull/7",
+        title: "Release 1.2.0",
+        author: "acme-release-bot",
+        reviewBody: "Restore the validate job.",
+        reviewId: "r-scope-ok",
+        reviewState: "CHANGES_REQUESTED",
+        source: "sync",
+      });
+
+      expect(client.items).toHaveLength(1);
+      expect(client.items[0].author).toBe("acme-release-bot");
+    });
+
+    it("does not enqueue the same identity on an unrelated branch", async () => {
+      process.env.PR_FOLLOWUP_BOT_IDENTITY_SCOPES = SCOPED_IDENTITIES_ENV;
+      const client = makeClient();
+
+      const result = await ingestReviewEvent(client, {
+        repoFullName: "acme/widgets",
+        headRepoFullName: "acme/widgets",
+        prNumber: 7,
+        branch: "chore/cleanup",
+        url: "https://github.com/acme/widgets/pull/7",
+        title: "Release 1.2.0",
+        author: "acme-release-bot",
+        reviewBody: "Restore the validate job.",
+        reviewId: "r-scope-branch",
+        reviewState: "CHANGES_REQUESTED",
+        source: "sync",
+      });
+
+      expect(result).toBeNull();
+      expect(client.items).toHaveLength(0);
+    });
+
+    it("does not enqueue a fork PR whose branch name matches the scope", async () => {
+      process.env.PR_FOLLOWUP_BOT_IDENTITY_SCOPES = SCOPED_IDENTITIES_ENV;
+      const client = makeClient();
+
+      const result = await ingestReviewEvent(client, {
+        repoFullName: "acme/widgets",
+        headRepoFullName: "forker/widgets",
+        prNumber: 7,
+        branch: "release/1.2.0",
+        url: "https://github.com/acme/widgets/pull/7",
+        title: "Release 1.2.0",
+        author: "acme-release-bot",
+        reviewBody: "Restore the validate job.",
+        reviewId: "r-scope-fork",
+        reviewState: "CHANGES_REQUESTED",
+        source: "sync",
+      });
+
+      expect(result).toBeNull();
+      expect(client.items).toHaveLength(0);
+    });
+
+    it("fails closed on a scoped review with missing head-repository data", async () => {
+      process.env.PR_FOLLOWUP_BOT_IDENTITY_SCOPES = SCOPED_IDENTITIES_ENV;
+      const client = makeClient();
+
+      const result = await ingestReviewEvent(client, {
+        repoFullName: "acme/widgets",
+        headRepoFullName: null,
+        prNumber: 7,
+        branch: "release/1.2.0",
+        url: "https://github.com/acme/widgets/pull/7",
+        title: "Release 1.2.0",
+        author: "acme-release-bot",
+        reviewBody: "Restore the validate job.",
+        reviewId: "r-scope-nohead",
+        reviewState: "CHANGES_REQUESTED",
+        source: "sync",
+      });
+
+      expect(result).toBeNull();
+      expect(client.items).toHaveLength(0);
+    });
+
+    it("enqueues a failing check under a matching scope and branch", async () => {
+      process.env.PR_FOLLOWUP_BOT_IDENTITY_SCOPES = SCOPED_IDENTITIES_ENV;
+      const client = makeClient();
+
+      await ingestCheckRunEvent(client, {
+        repoFullName: "acme/widgets",
+        headRepoFullName: "acme/widgets",
+        prNumber: 8,
+        branch: "task/provision",
+        url: "https://github.com/acme/widgets/pull/8",
+        title: "Provision staging",
+        author: "acme-task-bot",
+        checkName: "lint",
+        conclusion: "failure",
+        checkRunId: "cr-1",
+        source: "sync",
+      });
+
+      expect(client.items).toHaveLength(1);
+      expect(client.items[0].type).toBe("CI_FAILURE");
+    });
+
+    it("does not enqueue a failing check for a scoped identity on an unrelated branch", async () => {
+      process.env.PR_FOLLOWUP_BOT_IDENTITY_SCOPES = SCOPED_IDENTITIES_ENV;
+      const client = makeClient();
+
+      await ingestCheckRunEvent(client, {
+        repoFullName: "acme/widgets",
+        headRepoFullName: "acme/widgets",
+        prNumber: 8,
+        branch: "release/1.2.0",
+        url: "https://github.com/acme/widgets/pull/8",
+        title: "Provision staging",
+        author: "acme-task-bot",
+        checkName: "lint",
+        conclusion: "failure",
+        checkRunId: "cr-2",
+        source: "sync",
+      });
+
+      expect(client.items).toHaveLength(0);
+    });
+
+    it("does not enqueue a merge conflict for a scoped identity on a fork with a matching branch name", async () => {
+      process.env.PR_FOLLOWUP_BOT_IDENTITY_SCOPES = SCOPED_IDENTITIES_ENV;
+      const client = makeClient();
+
+      const result = await ingestMergeConflict(client, {
+        repoFullName: "acme/widgets",
+        prNumber: 11,
+        branch: "release/2.0",
+        url: "https://github.com/acme/widgets/pull/11",
+        title: "Release 2.0",
+        author: "acme-release-bot",
+        mergeable: "CONFLICTING",
+        headRepoFullName: "forker/widgets",
+        source: "sync",
+      });
+
+      expect(result).toBeNull();
+      expect(client.items).toHaveLength(0);
+    });
+
+    it("still enqueues an unscoped identity's conflict on any branch (legacy behavior)", async () => {
+      process.env.PR_FOLLOWUP_BOT_IDENTITIES = "acme-legacy-bot";
+      const client = makeClient();
+
+      const result = await ingestMergeConflict(client, {
+        repoFullName: "acme/widgets",
+        prNumber: 12,
+        branch: "legacy-branch",
+        url: "https://github.com/acme/widgets/pull/12",
+        title: "Legacy conflict",
+        author: "acme-legacy-bot",
+        mergeable: "CONFLICTING",
+        headRepoFullName: "acme/widgets",
+        source: "sync",
+      });
+
+      expect(result).not.toBeNull();
+      expect(client.items).toHaveLength(1);
+    });
+
+    afterEach(() => {
+      delete process.env.PR_FOLLOWUP_BOT_IDENTITIES;
+      delete process.env.PR_FOLLOWUP_BOT_IDENTITY_SCOPES;
+    });
+  });
+
+  describe("webhook ingestion (source: webhook)", () => {
+    it("enqueues a webhook review under a matching scope", async () => {
+      process.env.PR_FOLLOWUP_BOT_IDENTITY_SCOPES = SCOPED_IDENTITIES_ENV;
+      const client = makeClient();
+
+      const result = await processPrFollowupEvents(client, [
+        {
+          eventType: "review",
+          repoFullName: "acme/widgets",
+          headRepoFullName: "acme/widgets",
+          prNumber: 21,
+          branch: "task/provision",
+          url: "https://github.com/acme/widgets/pull/21",
+          title: "Provision staging",
+          author: "acme-task-bot",
+          body: "Change `fetch` to `axios` for better error handling",
+          id: "rv-1",
+          state: "CHANGES_REQUESTED",
+          source: "webhook",
+        },
+      ]);
+
+      expect(result.enqueued).toBe(1);
+      expect(client.items).toHaveLength(1);
+    });
+
+    it("skips a webhook review from a scoped identity on an unrelated branch", async () => {
+      process.env.PR_FOLLOWUP_BOT_IDENTITY_SCOPES = SCOPED_IDENTITIES_ENV;
+      const client = makeClient();
+
+      const result = await processPrFollowupEvents(client, [
+        {
+          eventType: "review",
+          repoFullName: "acme/widgets",
+          headRepoFullName: "acme/widgets",
+          prNumber: 21,
+          branch: "release/9.9",
+          url: "https://github.com/acme/widgets/pull/21",
+          title: "Provision staging",
+          author: "acme-task-bot",
+          body: "Change `fetch` to `axios` for better error handling",
+          id: "rv-2",
+          state: "CHANGES_REQUESTED",
+          source: "webhook",
+        },
+      ]);
+
+      expect(result.enqueued).toBe(0);
+      expect(client.items).toHaveLength(0);
+    });
+
+    it("skips a webhook merge-state event for a scoped identity on a fork with a matching branch", async () => {
+      process.env.PR_FOLLOWUP_BOT_IDENTITY_SCOPES = SCOPED_IDENTITIES_ENV;
+      const client = makeClient();
+
+      const result = await processPrFollowupEvents(client, [
+        {
+          eventType: "merge_state",
+          repoFullName: "acme/widgets",
+          headRepoFullName: "forker/widgets",
+          prNumber: 22,
+          branch: "task/provision",
+          url: "https://github.com/acme/widgets/pull/22",
+          title: "Provision staging",
+          author: "acme-task-bot",
+          mergeStateStatus: "dirty",
+          id: "ms-1",
+          source: "webhook",
+        },
+      ]);
+
+      expect(result.enqueued).toBe(0);
+      expect(client.items).toHaveLength(0);
+    });
+
+    afterEach(() => {
+      delete process.env.PR_FOLLOWUP_BOT_IDENTITIES;
+      delete process.env.PR_FOLLOWUP_BOT_IDENTITY_SCOPES;
+    });
+  });
+});
+
 // ─── Event Ingestion Tests ──────────────────────────────────────────────────
 
 describe("ingestCommentEvent", () => {

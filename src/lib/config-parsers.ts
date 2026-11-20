@@ -51,3 +51,61 @@ export function isValidRepoName(fullName: string): boolean {
 export function parseExcludedLabels(input: string | undefined): string[] {
   return parseDelimitedList(input);
 }
+
+/**
+ * One operator-configured follow-up identity scope (#1665).
+ *
+ * A shared automation identity can open PRs for several unrelated workflows,
+ * so an operator may narrow automatic PR follow-up for THAT login to PRs whose
+ * head branch starts with one of these prefixes (and whose head repository is
+ * the base repository — enforced by the ingestion gate). The login and the
+ * prefixes are operator configuration; Dispatch never assumes which agent or
+ * tool created a PR, and ships no default scopes.
+ */
+export interface FollowupIdentityScope {
+  /** The GitHub login the scope narrows (compared as configured). */
+  login: string;
+  /** Head-branch prefixes that qualify a PR for automatic follow-up. */
+  branchPrefixes: string[];
+}
+
+/**
+ * Parse `PR_FOLLOWUP_BOT_IDENTITY_SCOPES` (#1665): a JSON object mapping a
+ * GitHub login to its head-branch prefixes, e.g.
+ * `{"renovate[bot]": ["renovate/"]}`. A bare string prefix is tolerated as a
+ * one-element list. Entries are trimmed, empty prefixes dropped, prefix
+ * duplicates removed (order preserved); the first entry for a login wins.
+ *
+ * Fail closed: an unparsable or non-object value yields no scopes at all, so
+ * a login configured ONLY here is simply unconfigured (no automatic
+ * follow-up for it) rather than silently unscoped. An entry whose prefixes
+ * all end up empty is kept as a match-nothing scope — the literal reading of
+ * "no branch qualifies", never a silent widening back to unscoped.
+ */
+export function parseFollowupIdentityScopes(input: string | undefined): FollowupIdentityScope[] {
+  if (!input || !input.trim()) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(input);
+  } catch {
+    return [];
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return [];
+
+  const scopes: FollowupIdentityScope[] = [];
+  const seenLogins = new Set<string>();
+  for (const [rawLogin, rawPrefixes] of Object.entries(parsed as Record<string, unknown>)) {
+    const login = rawLogin.trim();
+    if (!login || seenLogins.has(login)) continue;
+    const candidates = Array.isArray(rawPrefixes) ? rawPrefixes : [rawPrefixes];
+    const prefixes: string[] = [];
+    for (const candidate of candidates) {
+      if (typeof candidate !== "string") continue;
+      const prefix = candidate.trim();
+      if (prefix && !prefixes.includes(prefix)) prefixes.push(prefix);
+    }
+    seenLogins.add(login);
+    scopes.push({ login, branchPrefixes: prefixes });
+  }
+  return scopes;
+}

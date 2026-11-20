@@ -284,6 +284,37 @@ describe("POST /api/pr-followup/webhook", () => {
     expect(mocks.processPrFollowupEvents).toHaveBeenCalled();
   });
 
+  // #1665: a scoped identity rule needs the PR's head repository and head
+  // branch to decide qualification. The webhook projection must carry both
+  // (plus the author) from the payload, or every scoped identity would fail
+  // closed on webhook deliveries regardless of operator configuration.
+  it("projects author, head repo, and head branch for the scoped-identity gate (#1665)", async () => {
+    const prBody = {
+      review: { id: 2, body: "Restore the validate job.", state: "CHANGES_REQUESTED" },
+      pull_request: {
+        number: 43,
+        html_url: "https://github.com/acme/widgets/pull/43",
+        title: "Release 1.2.0",
+        user: { login: "acme-release-bot" },
+        head: { ref: "release/1.2.0", repo: { full_name: "acme/widgets" } },
+        base: { repo: { full_name: "acme/widgets" } },
+      },
+    };
+
+    const res = await postRequest(prBody, {
+      Authorization: `Bearer ${mockToken}`,
+      "x-github-event": "pull_request_review",
+    });
+
+    expect(res.status).toBe(200);
+    expect(mocks.processPrFollowupEvents).toHaveBeenCalled();
+    const event = mocks.processPrFollowupEvents.mock.calls[0][1][0];
+    expect(event.author).toBe("acme-release-bot");
+    expect(event.headRepoFullName).toBe("acme/widgets");
+    expect(event.branch).toBe("release/1.2.0");
+    expect(event.repoFullName).toBe("acme/widgets");
+  });
+
   it("processes pull_request events", async () => {
     const prBody = {
       pull_request: {
