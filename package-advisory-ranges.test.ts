@@ -10,9 +10,10 @@ const acceptedRisksPath = join(process.cwd(), "SECURITY-ACCEPTED-RISKS.md");
 
 // The vulnerable version ranges below are the **union of every advisory the
 // npm advisory feed lists for these packages** (fetched per-package on
-// 2026-10-24), not only the advisories named in #1386: the blocking gate flags
-// any vulnerable resolution, so pinning a subset of a package's advisory
-// history would let a re-resolution into an older advisory through.
+// 2026-10-24, and for `effect` on 2026-11-20), not only the advisories named in
+// #1386: the blocking gate flags any vulnerable resolution, so pinning a subset
+// of a package's advisory history would let a re-resolution into an older
+// advisory through.
 //
 // Every boundary was read from the feed and cross-checked: no release the feed
 // marks as patched falls inside a pinned range (checked per major line for
@@ -121,6 +122,27 @@ const ADVISORY_SPECS: AdvisorySpec[] = [
     scope: "dev",
     vulnerableProbes: ["6.29.0", "7.30.0", "8.12.1"],
     patchedProbes: ["6.29.1", "7.30.1", "8.12.2"],
+  },
+  {
+    // effect: ReDoS in the Schema.TemplateLiteral compiled regex (every release
+    // through 3.22.0, fixed in 3.22.1) plus the earlier AsyncLocalStorage
+    // context-contamination advisory closing at 3.20.0. The feed's third live
+    // advisory affecting `effect` (read 2026-11-20) is GHSA-chp3-j5qr-2vfr, and
+    // the only range it attributes to this package is prerelease-only —
+    // 4.0.0-beta.0 through 4.0.0-beta.102 — so it cannot be pinned here: this
+    // guard compares numeric cores only, and a 4.0.0 boundary would also pin
+    // patched 4.0.0. (The same advisory's 0.1.0 … <0.97.1 range belongs to
+    // `@effect/platform`, which this tree does not contain.) The
+    // `overrides` floor (`effect: "^3.22.1"`, #1670) keeps the tree off the 4.x
+    // line entirely, which is also why the floor is caret-bounded instead of a
+    // bare `>=3.22.1`: its only consumer, @prisma/config, pins effect exactly and
+    // has never been resolved against an effect major it does not ship.
+    name: "effect",
+    ranges: [{ from: "0.0.0", to: "3.22.1" }],
+    advisories: ["GHSA-7589-6fvf-x4pw", "GHSA-38f7-945m-qr2g"],
+    scope: "prod",
+    vulnerableProbes: ["3.20.0", "3.22.0"],
+    patchedProbes: ["3.22.1"],
   },
 ];
 

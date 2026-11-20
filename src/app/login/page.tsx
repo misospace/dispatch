@@ -36,6 +36,7 @@ function LoginContent() {
   const handleSignIn = () => {
     setLoading(true);
     setError(null);
+    // eslint-disable-next-line @next/next/no-location-assign-relative-destination -- /api/login is a route handler: sign-in must be a full-page hand-off, not client routing (dispatch#1671)
     window.location.href = `/api/login?callbackUrl=${encodeURIComponent(callbackUrl)}`;
   };
 
