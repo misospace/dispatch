@@ -32,6 +32,7 @@
 import { createHash } from "node:crypto";
 import { AGENT_PREFIX, getAgentFromLabels } from "@/types";
 import { withIssueMutationGuard, fencedWriteTimeoutForCalls } from "@/lib/issue-mutation-guard";
+import { canonicalJson } from "@/lib/json";
 import { supersedeOwnershipReleaseIntent } from "@/lib/ownership-reconciliation";
 import {
   releaseIssueClaim,
@@ -114,16 +115,6 @@ export function normalizeRetryNote(
     return { ok: false, error: `note must be at most ${MAX_RETRY_NOTE_BYTES} bytes` };
   }
   return { ok: true, note: trimmed };
-}
-
-/** Deterministic key-sorted JSON for scalars/nested objects/arrays. */
-function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  const entries = Object.entries(value as Record<string, unknown>)
-    .filter(([, v]) => v !== undefined)
-    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(",")}}`;
 }
 
 /**

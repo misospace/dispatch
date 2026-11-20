@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { createHash } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import { errorResponse, handleApiError, readJsonObjectBody } from "@/lib/api-errors";
+import { canonicalJson } from "@/lib/json";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest, authErrorResponse, getBoundWorkerAgent } from "@/lib/auth";
 import { enforceWorkerAgentScope } from "@/lib/worker-identity";
@@ -326,20 +327,6 @@ function buildTouchedUrls(
   }
 
   return urls;
-}
-
-/**
- * Deterministic JSON for report payload comparison: object keys sorted,
- * `undefined` entries omitted. Two reports that differ only in key order or
- * in explicitly-undefined optional fields hash identically.
- */
-function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  const entries = Object.entries(value as Record<string, unknown>)
-    .filter(([, v]) => v !== undefined)
-    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(",")}}`;
 }
 
 function reportPayloadHash(

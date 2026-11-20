@@ -1,4 +1,5 @@
 import { getConfiguredLanes, getClaimableLanes, getBacklogLane } from "@/lib/lane-config";
+import { trimJsonFences } from "@/lib/json";
 import { STATUS_LABELS, PRIORITY_LABELS } from "@/types";
 import { buildGroomerSystemPrompt } from "./prompts/system-prompt";
 import { buildGroomingPlanResponseSchema } from "./plan-schema";
@@ -357,18 +358,3 @@ export async function callGroomerLLM(options: CallLlmOptions): Promise<unknown> 
   }
 }
 
-function trimJsonFences(text: string): string {
-  let result = text.trim();
-  if (result.startsWith("```")) {
-    const firstNewline = result.indexOf("\n");
-    if (firstNewline > 0) {
-      result = result.slice(firstNewline + 1);
-    } else {
-      result = result.slice(3);
-    }
-  }
-  if (result.endsWith("```")) {
-    result = result.slice(0, -3).trim();
-  }
-  return result;
-}
