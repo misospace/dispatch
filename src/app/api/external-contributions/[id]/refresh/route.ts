@@ -41,7 +41,7 @@ import { projectExternalContribution } from "@/lib/external-contribution-view";
  * Responses:
  * | Status | When |
  * |---|---|
- * | 200 | Observation recorded, explicit miss recorded as expired, or the cooldown window held |
+ * | 200 | Observation recorded, explicit miss recorded as expired, the cooldown window held, or a newer refresh superseded this read |
  * | 404 | No such request |
  * | 409 | The request was never accepted, so there is no run identity to track |
  * | 502 | Identity mismatch refused the observation |
@@ -105,17 +105,17 @@ export async function POST(
       }
     };
 
-    return respondToTracking(result, body, audit);
+    return await respondToTracking(result, body, audit);
   } catch (error) {
     return handleApiError("refresh external contribution tracking", error);
   }
 }
 
-function respondToTracking(
+async function respondToTracking(
   result: TrackingRefreshOutcome,
   body: ReturnType<typeof projectExternalContribution>,
   audit: (data: { success: boolean; errorMessage?: string; notes?: string }) => Promise<void>,
-): NextResponse {
+): Promise<NextResponse> {
   switch (result.outcome) {
     case "cooldown":
       // Duplicate-prevented refresh: stored evidence, zero network calls.
@@ -125,14 +125,14 @@ function respondToTracking(
     case "expired": {
       // The read succeeded with the shared miss: recorded explicitly, and
       // final evidence (if we held any) survives.
-      void audit({
+      await audit({
         success: true,
         notes: `requestId=${body.id} outcome=expired courierRun=${body.run} state=${body.tracking.state}`,
       });
       return NextResponse.json({ refreshed: true, expired: true, ...body });
     }
     case "mismatch":
-      void audit({
+      await audit({
         success: false,
         errorMessage: body.tracking.lastError ?? "courier status identity mismatch",
         notes: `requestId=${body.id}`,
@@ -142,7 +142,7 @@ function respondToTracking(
         { status: 502 },
       );
     case "refused":
-      void audit({
+      await audit({
         success: false,
         errorMessage: body.tracking.lastError ?? `courier status read refused with HTTP ${result.httpStatus}`,
         notes: `requestId=${body.id}`,
@@ -152,7 +152,7 @@ function respondToTracking(
         { status: 503 },
       );
     case "unavailable":
-      void audit({
+      await audit({
         success: false,
         errorMessage: body.tracking.lastError ?? "courier status read unavailable",
         notes: `requestId=${body.id}${result.retryAfterMs !== undefined ? ` retryAfterMs=${result.retryAfterMs}` : ""}`,
@@ -166,5 +166,10 @@ function respondToTracking(
         },
         { status: result.timeout ? 504 : 503 },
       );
+    case "superseded":
+      // A newer refresh claimed the row while this read was in flight (slow
+      // Courier answer outliving the cooldown). The newer result stands; this
+      // one was dropped instead of settling, so stale evidence never wins.
+      return NextResponse.json({ refreshed: false, superseded: true, ...body });
   }
 }

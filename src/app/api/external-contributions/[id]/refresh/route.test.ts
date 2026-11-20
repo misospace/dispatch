@@ -255,4 +255,14 @@ describe("POST /api/external-contributions/[id]/refresh", () => {
     expect(url.origin).toBe("https://courier.internal");
     expect(url.pathname).toBe("/v1/contributions/run-77");
   });
+
+  it("rate-limits hammering the refresh surface (429) without any Courier call", async () => {
+    // Fresh cooldown anchor: every call short-circuits on the stored row,
+    // so the only thing that can answer 429 is the per-actor rate limit.
+    const row = acceptedRow({ trackingCheckedAt: new Date() });
+    let last: Awaited<ReturnType<typeof refresh>> | undefined;
+    for (let i = 0; i < 31; i += 1) last = await refresh(row.id);
+    expect(last!.status).toBe(429);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });

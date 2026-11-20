@@ -107,7 +107,9 @@ export function getCourierTrackingConfig(): CourierTrackingConfig {
  * URL path — `encodeURIComponent` bounds the rest.
  */
 export function isAddressableRunName(run: string): boolean {
-  if (!run || run.length > 253) return false;
+  // A dot-only name would collapse path segments on the surface URL.
+  if (!run || /^\.+$/.test(run)) return false;
+  if (Buffer.byteLength(run, "utf8") > 253) return false;
   return !/[\u0000-\u0020\u007f/\\]/.test(run);
 }
 

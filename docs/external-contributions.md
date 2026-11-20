@@ -213,7 +213,7 @@ Refresh response statuses:
 
 | Status | When |
 |---|---|
-| 200 | Observation recorded, a 404 recorded as `expired`, or the cooldown window held (`refreshed: false`, `cooldownRemainingMs`) |
+| 200 | Observation recorded, a 404 recorded as `expired`, the cooldown window held (`refreshed: false`, `cooldownRemainingMs`), or a newer refresh superseded this read (`refreshed: false`, `superseded: true`) |
 | 404 | No such request |
 | 409 | The request was never accepted — there is no run identity to track |
 | 502 | Identity mismatch refused the observation; nothing was recorded but the diagnostic |
@@ -241,7 +241,9 @@ Rules:
   `namespace`, `lane`, `baseRepo`, and `workRepo`. Any mismatch refuses the
   whole observation: no phase, no publication, only a field-named diagnostic.
 - **Unknown keeps the last state.** The projection value `unknown` and any
-  unrecognized phase derive nothing new (the CRD enum can gain phases).
+  unrecognized phase derive nothing new (the CRD enum can gain phases). The
+  one exception is `unavailable`: it recorded no evidence, so the first
+  trustworthy observation replaces it.
 - **Retention is explicit loss.** A 404 is ambiguous by design on the Courier
   side (missing, foreign, or reaped). For a run we admitted it means the
   evidence is gone. Final evidence already persisted (a PR, a success, a
@@ -253,8 +255,11 @@ Rules:
   `TRACKING_REFRESH_COOLDOWN_MS` (15s — Courier paces frontends at 15–30s).
   The window is claimed by one conditional `updateMany`, so it holds across
   Dispatch instances; losers get the stored evidence with 200
-  `refreshed: false`. A refresh never re-submits the contribution — every
-  request it makes is a GET. A `503 Retry-After` is surfaced to the caller.
+  `refreshed: false`. The claim timestamp also owns the settlement: an answer
+  that arrives after a newer claim took the window is dropped (`superseded`),
+  so a slow stale read can never regress the recorded evidence. A refresh
+  never re-submits the contribution — every request it makes is a GET. A
+  `503 Retry-After` is surfaced to the caller.
 - **Missing capability, named.** No read token configured answers 503 with the
   missing piece and leaves submission untouched.
 

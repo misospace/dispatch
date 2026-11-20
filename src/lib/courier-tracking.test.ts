@@ -105,6 +105,15 @@ describe("isAddressableRunName / contributionStatusUrl", () => {
     expect(isAddressableRunName("a b")).toBe(false);
   });
 
+  it("bounds by UTF-8 BYTES and refuses dot-only path segments", () => {
+    // 200 two-byte characters = 400 bytes: over the 253-byte cap.
+    expect(isAddressableRunName("é".repeat(200))).toBe(false);
+    expect(isAddressableRunName("é".repeat(126))).toBe(true); // 252 bytes
+    expect(isAddressableRunName(".")).toBe(false);
+    expect(isAddressableRunName("..")).toBe(false);
+    expect(isAddressableRunName("....")).toBe(false);
+  });
+
   it("builds <surface>/<run>?namespace=<ns> with no query inheritance", () => {
     const config = { ...okConfig, statusBase: new URL(`${SURFACE}/`) };
     const url = contributionStatusUrl(config, "courier-3f2a", "team-alpha");

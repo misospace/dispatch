@@ -314,6 +314,55 @@ describe("refreshExternalContributionTracking", () => {
     }
   });
 
+  it("discards a stale answer that lands after a newer refresh already settled", async () => {
+    const row = acceptedRow();
+    let resolveSlow: ((value: Response) => void) | undefined;
+    const slow = new Promise<Response>((resolve) => {
+      resolveSlow = resolve;
+    });
+    const fetchMock = vi.fn().mockResolvedValueOnce(slow);
+    vi.stubGlobal("fetch", fetchMock);
+
+    // Slow read A claims at t0; its answer only arrives at the very end.
+    const t0 = new Date("2026-11-20T12:00:00.000Z");
+    const attemptA = refreshExternalContributionTracking(client, row as ExternalContributionRow, config, t0);
+
+    // 16s later (past the cooldown — the claim predicate's own spacing, so
+    // the two claim timestamps cannot collide) a newer refresh B claims and
+    // settles quickly.
+    const t1 = new Date(t0.getTime() + TRACKING_REFRESH_COOLDOWN_MS + 1_000);
+    fetchMock.mockResolvedValueOnce(statusResponse(200, statusBody({ phase: "Running" })));
+    const resultB = await refreshExternalContributionTracking(client, ledger.rows[0] as ExternalContributionRow, config, t1);
+    expect(resultB.outcome).toBe("observed");
+
+    // A's answer arrives LAST and must not regress the row: the settlement
+    // guard (the claim timestamp) drops it as superseded.
+    resolveSlow!(statusResponse(200, statusBody({ phase: "Done", observedAt: new Date(t1.getTime() + 60_000).toISOString() })));
+    const resultA = await attemptA;
+    expect(resultA.outcome).toBe("superseded");
+    expect(ledger.rows[0].courierPhase).toBe("Running");
+    expect(ledger.rows[0].trackingState).toBe("executing");
+  });
+
+  it("replaces the never-evidence `unavailable` state with the first trustworthy observation", async () => {
+    const row = acceptedRow();
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(statusResponse(401, JSON.stringify({ error: "invalid bearer token" }))));
+    const refused = await refreshExternalContributionTracking(client, row as ExternalContributionRow, config);
+    expect(refused.outcome).toBe("refused");
+    expect(ledger.rows[0].trackingState).toBe("unavailable");
+
+    // A later verified read whose phase the projection has not stamped yet
+    // must recover the state, not inherit the failure label.
+    ledger.rows[0].trackingCheckedAt = new Date(Date.now() - TRACKING_REFRESH_COOLDOWN_MS - 1);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(statusResponse(200, statusBody({ phase: "unknown" }))));
+    const observed = await refreshExternalContributionTracking(client, ledger.rows[0] as ExternalContributionRow, config);
+    expect(observed.outcome).toBe("observed");
+    if (observed.outcome === "observed") {
+      expect(observed.request.trackingState).toBe("admitted");
+      expect(observed.request.courierPhase).toBe("unknown");
+    }
+  });
+
   it("never re-submits: every network call this state machine makes is a GET", async () => {
     const row = acceptedRow();
     const fetchMock = vi
