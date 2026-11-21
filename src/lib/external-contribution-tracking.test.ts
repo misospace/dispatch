@@ -306,6 +306,49 @@ describe("refreshExternalContributionTracking", () => {
     }
   });
 
+  it("settles against the row as claimed, not the caller's stale snapshot (404 keep-final)", async () => {
+    // The caller read the row before a refresh that has since claimed +
+    // settled a publication (>1 cooldown ago, so this claim legitimately
+    // wins). The 404 keep-final check must see the settled `published`
+    // evidence, not the snapshot's absence of it (review finding on #1685).
+    const row = acceptedRow();
+    const staleSnapshot = { ...row };
+    ledger.rows[0].trackingState = "published";
+    ledger.rows[0].courierPhase = "AwaitingReview";
+    ledger.rows[0].courierPrUrl = "https://github.com/acme/widgets/pull/42";
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(statusResponse(404, JSON.stringify({ error: "contribution run not found" }))));
+
+    const result = await refreshExternalContributionTracking(client, staleSnapshot as ExternalContributionRow, config);
+    expect(result.outcome).toBe("expired");
+    if (result.outcome === "expired") {
+      expect(result.request.trackingState).toBe("published");
+      expect(ledger.rows[0].trackingState).toBe("published");
+      expect(result.request.courierPrUrl).toBe("https://github.com/acme/widgets/pull/42");
+      expect(result.request.trackingError).toMatch(/reaped or lost/);
+    }
+  });
+
+  it("settles against the row as claimed, not the caller's stale snapshot (partial observation merge)", async () => {
+    // Same hazard on the observation path: a partial projection with no
+    // publication block must merge against the CURRENTLY recorded PR, never
+    // the snapshot's null, which would erase the settled evidence.
+    const row = acceptedRow();
+    const staleSnapshot = { ...row };
+    ledger.rows[0].trackingState = "published";
+    ledger.rows[0].courierPrUrl = "https://github.com/acme/widgets/pull/42";
+    ledger.rows[0].courierCauseCategory = "verifier-rejection";
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(statusResponse(200, statusBody({ phase: "Done" }))));
+
+    const result = await refreshExternalContributionTracking(client, staleSnapshot as ExternalContributionRow, config);
+    expect(result.outcome).toBe("observed");
+    if (result.outcome === "observed") {
+      expect(result.request.trackingState).toBe("published");
+      expect(result.request.courierPrUrl).toBe("https://github.com/acme/widgets/pull/42");
+      expect(result.request.courierCauseCategory).toBe("verifier-rejection");
+      expect(result.request.courierPhase).toBe("Done");
+    }
+  });
+
   it("blocks duplicate reads inside the cooldown window without touching the network", async () => {
     const row = acceptedRow();
     const fetchMock = vi.fn().mockResolvedValue(statusResponse(200, statusBody()));

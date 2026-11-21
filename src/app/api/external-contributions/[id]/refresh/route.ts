@@ -80,8 +80,15 @@ export async function POST(
 
     const config = getCourierTrackingConfig();
     if (!config.ok) {
-      // Missing capability, named as such — submission stays untouched.
-      return NextResponse.json({ error: config.reason, tracking: { configured: false } }, { status: 503 });
+      // Missing capability, named as such — submission stays untouched. The
+      // body keeps the SHARED projection shape: every answer from this route
+      // carries the full `tracking` view (with `state`), so a client that
+      // reads `tracking.state` never gets `undefined` on one status alone.
+      // `refreshed: false` matches the other no-write answers.
+      return NextResponse.json(
+        { error: config.reason, refreshed: false, ...projectExternalContribution(row) },
+        { status: 503 },
+      );
     }
 
     const result = await refreshExternalContributionTracking(prisma, row, config);

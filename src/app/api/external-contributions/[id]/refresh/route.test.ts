@@ -151,6 +151,10 @@ describe("POST /api/external-contributions/[id]/refresh", () => {
     expect(body.error).toMatch(/tracking is unavailable/i);
     expect(body.error).toMatch(/DISPATCH_COURIER_READ_TOKEN/);
     expect(fetchMock).not.toHaveBeenCalled();
+    // Same projection shape as every other answer: `tracking.state` is a
+    // real value here, not undefined (review finding on #1685).
+    expect(body.refreshed).toBe(false);
+    expect(body.tracking).toMatchObject({ state: "admitted", stale: false, publication: null });
     // No cooldown was burned and no state was written for a read that never ran.
     expect(harness.rows[0].trackingCheckedAt).toBeNull();
     expect(harness.rows[0].trackingState).toBeNull();

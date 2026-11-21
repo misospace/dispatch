@@ -36,9 +36,12 @@
  *   cooldown window, claimed by ONE conditional `updateMany` (atomic at the
  *   database, so it holds across Dispatch instances): the claim flips
  *   `trackingCheckedAt` to now only while it is null or older than the
- *   cutoff. Losers answer with the stored evidence plus the remaining
- *   cooldown — no network call, no Courier pressure, and a refresh never
- *   re-submits the contribution.
+ *   cutoff. Right after the claim the row is RE-READ, so durability merges,
+ *   the 404 keep-final check, and the "never observed" `unavailable` marking
+ *   all see the current evidence, not a snapshot that predates a refresh that
+ *   already settled. Losers answer with the stored evidence plus the
+ *   remaining cooldown — no network call, no Courier pressure, and a refresh
+ *   never re-submits the contribution.
  * - Credential hygiene. The READ token lives only in `courier-tracking.ts`;
  *   everything this module may store goes through that module's already
  *   redacted diagnostics.
@@ -259,7 +262,10 @@ async function supersededOutcome(client: TrackingClient, rowId: string): Promise
  *
  * Ordering: the cooldown claim commits BEFORE the network call, so a crash
  * mid-read still consumed the window (a refresh is cheap to lose, a stampede
- * is not). The claim timestamp is also the settlement ownership token: a read
+ * is not). The row is re-read once the claim is held, and that fresh row —
+ * never the caller's possibly-older snapshot — is the baseline for the
+ * identity check, the durability merges, and the 404 keep-final decision.
+ * The claim timestamp is also the settlement ownership token: a read
  * whose answer arrives AFTER a newer claim took the slot (slow Courier, short
  * cooldown) is dropped as `superseded` instead of settling, so stale evidence
  * can never regress the recorded state. The contribution itself is never
@@ -295,10 +301,24 @@ export async function refreshExternalContributionTracking(
     return { outcome: "cooldown", request: fresh, cooldownRemainingMs: remaining };
   }
 
-  const result = await fetchContributionStatus(row.courierRun as string, row.courierNamespace ?? row.namespace, config);
+  // The claim makes this attempt the row's tracking writer: every settlement
+  // (this one included) is fenced by its claim timestamp, so a claimant that
+  // loses the token can never write behind us. Re-read the row as the
+  // settlement baseline — the caller's snapshot may predate a refresh that
+  // already claimed + settled (older than the cooldown), and merging or
+  // keep-final checks against that stale snapshot could erase the evidence
+  // the earlier refresh recorded.
+  const current = await client.externalContributionRequest.findUnique({ where: { id: row.id } });
+  if (!current) throw new Error("external contribution request disappeared during tracking");
+
+  const result = await fetchContributionStatus(
+    current.courierRun as string,
+    current.courierNamespace ?? current.namespace,
+    config,
+  );
 
   if (result.outcome === "ok") {
-    const mismatched = identityMismatch(row, result);
+    const mismatched = identityMismatch(current, result);
     if (mismatched) {
       // Refuse the whole observation: a response that does not describe THIS
       // admitted run is evidence of nothing. Keep only the bounded,
@@ -317,8 +337,8 @@ export async function refreshExternalContributionTracking(
     const hasPr = !!status.publication?.pr;
     const trackingState = deriveTrackingState(
       status.phase,
-      hasPr || !!row.courierPrUrl,
-      (row.trackingState as TrackingState | null) ?? null,
+      hasPr || !!current.courierPrUrl,
+      (current.trackingState as TrackingState | null) ?? null,
     );
     const applied = await settle(client, row.id, now, {
       trackingState,
@@ -327,17 +347,17 @@ export async function refreshExternalContributionTracking(
       // The terminal cause is recorded once at a run's ending (Courier only
       // ever attaches it there); like the publication fields, a later
       // partial projection without a `cause` block must not erase it.
-      courierCauseCategory: status.cause?.category ?? row.courierCauseCategory,
-      courierCauseOutcome: status.cause?.outcome ?? row.courierCauseOutcome,
+      courierCauseCategory: status.cause?.category ?? current.courierCauseCategory,
+      courierCauseOutcome: status.cause?.outcome ?? current.courierCauseOutcome,
       // Publication evidence is durable on the Courier side; a later partial
       // projection must never erase earlier recorded pieces.
-      courierPrUrl: status.publication?.pr ?? row.courierPrUrl,
-      courierPrBranch: status.publication?.branch ?? row.courierPrBranch,
-      courierPrHeadRepo: status.publication?.headRepo ?? row.courierPrHeadRepo,
-      courierPrHeadSha: status.publication?.headSha ?? row.courierPrHeadSha,
+      courierPrUrl: status.publication?.pr ?? current.courierPrUrl,
+      courierPrBranch: status.publication?.branch ?? current.courierPrBranch,
+      courierPrHeadRepo: status.publication?.headRepo ?? current.courierPrHeadRepo,
+      courierPrHeadSha: status.publication?.headSha ?? current.courierPrHeadSha,
       courierObservedAt: status.observedAt,
-      courierPhaseEnteredAt: status.phaseEnteredAt ?? row.courierPhaseEnteredAt,
-      courierFinishedAt: status.finishedAt ?? row.courierFinishedAt,
+      courierPhaseEnteredAt: status.phaseEnteredAt ?? current.courierPhaseEnteredAt,
+      courierFinishedAt: status.finishedAt ?? current.courierFinishedAt,
       trackingError: null,
     });
     if (!applied) return supersededOutcome(client, row.id);
@@ -349,12 +369,13 @@ export async function refreshExternalContributionTracking(
     // admitted it means the evidence is gone from Courier. Final evidence
     // already persisted is KEPT (that is the point of persisting before the
     // retention window); anything else becomes the explicit `expired` state.
-    const keepsFinal = row.trackingState !== null && FINAL_TRACKING_STATES.includes(row.trackingState as TrackingState);
+    const keepsFinal =
+      current.trackingState !== null && FINAL_TRACKING_STATES.includes(current.trackingState as TrackingState);
     const applied = await settle(client, row.id, now, {
       ...(keepsFinal ? {} : { trackingState: "expired" as TrackingState }),
       trackingError: redactSecret(
         keepsFinal
-          ? `courier no longer reports this run (reaped or lost); the recorded ${row.trackingState} evidence is kept — a 404 is never completion`
+          ? `courier no longer reports this run (reaped or lost); the recorded ${current.trackingState} evidence is kept — a 404 is never completion`
           : `${result.diagnostic}; recorded as expired, not completion — re-ingestion would require a new request identity`,
         config.token,
       ),
@@ -366,7 +387,7 @@ export async function refreshExternalContributionTracking(
   if (result.outcome === "refused") {
     const applied = await settle(client, row.id, now, {
       trackingError: result.diagnostic,
-      ...(row.trackingState === null ? { trackingState: "unavailable" as TrackingState } : {}),
+      ...(current.trackingState === null ? { trackingState: "unavailable" as TrackingState } : {}),
     });
     if (!applied) return supersededOutcome(client, row.id);
     return { outcome: "refused", request: applied, httpStatus: result.httpStatus };
@@ -374,7 +395,7 @@ export async function refreshExternalContributionTracking(
 
   const applied = await settle(client, row.id, now, {
     trackingError: result.diagnostic,
-    ...(row.trackingState === null ? { trackingState: "unavailable" as TrackingState } : {}),
+    ...(current.trackingState === null ? { trackingState: "unavailable" as TrackingState } : {}),
   });
   if (!applied) return supersededOutcome(client, row.id);
   return {
