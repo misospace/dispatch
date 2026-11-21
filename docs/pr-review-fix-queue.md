@@ -36,6 +36,7 @@ Configuration:
 | Env Var | Description | Default |
 |---------|-------------|---------|
 | `PR_FOLLOWUP_BOT_IDENTITIES` | Comma-separated GitHub logins whose PRs are eligible | `github-actions[bot]` |
+| `PR_FOLLOWUP_BOT_IDENTITY_SCOPES` | JSON object narrowing a configured login to PRs whose head repository is the base repository AND whose head branch starts with one of its prefixes, e.g. `{"renovate[bot]": ["renovate/"]}`. Fail closed when the head repo or branch is missing. Unscoped logins in `PR_FOLLOWUP_BOT_IDENTITIES` keep the legacy behavior. | Unset (no scopes) |
 | `PR_FOLLOWUP_BRANCH_OWNERS` | Comma-separated repo owners allowed for queueing | All (opt-in safety) |
 
 ### Real-time webhooks

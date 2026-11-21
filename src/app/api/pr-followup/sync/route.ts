@@ -181,8 +181,17 @@ export async function POST(request: NextRequest) {
         continue;
       }
 
-      // Filter to bot-authored PRs only
-      const botPrs = allPrs.filter((pr) => isAllowedBotAuthor(pr.user.login));
+      // Filter to bot-authored PRs only. #1665: a scoped identity is also
+      // narrowed here — by its head repository + head branch rule — so a PR
+      // the scope excludes is never scanned at all. The head fields are the
+      // same ones the #1637 ingestion gate reads from the list endpoint.
+      const botPrs = allPrs.filter((pr) =>
+        isAllowedBotAuthor(pr.user.login, {
+          baseRepoFullName: repoFullName,
+          headRepoFullName: pr.head?.repo?.full_name ?? null,
+          headBranch: pr.head?.ref ?? null,
+        }),
+      );
       prsScanned += botPrs.length;
 
       for (const pr of botPrs) {
