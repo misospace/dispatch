@@ -279,11 +279,14 @@ view.ts`) — it introduces no new write path, no new authority, and no second
 state machine. The nav entry ("Contributions") is present on every instance;
 an unconfigured surface still renders, naming its gaps.
 
-- **Configuration panel.** Shows what is configured — endpoint, approved
-  namespaces, and credential PRESENCE — resolved server-side by
+- **Configuration panel.** Shows what is configured — endpoint PRESENCE,
+  approved namespaces, and credential PRESENCE — resolved server-side by
   `projectCourierSurface()`. Credential values have no path into the client
-  tree. When submission or tracking is disabled, the panel renders the same
-  named capability gap the API answers with (503 reasons), never a generic
+  tree, and neither does the admission endpoint URL itself: it is credential-
+  bearing transport configuration (userinfo or token-like query parameters are
+  legal in a URL), so the panel renders `configured` / `not configured`, never
+  the string. When submission or tracking is disabled, the panel renders the
+  same named capability gap the API answers with (503 reasons), never a generic
   failure. The submission form is disabled until the surface is configured.
 - **Submission.** One namespace per submission, selectable ONLY from the
   operator-approved `DISPATCH_COURIER_ADMISSION_NAMESPACES` list (the form
@@ -292,9 +295,15 @@ an unconfigured surface still renders, naming its gaps.
   uncertain answer keeps the key so re-submitting retries the SAME identity
   (and says so), while a settled identity (Courier rejection, payload
   conflict, exhausted budget) is rotated so the next edit is a deliberately
-  new contribution. This mirrors the exactly-once rules above; the ledger and
-  the atomic claim still decide — the browser only avoids forking an identity
-  the caller did not mean to abandon.
+  new contribution. The durable half of that identity lives in the LEDGER,
+  not the browser: an unsettled (`pending` / `uncertain`) row offers
+  **Retry delivery**, which rebuilds the canonical POST from the row's own
+  stored fields and replays its recorded key — so a page reload between an
+  uncertain delivery and a retry still re-offers the SAME request, never a
+  forked identity (the server's payload-digest guard 409s any body that fails
+  to match the stored fields). This mirrors the exactly-once rules above; the
+  ledger and the atomic claim still decide — the browser only avoids forking
+  an identity the caller did not mean to abandon.
 - **Queue and detail.** The stored-request listing and one-request detail read
   the ledger routes, which never call Courier; they work while Courier is
   offline. A row shows the delivery status, the derived lifecycle state (plus
@@ -306,9 +315,13 @@ an unconfigured surface still renders, naming its gaps.
   on screen.
 - **Honesty rules carried through to the pixels.** A PR link renders only when
   `tracking.publication.pr` exists — an absent PR is never a broken link or a
-  placeholder. Absence of a lifecycle observation renders as `unobserved`
-  (unknown), never as any completion-flavoured state. Nothing here creates,
-  merges, or re-derives a PR, and nothing writes Kubernetes or GitHub state.
+  placeholder — and only when the recorded value parses as an absolute http(s)
+  URL; any other value stays on screen as plain text, never as an href
+  (Courier's provenance is not scheme safety). The same http(s)-only gate
+  applies to the upstream-issue link. Absence of a lifecycle observation
+  renders as `unobserved` (unknown), never as any completion-flavoured state.
+  Nothing here creates, merges, or re-derives a PR, and nothing writes
+  Kubernetes or GitHub state.
 
 ## Non-goals
 

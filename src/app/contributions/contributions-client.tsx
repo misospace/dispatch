@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { hasControlChars, isValidRepoName } from "@/lib/config-parsers";
-import type { CourierSurfaceView } from "@/lib/external-contribution-view";
+import type { CourierSurfaceView, ExternalContributionWire } from "@/lib/external-contribution-view";
 import { ExternalLink, RefreshCw } from "lucide-react";
 
 /**
@@ -16,44 +16,15 @@ import { ExternalLink, RefreshCw } from "lucide-react";
  * The browser surface over the #1537/#1538 APIs. Every rule the API state
  * machines own stays owned by them: this page re-submits nothing on refresh,
  * shows a PR only when Courier's own projection recorded one, and treats a
- * missing lifecycle observation as unknown — never completion. Credentials
- * never reach here; the config panel renders presence booleans and the named
- * capability gaps produced server-side by `projectCourierSurface`.
+ * missing lifecycle observation as unknown — never completion. Credentials and
+ * the admission endpoint URL never reach here; the config panel renders only
+ * the presence booleans and the named capability gaps produced server-side by
+ * `projectCourierSurface`. Row types come from the shared projection's wire
+ * type, so the client cannot silently diverge from the server shape.
  */
 
-/** Client mirror of the shared projection (`external-contribution-view.ts`). */
-interface ContributionRow {
-  id: string;
-  idempotencyKey: string;
-  status: string;
-  run: string | null;
-  namespace: string;
-  workItemId: string | null;
-  resumed: boolean | null;
-  baseRepo: string;
-  baseRef: string;
-  workRepo: string;
-  lane: string;
-  goal: string;
-  upstreamIssue: string | null;
-  attempts: number;
-  lastError: string | null;
-  tracking: {
-    state: string | null;
-    stale: boolean;
-    phase: string | null;
-    ciParked: boolean | null;
-    cause: { category: string | null; outcome: string | null } | null;
-    publication: { pr: string | null; branch: string | null; headRepo: string | null; headSha: string | null } | null;
-    observedAt: string | null;
-    phaseEnteredAt: string | null;
-    finishedAt: string | null;
-    checkedAt: string | null;
-    lastError: string | null;
-  };
-  createdAt: string;
-  updatedAt: string | null;
-}
+/** What the routes answer with, derived from the shared projection (`external-contribution-view.ts`). */
+type ContributionRow = ExternalContributionWire;
 
 interface Notice {
   tone: "success" | "warning" | "error" | "info";
@@ -145,7 +116,40 @@ function TrackingBadge({ state, stale }: { state: string | null; stale: boolean 
   );
 }
 
+function NoticeLine({ notice }: { notice: Notice | null }) {
+  if (!notice) return null;
+  return <div className={noticeClass(notice.tone)} role="status">{notice.text}</div>;
+}
+
+/**
+ * True only for a parsed absolute http(s) URL. Every value this page turns
+ * into an outbound link is server- or Courier-supplied data; provenance is
+ * not scheme safety, so anything that fails to parse as http(s) renders as
+ * text, never as a clickable href (no `javascript:`, `data:`, or custom
+ * schemes reaching the address bar).
+ */
+function isHttpUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The recorded PR. Renders a link ONLY for a safe http(s) URL; a hostile or
+ * malformed value stays visible as plain text (the evidence is Courier's —
+ * hiding it would lie) but is never an href.
+ */
 function PrLink({ url }: { url: string }) {
+  if (!isHttpUrl(url)) {
+    return (
+      <span className="text-sm text-muted-foreground">
+        Recorded PR value is not an http(s) URL: <span className="font-mono text-xs">{url}</span>
+      </span>
+    );
+  }
   return (
     <a
       href={url}
@@ -158,11 +162,6 @@ function PrLink({ url }: { url: string }) {
       Pull request
     </a>
   );
-}
-
-function NoticeLine({ notice }: { notice: Notice | null }) {
-  if (!notice) return null;
-  return <div className={noticeClass(notice.tone)} role="status">{notice.text}</div>;
 }
 
 /**
@@ -227,13 +226,15 @@ function ConfigPanel({ config }: { config: CourierSurfaceView }) {
       <CardContent className="space-y-2 text-sm">
         <p className="text-muted-foreground">
           What is configured, without exposing any credential. Values here are
-          read server-side; the tokens themselves never reach the browser.
+          read server-side; neither the tokens nor the admission endpoint URL
+          ever reach the browser — the URL is credential-bearing transport
+          configuration.
         </p>
         <dl className="grid gap-x-6 gap-y-1 sm:grid-cols-2">
           <div className="flex gap-2">
             <dt className="text-muted-foreground">Admission endpoint</dt>
             <dd className="min-w-0 break-all font-medium">
-              {config.endpoint ?? <span className="text-muted-foreground">not configured</span>}
+              {config.endpointConfigured ? "configured" : <span className="text-muted-foreground">not configured</span>}
             </dd>
           </div>
           <div className="flex gap-2">
@@ -258,7 +259,7 @@ function ConfigPanel({ config }: { config: CourierSurfaceView }) {
   );
 }
 
-function DetailBlock({ row }: { row: ContributionRow }) {
+function DetailBlock({ row, maxAttempts }: { row: ContributionRow; maxAttempts: number }) {
   const t = row.tracking;
   return (
     <div className="space-y-4 text-sm">
@@ -269,7 +270,7 @@ function DetailBlock({ row }: { row: ContributionRow }) {
         <p><span className="text-muted-foreground">Courier namespace:</span> {row.namespace}</p>
         <p><span className="text-muted-foreground">Work item id:</span> {row.workItemId ?? "unknown"}</p>
         <p><span className="text-muted-foreground">Resumed by Courier:</span> {row.resumed === null ? "unknown" : row.resumed ? "yes" : "no"}</p>
-        <p><span className="text-muted-foreground">Admission attempts:</span> {row.attempts} of 5</p>
+        <p><span className="text-muted-foreground">Admission attempts:</span> {row.attempts} of {maxAttempts}</p>
         <p><span className="text-muted-foreground">Created:</span> {formatTimestamp(row.createdAt)}</p>
         <p><span className="text-muted-foreground">Base:</span> {row.baseRepo}@{row.baseRef}</p>
         <p><span className="text-muted-foreground">Work repo:</span> {row.workRepo}</p>
@@ -283,7 +284,7 @@ function DetailBlock({ row }: { row: ContributionRow }) {
       {row.upstreamIssue ? (
         <p>
           <span className="text-muted-foreground">Upstream issue:</span>{" "}
-          {/^https?:\/\//.test(row.upstreamIssue) ? (
+          {isHttpUrl(row.upstreamIssue) ? (
             <a href={row.upstreamIssue} target="_blank" rel="noreferrer" className="underline underline-offset-2">
               {row.upstreamIssue}
             </a>
@@ -341,6 +342,8 @@ export function ContributionsClient({ config }: { config: CourierSurfaceView }) 
   const [detail, setDetail] = useState<{ status: "loading" | "ready" | "error"; row?: ContributionRow; error?: string } | null>(null);
   const [refreshingId, setRefreshingId] = useState<string | null>(null);
   const [refreshNotice, setRefreshNotice] = useState<Notice | null>(null);
+  const [retryingId, setRetryingId] = useState<string | null>(null);
+  const [retryNotice, setRetryNotice] = useState<Notice | null>(null);
 
   const [form, setForm] = useState<FormState>(() => emptyForm(config.namespaces[0] ?? ""));
   const [idempotencyKey, setIdempotencyKey] = useState<string>(newClientKey);
@@ -442,6 +445,89 @@ export function ContributionsClient({ config }: { config: CourierSurfaceView }) 
         setRefreshNotice({ tone: "error", text: err instanceof Error ? err.message : "Refresh failed; stored evidence is unchanged." });
       } finally {
         setRefreshingId(null);
+      }
+    },
+    [upsertRow],
+  );
+
+  /**
+   * Retry an unsettled delivery FROM THE DURABLE IDENTITY (#1539 exactly-once).
+   * The React-state key dies with a reload, but the ledger row does not: this
+   * action rebuilds the canonical POST body from the stored row's own fields
+   * and re-sends it under the row's recorded `idempotencyKey`, so a retry
+   * after a reload replays the SAME request identity instead of forking a new
+   * one. Only unsettled `pending` / `uncertain` rows still inside the
+   * server-side attempt budget offer it — deliberately narrower than the
+   * server's atomic claim, which additionally recovers expired-lease
+   * `in_flight` rows. The server-side payload-digest guard is the
+   * backstop: a body that fails to match the stored canonical fields answers
+   * 409 `payload_conflict` and admits nothing.
+   */
+  const retryDelivery = useCallback(
+    async (row: ContributionRow) => {
+      setRetryingId(row.id);
+      setRetryNotice(null);
+      try {
+        const res = await authedFetch("/api/external-contributions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            namespace: row.namespace,
+            lane: row.lane,
+            baseRepo: row.baseRepo,
+            baseRef: row.baseRef,
+            workRepo: row.workRepo,
+            goal: row.goal,
+            ...(row.upstreamIssue ? { upstreamIssue: row.upstreamIssue } : {}),
+            idempotencyKey: row.idempotencyKey,
+          }),
+        });
+        const body = (await res.json().catch(() => null)) as
+          | (Partial<ContributionRow> & { error?: string })
+          | null;
+        const projected = body && typeof body.id === "string" ? (body as ContributionRow) : null;
+        if (projected) upsertRow(projected);
+        if (res.ok && projected?.status === "in_flight") {
+          setRetryNotice({
+            tone: "info",
+            text: "A Courier delivery attempt for this identity is already running; this retry did not start a second one.",
+          });
+        } else if (res.status === 201) {
+          setRetryNotice({
+            tone: "success",
+            text: `Re-delivered under the SAME request identity${projected?.run ? ` — courier run ${projected.run}` : ""}. Identity is admission proof only, not execution or publication.`,
+          });
+        } else if (res.ok && projected?.resumed) {
+          setRetryNotice({
+            tone: "success",
+            text: `Re-delivered under the SAME request identity — Courier resumed run ${projected.run}. Identity is admission proof only, not execution or publication.`,
+          });
+        } else if (res.ok) {
+          // 200 `replay_accepted`: the identity settled (possibly while this
+          // page sat open) — say so honestly instead of claiming this click
+          // delivered anything.
+          setRetryNotice({
+            tone: "info",
+            text: `This request identity is already settled with Courier${projected?.run ? ` (run ${projected.run})` : ""}; the retry replayed it and created nothing new.`,
+          });
+        } else if (res.status === 502 || res.status === 504) {
+          setRetryNotice({
+            tone: "warning",
+            text: `${body?.error ?? "Courier delivery remains uncertain."} The identity is unchanged — retrying again replays the SAME request while attempts remain.`,
+          });
+        } else {
+          setRetryNotice({
+            tone: "error",
+            text: body?.error ?? `Retry failed (HTTP ${res.status}). The stored request identity is unchanged.`,
+          });
+        }
+      } catch (err) {
+        setRetryNotice({
+          tone: "error",
+          text: err instanceof Error ? err.message : "Retry failed; the request may not have reached Dispatch.",
+        });
+      } finally {
+        setRetryingId(null);
       }
     },
     [upsertRow],
@@ -639,7 +725,9 @@ export function ContributionsClient({ config }: { config: CourierSurfaceView }) 
                 </Button>
                 <span className="text-xs text-muted-foreground">
                   One request identity per form session: an uncertain delivery retries the SAME request; a
-                  deliberate new contribution is a fresh submission after the last one settles.
+                  deliberate new contribution is a fresh submission after the last one settles. If the page is
+                  reloaded during an uncertain delivery, use “Retry delivery” on the stored request — it replays
+                  the recorded identity instead of starting a new one.
                 </span>
               </div>
               {problems.length > 0 ? (
@@ -662,9 +750,10 @@ export function ContributionsClient({ config }: { config: CourierSurfaceView }) 
           <CardTitle className="text-base">Stored requests</CardTitle>
         </CardHeader>
         <CardContent>
-          {refreshNotice ? (
-            <div className="mb-3">
+          {refreshNotice || retryNotice ? (
+            <div className="mb-3 space-y-2">
               <NoticeLine notice={refreshNotice} />
+              <NoticeLine notice={retryNotice} />
             </div>
           ) : null}
           {requests.length === 0 && !loading ? (
@@ -676,6 +765,15 @@ export function ContributionsClient({ config }: { config: CourierSurfaceView }) 
               {requests.map((row) => {
                 const expanded = expandedId === row.id;
                 const trackable = row.status === "accepted" && row.run !== null;
+                // Unsettled settled-outcome rows still inside the server's
+                // attempt budget — the durable retry path survives a reload.
+                // (A crashed `in_flight` row keeps no retry here; it stays
+                // recoverable only through a deliberate resubmission of the
+                // same identity, which is why this affordance is deliberately
+                // narrower than the server's claim.)
+                const retryable =
+                  (row.status === "uncertain" || row.status === "pending") &&
+                  row.attempts < config.maxDeliveryAttempts;
                 return (
                   <div key={row.id} className="rounded-md border">
                     <div className="flex flex-wrap items-center gap-x-4 gap-y-1 px-3 py-2 text-sm">
@@ -692,6 +790,18 @@ export function ContributionsClient({ config }: { config: CourierSurfaceView }) 
                           a placeholder for one that does not exist. */}
                       {row.tracking.publication?.pr ? <PrLink url={row.tracking.publication.pr} /> : null}
                       <span className="ml-auto flex items-center gap-2">
+                        {retryable ? (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={retryingId === row.id}
+                            onClick={() => retryDelivery(row)}
+                            title="Re-deliver this exact request under its recorded idempotency key — never a new identity"
+                          >
+                            <RefreshCw className={`mr-1 h-3 w-3 ${retryingId === row.id ? "animate-spin" : ""}`} />
+                            Retry delivery
+                          </Button>
+                        ) : null}
                         {trackable ? (
                           <Button
                             variant="outline"
@@ -720,9 +830,9 @@ export function ContributionsClient({ config }: { config: CourierSurfaceView }) 
                         ) : detail?.status === "error" ? (
                           <p className="text-sm text-destructive">{detail.error}</p>
                         ) : detail?.status === "ready" && detail.row?.id === row.id ? (
-                          <DetailBlock row={detail.row} />
+                          <DetailBlock row={detail.row} maxAttempts={config.maxDeliveryAttempts} />
                         ) : (
-                          <DetailBlock row={row} />
+                          <DetailBlock row={row} maxAttempts={config.maxDeliveryAttempts} />
                         )}
                       </div>
                     ) : null}

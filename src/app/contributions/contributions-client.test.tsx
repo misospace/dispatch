@@ -11,17 +11,18 @@ import { authedFetch } from "@/lib/client-auth";
 import type { CourierSurfaceView } from "@/lib/external-contribution-view";
 
 const configured: CourierSurfaceView = {
-  endpoint: "https://courier.internal/v1/contributions",
+  endpointConfigured: true,
   namespaces: ["team-alpha", "team-beta"],
   admissionTokenConfigured: true,
   readTokenConfigured: true,
   admissionReason: null,
   trackingAvailable: true,
   trackingReason: null,
+  maxDeliveryAttempts: 5,
 };
 
 const disabled: CourierSurfaceView = {
-  endpoint: null,
+  endpointConfigured: false,
   namespaces: [],
   admissionTokenConfigured: false,
   readTokenConfigured: false,
@@ -30,6 +31,7 @@ const disabled: CourierSurfaceView = {
   trackingAvailable: false,
   trackingReason:
     "Courier tracking is unavailable — the read-only credential is not configured. Set DISPATCH_COURIER_READ_TOKEN (the counterpart of Courier's contributeAPI.readKeySecret). Submission remains unaffected.",
+  maxDeliveryAttempts: 5,
 };
 
 function rowFixture(overrides: Record<string, unknown> = {}) {
@@ -91,14 +93,17 @@ beforeEach(() => {
 });
 
 describe("ContributionsClient", () => {
-  it("shows the configured surface (endpoint, namespaces, credential presence) without any credential", async () => {
+  it("shows the configured surface (endpoint presence, namespaces, credential presence) without credentials or the endpoint URL", async () => {
     vi.mocked(authedFetch).mockResolvedValue(listed());
     render(<ContributionsClient config={configured} />);
 
     await waitFor(() => expect(screen.getByText("No contribution requests recorded yet.")).toBeTruthy());
-    expect(screen.getByText("https://courier.internal/v1/contributions")).toBeTruthy();
+    // The panel shows endpoint PRESENCE only — the admission URL (credential-
+    // bearing transport config) never enters the browser tree.
+    expect(screen.getByText("Admission endpoint")).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("courier.internal");
     expect(screen.getByText("team-alpha, team-beta")).toBeTruthy();
-    expect(screen.getAllByText("configured").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText("configured").length).toBeGreaterThanOrEqual(3);
     expect(document.body.textContent).not.toMatch(/bearer|token: /i);
   });
 
@@ -193,6 +198,152 @@ describe("ContributionsClient", () => {
     await userEvent.click(screen.getByRole("button", { name: /submit contribution/i }));
     await waitFor(() => expect(vi.mocked(authedFetch)).toHaveBeenCalledTimes(3));
     expect(lastPostBody().idempotencyKey).toBe(uncertainKey);
+  });
+
+  it("replays the durable identity from the stored row after a reload instead of forking a new one", async () => {
+    // Session one: the submit lands in uncertain delivery; the ledger row
+    // (and its recorded key) is now the only durable copy of the identity.
+    vi.mocked(authedFetch)
+      .mockResolvedValueOnce(listed())
+      .mockResolvedValue(
+        json(
+          {
+            error: "courier admission timed out; delivery outcome unknown",
+            ...rowFixture({
+              status: "uncertain",
+              run: null,
+              tracking: { ...rowFixture().tracking, state: null, publication: null },
+            }),
+          },
+          504,
+        ),
+      );
+    const first = render(<ContributionsClient config={configured} />);
+    await waitFor(() => expect(first.getByText("No contribution requests recorded yet.")).toBeTruthy());
+    await userEvent.type(first.getByLabelText("Base repo"), "acme/widgets");
+    await userEvent.type(first.getByLabelText("Work repo"), "acme/widgets-fork");
+    await userEvent.type(first.getByLabelText("Goal"), "Add a widget");
+    await userEvent.click(first.getByRole("button", { name: /submit contribution/i }));
+    await waitFor(() => expect(first.getByText(/retries the SAME request identity/i)).toBeTruthy());
+    const durableKey = String(lastPostBody().idempotencyKey);
+    const canonical = lastPostBody();
+    first.unmount();
+
+    // Reload: a fresh mount starts a NEW form-session key; the ledger row is
+    // the durable identity, and "Retry delivery" must replay exactly it.
+    vi.mocked(authedFetch).mockReset();
+    vi.mocked(authedFetch).mockImplementation(async (url: string, options?: RequestInit) => {
+      if (url === "/api/external-contributions" && options?.method === "POST") {
+        return json(rowFixture({ status: "accepted", run: "run-42" }), 201);
+      }
+      if (url === "/api/external-contributions") {
+        return listed(
+          rowFixture({
+            status: "uncertain",
+            run: null,
+            idempotencyKey: durableKey,
+            tracking: { ...rowFixture().tracking, state: null, publication: null },
+          }),
+        );
+      }
+      throw new Error(`unexpected url ${url}`);
+    });
+    render(<ContributionsClient config={configured} />);
+    await waitFor(() => expect(screen.getByText("uncertain")).toBeInTheDocument());
+
+    await userEvent.click(screen.getByRole("button", { name: /retry delivery/i }));
+    await waitFor(() =>
+      expect(screen.getByText(/Re-delivered under the SAME request identity/)).toBeTruthy(),
+    );
+
+    const posts = vi
+      .mocked(authedFetch)
+      .mock.calls.filter(([, options]) => options?.method === "POST");
+    // Exactly one POST — the retry reused the stored identity, it did not add one.
+    expect(posts).toHaveLength(1);
+    const body = JSON.parse(String(posts[0]?.[1]?.body));
+    expect(body.idempotencyKey).toBe(durableKey);
+    expect(body).toMatchObject({
+      namespace: canonical.namespace,
+      lane: canonical.lane,
+      baseRepo: canonical.baseRepo,
+      baseRef: canonical.baseRef,
+      workRepo: canonical.workRepo,
+      goal: canonical.goal,
+    });
+  });
+
+  it("says a retry on an already-settled identity replayed it instead of claiming a new delivery", async () => {
+    const unsettled = rowFixture({
+      status: "uncertain",
+      run: null,
+      tracking: { ...rowFixture().tracking, state: null, publication: null },
+    });
+    vi.mocked(authedFetch).mockImplementation(async (url: string, options?: RequestInit) => {
+      if (url === "/api/external-contributions" && options?.method === "POST") {
+        // 200 replay_accepted: the identity had already settled elsewhere.
+        return json(rowFixture({ status: "accepted", run: "run-42" }), 200);
+      }
+      if (url === "/api/external-contributions") return listed(unsettled);
+      throw new Error(`unexpected url ${url}`);
+    });
+    render(<ContributionsClient config={configured} />);
+    await waitFor(() => expect(screen.getByText("uncertain")).toBeInTheDocument());
+
+    await userEvent.click(screen.getByRole("button", { name: /retry delivery/i }));
+    await waitFor(() =>
+      expect(screen.getByText(/already settled with Courier \(run run-42\).*created nothing new/i)).toBeTruthy(),
+    );
+  });
+
+  it("does not offer retry delivery once the attempt budget is spent", async () => {
+    vi.mocked(authedFetch).mockResolvedValue(
+      listed(
+        rowFixture({
+          status: "uncertain",
+          run: null,
+          attempts: 5,
+          tracking: { ...rowFixture().tracking, state: null, publication: null },
+        }),
+      ),
+    );
+    render(<ContributionsClient config={configured} />);
+    await waitFor(() => expect(screen.getByText("uncertain")).toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: /retry delivery/i })).toBeNull();
+  });
+
+  it("renders a recorded non-http(s) PR value as text, never as an href", async () => {
+    vi.mocked(authedFetch).mockResolvedValue(
+      listed(
+        rowFixture({
+          tracking: {
+            ...rowFixture().tracking,
+            publication: { ...rowFixture().tracking.publication, pr: "javascript:alert(1)" },
+          },
+        }),
+      ),
+    );
+    render(<ContributionsClient config={configured} />);
+    await waitFor(() => expect(screen.getByText("accepted")).toBeInTheDocument());
+
+    // The hostile value stays visible (honesty) but is never a clickable link.
+    expect(screen.queryByRole("link", { name: /pull request/i })).toBeNull();
+    expect(screen.getByText("javascript:alert(1)")).toBeInTheDocument();
+    expect(document.querySelector("a[href^='javascript:']")).toBeNull();
+  });
+
+  it("shows the attempt bound from the server config, not a client-side constant", async () => {
+    const seven = { ...configured, maxDeliveryAttempts: 7 };
+    vi.mocked(authedFetch).mockImplementation(async (url: string) => {
+      if (url === "/api/external-contributions") return listed(rowFixture());
+      if (url === "/api/external-contributions/req-1") return json(rowFixture());
+      throw new Error(`unexpected url ${url}`);
+    });
+    render(<ContributionsClient config={seven} />);
+    await waitFor(() => expect(screen.getByText("accepted")).toBeInTheDocument());
+
+    await userEvent.click(screen.getByRole("button", { name: /^details$/i }));
+    await waitFor(() => expect(screen.getByText(/of 7/)).toBeInTheDocument());
   });
 
   it("rotates the identity after a settled Courier rejection", async () => {

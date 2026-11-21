@@ -82,7 +82,7 @@ describe("projectExternalContribution", () => {
 });
 
 describe("projectCourierSurface (#1539)", () => {
-  it("shows endpoint, namespaces, and credential presence when configured — and no credential value", () => {
+  it("shows endpoint presence, namespaces, and credential presence when configured — and no credential or endpoint value", () => {
     process.env.DISPATCH_COURIER_ADMISSION_URL = "https://courier.internal/v1/contributions";
     process.env.DISPATCH_COURIER_ADMISSION_TOKEN = "admission-secret-value";
     process.env.DISPATCH_COURIER_ADMISSION_NAMESPACES = "team-alpha, team-beta";
@@ -90,27 +90,49 @@ describe("projectCourierSurface (#1539)", () => {
 
     const surface = projectCourierSurface();
     expect(surface).toEqual({
-      endpoint: "https://courier.internal/v1/contributions",
+      endpointConfigured: true,
       namespaces: ["team-alpha", "team-beta"],
       admissionTokenConfigured: true,
       readTokenConfigured: true,
       admissionReason: null,
       trackingAvailable: true,
       trackingReason: null,
+      maxDeliveryAttempts: 5,
     });
     const serialized = JSON.stringify(surface);
     expect(serialized).not.toContain("admission-secret-value");
     expect(serialized).not.toContain("read-secret-value");
+    // The endpoint URL never crosses into the browser projection at all.
+    expect(serialized).not.toContain("courier.internal");
   });
 
-  it("names each missing capability when unconfigured, and never exposes a half-configured endpoint", () => {
+  it("never serializes a credential-bearing endpoint URL into the surface view", () => {
+    // Config resolution validates scheme/host but not userinfo or query, so an
+    // operator URL may legally carry userinfo or a token-like parameter. The
+    // view exposes presence only, so none of it may reach the projection.
+    process.env.DISPATCH_COURIER_ADMISSION_URL =
+      "https://user:pass@gw.internal:8443/v1/contributions?token=qs3cret";
+    process.env.DISPATCH_COURIER_ADMISSION_TOKEN = "admission-secret-value";
+    process.env.DISPATCH_COURIER_ADMISSION_NAMESPACES = "team-alpha";
+    process.env.DISPATCH_COURIER_READ_TOKEN = "read-secret-value";
+
+    const serialized = JSON.stringify(projectCourierSurface());
+    expect(serialized).not.toContain("gw.internal");
+    expect(serialized).not.toContain("user:pass");
+    expect(serialized).not.toContain("qs3cret");
+    expect(serialized).not.toContain("admission-secret-value");
+    expect(serialized).not.toContain("read-secret-value");
+    expect(projectCourierSurface().endpointConfigured).toBe(true);
+  });
+
+  it("names each missing capability when unconfigured, and never claims a configured endpoint", () => {
     delete process.env.DISPATCH_COURIER_ADMISSION_URL;
     delete process.env.DISPATCH_COURIER_ADMISSION_TOKEN;
     delete process.env.DISPATCH_COURIER_ADMISSION_NAMESPACES;
     delete process.env.DISPATCH_COURIER_READ_TOKEN;
 
     const surface = projectCourierSurface();
-    expect(surface.endpoint).toBeNull();
+    expect(surface.endpointConfigured).toBe(false);
     expect(surface.namespaces).toEqual([]);
     expect(surface.admissionTokenConfigured).toBe(false);
     expect(surface.readTokenConfigured).toBe(false);
@@ -127,7 +149,7 @@ describe("projectCourierSurface (#1539)", () => {
 
     const surface = projectCourierSurface();
     expect(surface.namespaces).toEqual(["team-alpha"]);
-    expect(surface.endpoint).toBeNull();
+    expect(surface.endpointConfigured).toBe(false);
     expect(surface.admissionReason).toContain("submission is disabled");
   });
 
