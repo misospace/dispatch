@@ -1,10 +1,12 @@
-# External contribution requests (#1537, parent #1349)
+# External contribution requests (#1537, #1538, parent #1349)
 
 Dispatch can persist a request to contribute work to an external repository and
-submit it — once, exactly — to Courier's HTTP admission API. Dispatch stays
-**optional**: nothing in this feature touches ordinary issue scheduling, the
-agent queue, or the PR-fix queue, and a missing or broken Courier configuration
-only disables submission itself.
+submit it — once, exactly — to Courier's HTTP admission API. Dispatch then
+tracks the Courier run's lifecycle with the read-only status API (#1538).
+Dispatch stays **optional**: nothing in this feature touches ordinary issue
+scheduling, the agent queue, or the PR-fix queue. A missing or broken Courier
+configuration disables submission, tracking, or both, and each gap names
+itself.
 
 ## Boundaries
 
@@ -18,23 +20,39 @@ only disables submission itself.
   Courier is **not** proof of successful execution or publication.
 - **Credentials stay server-side.** The admission token is read from
   `DISPATCH_COURIER_ADMISSION_TOKEN`, attached only to the operator-configured
-  endpoint, and never logged, stored, or returned. Every diagnostic is
-  token-redacted (`redactSecret`) before it can reach a log line, the ledger,
-  the audit log, or a response.
+  endpoint, and never logged, stored, or returned. Lifecycle reads use a
+  SECOND, read-only credential, `DISPATCH_COURIER_READ_TOKEN` (the counterpart
+  of Courier's `contributeAPI.readKeySecret`). Courier admits no read with the
+  admission token and submits no admission with the read token, so tracking can
+  be handed read-only authority. Every diagnostic is token-redacted
+  (`redactSecret`) before it can reach a log line, the ledger, the audit log,
+  or a response.
 - **No client-selected destination.** The endpoint comes from
   `DISPATCH_COURIER_ADMISSION_URL`; the fetch runs with `redirect: "error"` so a
   redirect can never carry the credential to another URL. The namespace must be
   on the operator-approved `DISPATCH_COURIER_ADMISSION_NAMESPACES` list.
+  Tracking derives its status URL from the same configured surface plus the
+  stored run identity — nothing else.
 - **No privileged toggles from the browser.** `fresh`/`debug` are Courier
   operator choices and are never part of the payload Dispatch builds.
 
-## Wire contract (Courier #708, at v0.1.18)
+## Wire contract (Courier #708 + #836, at Courier v0.1.26)
 
-`internal/source/adhoc/server.go` accepts `POST /v1/contributions` only. The
-`AdmissionRequest` carries `namespace`, `lane`, `baseRepo`, `baseRef`,
-`workRepo`, `goal`, optional `upstreamIssue`, and `idempotencyKey`. Responses
-contain `run`, `namespace`, `workItemId`, and `resumed` — 201 for creation, 200
-for resume.
+`internal/source/adhoc/server.go` accepts `POST /v1/contributions` for
+admission. The `AdmissionRequest` carries `namespace`, `lane`, `baseRepo`,
+`baseRef`, `workRepo`, `goal`, optional `upstreamIssue`, and `idempotencyKey`.
+Responses contain `run`, `namespace`, `workItemId`, and `resumed` — 201 for
+creation, 200 for resume.
+
+Lifecycle reads (Courier #836) use `GET /v1/contributions/<run>?namespace=<ns>`
+on the same surface, authenticated with the read-only bearer token. The 200
+body is a fixed-shape allowlist: `run`, `namespace`, `lane`, `baseRepo`,
+`workRepo`, `phase`, `ciParked`, `observedAt`, optional
+`publication{branch,headRepo,headSha,pr}`, optional `cause{category,outcome}`,
+and optional lifecycle timestamps. The shipped contract does NOT echo
+`workItemId` (it is caller-supplied text; Courier's #819 keeps it out). The
+`/v1` path prefix is the contract version: Dispatch refuses a 2xx body that
+fails this shape instead of guessing it into state.
 
 ## API
 
@@ -145,8 +163,116 @@ double-submit), so attempt ownership is durable state:
 4. A deliberate new contribution is a separate explicit submission with its own
    (new) identity.
 
+## Lifecycle tracking (#1538)
+
+Submission proves admission. It proves nothing about execution or publication.
+Tracking reads Courier's own recorded state and attaches each observation to
+the run identity stored on the request row.
+
+### Configuration
+
+| Variable | Meaning |
+|---|---|
+| `DISPATCH_COURIER_READ_TOKEN` | Read-only bearer credential for status reads. Unset = tracking unavailable; submission keeps working. |
+| `DISPATCH_COURIER_TRACKING_STALE_MS` | Age after which non-final evidence is reported `stale` (default 900000 = 15m, clamped 30s–24h). |
+
+The status URL is derived from `DISPATCH_COURIER_ADMISSION_URL` plus the stored
+run identity. There is no other destination and no lookup by anything other
+than the `run` + `namespace` the admission returned.
+
+### API
+
+All three surfaces are maintainer tier only (absent from the worker allowlist).
+
+- `GET /api/external-contributions` — stored-evidence listing (newest first,
+  `?limit=`, max 200). Pure ledger read; works while Courier is unreachable.
+- `GET /api/external-contributions/[id]` — one request's stored record and its
+  last trustworthy observation. Pure ledger read.
+- `POST /api/external-contributions/[id]/refresh` — one bounded status read for
+  an accepted request. Only accepted requests are trackable (409 otherwise).
+
+The `tracking` object on every projection:
+
+```json
+{
+  "state": "published",
+  "stale": false,
+  "phase": "AwaitingReview",
+  "ciParked": false,
+  "cause": null,
+  "publication": { "pr": "https://github.com/acme/widgets/pull/42", "branch": "courier/…", "headRepo": "bot/widgets", "headSha": "ab12…" },
+  "observedAt": "…",
+  "phaseEnteredAt": "…",
+  "finishedAt": null,
+  "checkedAt": "…",
+  "lastError": null
+}
+```
+
+Refresh response statuses:
+
+| Status | When |
+|---|---|
+| 200 | Observation recorded, a 404 recorded as `expired`, the cooldown window held (`refreshed: false`, `cooldownRemainingMs`), or a newer refresh superseded this read (`refreshed: false`, `superseded: true`) |
+| 404 | No such request |
+| 409 | The request was never accepted — there is no run identity to track |
+| 502 | Identity mismatch refused the observation; nothing was recorded but the diagnostic |
+| 503 | Tracking not configured (names the missing piece), or Courier refused / could not answer |
+| 504 | Courier sent no answer in time |
+
+### Tracking states
+
+`tracking.state` is derived only from VERIFIED observations (see identity
+binding below):
+
+| State | Set when |
+|---|---|
+| `admitted` | Courier accepted the request; no fresher observation yet, or the run is `Pending`/phase-unstamped |
+| `executing` | Phase `Claimed`, `Running`, or `Verifying` (`ciParked` distinguishes a durable CI park) |
+| `published` | Courier's own projection recorded a PR (`publication.pr`). A phase name alone never produces this state |
+| `completed` | Terminal success (`Done`/`AlreadyDone`) with no PR evidence |
+| `failed` | Terminal failure (`Failed`, `NeedsHuman`, `BlockedExternal`), with the bounded `cause{category,outcome}` when Courier recorded one |
+| `unavailable` | A refresh failed (refusal, 5xx, timeout, incompatible shape) before any state was ever observed |
+| `expired` | A 404 for a run Dispatch admitted, with no final evidence persisted. Explicit lost-run state — never completion |
+
+Rules:
+
+- **Identity binding.** A 200 response must echo the stored `run`,
+  `namespace`, `lane`, `baseRepo`, and `workRepo`. Any mismatch refuses the
+  whole observation: no phase, no publication, only a field-named diagnostic.
+- **Unknown keeps the last state.** The projection value `unknown`, the
+  recorded endings `AwaitingReview` (without PR evidence) and `HandedOff`,
+  and any unrecognized phase derive nothing new (the CRD enum can gain
+  phases; `AwaitingReview` without a recorded PR cannot be asserted as
+  published, and `HandedOff` declares neither success nor failure — the
+  verbatim `phase` field names the real ending). The one exception is
+  `unavailable`: it recorded no evidence, so the first trustworthy
+  observation replaces it.
+- **Retention is explicit loss.** A 404 is ambiguous by design on the Courier
+  side (missing, foreign, or reaped). For a run we admitted it means the
+  evidence is gone. Final evidence already persisted (a PR, a success, a
+  failure) survives the reaper because we recorded it while readable; the 404
+  then only notes the loss. Nothing final yet becomes `expired`.
+- **Publication is durable.** Once recorded, a partial later projection never
+  erases an earlier publication field.
+- **Cause is durable.** The bounded `cause{category,outcome}` is recorded
+  once at a run's ending; a later projection without a `cause` block never
+  erases it.
+- **Refresh is bounded and duplicate-prevented.** One read per row per
+  `TRACKING_REFRESH_COOLDOWN_MS` (15s — Courier paces frontends at 15–30s).
+  The window is claimed by one conditional `updateMany`, so it holds across
+  Dispatch instances; losers get the stored evidence with 200
+  `refreshed: false`. The claim timestamp also owns the settlement: an answer
+  that arrives after a newer claim took the window is dropped (`superseded`),
+  so a slow stale read can never regress the recorded evidence. A refresh
+  never re-submits the contribution — every request it makes is a GET. A
+  `503 Retry-After` is surfaced to the caller.
+- **Missing capability, named.** No read token configured answers 503 with the
+  missing piece and leaves submission untouched.
+
 ## Non-goals
 
-Status polling, a browser UI, fork discovery/creation, PR publication logic,
-automatic execution retries after a terminal Courier failure, and production
-enablement (the feature is off until an operator configures it).
+A browser UI, fork discovery/creation, PR publication logic, automatic
+execution retries after a terminal Courier failure, and production enablement
+(the feature is off until an operator configures it). Status polling is NOT a
+non-goal since #1538 — see above.
