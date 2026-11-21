@@ -41,3 +41,22 @@ export function rebaseWorkItem(stateLabel: string): {
     ].join("\n"),
   };
 }
+
+/**
+ * Whether a stored feedback entry carries the mechanical rebase instruction
+ * wall above (#1327). The wall is the mechanical-only lane's worker contract,
+ * so the #1675 REBASE→fix transfer drops entries matching this from the
+ * transferred repair attempt's retained feedback: a transferred row is an
+ * ordinary model-assisted repair attempt, and carrying the wall would hand
+ * its worker contradictory mechanical-only instructions. Anchored here (the
+ * wall's single producer) so the marker cannot drift from the text workers
+ * actually receive.
+ */
+export function isMechanicalRebaseInstruction(entry: unknown): boolean {
+  if (typeof entry !== "string") return false;
+  const trimmed = entry.trim();
+  return (
+    trimmed.startsWith("Mechanical rebase required:") ||
+    trimmed.includes("resolve conflicts MECHANICALLY ONLY")
+  );
+}
