@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 vi.mock("@/lib/client-auth", () => ({
@@ -212,6 +212,24 @@ describe("ContributionsClient", () => {
     await userEvent.click(screen.getByRole("button", { name: /submit contribution/i }));
     await waitFor(() => expect(vi.mocked(authedFetch)).toHaveBeenCalledTimes(3));
     expect(lastPostBody().idempotencyKey).not.toBe(rejectedKey);
+  });
+
+  it("rejects control characters in lane before submitting, mirroring the server rule", async () => {
+    vi.mocked(authedFetch).mockResolvedValue(listed());
+    render(<ContributionsClient config={configured} />);
+    await waitFor(() => expect(screen.getByText("No contribution requests recorded yet.")).toBeTruthy());
+
+    await userEvent.type(screen.getByLabelText("Base repo"), "acme/widgets");
+    await userEvent.type(screen.getByLabelText("Work repo"), "acme/widgets-fork");
+    await userEvent.type(screen.getByLabelText("Goal"), "Add a widget");
+    fireEvent.input(screen.getByLabelText("Lane"), { target: { value: "contrib\tution" } });
+    await userEvent.click(screen.getByRole("button", { name: /submit contribution/i }));
+
+    await waitFor(() =>
+      expect(screen.getByText("lane must not contain control characters.")).toBeTruthy(),
+    );
+    // Only the initial list load happened — the invalid form never submitted.
+    expect(vi.mocked(authedFetch)).toHaveBeenCalledTimes(1);
   });
 
   it("opens one request's details from the ledger route and shows the recorded goal", async () => {

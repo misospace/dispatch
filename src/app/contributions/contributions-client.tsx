@@ -6,7 +6,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { isValidRepoName } from "@/lib/config-parsers";
+import { hasControlChars, isValidRepoName } from "@/lib/config-parsers";
 import type { CourierSurfaceView } from "@/lib/external-contribution-view";
 import { ExternalLink, RefreshCw } from "lucide-react";
 
@@ -165,7 +165,13 @@ function NoticeLine({ notice }: { notice: Notice | null }) {
   return <div className={noticeClass(notice.tone)} role="status">{notice.text}</div>;
 }
 
-/** Mirror of the API-side shape bounds so the operator sees them before a 400. */
+/**
+ * Mirror of the API-side shape bounds (`parseContributionInput`) so the
+ * operator sees them before a 400. Lane stays bounded free text on purpose:
+ * Courier owns lane semantics and the wire relays it verbatim, so this form
+ * constrains its SHAPE with the same shared rules the server enforces —
+ * never its VALUE. The privileged choice (namespace) is select-only.
+ */
 function validateForm(form: FormState, namespaces: string[]): string[] {
   const problems: string[] = [];
   if (!namespaces.includes(form.namespace.trim())) {
@@ -174,15 +180,19 @@ function validateForm(form: FormState, namespaces: string[]): string[] {
   const lane = form.lane.trim();
   if (!lane) problems.push("lane is required.");
   else if (lane.length > 64) problems.push("lane is too long (max 64 characters).");
+  else if (hasControlChars(lane)) problems.push("lane must not contain control characters.");
   if (!isValidRepoName(form.baseRepo.trim())) problems.push("baseRepo must be owner/repo.");
   if (!isValidRepoName(form.workRepo.trim())) problems.push("workRepo must be owner/repo.");
   const baseRef = form.baseRef.trim();
   if (!baseRef) problems.push("baseRef is required.");
   else if (baseRef.length > 256) problems.push("baseRef is too long (max 256 characters).");
+  else if (hasControlChars(baseRef)) problems.push("baseRef must not contain control characters.");
   if (!form.goal.trim()) problems.push("goal is required.");
   else if (form.goal.length > 10_000) problems.push("goal is too long (max 10000 characters).");
   const upstream = form.upstreamIssue.trim();
   if (upstream.length > 512) problems.push("upstreamIssue is too long (max 512 characters).");
+  else if (hasControlChars(upstream))
+    problems.push("upstreamIssue must not contain control characters.");
   return problems;
 }
 
@@ -567,7 +577,7 @@ export function ContributionsClient({ config }: { config: CourierSurfaceView }) 
                   </select>
                 </label>
                 <label className="space-y-1 text-sm">
-                  <span className="text-muted-foreground">Lane</span>
+                  <span className="text-muted-foreground">Lane (bounded free text, relayed verbatim)</span>
                   <Input
                     aria-label="Lane"
                     value={form.lane}
