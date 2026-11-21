@@ -60,7 +60,7 @@ vi.mock("./github-prs", () => ({
 // keep the import alive without touching a real database.
 vi.mock("@/lib/prisma", () => ({ prisma: {} }));
 
-import { rebaseWorkItem } from "./pr-fix-rebase";
+import { rebaseWorkItem, isMechanicalRebaseInstruction } from "./pr-fix-rebase";
 import { conditionEvidenceKey } from "./pr-fix-evidence";
 import { ingestMergeConflict, clearResolvedConflictItems } from "./pr-followup-ingestion";
 import {
@@ -384,6 +384,20 @@ describe("parseRebaseRefusal (#1675)", () => {
     expect(parseRebaseRefusal(refusalPayload({ expectedRemoteHead: "x".repeat(101) })).ok).toBe(false);
   });
 
+  it("rejects control characters in conflicting-file entries so the route 400s, not storage", () => {
+    // A NUL byte in a stored path would make Postgres reject the report
+    // write (dispatch#1126) instead of failing closed at the shape gate.
+    for (const hostile of ["src/\u0000lib/a.ts", "src/\u0001lib/a.ts", "src/lib/\u007Fts", "src/\u001Blib/a.ts"]) {
+      const parsed = parseRebaseRefusal(refusalPayload({ conflictingFiles: [hostile] }));
+      expect(parsed.ok).toBe(false);
+      if (!parsed.ok) {
+        expect(parsed.reason).toMatch(/must not contain control characters/);
+      }
+    }
+    // The hostile entry is refused as a whole: nothing is stored.
+    expect(parseRebaseRefusal(refusalPayload({ conflictingFiles: ["src/lib/a.ts", "bad\u0000path"] })).ok).toBe(false);
+  });
+
   it("accepts other kinds for RECORDING but they never authorize a transfer", () => {
     const parsed = parseRebaseRefusal({ kind: "auth_failure" });
     expect(parsed.ok).toBe(true);
@@ -406,9 +420,14 @@ describe("transferRebaseEpisodeToFix (#1675)", () => {
     expect(result.action).toBe("transferred");
 
     const row = client.items[0];
-    // One authorized ordinary fix attempt at the next generation.
+    // One authorized ordinary fix attempt at the next generation. The row is
+    // an ORDINARY model-assisted repair attempt, never a mechanical-only
+    // MERGE_CONFLICT row (the worker contract gives that type the same
+    // mechanical-only walls as REBASE).
     expect(row.status).toBe("QUEUED");
-    expect(row.type).toBe("MERGE_CONFLICT");
+    expect(row.type).toBe("OTHER");
+    expect(row.type).not.toBe("MERGE_CONFLICT");
+    expect(row.type).not.toBe("REBASE");
     expect(row.generation).toBe(GENERATION + 1);
     expect(row.attemptType).toBeNull(); // re-stamped by the next hand-out
     expect(row.fixAttempts).toBe(2);
@@ -425,10 +444,16 @@ describe("transferRebaseEpisodeToFix (#1675)", () => {
     expect(row.rebaseEpisodeId).toBe(rebaseEpisodeIdentity(REPO, PR, BRANCH, HEAD));
     expect(row.rebaseEpisodeGeneration).toBe(GENERATION);
     expect(row.rebaseEpisodeTransferredAt).toBeInstanceOf(Date);
-    // The fix worker receives the bounded mechanical-failure context.
+    // The fix worker receives the bounded mechanical-failure context — and
+    // NOT the mechanical-only instruction wall: contradictory instructions
+    // would make the transfer something other than an ordinary repair
+    // attempt. Ordinary non-mechanical feedback (none in this fixture) is
+    // retained.
     expect(row.feedback.some((line: string) => line.includes("single authorized repair attempt"))).toBe(true);
     expect(row.feedback.some((line: string) => line.includes("package-lock.json"))).toBe(true);
     expect(row.feedback.some((line: string) => line.includes("semantic decision"))).toBe(true);
+    expect(row.feedback.some((line: string) => isMechanicalRebaseInstruction(line))).toBe(false);
+    expect(row.feedback.some((line: string) => line.includes("resolve conflicts MECHANICALLY ONLY"))).toBe(false);
     // Exactly one audit row.
     const transfers = client.history.filter((h: any) => h.action === "rebase_transfer");
     expect(transfers).toHaveLength(1);
@@ -600,7 +625,8 @@ describe("resolvePrFixFromAgentReport: REBASE→fix transfer (#1675)", () => {
     expect(result.matched).toBe(true);
     expect(result.action).toBe("requeued");
     expect(result.reason).toContain("transferred");
-    expect(client.items[0].type).toBe("MERGE_CONFLICT");
+    // An ordinary model-assisted repair attempt, never a mechanical-only row.
+    expect(client.items[0].type).toBe("OTHER");
     expect(client.items[0].generation).toBe(GENERATION + 1);
     expect(client.items[0].rebaseEpisodeTransferred).toBe(true);
     // Not a BLOCKED settlement: no needs-human surfacing.
@@ -626,7 +652,7 @@ describe("resolvePrFixFromAgentReport: REBASE→fix transfer (#1675)", () => {
     seedRebaseRow(client);
     await resolvePrFixFromAgentReport(reportInput(client) as any);
     const after = client.items[0];
-    expect(after.type).toBe("MERGE_CONFLICT");
+    expect(after.type).toBe("OTHER");
     expect(after.status).toBe("QUEUED");
 
     // The periodic sync re-reads the still-conflicting PR at the SAME head.
@@ -646,7 +672,7 @@ describe("resolvePrFixFromAgentReport: REBASE→fix transfer (#1675)", () => {
     const row = client.items[0];
     // The lane write was suppressed and no fresh attempt was minted: the
     // transferred fix attempt is untouched.
-    expect(row.type).toBe("MERGE_CONFLICT");
+    expect(row.type).toBe("OTHER");
     expect(row.status).toBe("QUEUED");
     expect(row.generation).toBe(GENERATION + 1);
     expect(row.rebaseEpisodeTransferred).toBe(true);
@@ -654,8 +680,10 @@ describe("resolvePrFixFromAgentReport: REBASE→fix transfer (#1675)", () => {
       (h: any) => h.action === "enqueue" && String(h.note ?? "").includes("REBASE type write was suppressed"),
     );
     expect(suppressionNotes).toHaveLength(1);
-    // The rebase instruction wall was NOT re-appended: exactly the seeded one.
-    expect(row.feedback.filter((line: string) => line.includes("resolve conflicts MECHANICALLY ONLY"))).toHaveLength(1);
+    // The mechanical instruction wall the transfer dropped is NOT
+    // re-appended by the suppressed resync: the row keeps the ordinary
+    // repair attempt's feedback.
+    expect(row.feedback.filter((line: string) => isMechanicalRebaseInstruction(line))).toHaveLength(0);
   });
 
   it("restart/resync with a branch-less observation derives the SAME episode identity (no bounce)", async () => {
@@ -674,7 +702,7 @@ describe("resolvePrFixFromAgentReport: REBASE→fix transfer (#1675)", () => {
       headSha: HEAD,
       source: "sync",
     });
-    expect(client.items[0].type).toBe("MERGE_CONFLICT");
+    expect(client.items[0].type).toBe("OTHER");
     expect(client.items[0].rebaseEpisodeTransferred).toBe(true);
   });
 
@@ -721,7 +749,7 @@ describe("resolvePrFixFromAgentReport: REBASE→fix transfer (#1675)", () => {
     expect(failed.action).toBe("requeued");
     expect(client.items[0].generation).toBe(GENERATION + 2);
     expect(client.items[0].stagnationCount).toBe(2);
-    expect(client.items[0].type).toBe("MERGE_CONFLICT");
+    expect(client.items[0].type).toBe("OTHER");
     // A resync between failures still cannot bounce the row onto REBASE.
     await ingestMergeConflict(client as any, {
       repoFullName: REPO,
@@ -735,7 +763,7 @@ describe("resolvePrFixFromAgentReport: REBASE→fix transfer (#1675)", () => {
       headSha: HEAD,
       source: "sync",
     });
-    expect(client.items[0].type).toBe("MERGE_CONFLICT");
+    expect(client.items[0].type).toBe("OTHER");
   });
 
   it("changed remote head settles the report as an ordinary BLOCKED human decision, with the decline audited", async () => {

@@ -1,6 +1,7 @@
 import { fetchPullRequestHeadSha } from "../github-prs";
 import { normalizePrFixType } from "@/types";
 import { sanitizeForStorage } from "../groomer/sanitize";
+import { isMechanicalRebaseInstruction } from "../pr-fix-rebase";
 import { type PrFixQueueClient } from "./client";
 import { uniqueAppend } from "./shared";
 import { linkedIssueEscalationClassified, preserveEscalationLane, releaseLaneFromParentClass } from "./escalation-lane";
@@ -94,6 +95,16 @@ const MAX_HEAD_LENGTH = 100;
 const MAX_KIND_LENGTH = 64;
 
 /**
+ * A conflicting-file entry is structured evidence (a path), not free text: any
+ * control character — NUL (U+0000) included, which Postgres rejects outright
+ * in text and jsonb (dispatch#1126) — is a malformed value and fails closed
+ * here, so the route 400s instead of the report write throwing in storage.
+ * C0 controls and DEL; \t/\n/\r at a path's edges are already removed by the
+ * trim below, and inside a path they are malformed too.
+ */
+const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001F\u007F]/;
+
+/**
  * Parse the structured nonmechanical-conflict refusal. Shape validation ONLY
  * (the route 400s on a `false`); the `kind` check that decides eligibility
  * lives in `isTransferEligibleRefusal` so an unknown kind can still be
@@ -123,6 +134,9 @@ export function parseRebaseRefusal(
     for (const file of files) {
       if (typeof file !== "string" || file.trim().length === 0 || file.trim().length > MAX_FILE_PATH_LENGTH) {
         return { ok: false, reason: `rebaseRefusal.conflictingFiles entries must be non-empty strings of at most ${MAX_FILE_PATH_LENGTH} characters` };
+      }
+      if (CONTROL_CHARACTER_PATTERN.test(file.trim())) {
+        return { ok: false, reason: "rebaseRefusal.conflictingFiles entries must not contain control characters" };
       }
     }
     conflictingFiles = files.map((file) => (file as string).trim());
@@ -370,16 +384,29 @@ export async function transferRebaseEpisodeToFix(
     // cleared), release the consumed rebase hand-out, and open the ONE
     // authorized ordinary fix attempt — plus the episode record — atomically.
     const feedbackLines = buildTransferFeedback(input.refusal, episodeId);
-    let feedback: string[] = Array.isArray(row.feedback) ? [...row.feedback] : [];
+    // The mechanical-only instruction wall (#1327) is the REBASE lane's worker
+    // contract, not evidence: a transferred row is an ordinary model-assisted
+    // repair attempt (#1675), and carrying the wall would hand its worker
+    // contradictory mechanical-only and repair instructions. Other retained
+    // feedback (ordinary observations, e.g. review evidence) is kept.
+    const retainedFeedback: string[] = Array.isArray(row.feedback) ? [...row.feedback] : [];
+    let feedback: string[] = retainedFeedback.filter((line) => !isMechanicalRebaseInstruction(line));
     for (const line of feedbackLines) {
       feedback = uniqueAppend(feedback, line, 12);
     }
     const transferData: Record<string, unknown> = {
       status: "QUEUED",
-      // The transferred lane is an ordinary conflict-fix attempt (not REBASE):
-      // this is also what makes `clearResolvedConflictItems` treat the row as
-      // a conflicts item with its normal success path.
-      type: "MERGE_CONFLICT",
+      // The transferred lane is an ORDINARY model-assisted repair attempt
+      // (#1675), not a mechanical-only conflict row: the worker contract
+      // defines MERGE_CONFLICT as carrying the same mechanical-only walls as
+      // REBASE, so a MERGE_CONFLICT-typed repair row would dispatch with
+      // contradictory instructions. OTHER is the ordinary requested-changes
+      // lane; the bounded refusal evidence in the feedback carries the repair
+      // context. The episode record below is what keeps
+      // `clearResolvedConflictItems` treating the row as a conflicts item
+      // with its normal success path — the row's conflicts-item identity
+      // moves from its (now ordinary) type to the transferred-episode marker.
+      type: "OTHER",
       // #1503: the transferred attempt keeps the exclusive lane for a
       // frontier parent — a mechanical exception must never become an
       // implicit bypass of escalation exclusivity.
