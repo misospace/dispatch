@@ -428,6 +428,51 @@ describe("ContributionsClient", () => {
     );
   });
 
+  it("shows an unauthorized list response honestly", async () => {
+    vi.mocked(authedFetch).mockResolvedValue(json({ error: "Unauthorized" }, 401));
+    render(<ContributionsClient config={configured} />);
+
+    await waitFor(() =>
+      expect(screen.getByText("contribution listing failed: HTTP 401")).toBeInTheDocument(),
+    );
+    // No rows are invented for a denied read.
+    expect(screen.queryByText("acme/widgets ← acme/widgets-fork")).toBeNull();
+
+    vi.mocked(authedFetch).mockClear();
+    vi.mocked(authedFetch).mockResolvedValue(json({ error: "Forbidden" }, 403));
+    render(<ContributionsClient config={configured} />);
+    await waitFor(() =>
+      expect(screen.getByText("contribution listing failed: HTTP 403")).toBeInTheDocument(),
+    );
+  });
+
+  it("rejects an invalid owner/repo value before submitting", async () => {
+    vi.mocked(authedFetch).mockResolvedValue(listed());
+    render(<ContributionsClient config={configured} />);
+    await waitFor(() => expect(screen.getByText("No contribution requests recorded yet.")).toBeTruthy());
+
+    await userEvent.type(screen.getByLabelText("Base repo"), "not-a-repo");
+    await userEvent.type(screen.getByLabelText("Work repo"), "acme/widgets-fork");
+    await userEvent.type(screen.getByLabelText("Goal"), "Add a widget");
+    await userEvent.click(screen.getByRole("button", { name: /submit contribution/i }));
+
+    await waitFor(() =>
+      expect(screen.getByText("baseRepo must be owner/repo.")).toBeInTheDocument(),
+    );
+    // Only the initial list load happened — the invalid form never submitted.
+    expect(vi.mocked(authedFetch)).toHaveBeenCalledTimes(1);
+
+    await userEvent.clear(screen.getByLabelText("Base repo"));
+    await userEvent.type(screen.getByLabelText("Base repo"), "acme/widgets");
+    await userEvent.clear(screen.getByLabelText("Work repo"));
+    await userEvent.type(screen.getByLabelText("Work repo"), "just-a-name");
+    await userEvent.click(screen.getByRole("button", { name: /submit contribution/i }));
+    await waitFor(() =>
+      expect(screen.getByText("workRepo must be owner/repo.")).toBeInTheDocument(),
+    );
+    expect(vi.mocked(authedFetch)).toHaveBeenCalledTimes(1);
+  });
+
   it("shows a failed refresh without hiding it behind a generic failure", async () => {
     vi.mocked(authedFetch).mockImplementation(async (url: string, options?: RequestInit) => {
       if (url === "/api/external-contributions") return listed(rowFixture());
