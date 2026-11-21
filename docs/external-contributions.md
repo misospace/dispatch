@@ -240,10 +240,14 @@ Rules:
 - **Identity binding.** A 200 response must echo the stored `run`,
   `namespace`, `lane`, `baseRepo`, and `workRepo`. Any mismatch refuses the
   whole observation: no phase, no publication, only a field-named diagnostic.
-- **Unknown keeps the last state.** The projection value `unknown` and any
-  unrecognized phase derive nothing new (the CRD enum can gain phases). The
-  one exception is `unavailable`: it recorded no evidence, so the first
-  trustworthy observation replaces it.
+- **Unknown keeps the last state.** The projection value `unknown`, the
+  recorded endings `AwaitingReview` (without PR evidence) and `HandedOff`,
+  and any unrecognized phase derive nothing new (the CRD enum can gain
+  phases; `AwaitingReview` without a recorded PR cannot be asserted as
+  published, and `HandedOff` declares neither success nor failure — the
+  verbatim `phase` field names the real ending). The one exception is
+  `unavailable`: it recorded no evidence, so the first trustworthy
+  observation replaces it.
 - **Retention is explicit loss.** A 404 is ambiguous by design on the Courier
   side (missing, foreign, or reaped). For a run we admitted it means the
   evidence is gone. Final evidence already persisted (a PR, a success, a
@@ -251,6 +255,9 @@ Rules:
   then only notes the loss. Nothing final yet becomes `expired`.
 - **Publication is durable.** Once recorded, a partial later projection never
   erases an earlier publication field.
+- **Cause is durable.** The bounded `cause{category,outcome}` is recorded
+  once at a run's ending; a later projection without a `cause` block never
+  erases it.
 - **Refresh is bounded and duplicate-prevented.** One read per row per
   `TRACKING_REFRESH_COOLDOWN_MS` (15s — Courier paces frontends at 15–30s).
   The window is claimed by one conditional `updateMany`, so it holds across

@@ -23,7 +23,10 @@
  *   merges, or re-derives a PR, and never shows one from a phase name.
  * - Unknown is not guessed. The projection value `unknown` and any
  *   unrecognized phase keep the last known state (the CRD enum can gain
- *   phases; treating them as a transition would invent one).
+ *   phases; treating them as a transition would invent one). The recorded
+ *   endings this vocabulary has no entry for (`AwaitingReview` without PR
+ *   evidence, `HandedOff`) follow the same rule; the verbatim `phase` field
+ *   on the projection names the real ending.
  * - Retention is explicit loss. A 404 for a run Dispatch previously admitted
  *   means reaped-or-lost; it maps to `expired` unless final evidence (a PR,
  *   `Done`/`AlreadyDone`, or a recorded failure) is already persisted, in
@@ -82,16 +85,6 @@ export function trackingStaleMs(): number {
   return Math.min(Math.max(raw, MIN_TRACKING_STALE_MS), MAX_TRACKING_STALE_MS);
 }
 
-/** Phases the Courier controller records as run endings (status.go phase docs). */
-const ENDING_PHASES = new Set(["AwaitingReview", "HandedOff", "NeedsHuman", "Done", "AlreadyDone", "Failed", "BlockedExternal"]);
-
-/** The projection-only value shown before the controller first stamps a phase. */
-export const UNKNOWN_PHASE = "unknown";
-
-export function isEndingPhase(phase: string | null | undefined): boolean {
-  return !!phase && ENDING_PHASES.has(phase);
-}
-
 /**
  * Derive the persisted lifecycle state from one VERIFIED observation.
  * `hasPrEvidence` only ever comes from Courier's own recorded
@@ -119,11 +112,23 @@ export function deriveTrackingState(
     case "NeedsHuman":
     case "BlockedExternal":
       return "failed";
+    case "AwaitingReview":
+    case "HandedOff":
+    case "unknown":
+      // Recorded endings this vocabulary has no distinct entry for, listed
+      // explicitly so the phase switch covers the full contract:
+      // `AwaitingReview` WITH a recorded PR is already `published` (the
+      // authority check above); without one Dispatch cannot assert
+      // publication. `HandedOff` left automation to a human without
+      // declaring success or failure. Both are state-preserving by design:
+      // the projection's verbatim `phase` field is what names the real
+      // ending. Same rule as any unrecognized phase below.
+      return previous && previous !== "unavailable" ? previous : "admitted";
     default:
-      // `unknown` or a phase newer than this build knows: keep the last
-      // known state. `unavailable` was never evidence, only the absence of
-      // it, so a trustworthy read replaces it; with no history at all, an
-      // existing run is at least admitted.
+      // A phase newer than this build knows: keep the last known state.
+      // `unavailable` was never evidence, only the absence of it, so a
+      // trustworthy read replaces it; with no history at all, an existing
+      // run is at least admitted.
       return previous && previous !== "unavailable" ? previous : "admitted";
   }
 }
@@ -319,8 +324,11 @@ export async function refreshExternalContributionTracking(
       trackingState,
       courierPhase: status.phase,
       courierCiParked: status.ciParked,
-      courierCauseCategory: status.cause?.category ?? null,
-      courierCauseOutcome: status.cause?.outcome ?? null,
+      // The terminal cause is recorded once at a run's ending (Courier only
+      // ever attaches it there); like the publication fields, a later
+      // partial projection without a `cause` block must not erase it.
+      courierCauseCategory: status.cause?.category ?? row.courierCauseCategory,
+      courierCauseOutcome: status.cause?.outcome ?? row.courierCauseOutcome,
       // Publication evidence is durable on the Courier side; a later partial
       // projection must never erase earlier recorded pieces.
       courierPrUrl: status.publication?.pr ?? row.courierPrUrl,

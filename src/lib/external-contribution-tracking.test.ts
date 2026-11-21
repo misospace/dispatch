@@ -77,6 +77,16 @@ describe("deriveTrackingState", () => {
     expect(deriveTrackingState("SomeNewPhase", false, "published")).toBe("published");
     expect(deriveTrackingState("unknown", false, null)).toBe("admitted");
   });
+
+  it("keeps the last known state for the recorded endings with no distinct vocabulary entry", () => {
+    // `AwaitingReview` without PR evidence cannot be asserted published, and
+    // `HandedOff` declares neither success nor failure: both are
+    // state-preserving, and the verbatim `phase` field names the ending.
+    expect(deriveTrackingState("AwaitingReview", false, "executing")).toBe("executing");
+    expect(deriveTrackingState("HandedOff", false, "admitted")).toBe("admitted");
+    expect(deriveTrackingState("HandedOff", false, null)).toBe("admitted");
+    expect(deriveTrackingState("AwaitingReview", false, "unavailable")).toBe("admitted");
+  });
 });
 
 describe("trackingStaleMs", () => {
@@ -239,6 +249,34 @@ describe("refreshExternalContributionTracking", () => {
       expect(second.request.trackingState).toBe("published");
       expect(second.request.courierPrUrl).toBe("https://github.com/acme/widgets/pull/42");
       expect(second.request.courierPhase).toBe("Done");
+    }
+  });
+
+  it("keeps a recorded cause when a later observation carries none", async () => {
+    const row = acceptedRow();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        statusResponse(200, statusBody({ phase: "Failed", cause: { category: "verifier-rejection", outcome: "changes" } })),
+      ),
+    );
+    const first = await refreshExternalContributionTracking(client, row as ExternalContributionRow, config);
+    expect(first.outcome).toBe("observed");
+    if (first.outcome === "observed") {
+      expect(first.request.trackingState).toBe("failed");
+      expect(first.request.courierCauseCategory).toBe("verifier-rejection");
+      expect(first.request.courierCauseOutcome).toBe("changes");
+    }
+
+    // A later projection without a `cause` block must not erase the recorded
+    // terminal classification — same durability rule as publication.
+    ledger.rows[0].trackingCheckedAt = new Date(Date.now() - TRACKING_REFRESH_COOLDOWN_MS - 1);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(statusResponse(200, statusBody({ phase: "Failed" }))));
+    const second = await refreshExternalContributionTracking(client, ledger.rows[0] as ExternalContributionRow, config);
+    expect(second.outcome).toBe("observed");
+    if (second.outcome === "observed") {
+      expect(second.request.courierCauseCategory).toBe("verifier-rejection");
+      expect(second.request.courierCauseOutcome).toBe("changes");
     }
   });
 
