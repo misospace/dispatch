@@ -22,6 +22,7 @@ import {
   type EvidenceVersionFields,
   type PrFixEvidenceKind,
 } from "@/lib/pr-fix-evidence";
+import { parseFollowupIdentityScopes, type FollowupIdentityScope } from "@/lib/config-parsers";
 
 // The mechanical rebase contract lives in its own module (#1327) so the
 // linked-PR health materialization writes the same instruction wall. It is
@@ -56,6 +57,13 @@ export type BranchOwnerAllowlist = string[];
 export interface PrFollowupConfig {
   botIdentities: BotIdentity[];
   branchOwnerAllowlist: BranchOwnerAllowlist;
+  /**
+   * #1665: operator-configured per-identity scopes. An identity named here is
+   * narrowed to PRs whose head repository is the base repository AND whose
+   * head branch carries one of its prefixes. Logins and prefixes are operator
+   * configuration; there are no product defaults.
+   */
+  identityScopes: FollowupIdentityScope[];
 }
 
 /** Classification result from feedback analysis */
@@ -76,17 +84,62 @@ function getConfig(): PrFollowupConfig {
     ? rawOwners.split(",").map((s) => s.trim()).filter(Boolean)
     : [];
 
-  return { botIdentities, branchOwnerAllowlist };
+  const identityScopes = parseFollowupIdentityScopes(process.env.PR_FOLLOWUP_BOT_IDENTITY_SCOPES);
+
+  return { botIdentities, branchOwnerAllowlist, identityScopes };
 }
 
 // ─── Author / Branch Allowlist ──────────────────────────────────────────────
 
 /**
- * Check if PR author is allowed bot identity.
+ * Head-repository / head-branch facts a follow-up author decision may need
+ * (#1665). All fields optional so legacy single-argument callers keep
+ * type-checking; a scoped identity called WITHOUT this context fails closed.
  */
-export function isAllowedBotAuthor(author: string | null | undefined): boolean {
+export interface FollowupAuthorContext {
+  /** The base (tracked) repository the event was observed in. */
+  baseRepoFullName?: string | null;
+  /** The PR's head repository full name; null/absent means unverifiable. */
+  headRepoFullName?: string | null;
+  /** The PR's head branch ref; null/absent means unknown. */
+  headBranch?: string | null;
+}
+
+/** The operator-configured scope for this login, if any (#1665). */
+function identityScopeFor(config: PrFollowupConfig, login: string): FollowupIdentityScope | null {
+  return config.identityScopes.find((scope) => scope.login === login) ?? null;
+}
+
+/**
+ * Check if PR author is allowed bot identity.
+ *
+ * #1665: an identity carrying an operator-configured scope is narrowed to
+ * PRs from the base repository whose head branch matches one of the scope's
+ * branch prefixes. The scope FAILS CLOSED when the head facts it needs are
+ * missing — no head repository, an unverifiable (foreign or absent) head
+ * repo, or no head branch never qualifies — and when the caller supplies no
+ * context at all. Unscoped identities keep the exact legacy behavior: this
+ * predicate is author-membership only, and the pre-existing gates (terminal
+ * PR, branch owner, head-repo proof #1637) still apply downstream to
+ * everyone. The explicit /dispatch-fix handoff (#1622) does not run through
+ * this predicate and stays unaffected.
+ */
+export function isAllowedBotAuthor(
+  author: string | null | undefined,
+  context?: FollowupAuthorContext,
+): boolean {
   if (!author) return false;
-  return isBotIdentity(author);
+  const config = getConfig();
+  const scope = identityScopeFor(config, author);
+  if (!scope && !config.botIdentities.includes(author)) return false;
+  if (!scope) return true;
+
+  // Scoped identity: head repository must be proven to be the base repo and
+  // the head branch must carry one of the configured prefixes.
+  if (!isHeadRepoOfBaseRepo(context?.headRepoFullName, context?.baseRepoFullName)) return false;
+  const headBranch = context?.headBranch;
+  if (!headBranch) return false;
+  return scope.branchPrefixes.some((prefix) => headBranch.startsWith(prefix));
 }
 
 /**
@@ -94,10 +147,35 @@ export function isAllowedBotAuthor(author: string | null | undefined): boolean {
  * automation logins). The /dispatch-fix command uses this to stay silent
  * toward bot commenters (#1622): replying to another bot's comment is how
  * bot-to-bot reply loops start.
+ *
+ * #1665: a login scoped via `PR_FOLLOWUP_BOT_IDENTITY_SCOPES` is also a
+ * configured automation identity (it is the operator's declaration that this
+ * login is automation), so membership is the union of the flat allowlist and
+ * the scoped logins. Scoping narrows automatic follow-up only; it does not
+ * change which commenters the reply guard stays silent toward beyond adding
+ * these declared automation identities.
  */
 export function isBotIdentity(login: string | null | undefined): boolean {
   if (!login) return false;
-  return getConfig().botIdentities.includes(login);
+  const config = getConfig();
+  return config.botIdentities.includes(login) || identityScopeFor(config, login) !== null;
+}
+
+/**
+ * Project the head facts an event carries onto the author-decision context
+ * (#1665). Shared by every gate inside this module so the work path, the
+ * record-only path, and the conflict path cannot drift apart.
+ */
+function followupAuthorContextFor(event: {
+  repoFullName: string;
+  headRepoFullName?: string | null;
+  branch: string | null;
+}): FollowupAuthorContext {
+  return {
+    baseRepoFullName: event.repoFullName,
+    headRepoFullName: event.headRepoFullName ?? null,
+    headBranch: event.branch ?? null,
+  };
 }
 
 /**
@@ -670,7 +748,10 @@ async function ingestEvent(client: PrFixQueueClient, event: PrFollowupEvent): Pr
   // owner is not an observation of this queue's work at all.
   if (descriptor.recordOnly?.(event)) {
     if (descriptor.filterTerminalPr && (event.prMergedAt || event.prState === "closed")) return null;
-    if (!isAllowedBotAuthor(event.author)) return null;
+    // #1665: the same eligibility filters as a work event, scoping included —
+    // an observation of a PR outside a scoped identity's rule is not an
+    // observation of this queue's work either.
+    if (!isAllowedBotAuthor(event.author, followupAuthorContextFor(event))) return null;
     if (!isAllowedBranchOwner(event.repoFullName)) return null;
     // #1637: an observation of a fork PR is not an observation of this queue's
     // work either — the same eligibility filter as a work event. Consequence:
@@ -694,8 +775,10 @@ async function ingestEvent(client: PrFixQueueClient, event: PrFollowupEvent): Pr
   // Filter merged/closed PRs — do not enqueue work for terminal PRs
   if (descriptor.filterTerminalPr && (event.prMergedAt || event.prState === "closed")) return null;
 
-  // Check author eligibility
-  if (!isAllowedBotAuthor(event.author)) return null;
+  // Check author eligibility. #1665: a scoped identity must also match its
+  // head-repository + head-branch rule; unscoped identities pass on
+  // membership alone, unchanged.
+  if (!isAllowedBotAuthor(event.author, followupAuthorContextFor(event))) return null;
 
   // Check repo owner eligibility
   if (!isAllowedBranchOwner(event.repoFullName)) return null;
@@ -1055,8 +1138,18 @@ export async function ingestMergeConflict(
   // Only CONFLICTING PRs trigger merge conflict items
   if (opts.mergeable.toUpperCase() !== "CONFLICTING") return null;
 
-  // Check author eligibility
-  if (!isAllowedBotAuthor(opts.author)) return null;
+  // Check author eligibility. #1665: a scoped identity must also match its
+  // head-repository + head-branch rule here (merge conflicts are ingested
+  // directly by the sync scan, not through ingestEvent).
+  if (
+    !isAllowedBotAuthor(opts.author, {
+      baseRepoFullName: opts.repoFullName,
+      headRepoFullName: opts.headRepoFullName ?? null,
+      headBranch: opts.branch ?? null,
+    })
+  ) {
+    return null;
+  }
 
   // Check repo owner eligibility
   if (!isAllowedBranchOwner(opts.repoFullName)) return null;
