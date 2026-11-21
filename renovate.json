@@ -9,6 +9,13 @@
       "allowedVersions": "<7.0.0"
     },
     {
+      "description": "Keep the @prisma/config effect override on the patched 3.x line: Prisma 7's config loader uses Effect 3 APIs that Effect 4 removed.",
+      "matchManagers": ["npm"],
+      "matchDepTypes": ["overrides"],
+      "matchPackageNames": ["effect"],
+      "allowedVersions": "<4.0.0"
+    },
+    {
       "matchPackageNames": ["aquasecurity/trivy-action"],
       "enabled": false
     }
