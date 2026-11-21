@@ -11,6 +11,20 @@
  */
 
 /**
+ * True when the text contains a control character (newlines and DEL
+ * included). Single source of truth for the single-line wire-field rule:
+ * the external-contribution submission validator (`external-contribution
+ * .ts`) and the operator form that mirrors it (`contributions-client.tsx`,
+ * #1539) enforce the SAME check from this one implementation, so the UI can
+ * never promise a field value the server then rejects. Lives here (not in
+ * `external-contribution.ts`) because that module is server-only (Prisma)
+ * and the client bundle must stay free of it.
+ */
+export function hasControlChars(text: string): boolean {
+  return /[\u0000-\u001f\u007f]/.test(text);
+}
+
+/**
  * Parse a comma/newline-delimited list into trimmed, deduped entries
  * (order preserved). Shared by the agent, excluded-label, repo, and Courier
  * admission-namespace parsers (#1537).

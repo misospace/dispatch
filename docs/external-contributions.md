@@ -1,4 +1,4 @@
-# External contribution requests (#1537, #1538, parent #1349)
+# External contribution requests (#1537, #1538, #1539, parent #1349)
 
 Dispatch can persist a request to contribute work to an external repository and
 submit it — once, exactly — to Courier's HTTP admission API. Dispatch then
@@ -76,7 +76,8 @@ Request body:
 
 `idempotencyKey` is generated server-side when omitted. The response (201
 created / 200 resumed-or-replayed) carries `id`, `idempotencyKey`, `status`,
-`run`, `namespace`, `workItemId`, `resumed`, `attempts`, and `lastError`.
+`run`, `namespace`, `workItemId`, `resumed`, `baseRepo`, `baseRef`, `workRepo`,
+`lane`, `goal`, `attempts`, and `lastError`.
 
 Delivery statuses recorded on the `ExternalContributionRequest` ledger row:
 
@@ -270,9 +271,49 @@ Rules:
 - **Missing capability, named.** No read token configured answers 503 with the
   missing piece and leaves submission untouched.
 
+## Operator UI (#1539)
+
+`/contributions` is the browser surface over the three routes above. It is a
+consumer of the existing API and shared projection (`external-contribution-
+view.ts`) — it introduces no new write path, no new authority, and no second
+state machine. The nav entry ("Contributions") is present on every instance;
+an unconfigured surface still renders, naming its gaps.
+
+- **Configuration panel.** Shows what is configured — endpoint, approved
+  namespaces, and credential PRESENCE — resolved server-side by
+  `projectCourierSurface()`. Credential values have no path into the client
+  tree. When submission or tracking is disabled, the panel renders the same
+  named capability gap the API answers with (503 reasons), never a generic
+  failure. The submission form is disabled until the surface is configured.
+- **Submission.** One namespace per submission, selectable ONLY from the
+  operator-approved `DISPATCH_COURIER_ADMISSION_NAMESPACES` list (the form
+  offers no free-text destination and the server re-checks). The form holds
+  one client-generated `idempotencyKey` per form session: an in-flight or
+  uncertain answer keeps the key so re-submitting retries the SAME identity
+  (and says so), while a settled identity (Courier rejection, payload
+  conflict, exhausted budget) is rotated so the next edit is a deliberately
+  new contribution. This mirrors the exactly-once rules above; the ledger and
+  the atomic claim still decide — the browser only avoids forking an identity
+  the caller did not mean to abandon.
+- **Queue and detail.** The stored-request listing and one-request detail read
+  the ledger routes, which never call Courier; they work while Courier is
+  offline. A row shows the delivery status, the derived lifecycle state (plus
+  a `stale` marker), and the verbatim Courier phase in detail.
+- **Bounded refresh.** Accepted requests offer "Refresh tracking", which calls
+  only `POST /api/external-contributions/[id]/refresh` — a GET-shaped settle,
+  never a re-submission. A cooldown answer says how long until Courier may be
+  asked again; failures render the named reason and leave the stored evidence
+  on screen.
+- **Honesty rules carried through to the pixels.** A PR link renders only when
+  `tracking.publication.pr` exists — an absent PR is never a broken link or a
+  placeholder. Absence of a lifecycle observation renders as `unobserved`
+  (unknown), never as any completion-flavoured state. Nothing here creates,
+  merges, or re-derives a PR, and nothing writes Kubernetes or GitHub state.
+
 ## Non-goals
 
-A browser UI, fork discovery/creation, PR publication logic, automatic
-execution retries after a terminal Courier failure, and production enablement
-(the feature is off until an operator configures it). Status polling is NOT a
-non-goal since #1538 — see above.
+Fork discovery/creation, PR publication logic, automatic execution retries
+after a terminal Courier failure, and production enablement (the feature is
+off until an operator configures it). Status polling is NOT a non-goal since
+#1538 — see above. A browser UI is NOT a non-goal since #1539 — see
+"Operator UI" above.

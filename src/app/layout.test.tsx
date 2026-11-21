@@ -70,7 +70,7 @@ describe("RootLayout app shell", () => {
     );
     const desktopNav = container.querySelector('nav[class*="sm:flex"]');
     expect(desktopNav).toBeTruthy();
-    expect(desktopNav?.querySelectorAll("a").length).toBe(8);
+    expect(desktopNav?.querySelectorAll("a").length).toBe(9);
   });
 
   it("renders children in the main content area", () => {
@@ -140,6 +140,7 @@ describe("RootLayout app shell", () => {
     expect(screen.getByText("Agents")).toBeInTheDocument();
     expect(screen.getByText("Attention")).toBeInTheDocument();
     expect(screen.getByText("Automation")).toBeInTheDocument();
+    expect(screen.getByText("Contributions")).toBeInTheDocument();
   });
 
   it("mobile nav contains theme toggle and version label when open", () => {

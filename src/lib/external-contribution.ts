@@ -64,6 +64,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { Prisma, type PrismaClient } from "@prisma/client";
 import { isValidRepoName } from "./config";
+// Shared single implementation of the single-line wire-field control-character
+// rule, also enforced client-side by the #1539 operator form.
+import { hasControlChars } from "./config-parsers";
 import {
   newIdempotencyKey,
   redactSecret,
@@ -123,11 +126,6 @@ type ValidationErr = { ok: false; error: string };
 
 function isString(value: unknown): value is string {
   return typeof value === "string";
-}
-
-/** Reject control characters (newlines included) in single-line wire fields. */
-function hasControlChars(text: string): boolean {
-  return /[\u0000-\u001f\u007f]/.test(text);
 }
 
 /**

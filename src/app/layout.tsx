@@ -99,6 +99,9 @@ Attention
                 <Link href="/delivery" className="text-muted-foreground hover:text-foreground">
                   Delivery
                 </Link>
+                <Link href="/contributions" className="text-muted-foreground hover:text-foreground">
+                  Contributions
+                </Link>
               </nav>
 
               {/* Mobile menu button */}
