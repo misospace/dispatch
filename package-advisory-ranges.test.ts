@@ -10,7 +10,9 @@ const acceptedRisksPath = join(process.cwd(), "SECURITY-ACCEPTED-RISKS.md");
 
 // The vulnerable version ranges below are the **union of every advisory the
 // npm advisory feed lists for these packages** (fetched per-package on
-// 2026-10-24, for `effect` on 2026-11-20, and for `minimatch` on 2026-11-20),
+// 2026-10-24, for `effect` on 2026-11-20, for `minimatch` on 2026-11-20 and
+// re-verified on 2026-11-21 against both the npm audit feed's bulk advisory
+// endpoint and the GitHub global advisory DB),
 // not only the advisories named in #1386: the blocking gate flags any
 // vulnerable resolution, so pinning a subset of a package's advisory history
 // would let a re-resolution into an older advisory through.
@@ -43,6 +45,10 @@ type AdvisorySpec = {
   // is dropped or narrowed, the vulnerable probes stop being flagged and
   // this data fails the guard below.
   vulnerableProbes: string[];
+  // First patched release of each affected major line, plus negative probes:
+  // versions a review or lockfile might plausibly treat as vulnerable that
+  // the feed does NOT mark vulnerable. These assert no range was invented
+  // beyond what the feed supports (e.g. an 11.x span that outlived the feed).
   patchedProbes: string[];
 };
 
@@ -161,6 +167,20 @@ const ADVISORY_SPECS: AdvisorySpec[] = [
     // bumped the toolchain to 8.73.0, which drops the nested copy and dedupes
     // onto the patched top-level 11.0.8; eslint-config-next's nested 3.1.5
     // predates the 7.x line and sits above every 3.x boundary.
+    //
+    // The 11.x line above 11.0.1 is deliberately unpinned: re-verified on
+    // 2026-11-21, the feed carries no advisory touching any `>= 11.0.1`
+    // release — npm's bulk advisory endpoint reports no advisory for
+    // minimatch 11.0.1 / 11.0.5 / 11.0.6 / 11.0.7 / 11.0.8 / 11.0.9, and the
+    // GitHub global advisory DB lists exactly the six advisories pinned here
+    // (reviewed and malware both). A PR-review finding alleged two live 11.x
+    // advisories (GHSA-cf2h-pxjq-68xw covering `>= 11.0.0 <= 11.0.6` patched
+    // 11.0.7, and GHSA-c859-jr93-m5j4 on 11.0.5); both IDs resolve HTTP 404
+    // on the advisory DB (`GET /advisories/{ghsa_id}`), so no 11.x boundary
+    // exists to pin — inventing one would mark a clean release vulnerable.
+    // `patchedProbes` carries 11.0.5 / 11.0.6 as negative probes so any such
+    // invented span fails the self-check, and if a real 11.x advisory ever
+    // lands the probes move to `vulnerableProbes` with its boundary.
     name: "minimatch",
     ranges: [
       { from: "0.0.0", to: "3.1.4" },
@@ -179,7 +199,7 @@ const ADVISORY_SPECS: AdvisorySpec[] = [
     ],
     scope: "dev",
     vulnerableProbes: ["3.1.3", "4.2.4", "5.1.7", "6.2.1", "10.2.6"],
-    patchedProbes: ["3.1.4", "4.2.5", "5.1.8", "6.2.2", "11.0.1"],
+    patchedProbes: ["3.1.4", "4.2.5", "5.1.8", "6.2.2", "11.0.1", "11.0.5", "11.0.6"],
   },
 ];
 
