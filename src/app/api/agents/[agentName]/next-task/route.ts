@@ -10,7 +10,7 @@ import {
 } from "@/lib/agent-task";
 import { isBacklogLane, prFixLaneForRequest } from "@/lib/lane-config";
 import { fetchAgentQueueData } from "@/lib/agent-queue-fetch";
-import { agentAlreadyHanded, agentHandoutToken, backfillPrFixClaimant, createLinkedPrFixItem, enforcePrFixHandoutLaneExclusivity, evaluatePrFixHandoutOwnership, handoutReceipt, hasInFlightRebaseHandout, isHeadRepoOfBaseRepo, isRebaseLaneAgent, isRebaseModelLaneAgent, linkedIssueEscalationClassified, newHandoutToken, normalizeQueueRepo, prFixOwnershipMode, withHandoutLaneExclusivityFence, withRebaseLaneAdmission, type PrFixQueueClient } from "@/lib/pr-fix-queue";
+import { agentAlreadyHanded, agentHandoutToken, backfillPrFixClaimant, createLinkedPrFixItem, enforcePrFixHandoutLaneExclusivity, evaluatePrFixHandoutOwnership, handoutReceipt, hasInFlightRebaseHandout, isHeadRepoOfBaseRepo, isRebaseLaneAgent, isRebaseModelLaneAgent, linkedIssueEscalationClassified, newHandoutToken, normalizeQueueRepo, prFixOwnershipMode, withHandoutLaneExclusivityFence, withRebaseLaneAdmission, type LinkedIssueEscalationClassification, type PrFixQueueClient } from "@/lib/pr-fix-queue";
 import { prFixOwnershipEvidence } from "@/lib/pr-fix-ownership";
 import { fetchPullRequestLabels, fetchPullRequestHeadSha, fetchPullRequestHeadRepo } from "@/lib/github";
 import { NEEDS_HUMAN_LABEL } from "@/lib/pr-fix-surfacing";
@@ -74,6 +74,33 @@ type PrFixCandidate = {
    */
   semanticConflict?: RebaseSemanticConflictContext | null;
 };
+
+/**
+ * The AUTHORITATIVE parent classification the model-capable REBASE path must
+ * clear (#1674 review blocker on the model-assist capability): the tri-state
+ * linked-issue escalation read (#1503), with the row's own stored lane folded
+ * in — a row already carrying ESCALATED is frontier-classified by itself
+ * (verified rows are never demoted, #1503), even when its linked issue row was
+ * pruned (the plain read treats a missing row as definitive NOT_ESCALATED).
+ *
+ * This gate exists because the MECHANICAL rebase lane is the declared
+ * exception to `enforcePrFixHandoutLaneExclusivity` (#1327/#1503: its
+ * exclusivity is the DISPATCH_REBASE_AGENTS local-only pool, not the lane
+ * column). That exception authorizes DETERMINISTIC work only. The
+ * model-capable path (`rebase-model-executor:1` + DISPATCH_REBASE_MODEL_AGENTS)
+ * must NOT inherit it — model execution preserves the authoritative parent
+ * classification and must not use the mechanical REBASE exception as a
+ * frontier bypass, so ESCALATED and UNKNOWN (fail closed) never authorize the
+ * local model wall/transport. Only NOT_ESCALATED clears the model-capable
+ * path; a frontier parent may still receive the deterministic mechanical wall.
+ */
+async function rebaseModelParentClass(
+  client: Pick<PrFixQueueClient, "issue">,
+  candidate: Pick<PrFixCandidate, "repo" | "pr" | "issue" | "lane">,
+): Promise<LinkedIssueEscalationClassification> {
+  if (candidate.lane === "ESCALATED") return "ESCALATED";
+  return linkedIssueEscalationClassified(client, candidate.repo, candidate.issue);
+}
 
 /**
  * Stamp the hand-out on the FIRST hand-out of this generation only:
@@ -779,7 +806,26 @@ export async function GET(
          const modelAssistRebase =
            dispatchedLane === "REBASE" &&
            negotiation.rebaseModelExecutorGranted &&
-           isRebaseModelLaneAgent(agentName);
+           isRebaseModelLaneAgent(agentName) &&
+           // #1674 review blocker: the fail-closed parent-classification gate
+           // for the MODEL-CAPABLE path. The mechanical REBASE exemption from
+           // #1503 lane exclusivity (this route skips
+           // `enforcePrFixHandoutLaneExclusivity` whenever dispatchedLane is
+           // REBASE) authorizes DETERMINISTIC work only — it is not a frontier
+           // bypass for the local model. Capability + pool alone (the checks
+           // above) must never cross a parent whose classification is
+           // ESCALATED or UNKNOWN (fail closed); only a NOT_ESCALATED parent
+           // authorizes the model wall and transport block below. The read
+           // runs on the ISSUANCE client — the admission transaction during a
+           // REBASE hand-out — so the decision lands as close to the write as
+           // this lane's boundary allows, and short-circuits to no query at
+           // all for non-REBASE hand-outs and for model-incapable polls.
+           // Deliberate failure direction: a parent that flips
+           // NORMAL→frontier after the pre-admission wall read drops ONLY the
+           // model path here; the hand-out proceeds on the persisted
+           // mechanical wall (the deterministic exception stays intentionally
+           // supported on frontier work), so no model ever runs on it.
+           (await rebaseModelParentClass(client, candidate)) === "NOT_ESCALATED";
          const taskReasons = modelAssistRebase
            ? [confirmed.reason, ...rebaseModelAssistFeedback()]
            : reasons;
@@ -880,10 +926,32 @@ export async function GET(
           // count reaches the idle reason, and nothing pretends a configured
           // model ran. A deterministic-only consumer keeps receiving ordinary
           // mechanical REBASE items unchanged.
-          if (candidate.semanticConflict != null && !(negotiation.rebaseModelExecutorGranted && isRebaseModelLaneAgent(agentName))) {
-            rebaseModelDeferredCount += 1;
-            console.info(`[next-task-pr-fix] deferring model-required REBASE ${candidate.repo}#${candidate.pr}: this poll is not authorized for model-assisted rebase (${REBASE_MODEL_EXECUTOR_CAPABILITY}:${REBASE_MODEL_EXECUTOR_CAPABILITY_VERSION} not granted, or agent ${agentName} is not in the model worker pool DISPATCH_REBASE_MODEL_AGENTS, #1674)`);
-            return null;
+          if (candidate.semanticConflict != null) {
+            // #1674 review blocker: capability + pool authorization is
+            // necessary but NOT sufficient for a model-REQUIRED item. The
+            // parent-classification gate (stored ESCALATED lane, or the
+            // linked issue escalation-classified; UNKNOWN fails closed) voids
+            // the authorization too — a frontier-owned parent must not reach
+            // the local model worker through the mechanical REBASE
+            // exemption's skip of lane exclusivity, and the item is deferred
+            // rather than downgraded to the mechanical wall it cannot be
+            // executed under. The classification read runs only for a
+            // model-authorized poll: an unauthorized poll's disposition is
+            // exactly what it was before this gate, at the same cost.
+            const modelAuthorized =
+              negotiation.rebaseModelExecutorGranted && isRebaseModelLaneAgent(agentName);
+            const modelParentClass = modelAuthorized
+              ? await rebaseModelParentClass(asPrFixQueueClient(prisma), candidate)
+              : null;
+            if (!modelAuthorized || modelParentClass !== "NOT_ESCALATED") {
+              rebaseModelDeferredCount += 1;
+              console.info(
+                !modelAuthorized
+                  ? `[next-task-pr-fix] deferring model-required REBASE ${candidate.repo}#${candidate.pr}: this poll is not authorized for model-assisted rebase (${REBASE_MODEL_EXECUTOR_CAPABILITY}:${REBASE_MODEL_EXECUTOR_CAPABILITY_VERSION} not granted, or agent ${agentName} is not in the model worker pool DISPATCH_REBASE_MODEL_AGENTS, #1674)`
+                  : `[next-task-pr-fix] deferring model-required REBASE ${candidate.repo}#${candidate.pr}: the model-capable path is gated on the authoritative parent classification — the linked parent is ${modelParentClass === "ESCALATED" ? "frontier-owned (ESCALATED)" : "of unverifiable classification (UNKNOWN, fail closed)"}; model-assisted rebase must not use the mechanical REBASE exception as a frontier bypass (#1674)`,
+              );
+              return null;
+            }
           }
           try {
            const issued = await withRebaseLaneAdmission(asPrFixQueueClient(prisma), async (tx) => {
@@ -977,7 +1045,7 @@ export async function GET(
         ? `${rebaseDeferredCount} rebase candidate${rebaseDeferredCount === 1 ? "" : "s"} deferred`
         : null;
       const modelNote = rebaseModelDeferredCount > 0
-        ? `${rebaseModelDeferredCount} model-required rebase candidate${rebaseModelDeferredCount === 1 ? "" : "s"} deferred: this poll is not authorized for model-assisted rebase (${REBASE_MODEL_EXECUTOR_CAPABILITY}:${REBASE_MODEL_EXECUTOR_CAPABILITY_VERSION} + DISPATCH_REBASE_MODEL_AGENTS, #1674)`
+        ? `${rebaseModelDeferredCount} model-required rebase candidate${rebaseModelDeferredCount === 1 ? "" : "s"} deferred: not authorized for model-assisted rebase on this poll (${REBASE_MODEL_EXECUTOR_CAPABILITY}:${REBASE_MODEL_EXECUTOR_CAPABILITY_VERSION} + DISPATCH_REBASE_MODEL_AGENTS, or the parent classification gates the model-capable path, #1674)`
         : null;
       const notes = [deferredNote, modelNote].filter(Boolean).join("; ");
       return respond(createIdleTask(
@@ -1227,7 +1295,7 @@ export async function GET(
     // poll; the note keeps the hold visible instead of pretending the
     // candidate did not exist.
     const rebaseModelNote = rebaseModelDeferredCount > 0
-      ? `${rebaseModelDeferredCount} model-required rebase candidate${rebaseModelDeferredCount === 1 ? "" : "s"} deferred: this poll is not authorized for model-assisted rebase (${REBASE_MODEL_EXECUTOR_CAPABILITY}:${REBASE_MODEL_EXECUTOR_CAPABILITY_VERSION} + DISPATCH_REBASE_MODEL_AGENTS)`
+      ? `${rebaseModelDeferredCount} model-required rebase candidate${rebaseModelDeferredCount === 1 ? "" : "s"} deferred: not authorized for model-assisted rebase on this poll (${REBASE_MODEL_EXECUTOR_CAPABILITY}:${REBASE_MODEL_EXECUTOR_CAPABILITY_VERSION} + DISPATCH_REBASE_MODEL_AGENTS, or the parent classification gates the model-capable path, #1674)`
       : null;
 
     if (withheldQueue.length > 0) {

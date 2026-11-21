@@ -7,6 +7,7 @@
  */
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } from "@/test/route-helpers";
+import { resetLaneConfig, setLaneConfig } from "@/lib/lane-config";
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 // #1569: the ownership gate refuses a row with no recorded claimant in every
@@ -779,5 +780,149 @@ describe("model-assisted rebase negotiation (#1674)", () => {
 
     expect(body.type).toBe("idle");
     expect(body.reason).toContain("1 model-required rebase candidate deferred");
+  });
+});
+
+/**
+ * #1674 review blocker: the model-capable REBASE path must clear the
+ * AUTHORITATIVE parent classification. The mechanical REBASE lane is the
+ * declared exception to #1503 lane-exclusivity (its exclusivity is the
+ * DISPATCH_REBASE_AGENTS pool, not the lane column), but that exception
+ * authorizes DETERMINISTIC work only — a frontier-owned parent (ESCALATED) or
+ * an unverifiable one (UNKNOWN, fail closed) must never cross into the local
+ * model-assist path merely because the poll's agent sits in the rebase and
+ * model pools.
+ */
+describe("model-assisted rebase — the parent-classification boundary (#1674 review)", () => {
+  beforeEach(() => {
+    // A parent can only classify as frontier where the operator declared an
+    // escalation lane (#1503); without one every parent reads definitively
+    // local. Pin one so the classification read actually decides.
+    setLaneConfig({
+      lanes: [
+        { id: "local", title: "Local", claimable: true, role: "default" },
+        { id: "frontier", title: "Frontier", claimable: true, role: "escalation" },
+      ],
+    });
+    // This poll is FULLY model-authorized (capability granted, agent in the
+    // model pool): every deferral below is caused by the parent
+    // classification alone, and every mechanical hand-out loses exactly the
+    // model path and nothing else.
+    process.env.DISPATCH_REBASE_MODEL_AGENTS = AGENT;
+  });
+
+  afterEach(() => {
+    resetLaneConfig();
+    delete process.env.DISPATCH_REBASE_MODEL_AGENTS;
+  });
+
+  it("frontier-owned parent + model-required item: the authorized model worker is refused the hand-out (fail closed)", async () => {
+    const row = { ...modelRequiredRebaseRow(), issue: 7 };
+    mocks.prFixRows.push(row);
+    mocks.issueFindFirst.mockResolvedValue({ currentLane: "frontier" });
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+
+    const body = await (await poll(NEW_COURIER_REBASE_ONLY)).json();
+
+    expect(body.type).toBe("idle");
+    expect(body.prFixItem).toBeUndefined();
+    expect(row.agentHandouts).toEqual([]);
+    expect(row.dispatchedGeneration).toBeNull();
+    expect(body.reason).toContain("model-required rebase candidate");
+    // The deferral trace names the parent classification, not the pool — an
+    // operator must not be sent to check DISPATCH_REBASE_MODEL_AGENTS.
+    expect(info.mock.calls.flat().join(" ")).toContain("frontier-owned (ESCALATED)");
+    expect(info.mock.calls.flat().join(" ")).toContain("frontier bypass");
+    info.mockRestore();
+  });
+
+  it("frontier-owned parent + initially-mechanical row: the deterministic exception stays supported, on the MECHANICAL wall only", async () => {
+    const row = rebaseRow(88, { issue: 7 });
+    mocks.prFixRows.push(row);
+    mocks.issueFindFirst.mockResolvedValue({ currentLane: "frontier" });
+
+    const body = await (await poll(NEW_COURIER_REBASE_ONLY)).json();
+
+    // The hand-out happens — the mechanical REBASE exception is intentional
+    // on frontier work — but the MODEL-ASSIST wall and the transport block
+    // must not cross the boundary: the shipped contract is the persisted
+    // mechanical wall, byte-identical to the pre-#1674 shape.
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem.fixType).toBe("REBASE");
+    expect(row.agentHandouts).toEqual([`${AGENT}@1`]);
+    expect(body.reasons).toEqual([
+      "Mechanical rebase: PR dirty against base (#1327)",
+      "MECHANICALLY ONLY",
+    ]);
+    expect(JSON.stringify(body.reasons)).not.toContain("CONFIGURED MODEL COORDINATOR");
+    expect("rebaseModel" in body).toBe(false);
+  });
+
+  it("UNKNOWN parent classification + model-required item defers (fail closed)", async () => {
+    const row = { ...modelRequiredRebaseRow(), issue: 7 };
+    mocks.prFixRows.push(row);
+    mocks.issueFindFirst.mockRejectedValue(new Error("classification read failed"));
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+
+    const body = await (await poll(NEW_COURIER_REBASE_ONLY)).json();
+
+    // An unverifiable classification authorizes nothing on the model path.
+    expect(body.type).toBe("idle");
+    expect(body.prFixItem).toBeUndefined();
+    expect(row.agentHandouts).toEqual([]);
+    expect(info.mock.calls.flat().join(" ")).toContain("unverifiable classification (UNKNOWN, fail closed)");
+    info.mockRestore();
+  });
+
+  it("UNKNOWN parent + initially-mechanical row still dispatches mechanically (fail closed toward the model path only)", async () => {
+    const row = rebaseRow(89, { issue: 7 });
+    mocks.prFixRows.push(row);
+    mocks.issueFindFirst.mockRejectedValue(new Error("classification read failed"));
+
+    const body = await (await poll(NEW_COURIER_REBASE_ONLY)).json();
+
+    expect(body.type).toBe("followup-pr");
+    expect(row.agentHandouts).toEqual([`${AGENT}@1`]);
+    expect("rebaseModel" in body).toBe(false);
+    expect(JSON.stringify(body.reasons)).not.toContain("CONFIGURED MODEL COORDINATOR");
+  });
+
+  it("a NOT_ESCALATED parent keeps the model path available to the authorized poll", async () => {
+    const row = { ...modelRequiredRebaseRow(), issue: 7 };
+    mocks.prFixRows.push(row);
+    mocks.issueFindFirst.mockResolvedValue({ currentLane: "local" });
+
+    const body = await (await poll(NEW_COURIER_REBASE_ONLY)).json();
+
+    // The gate must not over-block: with an escalation lane CONFIGURED but
+    // the parent verifiably local, the model wall + transport still ship.
+    expect(body.type).toBe("followup-pr");
+    expect(row.agentHandouts).toEqual([`${AGENT}@1`]);
+    expect(body.rebaseModel).toEqual({
+      capability: "rebase-model-executor",
+      version: 1,
+      semanticConflict: {
+        base: "main",
+        files: ["src/enrich_flux.go"],
+        reason: "two-sided code edit outside the mechanical rules",
+      },
+    });
+    expect(body.reasons.join("\n")).toContain("CONFIGURED MODEL COORDINATOR");
+  });
+
+  it("a stored ESCALATED row never reaches the model path even when its linked issue reads NOT_ESCALATED", async () => {
+    const row = { ...modelRequiredRebaseRow(79), lane: "ESCALATED", issue: null };
+    mocks.prFixRows.push(row);
+    // No linked issue, and a missing issue row is a DEFINITIVE NOT_ESCALATED
+    // read (#1503) — the row's own stored lane is what must hold the model
+    // path here (a verified ESCALATED row is never demoted, #1503).
+    mocks.issueFindFirst.mockResolvedValue(null);
+
+    const body = await (await poll(NEW_COURIER_REBASE_ONLY)).json();
+
+    expect(body.type).toBe("idle");
+    expect(body.prFixItem).toBeUndefined();
+    expect(row.agentHandouts).toEqual([]);
+    expect(body.reason).toContain("model-required rebase candidate");
   });
 });
