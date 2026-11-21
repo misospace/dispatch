@@ -42,13 +42,16 @@
  *
  * Versioning: the evidence object carries `contract: 1` and rides on the
  * #1532 intake negotiation. A consumer receives it only after declaring and
- * being granted the `pr-ownership-evidence:1` capability — an un-negotiated
- * peer gets the byte-identical legacy payload (safe mixed-version behavior),
- * while a negotiated peer can REQUIRE ownership evidence before accepting a
- * hand-out. The block rides on a granted hand-out only, and the gate refuses
- * an unresolved row in every mode, so a shipped block always names an
- * identity. The queue listing shows a null `originalClaimant` for a row that
- * still needs recovery.
+ * being granted the `pr-ownership-evidence:1` capability — the versioned
+ * block stays invisible to an un-negotiated peer (safe mixed-version
+ * behavior), while a negotiated peer can REQUIRE ownership evidence before
+ * accepting a hand-out. #1582: the claimant alone is additionally mirrored
+ * inline on the hand-out's `prFixItem.originalClaimant` for every poll, so a
+ * gate-enforcing consumer that never negotiated (a deployed pre-contract
+ * build) still receives it. The block rides on a granted hand-out only, and
+ * the gate refuses an unresolved row in every mode, so a shipped block
+ * always names an identity. The queue listing shows a null `originalClaimant`
+ * for a row that still needs recovery.
  */
 
 export const PR_FIX_OWNERSHIP_CONTRACT_VERSION = 1 as const;

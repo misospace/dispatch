@@ -111,7 +111,7 @@ For `REBASE` the one-attempt bound is enforced server-side, not only in prose (#
 
 ### Ownership evidence (#1569)
 
-A `followup-pr` task carries an `ownership` block **only** when the poll declared and was granted `pr-ownership-evidence:1`: `{ contract: 1, owningLane, originalClaimant, provenance, prAuthor? }`. An un-negotiated poll receives the byte-identical legacy task.
+A `followup-pr` task carries an `ownership` block **only** when the poll declared and was granted `pr-ownership-evidence:1`: `{ contract: 1, owningLane, originalClaimant, provenance, prAuthor? }`. An un-negotiated poll never sees that block; the original claimant additionally rides on **every** hand-out as the additive inline fields `prFixItem.originalClaimant` (always present on a shipped hand-out) and `prFixItem.claimantSource` (present when a source was recorded), so a gate-enforcing consumer that never negotiated still receives the evidence (#1582).
 
 - `originalClaimant` is the identity that originally owned the work (live Lease → single `agent/*` label → single `owner/*` label → PR author). It is never a hand-out recipient, and a lane re-classification never transfers it.
 - `owningLane` is the queue ROW's lane, not the dispatched lane (`prFixItem.fixType` names the dispatched lane).
