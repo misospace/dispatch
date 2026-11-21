@@ -550,6 +550,25 @@ describe("handleDispatchFixCommand", () => {
     expect(mocks.addIssueComment).not.toHaveBeenCalled();
   });
 
+  it("stays silent toward a scope-only configured identity on the success path (#1665 review: the widened reply guard is intended)", async () => {
+    // A login configured only via PR_FOLLOWUP_BOT_IDENTITY_SCOPES is the
+    // operator's declaration that this commenter is automation, so the #1622
+    // reply guard stays silent toward it even though the scope only narrows
+    // automatic follow-up for its PRs. The command itself still runs — silence
+    // means no reply, not ignore: the enqueue and the audit row both happen.
+    process.env.PR_FOLLOWUP_BOT_IDENTITY_SCOPES = JSON.stringify({ "acme-ops-bot": ["release/"] });
+    try {
+      mocks.fetchPullRequestDetail.mockResolvedValue({ ...PR_DETAIL, author: "acme-ops-bot" });
+      const outcome = await handleDispatchFixCommand(baseCommand({ commenter: "acme-ops-bot" }));
+      expect(outcome.outcome).toBe("enqueued");
+      expect(mocks.enqueuePrFixItem).toHaveBeenCalledTimes(1);
+      expect(mocks.addIssueComment).not.toHaveBeenCalled();
+      expect(mocks.auditLogCreate).toHaveBeenCalled();
+    } finally {
+      delete process.env.PR_FOLLOWUP_BOT_IDENTITY_SCOPES;
+    }
+  });
+
   it("stays silent toward a bot PR author on every refusal path (AI review: all replies are bot-guarded)", async () => {
     // A bot that authored the PR is authorized (author tier), so these
     // refusals run past the authorization gate — each must be handled

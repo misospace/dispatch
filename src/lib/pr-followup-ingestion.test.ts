@@ -8,6 +8,7 @@ import {
   isInformationalComment,
   computeEvidenceKey,
   isAllowedBotAuthor,
+  isBotIdentity,
   isAllowedBranchOwner,
   isHeadRepoOfBaseRepo,
   ingestCommentEvent,
@@ -345,6 +346,45 @@ describe("scoped bot identities (#1665)", () => {
       ).toBe(false);
       // A human login outside both lists stays excluded.
       expect(isAllowedBotAuthor("some-human")).toBe(false);
+    });
+
+    afterEach(() => {
+      delete process.env.PR_FOLLOWUP_BOT_IDENTITIES;
+      delete process.env.PR_FOLLOWUP_BOT_IDENTITY_SCOPES;
+    });
+  });
+
+  describe("isBotIdentity (reply-guard membership)", () => {
+    // Review decision on the #1665 PR (info finding at
+    // pr-followup-ingestion.ts isBotIdentity): the widening of the /dispatch-fix
+    // reply guard toward scope-only logins IS intended. A login listed in
+    // PR_FOLLOWUP_BOT_IDENTITY_SCOPES is the operator's declaration that the
+    // login is automation; the #1622 reply guard keys on automation-ness (never
+    // replying to a bot command is how bot-to-bot loops are avoided), not on
+    // follow-up eligibility, which is what the scope narrows. These tests pin
+    // that union membership so the two predicates cannot silently drift apart.
+    it("treats a scope-only configured login as a bot identity", () => {
+      process.env.PR_FOLLOWUP_BOT_IDENTITY_SCOPES = SCOPED_IDENTITIES_ENV;
+      expect(isBotIdentity("acme-release-bot")).toBe(true);
+      expect(isBotIdentity("acme-task-bot")).toBe(true);
+    });
+
+    it("keeps the unscoped flat-list membership (legacy behavior)", () => {
+      process.env.PR_FOLLOWUP_BOT_IDENTITIES = "acme-legacy-bot";
+      expect(isBotIdentity("acme-legacy-bot")).toBe(true);
+    });
+
+    it("keeps the shipped default identity without any operator config", () => {
+      expect(isBotIdentity("github-actions[bot]")).toBe(true);
+    });
+
+    it("excludes logins configured in neither list", () => {
+      process.env.PR_FOLLOWUP_BOT_IDENTITIES = "acme-legacy-bot";
+      process.env.PR_FOLLOWUP_BOT_IDENTITY_SCOPES = SCOPED_IDENTITIES_ENV;
+      expect(isBotIdentity("some-human")).toBe(false);
+      expect(isBotIdentity("")).toBe(false);
+      expect(isBotIdentity(null)).toBe(false);
+      expect(isBotIdentity(undefined)).toBe(false);
     });
 
     afterEach(() => {
