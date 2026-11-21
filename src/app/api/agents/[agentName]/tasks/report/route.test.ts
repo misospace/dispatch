@@ -682,6 +682,15 @@ describe("POST /api/agents/[agentName]/tasks/report — rebaseRefusal (#1675)", 
     expect((await longExplanation.json()).error).toMatch(/rebaseRefusal\.explanation/);
   });
 
+  it("returns 400 for a control character in a conflicting-file entry (a NUL must fail closed, not break the report write)", async () => {
+    const nulPath = await postRequest({
+      ...blockedReport,
+      rebaseRefusal: { kind: "nonmechanical_conflict", conflictingFiles: ["src/lib/a\u0000.ts"] },
+    });
+    expect(nulPath.status).toBe(400);
+    expect((await nulPath.json()).error).toMatch(/must not contain control characters/);
+  });
+
   it("accepts other refusal kinds (they settle ordinarily; the resolver gates the transfer)", async () => {
     const res = await postRequest({ ...blockedReport, blockReason: "human_decision", rebaseRefusal: { kind: "auth_failure" } });
     expect(res.status).toBe(200);
