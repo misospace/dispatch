@@ -90,7 +90,13 @@ Shape:
 
 `originalClaimant` is null when ownership is unresolved. `prAuthor` is included when available.
 
-Mixed-version behavior: an un-negotiated peer gets the byte-identical legacy task. The ack lists the capability as granted or unsupported, so a new client can refuse unsupported servers safely.
+### Inline claimant (#1582)
+
+Every hand-out also mirrors the claimant inline on the task's `prFixItem`: `originalClaimant`, plus `claimantSource` when a source was recorded. This is the fallback for a gate-enforcing consumer that never negotiated — a deployed build predating the #1532 intake that reads only `prFixItem` — so the same evidence heals a running fleet without waiting for a client release. For a negotiated peer the versioned `ownership` block is authoritative; the inline field carries the same claimant the gate authorized the hand-out with. Because the gate refuses an unresolved row in every mode, a shipped hand-out always names a claimant inline. Consumers treat it as the same non-secret identity the queue listings already expose.
+
+A legacy row (a row that predates this contract) carries no recorded source, so its hand-out ships `originalClaimant` and omits the `claimantSource` key. An inline-only consumer therefore cannot distinguish a legacy claimant from a source-resolved one. That is intentional: the claimant is the authority (see "Reading the provenance"), so an inline consumer treats both the same. A peer that needs to distinguish them negotiates and reads `provenance: "legacy"` in the `ownership` block.
+
+Mixed-version behavior: the `ownership` block never appears for an un-negotiated task; the only delta such a peer sees is the additive `prFixItem` fields, which ignore-unknown-field consumers skip. The ack lists the capability as granted or unsupported, so a new client can refuse unsupported servers safely.
 
 Queue listings carry `claimant`, `claimantSource`, and `ownership` additively.
 
