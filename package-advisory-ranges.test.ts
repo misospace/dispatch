@@ -133,10 +133,12 @@ const ADVISORY_SPECS: AdvisorySpec[] = [
     // guard compares numeric cores only, and a 4.0.0 boundary would also pin
     // patched 4.0.0. (The same advisory's 0.1.0 … <0.97.1 range belongs to
     // `@effect/platform`, which this tree does not contain.) The
-    // `overrides` floor (`effect: "^3.22.1"`, #1670) keeps the tree off the 4.x
-    // line entirely, which is also why the floor is caret-bounded instead of a
-    // bare `>=3.22.1`: its only consumer, @prisma/config, pins effect exactly and
-    // has never been resolved against an effect major it does not ship.
+    // `@prisma/config`-scoped override (`effect: "^3.22.1"`, #1670) keeps the
+    // transitive copy on the patched 3.x line. Effect 4 cannot replace it:
+    // @prisma/config 7.10.1 uses Effect 3 APIs (`Either`,
+    // `Schema.decodeUnknownEither`) that effect 4 removed, so the consumer must
+    // stay on 3.x. `renovate.json` holds this override below 4.0.0 until a
+    // stable Prisma release ships a compatible, patched effect pin.
     name: "effect",
     ranges: [{ from: "0.0.0", to: "3.22.1" }],
     advisories: ["GHSA-7589-6fvf-x4pw", "GHSA-38f7-945m-qr2g"],
