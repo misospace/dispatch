@@ -26,6 +26,14 @@ import { ExternalLink, RefreshCw } from "lucide-react";
 /** What the routes answer with, derived from the shared projection (`external-contribution-view.ts`). */
 type ContributionRow = ExternalContributionWire;
 
+/**
+ * Widest single page the stored-requests listing answers with — mirrors
+ * `LIST_MAX_LIMIT` in `app/api/external-contributions/route.ts` (#1538). The
+ * page asks for it so the operator sees the newest 200, and says so when the
+ * ledger is even wider.
+ */
+const LIST_FETCH_LIMIT = 200;
+
 interface Notice {
   tone: "success" | "warning" | "error" | "info";
   text: string;
@@ -365,7 +373,7 @@ export function ContributionsClient({ config }: { config: CourierSurfaceView }) 
 
   const load = useCallback(async () => {
     try {
-      const res = await authedFetch("/api/external-contributions");
+      const res = await authedFetch(`/api/external-contributions?limit=${LIST_FETCH_LIMIT}`);
       if (!res.ok) throw new Error(`contribution listing failed: HTTP ${res.status}`);
       const body = (await res.json()) as { requests?: ContributionRow[] };
       setRequests(body.requests ?? []);
@@ -497,18 +505,20 @@ export function ContributionsClient({ config }: { config: CourierSurfaceView }) 
             tone: "success",
             text: `Re-delivered under the SAME request identity${projected?.run ? ` — courier run ${projected.run}` : ""}. Identity is admission proof only, not execution or publication.`,
           });
-        } else if (res.ok && projected?.resumed) {
-          setRetryNotice({
-            tone: "success",
-            text: `Re-delivered under the SAME request identity — Courier resumed run ${projected.run}. Identity is admission proof only, not execution or publication.`,
-          });
         } else if (res.ok) {
-          // 200 `replay_accepted`: the identity settled (possibly while this
-          // page sat open) — say so honestly instead of claiming this click
-          // delivered anything.
+          // 200 covers BOTH a genuine resume and a replay of an already-
+          // settled identity, and the answer carries no marker for which —
+          // the stored row's `resumed` flag records the admission-level fact,
+          // not which call produced it. So attribute nothing to this click:
+          // the identity is settled, the retry reused the SAME key, and the
+          // row detail shows whether Courier had to resume. `info`, not
+          // `success`: nothing here is provably a delivery by this click.
           setRetryNotice({
             tone: "info",
-            text: `This request identity is already settled with Courier${projected?.run ? ` (run ${projected.run})` : ""}; the retry replayed it and created nothing new.`,
+            text:
+              `This request identity is settled with Courier${projected?.run ? ` (run ${projected.run})` : ""}` +
+              `${projected?.resumed ? " — Courier had resumed the existing run for this identity" : ""}. ` +
+              `The retry reused the SAME identity and created nothing new. Identity is admission proof only, not execution or publication.`,
           });
         } else if (res.status === 502 || res.status === 504) {
           setRetryNotice({
@@ -841,6 +851,12 @@ export function ContributionsClient({ config }: { config: CourierSurfaceView }) 
               })}
             </div>
           )}
+          {requests.length >= LIST_FETCH_LIMIT ? (
+            <p className="pt-2 text-center text-xs text-muted-foreground">
+              Showing the newest {LIST_FETCH_LIMIT} stored requests — the listing API caps a page here;
+              older requests remain readable via <code>GET /api/external-contributions</code>.
+            </p>
+          ) : null}
         </CardContent>
       </Card>
     </div>

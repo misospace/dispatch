@@ -236,7 +236,7 @@ describe("ContributionsClient", () => {
       if (url === "/api/external-contributions" && options?.method === "POST") {
         return json(rowFixture({ status: "accepted", run: "run-42" }), 201);
       }
-      if (url === "/api/external-contributions") {
+      if (url.split("?")[0] === "/api/external-contributions") {
         return listed(
           rowFixture({
             status: "uncertain",
@@ -284,7 +284,7 @@ describe("ContributionsClient", () => {
         // 200 replay_accepted: the identity had already settled elsewhere.
         return json(rowFixture({ status: "accepted", run: "run-42" }), 200);
       }
-      if (url === "/api/external-contributions") return listed(unsettled);
+      if (url.split("?")[0] === "/api/external-contributions") return listed(unsettled);
       throw new Error(`unexpected url ${url}`);
     });
     render(<ContributionsClient config={configured} />);
@@ -292,8 +292,48 @@ describe("ContributionsClient", () => {
 
     await userEvent.click(screen.getByRole("button", { name: /retry delivery/i }));
     await waitFor(() =>
-      expect(screen.getByText(/already settled with Courier \(run run-42\).*created nothing new/i)).toBeTruthy(),
+      expect(screen.getByText(/is settled with Courier \(run run-42\)\. The retry reused the SAME identity and created nothing new/i)).toBeTruthy(),
     );
+  });
+
+  it("does not credit the click when a retry replays an identity whose original admission was a resume", async () => {
+    // The original delivery resumed an existing Courier run and the ledger
+    // row kept `resumed: true`. A later retry that only replays the settled
+    // identity answers with the same 200 shape — the notice must state the
+    // recorded resume without claiming this retry delivered anything.
+    const unsettled = rowFixture({
+      status: "uncertain",
+      run: null,
+      tracking: { ...rowFixture().tracking, state: null, publication: null },
+    });
+    vi.mocked(authedFetch).mockImplementation(async (url: string, options?: RequestInit) => {
+      if (url === "/api/external-contributions" && options?.method === "POST") {
+        return json(rowFixture({ status: "accepted", run: "run-9", resumed: true }), 200);
+      }
+      if (url.split("?")[0] === "/api/external-contributions") return listed(unsettled);
+      throw new Error(`unexpected url ${url}`);
+    });
+    render(<ContributionsClient config={configured} />);
+    await waitFor(() => expect(screen.getByText("uncertain")).toBeInTheDocument());
+
+    await userEvent.click(screen.getByRole("button", { name: /retry delivery/i }));
+    await waitFor(() =>
+      expect(screen.getByText(/Courier had resumed the existing run for this identity/i)).toBeTruthy(),
+    );
+    expect(screen.queryByText(/Re-delivered/i)).toBeNull();
+  });
+
+  it("asks for the widest listing page and flags the cap when the ledger is wider", async () => {
+    const many = Array.from({ length: 200 }, (_, i) => rowFixture({ id: `req-${i}` }));
+    vi.mocked(authedFetch).mockImplementation(async (url: string) => {
+      if (url.split("?")[0] === "/api/external-contributions") return listed(...many);
+      throw new Error(`unexpected url ${url}`);
+    });
+    render(<ContributionsClient config={configured} />);
+    await waitFor(() =>
+      expect(screen.getByText(/Showing the newest 200 stored requests/i)).toBeTruthy(),
+    );
+    expect(vi.mocked(authedFetch).mock.calls[0]?.[0]).toContain("limit=200");
   });
 
   it("does not offer retry delivery once the attempt budget is spent", async () => {
@@ -335,7 +375,7 @@ describe("ContributionsClient", () => {
   it("shows the attempt bound from the server config, not a client-side constant", async () => {
     const seven = { ...configured, maxDeliveryAttempts: 7 };
     vi.mocked(authedFetch).mockImplementation(async (url: string) => {
-      if (url === "/api/external-contributions") return listed(rowFixture());
+      if (url.split("?")[0] === "/api/external-contributions") return listed(rowFixture());
       if (url === "/api/external-contributions/req-1") return json(rowFixture());
       throw new Error(`unexpected url ${url}`);
     });
@@ -385,7 +425,7 @@ describe("ContributionsClient", () => {
 
   it("opens one request's details from the ledger route and shows the recorded goal", async () => {
     vi.mocked(authedFetch).mockImplementation(async (url: string) => {
-      if (url === "/api/external-contributions") return listed(rowFixture());
+      if (url.split("?")[0] === "/api/external-contributions") return listed(rowFixture());
       if (url === "/api/external-contributions/req-1") {
         return json(rowFixture({ goal: "Add a very specific widget", upstreamIssue: "https://github.com/acme/widgets/issues/12" }));
       }
@@ -404,7 +444,7 @@ describe("ContributionsClient", () => {
 
   it("refreshes tracking only for accepted requests and surfaces the bounded cooldown honestly", async () => {
     vi.mocked(authedFetch).mockImplementation(async (url: string, options?: RequestInit) => {
-      if (url === "/api/external-contributions") {
+      if (url.split("?")[0] === "/api/external-contributions") {
         return listed(
           rowFixture(),
           rowFixture({ id: "req-5", status: "pending", run: null }),
@@ -475,7 +515,7 @@ describe("ContributionsClient", () => {
 
   it("shows a failed refresh without hiding it behind a generic failure", async () => {
     vi.mocked(authedFetch).mockImplementation(async (url: string, options?: RequestInit) => {
-      if (url === "/api/external-contributions") return listed(rowFixture());
+      if (url.split("?")[0] === "/api/external-contributions") return listed(rowFixture());
       if (options?.method === "POST") {
         return json({ error: "Courier tracking is unavailable — the read-only credential is not configured. Set DISPATCH_COURIER_READ_TOKEN (the counterpart of Courier's contributeAPI.readKeySecret). Submission remains unaffected.", refreshed: false, ...rowFixture() }, 503);
       }

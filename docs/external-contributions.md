@@ -309,7 +309,9 @@ an unconfigured surface still renders, naming its gaps.
 - **Queue and detail.** The stored-request listing and one-request detail read
   the ledger routes, which never call Courier; they work while Courier is
   offline. A row shows the delivery status, the derived lifecycle state (plus
-  a `stale` marker), and the verbatim Courier phase in detail.
+  a `stale` marker), and the verbatim Courier phase in detail. The listing
+  asks for the widest page the API answers (`?limit=200`) and says so when the
+  ledger is wider; older requests remain readable through the API.
 - **Bounded refresh.** Accepted requests offer "Refresh tracking", which calls
   only `POST /api/external-contributions/[id]/refresh` — a GET-shaped settle,
   never a re-submission. A cooldown answer says how long until Courier may be
@@ -322,6 +324,10 @@ an unconfigured surface still renders, naming its gaps.
   (Courier's provenance is not scheme safety). The same http(s)-only gate
   applies to the upstream-issue link. Absence of a lifecycle observation
   renders as `unobserved` (unknown), never as any completion-flavoured state.
+  A retry answered `200` covers both a genuine Courier resume and a replay of
+  an already-settled identity — the wire carries no per-call marker — so the
+  notice attributes a recorded resume to the identity, never to the click, and
+  never claims the retry delivered anything it cannot prove.
   Nothing here creates, merges, or re-derives a PR, and nothing writes
   Kubernetes or GitHub state.
 
