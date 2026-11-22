@@ -1,4 +1,4 @@
-# External contribution requests (#1537, #1538, parent #1349)
+# External contribution requests (#1537, #1538, #1539, parent #1349)
 
 Dispatch can persist a request to contribute work to an external repository and
 submit it — once, exactly — to Courier's HTTP admission API. Dispatch then
@@ -76,7 +76,8 @@ Request body:
 
 `idempotencyKey` is generated server-side when omitted. The response (201
 created / 200 resumed-or-replayed) carries `id`, `idempotencyKey`, `status`,
-`run`, `namespace`, `workItemId`, `resumed`, `attempts`, and `lastError`.
+`run`, `namespace`, `workItemId`, `resumed`, `baseRepo`, `baseRef`, `workRepo`,
+`lane`, `goal`, `attempts`, and `lastError`.
 
 Delivery statuses recorded on the `ExternalContributionRequest` ledger row:
 
@@ -270,9 +271,78 @@ Rules:
 - **Missing capability, named.** No read token configured answers 503 with the
   missing piece and leaves submission untouched.
 
+## Operator UI (#1539)
+
+`/contributions` is the browser surface over the four routes above — the
+`POST /api/external-contributions` submission route plus the three
+stored-evidence routes. It is a
+consumer of the existing API and shared projection (`external-contribution-
+view.ts`) — it introduces no new write path, no new authority, and no second
+state machine. The nav entry ("Contributions") is present on every instance;
+an unconfigured surface still renders, naming its gaps.
+
+- **Configuration panel.** Shows what is configured — endpoint PRESENCE,
+  approved namespaces, and credential PRESENCE — resolved server-side by
+  `projectCourierSurface()`. Credential values have no path into the client
+  tree, and neither does the admission endpoint URL itself: it is credential-
+  bearing transport configuration (userinfo or token-like query parameters are
+  legal in a URL), so the panel renders `configured` / `not configured`, never
+  the string. When submission or tracking is disabled, the panel renders the
+  same named capability gap the API answers with (503 reasons), never a generic
+  failure. The submission form is disabled until the surface is configured.
+- **Submission.** One namespace per submission, selectable ONLY from the
+  operator-approved `DISPATCH_COURIER_ADMISSION_NAMESPACES` list (the form
+  offers no free-text destination and the server re-checks). The form holds
+  one client-generated `idempotencyKey` per form session: an in-flight or
+  uncertain answer keeps the key so re-submitting retries the SAME identity
+  (and says so), while a settled identity (Courier rejection, payload
+  conflict, exhausted budget) is rotated so the next edit is a deliberately
+   new contribution. The durable half of that identity lives in the LEDGER,
+   not the browser: every unsettled row inside the attempt budget —
+   `pending`, `uncertain`, AND `in_flight` — offers **Retry delivery**, which
+   rebuilds the canonical POST from the row's own stored fields and replays
+   its recorded key. A page reload between an uncertain delivery and a retry
+   therefore still re-offers the SAME request, never a forked identity, and a
+   crashed Dispatch attempt (an `in_flight` row whose `inFlightUntil` lease
+   expires) recovers through the SAME identity too — while the lease is still
+   live the replay just answers `in_flight` with no second Courier call and no
+   consumed attempt (the server's payload-digest guard 409s any body that
+   fails to match the stored fields). While any such row exists the submission
+   form says so and points at the stored request's retry: the form always
+   carries a fresh identity, so it is for deliberately new work only, never
+   for repeating an unsettled one. This mirrors the exactly-once rules above;
+   the ledger and the atomic claim still decide — the browser only avoids
+   forking an identity the caller did not mean to abandon.
+- **Queue and detail.** The stored-request listing and one-request detail read
+  the ledger routes, which never call Courier; they work while Courier is
+  offline. A row shows the delivery status, the derived lifecycle state (plus
+  a `stale` marker), and the verbatim Courier phase in detail. The listing
+  asks for the widest page the API answers (`?limit=200`, the shared bound in
+  `lib/external-contribution-list.ts` that the route enforces too) and says so
+  when the ledger is wider; older requests remain readable through the API.
+- **Bounded refresh.** Accepted requests offer "Refresh tracking", which calls
+  only `POST /api/external-contributions/[id]/refresh` — a GET-shaped settle,
+  never a re-submission. A cooldown answer says how long until Courier may be
+  asked again; failures render the named reason and leave the stored evidence
+  on screen.
+- **Honesty rules carried through to the pixels.** A PR link renders only when
+  `tracking.publication.pr` exists — an absent PR is never a broken link or a
+  placeholder — and only when the recorded value parses as an absolute http(s)
+  URL; any other value stays on screen as plain text, never as an href
+  (Courier's provenance is not scheme safety). The same http(s)-only gate
+  applies to the upstream-issue link. Absence of a lifecycle observation
+  renders as `unobserved` (unknown), never as any completion-flavoured state.
+  A retry answered `200` covers both a genuine Courier resume and a replay of
+  an already-settled identity — the wire carries no per-call marker — so the
+  notice attributes a recorded resume to the identity, never to the click, and
+  never claims the retry delivered anything it cannot prove.
+  Nothing here creates, merges, or re-derives a PR, and nothing writes
+  Kubernetes or GitHub state.
+
 ## Non-goals
 
-A browser UI, fork discovery/creation, PR publication logic, automatic
-execution retries after a terminal Courier failure, and production enablement
-(the feature is off until an operator configures it). Status polling is NOT a
-non-goal since #1538 — see above.
+Fork discovery/creation, PR publication logic, automatic execution retries
+after a terminal Courier failure, and production enablement (the feature is
+off until an operator configures it). Status polling is NOT a non-goal since
+#1538 — see above. A browser UI is NOT a non-goal since #1539 — see
+"Operator UI" above.

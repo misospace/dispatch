@@ -14,6 +14,7 @@ const navLinks = [
   { href: "/automation", label: "Automation" },
   { href: "/groomer", label: "Groomer" },
   { href: "/delivery", label: "Delivery" },
+  { href: "/contributions", label: "Contributions" },
 ];
 
 export function MobileNav() {
