@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import {
   projectExternalContribution,
   projectCourierSurface,
+  type ExternalContributionWire,
 } from "./external-contribution-view";
 import type { ExternalContributionRow } from "./external-contribution";
 
@@ -78,6 +79,31 @@ describe("projectExternalContribution", () => {
     });
     expect(view.tracking).toMatchObject({ state: "published", phase: "AwaitingReview" });
     expect(view.tracking.publication?.pr).toBe("https://github.com/acme/widgets/pull/42");
+  });
+});
+
+describe("ExternalContributionWire (#1688 review)", () => {
+  it("keeps nullable projection fields nullable on the wire type", () => {
+    // `WireValue` is a naked conditional type, so it distributes and `null`
+    // falls through unchanged (it extends neither `Date` nor `object`). This
+    // assignment is the regression pin: a refactor that maps a nullable field
+    // to a plain `string` stops compiling here while `strict` stays on
+    // (tsconfig.json).
+    const wire: Pick<
+      ExternalContributionWire,
+      "run" | "workItemId" | "upstreamIssue" | "lastError"
+    > & {
+      state: ExternalContributionWire["tracking"]["state"];
+      cause: ExternalContributionWire["tracking"]["cause"];
+    } = {
+      run: null,
+      workItemId: null,
+      upstreamIssue: null,
+      lastError: null,
+      state: null,
+      cause: null,
+    };
+    expect(Object.values(wire).every((value) => value === null)).toBe(true);
   });
 });
 

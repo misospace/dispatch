@@ -273,7 +273,9 @@ Rules:
 
 ## Operator UI (#1539)
 
-`/contributions` is the browser surface over the three routes above. It is a
+`/contributions` is the browser surface over the four routes above — the
+`POST /api/external-contributions` submission route plus the three
+stored-evidence routes. It is a
 consumer of the existing API and shared projection (`external-contribution-
 view.ts`) — it introduces no new write path, no new authority, and no second
 state machine. The nav entry ("Contributions") is present on every instance;
