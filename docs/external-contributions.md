@@ -297,21 +297,29 @@ an unconfigured surface still renders, naming its gaps.
   uncertain answer keeps the key so re-submitting retries the SAME identity
   (and says so), while a settled identity (Courier rejection, payload
   conflict, exhausted budget) is rotated so the next edit is a deliberately
-  new contribution. The durable half of that identity lives in the LEDGER,
-  not the browser: an unsettled (`pending` / `uncertain`) row offers
-  **Retry delivery**, which rebuilds the canonical POST from the row's own
-  stored fields and replays its recorded key — so a page reload between an
-  uncertain delivery and a retry still re-offers the SAME request, never a
-  forked identity (the server's payload-digest guard 409s any body that fails
-  to match the stored fields). This mirrors the exactly-once rules above; the
-  ledger and the atomic claim still decide — the browser only avoids forking
-  an identity the caller did not mean to abandon.
+   new contribution. The durable half of that identity lives in the LEDGER,
+   not the browser: every unsettled row inside the attempt budget —
+   `pending`, `uncertain`, AND `in_flight` — offers **Retry delivery**, which
+   rebuilds the canonical POST from the row's own stored fields and replays
+   its recorded key. A page reload between an uncertain delivery and a retry
+   therefore still re-offers the SAME request, never a forked identity, and a
+   crashed Dispatch attempt (an `in_flight` row whose `inFlightUntil` lease
+   expires) recovers through the SAME identity too — while the lease is still
+   live the replay just answers `in_flight` with no second Courier call and no
+   consumed attempt (the server's payload-digest guard 409s any body that
+   fails to match the stored fields). While any such row exists the submission
+   form says so and points at the stored request's retry: the form always
+   carries a fresh identity, so it is for deliberately new work only, never
+   for repeating an unsettled one. This mirrors the exactly-once rules above;
+   the ledger and the atomic claim still decide — the browser only avoids
+   forking an identity the caller did not mean to abandon.
 - **Queue and detail.** The stored-request listing and one-request detail read
   the ledger routes, which never call Courier; they work while Courier is
   offline. A row shows the delivery status, the derived lifecycle state (plus
   a `stale` marker), and the verbatim Courier phase in detail. The listing
-  asks for the widest page the API answers (`?limit=200`) and says so when the
-  ledger is wider; older requests remain readable through the API.
+  asks for the widest page the API answers (`?limit=200`, the shared bound in
+  `lib/external-contribution-list.ts` that the route enforces too) and says so
+  when the ledger is wider; older requests remain readable through the API.
 - **Bounded refresh.** Accepted requests offer "Refresh tracking", which calls
   only `POST /api/external-contributions/[id]/refresh` — a GET-shaped settle,
   never a re-submission. A cooldown answer says how long until Courier may be

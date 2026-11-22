@@ -323,6 +323,111 @@ describe("ContributionsClient", () => {
     expect(screen.queryByText(/Re-delivered/i)).toBeNull();
   });
 
+  it("offers retry delivery on a crashed in_flight row and replays the recorded identity", async () => {
+    // Dispatch died between claiming the delivery and settling it: the row is
+    // `in_flight` under a lease. After a reload the browser has no form key
+    // left, so the durable retry affordance must cover this state and replay
+    // the RECORDED identity — never fork a new one through the form.
+    const crashed = rowFixture({
+      status: "in_flight",
+      run: null,
+      attempts: 1,
+      tracking: { ...rowFixture().tracking, state: null, publication: null },
+    });
+    vi.mocked(authedFetch).mockImplementation(async (url: string, options?: RequestInit) => {
+      if (url === "/api/external-contributions" && options?.method === "POST") {
+        // Lease expired server-side: the same-identity POST re-claims the row
+        // for exactly one bounded re-attempt and the delivery lands.
+        return json(rowFixture({ status: "accepted", run: "run-recovered" }), 201);
+      }
+      if (url.split("?")[0] === "/api/external-contributions") return listed(crashed);
+      throw new Error(`unexpected url ${url}`);
+    });
+    render(<ContributionsClient config={configured} />);
+    await waitFor(() => expect(screen.getByText("in_flight")).toBeInTheDocument());
+
+    await userEvent.click(screen.getByRole("button", { name: /retry delivery/i }));
+    await waitFor(() =>
+      expect(screen.getByText(/Re-delivered under the SAME request identity/)).toBeTruthy(),
+    );
+
+    const posts = vi
+      .mocked(authedFetch)
+      .mock.calls.filter(([, options]) => options?.method === "POST");
+    // Exactly one POST, carrying the row's recorded key and canonical fields.
+    expect(posts).toHaveLength(1);
+    expect(JSON.parse(String(posts[0]?.[1]?.body))).toMatchObject({
+      idempotencyKey: "key-1",
+      namespace: "team-alpha",
+      lane: "contribution",
+      baseRepo: "acme/widgets",
+      baseRef: "main",
+      workRepo: "acme/widgets-fork",
+      goal: "Add a widget",
+    });
+  });
+
+  it("reports an in-flight retry as already running while the lease is live, without forking", async () => {
+    const live = rowFixture({
+      status: "in_flight",
+      run: null,
+      tracking: { ...rowFixture().tracking, state: null, publication: null },
+    });
+    vi.mocked(authedFetch).mockImplementation(async (url: string, options?: RequestInit) => {
+      if (url === "/api/external-contributions" && options?.method === "POST") {
+        // Live lease: the server re-reads the row and answers `in_flight` —
+        // no second Courier call, no attempt consumed, no fork.
+        return json(live, 200);
+      }
+      if (url.split("?")[0] === "/api/external-contributions") return listed(live);
+      throw new Error(`unexpected url ${url}`);
+    });
+    render(<ContributionsClient config={configured} />);
+    await waitFor(() => expect(screen.getByText("in_flight")).toBeInTheDocument());
+
+    await userEvent.click(screen.getByRole("button", { name: /retry delivery/i }));
+    await waitFor(() =>
+      expect(
+        screen.getByText(/already running; this retry did not start a second one/i),
+      ).toBeTruthy(),
+    );
+  });
+
+  it("does not offer retry delivery on an in_flight row once the attempt budget is spent", async () => {
+    vi.mocked(authedFetch).mockResolvedValue(
+      listed(
+        rowFixture({
+          status: "in_flight",
+          run: null,
+          attempts: 5,
+          tracking: { ...rowFixture().tracking, state: null, publication: null },
+        }),
+      ),
+    );
+    render(<ContributionsClient config={configured} />);
+    await waitFor(() => expect(screen.getByText("in_flight")).toBeInTheDocument());
+    // Past the budget the identity is settled-terminal; a retry could only
+    // answer retry_exhausted, so no affordance is offered.
+    expect(screen.queryByRole("button", { name: /retry delivery/i })).toBeNull();
+  });
+
+  it("names the durable retry path while stored requests remain unsettled", async () => {
+    vi.mocked(authedFetch).mockResolvedValue(
+      listed(
+        rowFixture({
+          status: "in_flight",
+          run: null,
+          tracking: { ...rowFixture().tracking, state: null, publication: null },
+        }),
+      ),
+    );
+    render(<ContributionsClient config={configured} />);
+    await waitFor(() => expect(screen.getByText("in_flight")).toBeInTheDocument());
+
+    expect(screen.getByText(/still has an unsettled delivery/i)).toBeInTheDocument();
+    expect(screen.getByText(/This form always starts a NEW request/i)).toBeInTheDocument();
+  });
+
   it("asks for the widest listing page and flags the cap when the ledger is wider", async () => {
     const many = Array.from({ length: 200 }, (_, i) => rowFixture({ id: `req-${i}` }));
     vi.mocked(authedFetch).mockImplementation(async (url: string) => {

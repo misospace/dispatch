@@ -6,6 +6,10 @@ import { enforceRateLimit } from "@/lib/rate-limit";
 import { getCourierAdmissionConfig } from "@/lib/courier-admission";
 import { parseContributionInput, submitExternalContribution } from "@/lib/external-contribution";
 import { projectExternalContribution } from "@/lib/external-contribution-view";
+import {
+  EXTERNAL_CONTRIBUTION_LIST_DEFAULT_LIMIT,
+  EXTERNAL_CONTRIBUTION_LIST_MAX_LIMIT,
+} from "@/lib/external-contribution-list";
 
 /**
  * POST /api/external-contributions (#1537, parent #1349).
@@ -38,9 +42,9 @@ import { projectExternalContribution } from "@/lib/external-contribution-view";
 
 const RATE_LIMIT = { limit: 10, windowMs: 60_000 };
 
-/** Default / cap for the stored-requests listing (#1538). */
-const LIST_DEFAULT_LIMIT = 50;
-const LIST_MAX_LIMIT = 200;
+// Default / cap for the stored-requests listing (#1538) come from the shared
+// bound in `lib/external-contribution-list.ts`, which the operator UI imports
+// too, so the widest page the browser asks for cannot drift from this cap.
 
 /**
  * GET /api/external-contributions (#1538) — the operator's stored-evidence
@@ -62,11 +66,18 @@ export async function GET(request: Request) {
 
   try {
     const raw = new URL(request.url).searchParams.get("limit");
-    let take = LIST_DEFAULT_LIMIT;
+    let take = EXTERNAL_CONTRIBUTION_LIST_DEFAULT_LIMIT;
     if (raw !== null && raw !== "") {
       const parsed = Number(raw);
-      if (!Number.isInteger(parsed) || parsed < 1 || parsed > LIST_MAX_LIMIT) {
-        return errorResponse(`limit must be an integer between 1 and ${LIST_MAX_LIMIT}`, 400);
+      if (
+        !Number.isInteger(parsed) ||
+        parsed < 1 ||
+        parsed > EXTERNAL_CONTRIBUTION_LIST_MAX_LIMIT
+      ) {
+        return errorResponse(
+          `limit must be an integer between 1 and ${EXTERNAL_CONTRIBUTION_LIST_MAX_LIMIT}`,
+          400,
+        );
       }
       take = parsed;
     }

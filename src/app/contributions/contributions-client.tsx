@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { hasControlChars, isValidRepoName } from "@/lib/config-parsers";
+import { EXTERNAL_CONTRIBUTION_LIST_MAX_LIMIT } from "@/lib/external-contribution-list";
 import type { CourierSurfaceView, ExternalContributionWire } from "@/lib/external-contribution-view";
 import { ExternalLink, RefreshCw } from "lucide-react";
 
@@ -26,13 +27,10 @@ import { ExternalLink, RefreshCw } from "lucide-react";
 /** What the routes answer with, derived from the shared projection (`external-contribution-view.ts`). */
 type ContributionRow = ExternalContributionWire;
 
-/**
- * Widest single page the stored-requests listing answers with — mirrors
- * `LIST_MAX_LIMIT` in `app/api/external-contributions/route.ts` (#1538). The
- * page asks for it so the operator sees the newest 200, and says so when the
- * ledger is even wider.
- */
-const LIST_FETCH_LIMIT = 200;
+// The page asks for the widest listing page the API answers with, imported
+// from the shared bound (`lib/external-contribution-list.ts`) so it can never
+// drift from the server cap, and says so when the ledger is even wider.
+const LIST_FETCH_LIMIT = EXTERNAL_CONTRIBUTION_LIST_MAX_LIMIT;
 
 interface Notice {
   tone: "success" | "warning" | "error" | "info";
@@ -361,6 +359,19 @@ export function ContributionsClient({ config }: { config: CourierSurfaceView }) 
 
   const submissionEnabled = config.admissionReason === null && config.namespaces.length > 0;
 
+  // Unsettled requests still inside the attempt budget. The form always
+  // carries a NEW identity, so it can never repeat-submit one of these; the
+  // honest risk is an operator FORKING the same work into a second identity.
+  // The notice names the durable retry path instead (the ledger, not the
+  // browser, decides; new deliberate work stays possible).
+  const unsettledRetryable = requests.filter(
+    (row) =>
+      (row.status === "pending" ||
+        row.status === "in_flight" ||
+        row.status === "uncertain") &&
+      row.attempts < config.maxDeliveryAttempts,
+  ).length;
+
   const upsertRow = useCallback((row: ContributionRow) => {
     setRequests((prev) => {
       const index = prev.findIndex((r) => r.id === row.id);
@@ -464,12 +475,22 @@ export function ContributionsClient({ config }: { config: CourierSurfaceView }) 
    * action rebuilds the canonical POST body from the stored row's own fields
    * and re-sends it under the row's recorded `idempotencyKey`, so a retry
    * after a reload replays the SAME request identity instead of forking a new
-   * one. Only unsettled `pending` / `uncertain` rows still inside the
-   * server-side attempt budget offer it — deliberately narrower than the
-   * server's atomic claim, which additionally recovers expired-lease
-   * `in_flight` rows. The server-side payload-digest guard is the
+   * one. Every unsettled row inside the server-side attempt budget offers it —
+   * `pending`, `uncertain`, AND `in_flight` — every replay the server's atomic
+   * claim could win; the one claim-adjacent case left un-offered (budget spent
+   * with a live final attempt) can only be answered `in_flight` or
+   * `retry_exhausted`, so a click there would be a provable no-op. The
+   * `in_flight` case is the crash-recovery path: if
+   * Dispatch died between claiming the attempt and settling it, the row's
+   * `inFlightUntil` lease eventually expires and this same-identity POST
+   * re-claims it for one bounded re-attempt; while the lease is still live the
+   * server answers `in_flight` with no second Courier call, so the click can
+   * never fork a delivery. The server-side payload-digest guard is the
    * backstop: a body that fails to match the stored canonical fields answers
-   * 409 `payload_conflict` and admits nothing.
+   * 409 `payload_conflict` and admits nothing. The replayed `row.namespace`
+   * is safe to send because the projection's `courierNamespace ?? namespace`
+   * override only ever appears on SETTLED rows (it is written at accepted
+   * settlement), and settled rows never offer this action.
    */
   const retryDelivery = useCallback(
     async (row: ContributionRow) => {
@@ -729,6 +750,16 @@ export function ContributionsClient({ config }: { config: CourierSurfaceView }) 
                   onChange={(e) => setForm((f) => ({ ...f, goal: e.target.value }))}
                 />
               </label>
+              {unsettledRetryable > 0 ? (
+                <p className={noticeClass("info")}>
+                  {unsettledRetryable === 1
+                    ? "One stored request still has an unsettled delivery."
+                    : `${unsettledRetryable} stored requests still have unsettled deliveries.`}{" "}
+                  Re-offer that work with “Retry delivery” on the stored request — it replays the
+                  recorded identity. This form always starts a NEW request, so use it only for
+                  deliberately new work, never to repeat an unsettled one.
+                </p>
+              ) : null}
               <div className="flex items-center gap-3">
                 <Button type="submit" disabled={submitting}>
                   {submitting ? "Submitting…" : "Submit contribution"}
@@ -775,14 +806,22 @@ export function ContributionsClient({ config }: { config: CourierSurfaceView }) 
               {requests.map((row) => {
                 const expanded = expandedId === row.id;
                 const trackable = row.status === "accepted" && row.run !== null;
-                // Unsettled settled-outcome rows still inside the server's
-                // attempt budget — the durable retry path survives a reload.
-                // (A crashed `in_flight` row keeps no retry here; it stays
-                // recoverable only through a deliberate resubmission of the
-                // same identity, which is why this affordance is deliberately
-                // narrower than the server's claim.)
+                // Unsettled rows inside the server's attempt budget — the
+                // durable retry path survives a reload, and every replay the
+                // server's claim could win is offered (a spent-budget row with
+                // a live final attempt is left un-offered: it can only answer
+                // `in_flight`/`retry_exhausted`). `in_flight` counts too: a
+                // Dispatch crash after the delivery claim leaves a row whose
+                // lease expires into recoverability, and the same-identity
+                // POST re-claims it server-side; while the lease is still live
+                // that POST just reports `in_flight` without a second Courier
+                // call. Hiding the affordance here would strand the
+                // recoverable row (a fresh form submission would fork a new
+                // identity instead).
                 const retryable =
-                  (row.status === "uncertain" || row.status === "pending") &&
+                  (row.status === "uncertain" ||
+                    row.status === "pending" ||
+                    row.status === "in_flight") &&
                   row.attempts < config.maxDeliveryAttempts;
                 return (
                   <div key={row.id} className="rounded-md border">
