@@ -32,7 +32,7 @@
  * the state machine in `external-contribution-tracking.ts` maps it for a run
  * we previously admitted to an explicit expired observation, never completion.
  */
-import { courierAdmissionTimeoutMs, redactSecret } from "./courier-admission";
+import { courierAdmissionTimeoutMs, errorName, errorMessage, redactSecret } from "./courier-admission";
 
 /** Operator-configured status-read endpoint + read-only credential, or why tracking is off. */
 export type CourierTrackingConfig =
@@ -282,16 +282,6 @@ function parseRetryAfterMs(response: Response): number | undefined {
   const seconds = Number(raw.trim());
   if (!Number.isFinite(seconds) || seconds < 0) return undefined;
   return Math.round(seconds * 1000);
-}
-
-function errorName(error: unknown): string {
-  const name = (error as { name?: unknown } | null | undefined)?.name;
-  return typeof name === "string" ? name : "";
-}
-
-function errorMessage(error: unknown): string {
-  const message = (error as { message?: unknown } | null | undefined)?.message;
-  return typeof message === "string" && message ? message : "Unknown network error";
 }
 
 function diagnosticFromErrorBody(bodyText: string, status: number): string {
