@@ -22,12 +22,13 @@ import { normalizeQueueRepo } from "./shared";
  *   AUDIT marker so an operator can enumerate the rows that still need a
  *   claimant. Migration window for operators — it observes the unresolved
  *   population, it does not dispatch it.
- * - "off": refuse exactly like "enforce"; the issuance-side lazy backfill
- *   does NOT run, so Dispatch performs no issuance-side write on the row.
- *   Recovery is then entirely operator-driven (re-ingestion, operator
- *   requeue, or `POST /api/pr-fix-queue/claimant`). Ingestion-side capture
- *   — the claimant columns and the provenance they record — keeps running,
- *   and a negotiated poll still receives the evidence object.
+  * - "off": refuse exactly like "enforce"; the issuance-side lazy backfill
+  *   does NOT run, so Dispatch performs no issuance-side write on the row.
+  *   Recovery is then entirely operator-driven (re-ingestion, operator
+  *   requeue, or `POST /api/pr-fix-queue/claimant` stamp/clear/transfer).
+  *   Ingestion-side capture — the claimant columns and the provenance they
+  *   record — keeps running, and a negotiated poll still receives the evidence
+  *   object.
  *
  * Unresolved rows are NOT silently stranded: outside "off", the gate first
  * attempts a lazy re-resolution from the authoritative records (live Lease,
@@ -346,4 +347,89 @@ export async function setPrFixClaimant(
     });
     return { updated: true } as const;
   });
+}
+
+export type PrFixClaimantMutationResult = {
+  updated: boolean;
+  previousClaimant: string | null;
+  previousSource: string | null;
+  reason?: "not_found" | "contended";
+};
+
+async function mutatePrFixClaimant(
+  client: PrFixQueueClient,
+  input: { repo: string; pr: number; claimant: string | null },
+): Promise<PrFixClaimantMutationResult> {
+  const repo = normalizeQueueRepo(input.repo);
+  const claimant = input.claimant?.trim() ?? null;
+  return client.$transaction(async (tx) => {
+    const existing = await tx.prFixQueueItem.findUnique({
+      where: { repo_pr: { repo, pr: input.pr } },
+      select: { id: true, claimant: true, claimantSource: true },
+    });
+    if (!existing) {
+      return { updated: false, previousClaimant: null, previousSource: null, reason: "not_found" };
+    }
+
+    let observedClaimant: string | null = existing.claimant ?? null;
+    let observedSource: string | null = existing.claimantSource ?? null;
+    if (claimant === null && observedClaimant === null) {
+      return { updated: true, previousClaimant: null, previousSource: observedSource };
+    }
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const { count } = await tx.prFixQueueItem.updateMany({
+        // Pin the observed PAIR, not just the identity: a concurrent transfer
+        // can keep the same claimant string while flipping provenance (e.g.
+        // "agent-label" -> "operator"), and a predicate on the claimant alone
+        // would clear that operator decision without ever taking the re-read
+        // path — with an audit note claiming the stale provenance.
+        where: { id: existing.id, claimant: observedClaimant, claimantSource: observedSource },
+        data: claimant === null
+          ? { claimant: null, claimantSource: null }
+          : { claimant, claimantSource: "operator" },
+      });
+      if (count === 1) {
+        if (claimant !== null || observedClaimant !== null) {
+          const note = claimant === null
+            ? `#1695 operator claimant clear: ${observedClaimant ?? "(unset)"} (provenance "${observedSource ?? "none"}") -> (unset).`
+            : `#1695 operator claimant transfer: ${observedClaimant ?? "(unset)"} (provenance "${observedSource ?? "none"}") -> ${claimant} (provenance "operator").`;
+          await tx.prFixHistory.create({ data: { itemId: existing.id, action: "mark", note } });
+        }
+        return { updated: true, previousClaimant: observedClaimant, previousSource: observedSource };
+      }
+      if (attempt < 2) {
+        const fresh = await tx.prFixQueueItem.findUnique({
+          where: { id: existing.id },
+          select: { claimant: true, claimantSource: true },
+        });
+        if (!fresh) return { updated: false, previousClaimant: null, previousSource: null, reason: "not_found" };
+        observedClaimant = fresh.claimant ?? null;
+        observedSource = fresh.claimantSource ?? null;
+      }
+    }
+    return { updated: false, previousClaimant: observedClaimant, previousSource: observedSource, reason: "contended" };
+  });
+}
+
+/**
+ * #1695: Operator clear/transfer re-observes after each lost conditional write.
+ * A concurrent backfill only writes from NULL, and invalidation pins the stale
+ * agent-label pair, so neither can overwrite an operator decision unseen. The
+ * write is pinned on the observed claimant AND provenance pair — a concurrent
+ * transfer that keeps the identity but changes provenance loses the pin and
+ * forces the re-read — so each operator write re-observes before overriding a
+ * concurrent change, and its audit note reports the provenance it overrode.
+ */
+export function clearPrFixClaimant(
+  client: PrFixQueueClient,
+  input: { repo: string; pr: number },
+): Promise<PrFixClaimantMutationResult> {
+  return mutatePrFixClaimant(client, { ...input, claimant: null });
+}
+
+export function transferPrFixClaimant(
+  client: PrFixQueueClient,
+  input: { repo: string; pr: number; claimant: string },
+): Promise<PrFixClaimantMutationResult> {
+  return mutatePrFixClaimant(client, input);
 }
