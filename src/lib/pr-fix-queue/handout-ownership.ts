@@ -378,7 +378,12 @@ async function mutatePrFixClaimant(
     }
     for (let attempt = 0; attempt < 3; attempt++) {
       const { count } = await tx.prFixQueueItem.updateMany({
-        where: { id: existing.id, claimant: observedClaimant },
+        // Pin the observed PAIR, not just the identity: a concurrent transfer
+        // can keep the same claimant string while flipping provenance (e.g.
+        // "agent-label" -> "operator"), and a predicate on the claimant alone
+        // would clear that operator decision without ever taking the re-read
+        // path — with an audit note claiming the stale provenance.
+        where: { id: existing.id, claimant: observedClaimant, claimantSource: observedSource },
         data: claimant === null
           ? { claimant: null, claimantSource: null }
           : { claimant, claimantSource: "operator" },
@@ -410,8 +415,10 @@ async function mutatePrFixClaimant(
  * #1695: Operator clear/transfer re-observes after each lost conditional write.
  * A concurrent backfill only writes from NULL, and invalidation pins the stale
  * agent-label pair, so neither can overwrite an operator decision unseen. The
- * observed-value pin and retry ensure each operator write re-observes before
- * overriding a concurrent change.
+ * write is pinned on the observed claimant AND provenance pair — a concurrent
+ * transfer that keeps the identity but changes provenance loses the pin and
+ * forces the re-read — so each operator write re-observes before overriding a
+ * concurrent change, and its audit note reports the provenance it overrode.
  */
 export function clearPrFixClaimant(
   client: PrFixQueueClient,

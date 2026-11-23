@@ -441,7 +441,8 @@ model PrFixQueueItem {
   // operator stamp) is pinned on `claimant IS NULL`. Two #1695 exceptions:
   // label-cache writers invalidate stale `agent-label` evidence, pinned on the
   // exact recorded pair; operator clear/transfer is pinned on the observed
-  // value. The operator stamp refuses a row that already carries a claimant.
+  // claimant and provenance pair. The operator stamp refuses a row that
+  // already carries a claimant.
   // NULL claimant means unresolved; `claimantSource`
   // records WHY ("missing": no authoritative source existed; "ambiguous":
   // sources conflicted; NULL: legacy row from before the contract, treated as

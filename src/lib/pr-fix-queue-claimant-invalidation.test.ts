@@ -154,6 +154,65 @@ describe("#1695 claimant invalidation and operator mutations", () => {
     expect(await transferPrFixClaimant(fake.client, { repo: "org/repo", pr: 92, claimant: "smurf" })).toMatchObject({ updated: false, reason: "not_found" });
   });
 
+  it("clear re-observes a concurrent transfer that kept the identity but flipped provenance", async () => {
+    // Clear observed courier-x/agent-label; a concurrent operator transfer
+    // committed courier-x/operator before clear's conditional write ran. A
+    // claimant-only predicate would still match and clear the operator
+    // decision without the re-read, its note claiming the stale provenance.
+    const fake = makeClient([row("race", "courier-x", "agent-label")]);
+    const updateMany = fake.client.prFixQueueItem.updateMany;
+    let transferred = false;
+    fake.client.prFixQueueItem.updateMany = async (args: any) => {
+      if (!transferred) {
+        transferred = true;
+        Object.assign(fake.rows[0], { claimant: "courier-x", claimantSource: "operator" });
+      }
+      return updateMany(args);
+    };
+    expect(await clearPrFixClaimant(fake.client, { repo: "org/repo", pr: 90 })).toEqual({
+      updated: true,
+      previousClaimant: "courier-x",
+      previousSource: "operator",
+    });
+    expect(fake.rows[0]).toMatchObject({ claimant: null, claimantSource: null });
+    expect(fake.history).toHaveLength(1);
+    expect(fake.history[0].note).toContain('courier-x (provenance "operator") -> (unset)');
+  });
+
+  it("transfer re-observes a concurrent write that kept the identity but flipped provenance", async () => {
+    const fake = makeClient([row("race", "courier-x", "agent-label")]);
+    const updateMany = fake.client.prFixQueueItem.updateMany;
+    let flipped = false;
+    fake.client.prFixQueueItem.updateMany = async (args: any) => {
+      if (!flipped) {
+        flipped = true;
+        Object.assign(fake.rows[0], { claimant: "courier-x", claimantSource: "operator" });
+      }
+      return updateMany(args);
+    };
+    expect(await transferPrFixClaimant(fake.client, { repo: "org/repo", pr: 90, claimant: "operator-x" })).toEqual({
+      updated: true,
+      previousClaimant: "courier-x",
+      previousSource: "operator",
+    });
+    expect(fake.rows[0]).toMatchObject({ claimant: "operator-x", claimantSource: "operator" });
+    expect(fake.history).toHaveLength(1);
+    expect(fake.history[0].note).toContain('courier-x (provenance "operator") -> operator-x');
+  });
+
+  it("still clears a legacy row whose provenance stayed NULL through the race window", async () => {
+    // Legacy rows carry claimant with NULL provenance; the pinned pair
+    // (claimant + claimantSource: null) matches them and only them.
+    const fake = makeClient([row("legacy", "courier-x", null)]);
+    expect(await clearPrFixClaimant(fake.client, { repo: "org/repo", pr: 90 })).toMatchObject({
+      updated: true,
+      previousClaimant: "courier-x",
+      previousSource: null,
+    });
+    expect(fake.rows[0]).toMatchObject({ claimant: null, claimantSource: null });
+    expect(fake.history).toHaveLength(1);
+  });
+
   it("bounds contended writes without adding history", async () => {
     const fake = makeClient([row("contended", "courier-x", "agent-label")]);
     fake.contend();
