@@ -235,12 +235,12 @@ function parseAdmissionIdentity(status: number, bodyText: string): AdmissionResu
  * Error`: fetch/abort failures arrive as `DOMException` (`TimeoutError`,
  * `AbortError`), which does not subclass `Error` in every runtime.
  */
-function errorName(error: unknown): string {
+export function errorName(error: unknown): string {
   const name = (error as { name?: unknown } | null | undefined)?.name;
   return typeof name === "string" ? name : "";
 }
 
-function errorMessage(error: unknown): string {
+export function errorMessage(error: unknown): string {
   const message = (error as { message?: unknown } | null | undefined)?.message;
   return typeof message === "string" && message ? message : "Unknown network error";
 }
