@@ -14,6 +14,7 @@ const { mocks } = vi.hoisted(() => ({
     createLifecycleEvent: vi.fn(),
     upsertLifecycleEvent: vi.fn(),
     invalidateGroomingForComment: vi.fn(),
+    invalidateStaleAgentLabelClaimants: vi.fn(),
   },
 }));
 
@@ -21,7 +22,16 @@ vi.mock("@/lib/groomer/freshness-invalidation", () => ({
   invalidateGroomingForComment: mocks.invalidateGroomingForComment,
 }));
 
+vi.mock("@/lib/pr-fix-queue/claimant-invalidation", () => ({
+  invalidateStaleAgentLabelClaimants: mocks.invalidateStaleAgentLabelClaimants,
+}));
+
+vi.mock("@/lib/pr-fix-queue", () => ({
+  normalizeQueueRepo: (repo: string) => repo.trim().toLowerCase(),
+}));
+
 vi.mock("@/lib/prisma", () => ({
+  asPrFixQueueClient: (client: unknown) => client,
   prisma: {
     repository: { findUnique: mocks.repoFindUnique },
     issue: {
@@ -104,6 +114,7 @@ describe("POST /api/issues/webhook", () => {
     mocks.issueUpdateMany.mockResolvedValue({ count: 1 });
     mocks.createLifecycleEvent.mockResolvedValue({ id: "evt-1" });
     mocks.upsertLifecycleEvent.mockResolvedValue({ id: "evt-1" });
+    mocks.invalidateStaleAgentLabelClaimants.mockResolvedValue({ invalidated: 0 });
   });
 
   describe("signature verification (fail-closed default)", () => {
@@ -196,6 +207,19 @@ describe("POST /api/issues/webhook", () => {
           lastSyncedAt: expect.any(Date),
         }),
       });
+      expect(mocks.invalidateStaleAgentLabelClaimants).toHaveBeenCalledTimes(1);
+      expect(mocks.invalidateStaleAgentLabelClaimants).toHaveBeenCalledWith(expect.anything(), {
+        repo: "org/repo",
+        issue: 42,
+        labelsAfter: ["status/backlog", "type/bug"],
+      });
+    });
+
+    it("keeps a committed label update successful when claimant invalidation fails", async () => {
+      mocks.invalidateStaleAgentLabelClaimants.mockRejectedValueOnce(new Error("queue down"));
+      const res = await POST(signedRequest(makeIssuesEvent({ action: "labeled" })));
+      expect(res.status).toBe(200);
+      expect(mocks.invalidateStaleAgentLabelClaimants).toHaveBeenCalledTimes(1);
     });
 
     it("removes the label on a valid HMAC unlabeled delivery", async () => {
@@ -400,6 +424,7 @@ describe("POST /api/issues/webhook — lifecycle evidence (#1202)", () => {
     mocks.issueUpdateMany.mockResolvedValue({ count: 1 });
     mocks.createLifecycleEvent.mockResolvedValue({ id: "evt-1" });
     mocks.upsertLifecycleEvent.mockResolvedValue({ id: "evt-1" });
+    mocks.invalidateStaleAgentLabelClaimants.mockResolvedValue({ invalidated: 0 });
   });
 
   const statusDelivery = makeIssuesEvent({
@@ -407,6 +432,17 @@ describe("POST /api/issues/webhook — lifecycle evidence (#1202)", () => {
     label: { name: "status/ready" },
     issue: { number: 42, updated_at: "2026-10-02T08:00:00Z" },
     sender: { login: "octocat" },
+  });
+
+  it("invalidates claimant evidence from the committed labels and swallows failures", async () => {
+    mocks.invalidateStaleAgentLabelClaimants.mockRejectedValueOnce(new Error("queue down"));
+    const res = await POST(signedRequest(statusDelivery));
+    expect(res.status).toBe(200);
+    expect(mocks.invalidateStaleAgentLabelClaimants).toHaveBeenCalledWith(expect.anything(), {
+      repo: "org/repo",
+      issue: 42,
+      labelsAfter: ["status/backlog", "status/ready"],
+    });
   });
 
   it("records a status label move with the delivery as its idempotency identity", async () => {
@@ -536,6 +572,7 @@ describe("POST /api/issues/webhook — concurrent deliveries (#1220)", () => {
     mocks.repoFindUnique.mockResolvedValue({ id: "repo-1", fullName: "org/repo" });
     mocks.createLifecycleEvent.mockResolvedValue({ id: "evt-1" });
     mocks.upsertLifecycleEvent.mockResolvedValue({ id: "evt-1" });
+    mocks.invalidateStaleAgentLabelClaimants.mockResolvedValue({ invalidated: 0 });
   });
 
   /**

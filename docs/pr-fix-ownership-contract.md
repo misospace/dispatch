@@ -36,7 +36,7 @@ Failure states:
 - `missing` — no source resolved.
 - `legacy` — the row predates this contract, so `claimantSource` is NULL. Treated like missing.
 
-A recorded claimant is never overwritten, refreshed, or cleared by any writer. Every write after row creation is pinned on `claimant IS NULL`. The operator stamp refuses a row that already carries a claimant (`409`), and a successful stamp is audited in `PrFixHistory`.
+A recorded claimant is never overwritten or refreshed, with two #1695 exceptions: label-cache writers invalidate stale `agent-label` evidence, pinned on the exact recorded pair, and operator clear/transfer, pinned on the observed value. Invalidation runs in every mode and applies to all row statuses, including FIXED: FIXED is a recoverable tombstone (#940/#1218), and requeue re-resolves only while the claimant is NULL. The invalidation is audited in `PrFixHistory` and its note names the invalidated identity (there is no ingestion-time capture note). `operator`, `pr-author`, `lease`, and `owner-label` sources are never auto-invalidated. The operator stamp refuses a row that already carries a claimant (`409`), and a successful stamp is audited in `PrFixHistory`.
 
 ## Enforcement at issuance (next-task)
 
@@ -58,7 +58,8 @@ The mode never allows an automatic hand-out of a row with unresolved ownership. 
 
 1. Re-ingestion while unresolved.
 2. Operator requeue (re-resolves).
-3. `POST /api/pr-fix-queue/claimant` with `{ repo, pr, claimant }` — maintainer-only; stamps provenance `operator`. The stamp is a `claimant IS NULL` conditional write, atomic with its `PrFixHistory` audit row: a row that already carries a claimant is refused with `409` instead of transferred.
+3. `POST /api/pr-fix-queue/claimant` with `{ repo, pr, claimant }` — maintainer-only; stamps provenance `operator`. The stamp refuses an existing claimant with `409`.
+4. The same endpoint with `action: "clear"` clears to unresolved (idempotently), or `action: "transfer"` overwrites any claimant with provenance `operator`. Both are audited; neither refuses an existing claimant. A missing row returns `404`. The bounded optimistic loop returns retryable `503`; lock contention exceeding the interactive-transaction timeout surfaces as `500`. Both are retryable by the caller.
 
 ## Lane isolation at issuance
 
@@ -103,7 +104,7 @@ Queue listings carry `claimant`, `claimantSource`, and `ownership` additively.
 ### Reading the provenance
 
 - `originalClaimant` is the authority. A row that carries a claimant dispatches, whatever its `provenance` says.
-- `provenance: "legacy"` means the row predates this contract (no recorded source). It does not by itself mean "unowned": a claimant-bearing row with no recorded source still reports `legacy` and still dispatches.
+- `provenance: "legacy"` means the row predates this contract or has no recorded source. It does not by itself mean "unowned": a claimant-bearing row with no recorded source still reports `legacy` and still dispatches. An invalidated (#1695) or operator-cleared row also reports `legacy` while unresolved (`claimant` NULL and `claimantSource` NULL).
 - `missing` and `ambiguous` are the recorded failure states. Both refuse an automatic hand-out in every mode.
 - The ownership block rides on a granted hand-out only. The gate refuses a row with no resolvable claimant in every mode, so a shipped block always names an identity.
 - The queue listing shows a null `originalClaimant` for a row that still needs recovery. A capability grant is not a promise of a claimant.
@@ -111,7 +112,7 @@ Queue listings carry `claimant`, `claimantSource`, and `ownership` additively.
 
 ## Write rules
 
-- A claimant is written at row creation, and afterwards only by a write pinned on `claimant IS NULL` (re-ingestion backfill, issuance backfill, operator requeue, operator stamp). The pin is the invariant: a claimant an operator stamped, or a backfill that committed first, can never be transferred or cleared by a later writer — including the operator stamp endpoint itself, which refuses (`409`) when a claimant is already recorded.
+- A claimant is written at row creation, and afterwards by writes pinned on `claimant IS NULL` (re-ingestion backfill, issuance backfill, operator requeue, operator stamp), except mode-independent sync-side invalidation of stale `agent-label` evidence (pinned on the exact recorded pair) and operator clear/transfer (pinned on the observed value). Invalidation is a sync-side evidence-truthfulness write, not an issuance-side write, and applies to ALL row statuses including FIXED: FIXED is a recoverable tombstone and requeue re-resolves only while claimant is NULL. This does not change `off` mode's no-issuance-write promise.
 - Re-ingestion and requeue write only a RESOLVED value. An unresolved observation leaves an existing row untouched instead of rewriting a failure state every cycle.
 - A backfill that loses its `claimant IS NULL` write race (a sibling backfill or the operator stamp committed first) re-reads the row and reports the PERSISTED claimant. The losing caller's locally resolved identity was rejected and is never shipped; if the re-read fails, the caller reports no claimant and the gate refuses.
 - A failed claimant-fact read records nothing at all. The row stays unresolved (`claimantSource` NULL, reported as `legacy`), and a later observation or recovery re-resolves it — a transient database error is never stored as provenance.
@@ -138,7 +139,7 @@ The rebase executor (`DISPATCH_REBASE_AGENTS` pool) can be the claimant of recor
 Two rules keep the pool off non-REBASE items:
 
 1. At claimant resolution (enqueue, materialization, requeue, and the lazy issuance backfill), a rebase-executor name is not ownership evidence on a non-REBASE item. An `agent/<name>` label is filtered out, and a live lease held by the pool name is treated as absent. Resolution falls through to the next source, or records `missing` for operator stamping. The excluded name also cannot manufacture an `ambiguous` state against the identities that remain. A REBASE-typed item keeps its rebase-executor claimant.
-2. At the hand-out gate, a row with an already-recorded rebase-executor claimant and a non-REBASE dispatched lane is refused in every rollout mode. A recorded claimant is never cleared (the write rules above), so the refusal stops the decline loop; it ends when the PR settles.
+2. At the hand-out gate, a row with an already-recorded rebase-executor claimant and a non-REBASE dispatched lane is refused in every rollout mode. #1695 caveat: if the supporting `agent/*` label moves, invalidation clears the poison claimant to unresolved; enforce/audit self-heal through backfill, which still excludes rebase-executor names, while off leaves recovery to the operator.
 
 A bare `*` in `DISPATCH_REBASE_AGENTS` is a lane-eligibility opt-in only. It declares no executor names and excludes nothing from claimant resolution.
 

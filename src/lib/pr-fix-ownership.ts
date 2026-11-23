@@ -36,9 +36,9 @@
  * Authorization rule (fail closed): "missing" / "ambiguous" / "legacy"
  * NEVER authorize an automatic hand-out, in ANY rollout mode, to a
  * declared-lane consumer or to the unfiltered operator poll (#1046).
- * Recovery is explicit: re-ingestion re-resolves while unresolved, an
- * operator requeue re-resolves, or `POST /api/pr-fix-queue/claimant` stamps
- * an identity as "operator".
+  * Recovery is explicit: re-ingestion or operator requeue re-resolves while
+  * unresolved; `POST /api/pr-fix-queue/claimant` stamps, clears, or transfers
+  * an identity; #1695 label-cache writers invalidate stale agent-label claims.
  *
  * Versioning: the evidence object carries `contract: 1` and rides on the
  * #1532 intake negotiation. A consumer receives it only after declaring and

@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { errorResponse, readJsonObjectBody } from "@/lib/api-errors";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
-import { setPrFixClaimant, normalizeQueueRepo } from "@/lib/pr-fix-queue";
+import { setPrFixClaimant, clearPrFixClaimant, transferPrFixClaimant, normalizeQueueRepo } from "@/lib/pr-fix-queue";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
@@ -63,23 +63,50 @@ export async function POST(request: Request) {
     return errorResponse("pr must be an integer >= 1", 400);
   }
 
-  if (typeof body.claimant !== "string" || !body.claimant.trim()) {
-    return errorResponse("Missing required field: claimant", 400);
+  const action = body.action === undefined ? "stamp" : body.action;
+  if (action !== "stamp" && action !== "clear" && action !== "transfer") {
+    return errorResponse('action must be "stamp", "clear", or "transfer"', 400);
   }
-  if (CONTROL_CHARS.test(body.claimant)) {
-    return errorResponse("claimant must not contain control characters", 400);
+  if (action === "clear" && body.claimant !== undefined) {
+    return errorResponse('claimant must be omitted when action is "clear"', 400);
   }
-  const claimant = body.claimant.trim();
-  if (claimant.length > MAX_CLAIMANT_LENGTH) {
-    return errorResponse(`claimant must be at most ${MAX_CLAIMANT_LENGTH} characters`, 400);
+
+  let claimant: string | undefined;
+  if (action !== "clear") {
+    if (typeof body.claimant !== "string" || !body.claimant.trim()) {
+      return errorResponse("Missing required field: claimant", 400);
+    }
+    if (CONTROL_CHARS.test(body.claimant)) {
+      return errorResponse("claimant must not contain control characters", 400);
+    }
+    claimant = body.claimant.trim();
+    if (claimant.length > MAX_CLAIMANT_LENGTH) {
+      return errorResponse(`claimant must be at most ${MAX_CLAIMANT_LENGTH} characters`, 400);
+    }
   }
 
   try {
-    // The helper owns the row write (`repo_pr` unique key, `claimant IS NULL`
-    // conditional update to "operator" + claimantSource, atomic with its
-    // PrFixHistory "mark" note) and refuses to transfer an existing
-    // claimant (#1569 preservation rule).
-    const result = await setPrFixClaimant(asPrFixQueueClient(prisma), { repo, pr, claimant });
+    const client = asPrFixQueueClient(prisma);
+    if (action === "clear") {
+      const result = await clearPrFixClaimant(client, { repo, pr });
+      if (!result.updated) {
+        return result.reason === "contended"
+          ? errorResponse("pr-fix claimant update contended, retry", 503)
+          : errorResponse("pr-fix item not found", 404);
+      }
+      return NextResponse.json({ ok: true, action: "clear", repo, pr, previousClaimant: result.previousClaimant, previousSource: result.previousSource });
+    }
+    if (action === "transfer") {
+      const result = await transferPrFixClaimant(client, { repo, pr, claimant: claimant! });
+      if (!result.updated) {
+        return result.reason === "contended"
+          ? errorResponse("pr-fix claimant update contended, retry", 503)
+          : errorResponse("pr-fix item not found", 404);
+      }
+      return NextResponse.json({ ok: true, action: "transfer", repo, pr, claimant, previousClaimant: result.previousClaimant, previousSource: result.previousSource });
+    }
+    // #1569 stamp semantics remain unchanged: only NULL can be stamped.
+    const result = await setPrFixClaimant(client, { repo, pr, claimant: claimant! });
     if (!result.updated) {
       if (result.reason === "already_set") {
         return errorResponse(
@@ -91,7 +118,7 @@ export async function POST(request: Request) {
     }
     return NextResponse.json({ ok: true, updated: true, repo, pr, claimant });
   } catch (error) {
-    console.error("Failed to stamp pr-fix claimant:", error);
-    return errorResponse("Failed to stamp pr-fix claimant", 500);
+    console.error("Failed to update pr-fix claimant:", error);
+    return errorResponse(action === "stamp" ? "Failed to stamp pr-fix claimant" : "Failed to update pr-fix claimant", 500);
   }
 }
