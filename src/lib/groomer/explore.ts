@@ -8,6 +8,7 @@ import type { RelatedWorkObservation } from "./evidence-snapshot";
 import type { PinnedRead } from "./close-grounding";
 import type { InvestigationGapFacts } from "./investigation-gap";
 import { sanitizeModelJson, sanitizeModelText } from "./sanitize";
+import { litellmSessionHeaders } from "./session-affinity";
 
 export interface ExploreOptions {
   baseUrl: string;
@@ -27,6 +28,14 @@ export interface ExploreOptions {
   /** The snapshot SHA all file/directory reads in this exploration are pinned
    *  to; forwarded to the tool layer. */
   pinnedRef?: string;
+  /**
+   * LiteLLM session affinity (dispatch#1677): the id every round of this loop
+   * sends in `x-litellm-session-id`, the same id the plan call uses, so the
+   * exploration rounds and the plan turn of one grooming run stay pinned to
+   * the deployment the first request landed on. Absent for a caller with no
+   * run session. See `session-affinity.ts`.
+   */
+  sessionId?: string;
 }
 
 export interface ExploreToolRecord {
@@ -343,6 +352,7 @@ export async function exploreRepository(
         headers: {
           Authorization: `Bearer ${options.apiKey}`,
           "Content-Type": "application/json",
+          ...litellmSessionHeaders(options.sessionId),
         },
         body: JSON.stringify({
           model: options.model,

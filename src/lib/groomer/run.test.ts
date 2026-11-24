@@ -143,6 +143,7 @@ import {
 import { IssueMutationBusyError } from "@/lib/lease";
 import { setLaneConfig } from "@/lib/lane-config";
 import { computeGroomingIssueFingerprint } from "./freshness";
+import { groomerSessionId } from "./session-affinity";
 
 const mockCandidate: GroomingCandidate = {
   id: "issue-42",
@@ -817,6 +818,39 @@ describe("runHostedGroomer", () => {
         }),
         expect.any(Object),
       );
+    });
+
+    it("carries one LiteLLM session id across the exploration and the plan call (#1677)", async () => {
+      // One grooming run is several model requests: a round per exploration
+      // turn plus the plan call (and, inside it, a schema fallback, a retry or
+      // a repair turn). They must all hold the same id, or the run hops
+      // backends mid-run and every turn rebuilds the context the last one had.
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true, toolLoopEnabled: true });
+      mocks.exploreRepository.mockResolvedValue(mockExploration);
+
+      await runHostedGroomer();
+
+      const sessionId = groomerSessionId(mockGroomingRun.id);
+      expect(mocks.exploreRepository).toHaveBeenCalledWith(expect.objectContaining({ sessionId }));
+      // Every plan-stage call, not just one of them: a repair turn that lost
+      // the id would repin the run mid-plan.
+      expect(mocks.callGroomerLLM.mock.calls.length).toBeGreaterThan(0);
+      expect(mocks.callGroomerLLM.mock.calls.every(([llm]) => llm.sessionId === sessionId)).toBe(true);
+    });
+
+    it("keeps the run id itself as the session id when it is already header-safe (#1677)", async () => {
+      // A cuid is what the GroomingRun row holds, so the pin an operator sees
+      // in the LiteLLM logs names the run behind it.
+      const runId = "ckzq8t2v10000ab12cd34ef56";
+      mocks.prisma.groomingRun.create.mockResolvedValue({ id: runId, stage: "selected" });
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true, toolLoopEnabled: true });
+      mocks.exploreRepository.mockResolvedValue(mockExploration);
+
+      await runHostedGroomer();
+
+      expect(mocks.exploreRepository).toHaveBeenCalledWith(expect.objectContaining({ sessionId: runId }));
+      expect(mocks.callGroomerLLM.mock.calls.length).toBeGreaterThan(0);
+      expect(mocks.callGroomerLLM.mock.calls.every(([llm]) => llm.sessionId === runId)).toBe(true);
     });
 
     it("evidence capture failure does not fail the run", async () => {

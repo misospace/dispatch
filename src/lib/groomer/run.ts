@@ -35,6 +35,7 @@ import type { RepositoryContextInput, RepositoryContextConfig } from "./reposito
 import { createGroomingRunRecord, completeGroomingRunRecord, updateGroomingRunRecord } from "./history";
 import { explorationCallsForFreshness } from "./freshness";
 import { freshnessBaselineIssueData } from "./freshness-invalidation";
+import { groomerSessionId } from "./session-affinity";
 import { compareCommits, searchRepositoryCode } from "@/lib/github-code-search";
 import {
   lifecycleDedupeKey,
@@ -281,6 +282,14 @@ async function executeGroomerRun(
     candidateSource: candidateSourceOf(candidate),
     staleReasons: candidate.staleReasons,
   });
+
+  // LiteLLM session affinity (dispatch#1677): one id for every model request
+  // this run makes — each exploration round, the plan call, its schema
+  // fallback and retries, and the repair turn — so the turns of one run stay
+  // on the deployment the first of them landed on instead of each paying for a
+  // cold context on a fresh backend. Derived from the run row, so a run keeps
+  // one id for its whole life and two runs never share a pin.
+  const sessionId = groomerSessionId(groomingRun.id);
 
   // #1362: `upsertLease` RENEWS an existing (agent, issue) row instead of
   // creating one, and a plain renewal keeps that row's own claim token — the
@@ -622,6 +631,7 @@ async function executeGroomerRun(
           maxFileBytes: config.exploration.maxFileBytes,
           maxDirEntries: config.maxDirEntries,
           pinnedRef: evidence.headSha ?? undefined,
+          sessionId,
         })
       : null;
 
@@ -696,6 +706,7 @@ async function executeGroomerRun(
         timeoutMs: config.timeoutMs,
         explorationFindings: exploration?.findings,
         evidenceCatalog,
+        sessionId,
       },
       catalog: evidenceCatalog,
       deadline: leaseExpiresAt - LEASE_APPLY_RESERVE_MS,
