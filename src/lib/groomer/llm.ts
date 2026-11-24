@@ -5,6 +5,7 @@ import { buildGroomerSystemPrompt } from "./prompts/system-prompt";
 import { buildGroomingPlanResponseSchema } from "./plan-schema";
 import { renderEvidenceCatalog, type EvidenceCatalog } from "./plan-evidence";
 import { sanitizeForStorage, sanitizeModelText } from "./sanitize";
+import { litellmSessionHeaders } from "./session-affinity";
 
 export interface CallLlmOptions {
   baseUrl: string;
@@ -37,6 +38,14 @@ export interface CallLlmOptions {
    * full context it was produced from.
    */
   repair?: { previousResponse: string; errors: string[] };
+  /**
+   * LiteLLM session affinity (dispatch#1677): the id this run sends in
+   * `x-litellm-session-id` on every request of the call, so the schema
+   * fallback, a transient retry and the repair turn stay on the deployment the
+   * first request landed on. Absent for a stateless call. See
+   * `session-affinity.ts`.
+   */
+  sessionId?: string;
 }
 
 /**
@@ -179,6 +188,7 @@ function postChatCompletion(
     headers: {
       Authorization: `Bearer ${options.apiKey}`,
       "Content-Type": "application/json",
+      ...litellmSessionHeaders(options.sessionId),
     },
     body: JSON.stringify({
       model: options.model,
