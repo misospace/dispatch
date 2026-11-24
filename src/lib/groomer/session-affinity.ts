@@ -50,7 +50,14 @@ export function groomerSessionId(groomingRunId: string): string {
  * The session headers a model request carries. Empty when the caller has no
  * session: a stateless one-shot call (the lesson feed, a lane classification)
  * stays stateless and keeps LiteLLM's normal per-request routing.
+ *
+ * The helper re-checks the value itself through `groomerSessionId`, so a
+ * caller that hands it something unsanitized still gets a header-safe value
+ * instead of an id the proxy could reject or that could split a header. A
+ * header-safe id (what `groomerSessionId` already returns for a run row) is
+ * untouched, and the same input always produces the same header, so an
+ * accidental re-derivation never moves a run to a new pin.
  */
 export function litellmSessionHeaders(sessionId?: string | null): Record<string, string> {
-  return sessionId ? { [LITELLM_SESSION_HEADER]: sessionId } : {};
+  return sessionId ? { [LITELLM_SESSION_HEADER]: groomerSessionId(sessionId) } : {};
 }

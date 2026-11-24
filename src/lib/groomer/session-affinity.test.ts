@@ -71,4 +71,21 @@ describe("litellmSessionHeaders", () => {
     expect(litellmSessionHeaders(null)).toEqual({});
     expect(litellmSessionHeaders("")).toEqual({});
   });
+
+  it("re-derives an unsanitized id instead of trusting the caller", () => {
+    // The helper is the last gate before a header: a CR, an LF or a space can
+    // never reach one, even from a caller that skipped groomerSessionId.
+    const headers = litellmSessionHeaders("run id with spaces\r\nX: injected");
+    const value = headers[LITELLM_SESSION_HEADER];
+    expect(value).toMatch(HEADER_SAFE);
+    expect(value).toBe(groomerSessionId("run id with spaces\r\nX: injected"));
+  });
+
+  it("keeps the same pin for a repeated unsanitized id", () => {
+    // Pure derivation: an accidental re-derivation of the same bad id never
+    // moves a run to a new backend mid-flight.
+    const first = litellmSessionHeaders("bad id\n");
+    const second = litellmSessionHeaders("bad id\n");
+    expect(first).toEqual(second);
+  });
 });
