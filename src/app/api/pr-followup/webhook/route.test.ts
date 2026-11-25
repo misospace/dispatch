@@ -1065,7 +1065,7 @@ describe("POST /api/pr-followup/webhook — rate limit", () => {
 
   // Route-boundary pin for #1698: a legitimate GitHub burst (distinct
   // deliveries — distinct bodies and GUIDs) must not contend for one bucket.
-  it("does not 429 a burst of distinct GUID-keyed signed deliveries", async () => {
+  it("does not 429 a burst of distinct body-keyed signed deliveries", async () => {
     for (let i = 0; i < 35; i++) {
       const res = await signedRequest(
         "pull_request_review",

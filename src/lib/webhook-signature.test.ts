@@ -103,19 +103,30 @@ describe("authenticateWebhookDelivery", () => {
 
       expect(result.authenticated).toBe(true);
       if (!result.authenticated) throw new Error("expected authentication");
-      expect(result.actor).toBe("webhook");
+      expect(result.actor).toMatch(/^body:[0-9a-f]{64}$/);
     });
 
-    it("attributes a verified delivery by its GitHub delivery GUID (#1698)", async () => {
-      const { request, payload } = signedDelivery(undefined, {
+    it("attributes verified deliveries by their HMAC-covered body, not the caller-supplied GUID (#1698)", async () => {
+      const first = signedDelivery(undefined, {
         headers: { "x-github-delivery": "0f9d7d10-b3ea-4f28-8f6e-2f5f21d3a111" },
       });
+      const sameBody = signedDelivery(undefined, {
+        headers: { "x-github-delivery": "aaaaaaaa-b3ea-4f28-8f6e-2f5f21d3a222" },
+      });
+      const otherBody = signedDelivery({ ok: false });
 
-      const result = await authenticateWebhookDelivery(request, payload, "issues-webhook");
-
+      const result = await authenticateWebhookDelivery(first.request, first.payload, "issues-webhook");
       expect(result.authenticated).toBe(true);
       if (!result.authenticated) throw new Error("expected authentication");
-      expect(result.actor).toBe("delivery:0f9d7d10-b3ea-4f28-8f6e-2f5f21d3a111");
+      expect(result.actor).toMatch(/^body:[0-9a-f]{64}$/);
+
+      const same = await authenticateWebhookDelivery(sameBody.request, sameBody.payload, "issues-webhook");
+      const other = await authenticateWebhookDelivery(otherBody.request, otherBody.payload, "issues-webhook");
+      if (!same.authenticated) throw new Error("expected authentication");
+      if (!other.authenticated) throw new Error("expected authentication");
+      // Same body → same bucket; the GUID never enters the key.
+      expect(same.actor).toBe(result.actor);
+      expect(other.actor).not.toBe(result.actor);
     });
 
     it("rejects a signature computed over a different payload", async () => {
@@ -211,10 +222,9 @@ describe("authenticateWebhookDelivery", () => {
       process.env.WEBHOOK_SECRET = WEBHOOK_SECRET;
     });
 
-    // These deliveries carry no x-github-delivery GUID, so they are not
-    // shaped like real GitHub deliveries and keep the shared fallback
-    // bucket (#1698).
-    it("returns 429 with Retry-After once 30 GUID-less deliveries land in the window", async () => {
+    // These deliveries all carry the same body, so they share one per-body
+    // bucket and the 31st is throttled (#1698).
+    it("returns 429 with Retry-After once 30 same-body deliveries land in the window", async () => {
       for (let i = 0; i < 30; i++) {
         const { request, payload } = signedDelivery();
         const result = await authenticateWebhookDelivery(request, payload, "issues-webhook");
@@ -234,24 +244,27 @@ describe("authenticateWebhookDelivery", () => {
       expect(retryAfter).toBeLessThanOrEqual(10);
     });
 
-    it("keys each distinct delivery on its GitHub GUID, so a burst of valid signed deliveries is not throttled (#1698)", async () => {
+    it("keys distinct deliveries per body, so a burst of valid signed deliveries is not throttled even under one GUID (#1698)", async () => {
+      // Distinct bodies each get their own bucket. Sharing one GUID across
+      // the burst pins that the GUID is not the key: GUID keying would have
+      // 429'd the 31st delivery.
       for (let i = 0; i < 35; i++) {
         const { request, payload } = signedDelivery({ n: i }, {
-          headers: { "x-github-delivery": crypto.randomUUID() },
+          headers: { "x-github-delivery": "same-guid-across-the-burst" },
         });
         const result = await authenticateWebhookDelivery(request, payload, "issues-webhook");
         expect(result.authenticated).toBe(true);
       }
     });
 
-    it("caps GUID rotation of one captured signed delivery at the aggregate ceiling (#1698)", async () => {
-      // A captured (body, signature) pair replayed under fresh GUIDs must
-      // not mint unlimited fresh buckets: the aggregate ceiling (keyed on
-      // the secret's fingerprint) is what bounds that path.
+    it("caps a captured (body, signature) pair replayed under fresh GUIDs at the per-body bucket (#1698)", async () => {
+      // The body digest is the bucket key, so GUID rotation cannot mint
+      // fresh buckets: the whole replay lands in one 30/10s bucket — the
+      // old shared-bucket bound (3/s) — far below the aggregate ceiling.
       const captured = signedDelivery({ ok: true });
       const capturedSignature = captured.request.headers.get("x-hub-signature-256") as string;
 
-      for (let i = 0; i < 1000; i++) {
+      for (let i = 0; i < 30; i++) {
         const { request, payload } = signedDelivery({ ok: true }, {
           signature: capturedSignature,
           headers: { "x-github-delivery": crypto.randomUUID() },
@@ -271,20 +284,45 @@ describe("authenticateWebhookDelivery", () => {
       expect(capped.response.status).toBe(429);
     });
 
-    it("accepts a GUID at the length-cap boundary (Headers already strips header OWS)", async () => {
-      const capped = "a".repeat(128);
-      const { request, payload } = signedDelivery(undefined, {
-        headers: { "x-github-delivery": `  ${capped}  ` },
-      });
+    it("keeps the aggregate ceiling over distinct signed bodies so a secret-holder cannot grow the key space unbounded", async () => {
+      // Distinct bodies never fill a per-body bucket (one delivery each),
+      // so the 1001st distinct signed body can only be rejected by the
+      // aggregate ceiling.
+      for (let i = 0; i < 1000; i++) {
+        const { request, payload } = signedDelivery({ n: i });
+        const result = await authenticateWebhookDelivery(request, payload, "issues-webhook");
+        expect(result.authenticated).toBe(true);
+      }
 
-      const result = await authenticateWebhookDelivery(request, payload, "issues-webhook");
+      const { request, payload } = signedDelivery({ n: 1000 });
+      const capped = await authenticateWebhookDelivery(request, payload, "issues-webhook");
 
-      expect(result.authenticated).toBe(true);
-      if (!result.authenticated) throw new Error("expected authentication");
-      expect(result.actor).toBe(`delivery:${capped}`);
+      expect(capped.authenticated).toBe(false);
+      if (capped.authenticated) throw new Error("expected rejection");
+      expect(capped.response.status).toBe(429);
     });
 
-    it("throttles a same-GUID replay flood together (GitHub redeliveries reuse the GUID)", async () => {
+    it("does not let the GUID header value change the bucket key (oversized GUIDs share the body bucket)", async () => {
+      const oversized = "g".repeat(129);
+      for (let i = 0; i < 30; i++) {
+        const { request, payload } = signedDelivery(undefined, {
+          headers: { "x-github-delivery": oversized },
+        });
+        const result = await authenticateWebhookDelivery(request, payload, "issues-webhook");
+        expect(result.authenticated).toBe(true);
+      }
+
+      // A GUID-less delivery with the same body contends on the same
+      // bucket — the header is not part of the key at all.
+      const { request, payload } = signedDelivery();
+      const limited = await authenticateWebhookDelivery(request, payload, "issues-webhook");
+
+      expect(limited.authenticated).toBe(false);
+      if (limited.authenticated) throw new Error("expected rejection");
+      expect(limited.response.status).toBe(429);
+    });
+
+    it("throttles same-body redeliveries together (GitHub redeliveries resend the same body)", async () => {
       const guid = "11111111-2222-3333-4444-555555555555";
       for (let i = 0; i < 30; i++) {
         const { request, payload } = signedDelivery(undefined, {
@@ -302,25 +340,6 @@ describe("authenticateWebhookDelivery", () => {
       expect(replay.authenticated).toBe(false);
       if (replay.authenticated) throw new Error("expected rejection");
       expect(replay.response.status).toBe(429);
-    });
-
-    it("falls back to the shared bucket when the GUID header is unusable (oversized)", async () => {
-      const oversized = "g".repeat(129);
-      for (let i = 0; i < 30; i++) {
-        const { request, payload } = signedDelivery(undefined, {
-          headers: { "x-github-delivery": oversized },
-        });
-        const result = await authenticateWebhookDelivery(request, payload, "issues-webhook");
-        expect(result.authenticated).toBe(true);
-      }
-
-      // A GUID-less delivery contends on the same fallback bucket.
-      const { request, payload } = signedDelivery();
-      const limited = await authenticateWebhookDelivery(request, payload, "issues-webhook");
-
-      expect(limited.authenticated).toBe(false);
-      if (limited.authenticated) throw new Error("expected rejection");
-      expect(limited.response.status).toBe(429);
     });
 
     it("keeps each route's bucket separate", async () => {
