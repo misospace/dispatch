@@ -95,6 +95,66 @@ export function preserveEscalationLane(lane: unknown): PrFixLane {
 }
 
 /**
+ * Locking-read variant of the tri-state classification (#1674 review TOCTOU
+ * fix): the model-capable REBASE decision is an AUTHORITY decision, so it must
+ * be serialized against parent reclassification at the issuance boundary, the
+ * same `SELECT ... FOR SHARE` contract `withHandoutLaneExclusivityFence` uses
+ * for #1503. `issue.findFirstLocked` is only meaningful on a transaction
+ * client; a concurrent parent NORMAL→frontier UPDATE then either commits
+ * before the locked read (this read sees the frontier lane) or blocks on the
+ * share lock until the issuance transaction commits (the hand-out was valid at
+ * its commit).
+ *
+ * FAIL CLOSED: a missing locked-read surface, a thrown read, or an ABSENT row
+ * is `UNKNOWN`, never `NOT_ESCALATED` — an unestablished authority must not
+ * authorize the model-capable path (callers may still take the deterministic
+ * mechanical exception on it, with the mechanical wall only). The absent-row
+ * case matters even though the plain lookup treats "no row" as definitive:
+ * `SELECT ... FOR SHARE` on a missing row locks nothing, so a concurrent sync
+ * can INSERT an escalation-classified row inside this transaction's window
+ * without blocking. There is then no serialized authority to rely on, which
+ * is exactly what UNKNOWN means here. (An unlinked item and a deployment with
+ * no declared escalation lane are still positive `NOT_ESCALATED` answers:
+ * neither has a parent classification to serialise.)
+ */
+export async function linkedIssueEscalationClassifiedLocked(
+  client: Pick<PrFixQueueClient, "issue">,
+  repo: string,
+  issue: number | null | undefined,
+): Promise<LinkedIssueEscalationClassification> {
+  if (issue === null || issue === undefined) return "NOT_ESCALATED";
+  const escalationLane = getExplicitEscalationLane();
+  if (!escalationLane) return "NOT_ESCALATED";
+  if (typeof client.issue?.findFirstLocked !== "function") {
+    console.warn(
+      "[pr-fix-queue] no locked parent read available; deferring classification as UNKNOWN (#1674)",
+      { repo, issue },
+    );
+    return "UNKNOWN";
+  }
+  try {
+    // The lock wrapper folds repo casing itself (LOWER()=LOWER()); pass the
+    // queue-normalized repo exactly as the #1503 fence does.
+    const row = await client.issue.findFirstLocked(repo, issue);
+    if (!row) {
+      console.warn(
+        "[pr-fix-queue] linked issue row absent under the locked read; deferring classification as UNKNOWN (#1674)",
+        { repo, issue },
+      );
+      return "UNKNOWN";
+    }
+    return laneMatchesConfigured(row.currentLane ?? null, escalationLane.id) ? "ESCALATED" : "NOT_ESCALATED";
+  } catch (error) {
+    console.warn("[pr-fix-queue] locked linked-issue escalation lookup failed; deferring classification as UNKNOWN (#1674)", {
+      repo,
+      issue,
+      errorType: error instanceof Error ? error.name : typeof error,
+    });
+    return "UNKNOWN";
+  }
+}
+
+/**
  * Release-lane rule (#1503 review): any path that returns a held or parked
  * row to the dispatchable loop re-derives the authoritative classification
  * from the linked issue — a NEEDS_HUMAN hold replaced the lane column, so
