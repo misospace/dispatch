@@ -22,6 +22,8 @@
  * shape isn't justified.
  */
 
+import { trimJsonFences } from "@/lib/json";
+
 export type LessonOutcome =
   | { kind: "no_lesson" }
   | { kind: "lesson"; text: string };
@@ -275,22 +277,6 @@ function postChatCompletion(
     }),
     signal,
   });
-}
-
-function trimJsonFences(text: string): string {
-  let result = text.trim();
-  if (result.startsWith("```")) {
-    const firstNewline = result.indexOf("\n");
-    if (firstNewline > 0) {
-      result = result.slice(firstNewline + 1);
-    } else {
-      result = result.slice(3);
-    }
-  }
-  if (result.endsWith("```")) {
-    result = result.slice(0, -3).trim();
-  }
-  return result;
 }
 
 /** Cheap textual dedupe hint for the future PR-opener to use. */

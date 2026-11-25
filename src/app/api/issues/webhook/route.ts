@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
-import { prisma } from "@/lib/prisma";
+import { prisma, asPrFixQueueClient } from "@/lib/prisma";
+import { normalizeQueueRepo } from "@/lib/pr-fix-queue";
+import { invalidateStaleAgentLabelClaimants } from "@/lib/pr-fix-queue/claimant-invalidation";
 import { authenticateWebhookDelivery } from "@/lib/webhook-signature";
 import { invalidateGroomingForComment } from "@/lib/groomer/freshness-invalidation";
 import {
@@ -245,6 +247,16 @@ export async function POST(request: Request) {
         },
         "issues webhook",
       );
+    }
+
+    try {
+      await invalidateStaleAgentLabelClaimants(asPrFixQueueClient(prisma), {
+        repo: normalizeQueueRepo(repoFullName),
+        issue: issueNumber,
+        labelsAfter: nextLabels,
+      });
+    } catch (error) {
+      console.error(`[pr-fix-queue] claimant invalidation failed for ${repoFullName}#${issueNumber} (#1695):`, error);
     }
 
     return NextResponse.json({

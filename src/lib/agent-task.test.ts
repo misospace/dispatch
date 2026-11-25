@@ -165,6 +165,20 @@ describe("createFollowupPrTask", () => {
     expect(task.prFixItem?.fixType).toBe("REBASE");
   });
 
+  it("forwards the inline claimant evidence on the PR-fix identity (#1582)", () => {
+    const task = createFollowupPrTask({
+      ...baseInput,
+      prFixItem: {
+        id: "cuid-1",
+        generation: 3,
+        originalClaimant: "worker-7",
+        claimantSource: "lease",
+      },
+    });
+    expect(task.prFixItem?.originalClaimant).toBe("worker-7");
+    expect(task.prFixItem?.claimantSource).toBe("lease");
+  });
+
   it("omits PR-fix identity when not provided", () => {
     const task = createFollowupPrTask(baseInput);
     expect(task.prFixItem).toBeUndefined();

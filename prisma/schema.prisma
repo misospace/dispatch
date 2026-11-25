@@ -438,9 +438,12 @@ model PrFixQueueItem {
   // hand-out recipient never becomes the claimant, and a lane re-classification
   // never moves it. The value is captured at ingestion/materialization; every
   // later write (re-ingestion backfill, issuance backfill, operator requeue,
-  // operator stamp) is pinned on `claimant IS NULL`, so a recorded claimant is
-  // never transferred or cleared and the operator stamp refuses a row that
-  // already carries one. NULL claimant means unresolved; `claimantSource`
+  // operator stamp) is pinned on `claimant IS NULL`. Two #1695 exceptions:
+  // label-cache writers invalidate stale `agent-label` evidence, pinned on the
+  // exact recorded pair; operator clear/transfer is pinned on the observed
+  // claimant and provenance pair. The operator stamp refuses a row that
+  // already carries a claimant.
+  // NULL claimant means unresolved; `claimantSource`
   // records WHY ("missing": no authoritative source existed; "ambiguous":
   // sources conflicted; NULL: legacy row from before the contract, treated as
   // missing). Unresolved ownership never authorizes an automatic hand-out to
@@ -1647,8 +1650,45 @@ model ExternalContributionRequest {
   // delayed response from a recovered (stale) attempt can never overwrite a
   // newer attempt's result.
   attemptToken      String?
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
+
+  // ---- Courier lifecycle tracking (#1538) ----
+  // Observations come ONLY from the authenticated Courier status read
+  // (`GET /v1/contributions/<run>`, Courier #836) after the identity echo is
+  // verified against `courierRun`/`courierNamespace` and the canonical
+  // request fields. A missing read credential means tracking is unavailable,
+  // never a silent failure of submission.
+  //
+  // Derived lifecycle state persisted from verified observations:
+  // admitted | executing | published | completed | failed | unavailable |
+  // expired. Null = tracking never ran. `published` requires authoritative
+  // publication evidence (a PR identity Courier itself recorded); `expired`
+  // is the explicit lost-run state, never completion.
+  trackingState String?
+  // Last Courier phase verbatim (`Pending`…`BlockedExternal`, or projection
+  // `unknown`). Unrecognized values are recorded but derive nothing.
+  courierPhase          String?
+  courierCiParked       Boolean?
+  courierCauseCategory  String?
+  courierCauseOutcome   String?
+  // Authoritative publication evidence (bounded allowlist fields from the
+  // status projection). Dispatch never creates, merges, or re-derives a PR.
+  courierPrUrl          String?
+  courierPrBranch       String?
+  courierPrHeadRepo     String?
+  courierPrHeadSha      String?
+  // Courier's own `observedAt` for the last verified observation (bounded
+  // freshness of the recorded state).
+  courierObservedAt     DateTime?
+  courierPhaseEnteredAt DateTime?
+  courierFinishedAt     DateTime?
+  // When Dispatch last ATTEMPTED a status read (refresh cooldown anchor).
+  trackingCheckedAt DateTime?
+  // Last safe tracking diagnostic (bounded, token-redacted). Never a
+  // credential, never raw cluster text.
+  trackingError String? @db.Text
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
 
   @@index([createdAt])
 }

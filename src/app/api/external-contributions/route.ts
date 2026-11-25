@@ -4,7 +4,12 @@ import { prisma } from "@/lib/prisma";
 import { authorizeRequest, authErrorResponse, getAuthorizedActor } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { getCourierAdmissionConfig } from "@/lib/courier-admission";
-import { parseContributionInput, submitExternalContribution, type ExternalContributionRow } from "@/lib/external-contribution";
+import { parseContributionInput, submitExternalContribution } from "@/lib/external-contribution";
+import { projectExternalContribution } from "@/lib/external-contribution-view";
+import {
+  EXTERNAL_CONTRIBUTION_LIST_DEFAULT_LIMIT,
+  EXTERNAL_CONTRIBUTION_LIST_MAX_LIMIT,
+} from "@/lib/external-contribution-list";
 
 /**
  * POST /api/external-contributions (#1537, parent #1349).
@@ -37,27 +42,53 @@ import { parseContributionInput, submitExternalContribution, type ExternalContri
 
 const RATE_LIMIT = { limit: 10, windowMs: 60_000 };
 
-/** The response projection of a request row. No credential ever exists here. */
-function projectRequest(row: ExternalContributionRow) {
-  return {
-    id: row.id,
-    idempotencyKey: row.idempotencyKey,
-    status: row.deliveryStatus,
-    // The identity Courier returned (null until accepted). Identity is not
-    // proof of successful execution or publication.
-    run: row.courierRun,
-    namespace: row.courierNamespace ?? row.namespace,
-    workItemId: row.courierWorkItemId,
-    resumed: row.resumed,
-    baseRepo: row.baseRepo,
-    baseRef: row.baseRef,
-    workRepo: row.workRepo,
-    upstreamIssue: row.upstreamIssue,
-    attempts: row.attemptCount,
-    lastError: row.lastError,
-    createdAt: row.createdAt,
-    updatedAt: row.updatedAt,
-  };
+// Default / cap for the stored-requests listing (#1538) come from the shared
+// bound in `lib/external-contribution-list.ts`, which the operator UI imports
+// too, so the widest page the browser asks for cannot drift from this cap.
+
+/**
+ * GET /api/external-contributions (#1538) — the operator's stored-evidence
+ * listing. This is a pure ledger read: it performs NO Courier call and never
+ * re-submits anything, so an offline or rate-limited Courier still shows the
+ * last trustworthy lifecycle observation for every request. Newest first,
+ * bounded (`?limit=`, max 200).
+ *
+ * Maintainer tier only (absent from WORKER_ALLOWLIST), like submission.
+ */
+export async function GET(request: Request) {
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
+    return authErrorResponse(auth);
+  }
+
+  const limited = enforceRateLimit(`external-contributions-list:${auth.throttleKey}`, RATE_LIMIT);
+  if (limited) return limited;
+
+  try {
+    const raw = new URL(request.url).searchParams.get("limit");
+    let take = EXTERNAL_CONTRIBUTION_LIST_DEFAULT_LIMIT;
+    if (raw !== null && raw !== "") {
+      const parsed = Number(raw);
+      if (
+        !Number.isInteger(parsed) ||
+        parsed < 1 ||
+        parsed > EXTERNAL_CONTRIBUTION_LIST_MAX_LIMIT
+      ) {
+        return errorResponse(
+          `limit must be an integer between 1 and ${EXTERNAL_CONTRIBUTION_LIST_MAX_LIMIT}`,
+          400,
+        );
+      }
+      take = parsed;
+    }
+    const rows = await prisma.externalContributionRequest.findMany({
+      orderBy: { createdAt: "desc" },
+      take,
+    });
+    return NextResponse.json({ requests: rows.map((row) => projectExternalContribution(row)) });
+  } catch (error) {
+    return handleApiError("list external contributions", error);
+  }
 }
 
 export async function POST(request: Request) {
@@ -114,7 +145,7 @@ export async function POST(request: Request) {
 
   try {
     const result = await submitExternalContribution(prisma, input.input, { actor }, config);
-    const body = projectRequest(result.request);
+    const body = projectExternalContribution(result.request);
     const row = result.request;
 
     switch (result.outcome) {

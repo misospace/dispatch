@@ -3,6 +3,7 @@ import { RelatedWorkNotFoundError } from "@/lib/github-related-work";
 import { exploreRepository, type ExploreDeps, type ExploreOptions } from "./explore";
 import { resolveExplorationBudget } from "./exploration-budget";
 import { explorationCallsForFreshness, hasNegativeSearchResult } from "./freshness";
+import { LITELLM_SESSION_HEADER } from "./session-affinity";
 
 const options: ExploreOptions = {
   baseUrl: "https://llm.example.com/v1",
@@ -1265,5 +1266,58 @@ describe("exploreRepository investigation gaps (dispatch#1452)", () => {
 
     expect(result.gaps.truncatedReads).toEqual(["the repository root"]);
     expect(result.findings).toContain("- the read of the repository root was truncated");
+  });
+});
+
+describe("exploreRepository session affinity (dispatch#1677)", () => {
+  const SESSION_ID = "ckzq8t2v10000ab12cd34ef56";
+
+  function headersOf(spy: ReturnType<typeof vi.fn>): Record<string, string>[] {
+    return spy.mock.calls.map(([, init]) => (init as { headers: Record<string, string> }).headers);
+  }
+
+  it("carries the run's session id on every round of the loop", async () => {
+    // The loop is the multi-turn part of a grooming run: one request per tool
+    // round. A round that lost the id would repin the run to another backend
+    // and the next round would answer from a cold context.
+    const spy = vi.fn(
+      fetchReturning(
+        { content: null, tool_calls: [toolCall("1", "search_code", { query: "PrismaPg" })] },
+        { content: null, tool_calls: [toolCall("2", "read_file", { path: "src/lib/prisma.ts" })] },
+        {
+          content: null,
+          tool_calls: [
+            toolCall("3", "submit_findings", {
+              files: ["src/lib/prisma.ts"],
+              ask: "Map libpq sslmode onto the pg driver's ssl option.",
+              notes: "",
+            }),
+          ],
+        },
+      ),
+    );
+    const deps = makeDeps(
+      {
+        searchCode: vi.fn().mockResolvedValue([{ path: "src/lib/prisma.ts" }]),
+        readFile: vi.fn().mockResolvedValue("const adapter = new PrismaPg(url);"),
+      },
+      spy as unknown as typeof fetch,
+    );
+
+    await exploreRepository({ ...options, sessionId: SESSION_ID }, deps);
+
+    expect(spy).toHaveBeenCalledTimes(3);
+    expect(headersOf(spy).map((headers) => headers[LITELLM_SESSION_HEADER])).toEqual([
+      SESSION_ID,
+      SESSION_ID,
+      SESSION_ID,
+    ]);
+  });
+
+  it("sends no session header when the caller has no run session", async () => {
+    const spy = vi.fn(fetchReturning({ content: "done", tool_calls: [] }));
+    await exploreRepository(options, makeDeps({}, spy as unknown as typeof fetch));
+
+    expect(headersOf(spy)[0]).not.toHaveProperty(LITELLM_SESSION_HEADER);
   });
 });

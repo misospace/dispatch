@@ -36,6 +36,7 @@ const { mocks } = vi.hoisted(() => ({
     txIssueFindUnique: vi.fn(),
     createLifecycleEvent: vi.fn(),
     upsertLifecycleEvent: vi.fn(),
+    invalidateStaleAgentLabelClaimants: vi.fn().mockResolvedValue({ invalidated: 0 }),
   },
 }));
 
@@ -43,7 +44,12 @@ vi.mock("@/lib/github", () => ({
   fetchIssues: mocks.fetchIssues,
 }));
 
+vi.mock("./pr-fix-queue/claimant-invalidation", () => ({
+  invalidateStaleAgentLabelClaimants: mocks.invalidateStaleAgentLabelClaimants,
+}));
+
 vi.mock("@/lib/prisma", () => ({
+  asPrFixQueueClient: (client: unknown) => client,
   prisma: {
     issue: {
       aggregate: mocks.issueAggregate,
@@ -995,12 +1001,29 @@ describe("makePrismaIssueStore — lifecycle evidence (#1202)", () => {
     expect(kinds).toEqual(["status_changed", "issue_closed"]);
   });
 
+  it("keeps the mirror successful when claimant invalidation fails", async () => {
+    const store = makePrismaIssueStore();
+    await store.findIssue("repo-1", 42);
+    mocks.invalidateStaleAgentLabelClaimants.mockRejectedValueOnce(new Error("queue down"));
+    await expect(store.updateIssue("issue-1", syncData(), null)).resolves.toBeUndefined();
+  });
+
+  it("does not invalidate when the repo lookup was missed", async () => {
+    await makePrismaIssueStore().updateIssue("issue-missing", syncData(), null);
+    expect(mocks.invalidateStaleAgentLabelClaimants).not.toHaveBeenCalled();
+  });
+
   it("records nothing when the synced issue did not change", async () => {
     const store = makePrismaIssueStore();
     await store.findIssue("repo-1", 42);
     await store.updateIssue("issue-1", syncData({ labels: ["status/ready"] }), { labels: ["status/ready"], state: "open" });
 
     expect(mocks.issueUpdate).toHaveBeenCalled();
+    expect(mocks.invalidateStaleAgentLabelClaimants).toHaveBeenCalledWith(expect.anything(), {
+      repo: "org/repo",
+      issue: 42,
+      labelsAfter: ["status/ready"],
+    });
     expect(mocks.createLifecycleEvent).not.toHaveBeenCalled();
     expect(mocks.upsertLifecycleEvent).not.toHaveBeenCalled();
   });

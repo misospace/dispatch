@@ -8,12 +8,16 @@ import { join } from "node:path";
 const lockfilePath = join(process.cwd(), "package-lock.json");
 const acceptedRisksPath = join(process.cwd(), "SECURITY-ACCEPTED-RISKS.md");
 
-// The vulnerable version ranges below are the **union of every advisory the
-// npm advisory feed lists for these packages** (fetched per-package on
-// 2026-10-24, and for `effect` on 2026-11-20), not only the advisories named in
-// #1386: the blocking gate flags any vulnerable resolution, so pinning a subset
-// of a package's advisory history would let a re-resolution into an older
-// advisory through.
+// The vulnerable version ranges below are the **union of every advisory
+// published for these packages** — npm's advisory feed, plus the publisher's
+// repository advisories where they exist — fetched per-package on
+// 2026-10-24, for `effect` on 2026-11-20, for `minimatch` on 2026-11-20 and
+// re-verified on 2026-11-25 against the npm audit feed's bulk advisory
+// endpoint, the GitHub global advisory DB and the publisher's repository
+// advisory DB (`minimatch`'s live 11.x advisories exist only in the last
+// one), not only the advisories named in #1386: the blocking gate flags any
+// vulnerable resolution, so pinning a subset of a package's advisory history
+// would let a re-resolution into an older advisory through.
 //
 // Every boundary was read from the feed and cross-checked: no release the feed
 // marks as patched falls inside a pinned range (checked per major line for
@@ -43,6 +47,10 @@ type AdvisorySpec = {
   // is dropped or narrowed, the vulnerable probes stop being flagged and
   // this data fails the guard below.
   vulnerableProbes: string[];
+  // First patched release of each affected major line, plus negative probes:
+  // versions a review or lockfile might plausibly treat as vulnerable that
+  // the feed does NOT mark vulnerable. These assert no range was invented
+  // beyond what the feed supports (e.g. an 11.x span that outlived the feed).
   patchedProbes: string[];
 };
 
@@ -133,16 +141,88 @@ const ADVISORY_SPECS: AdvisorySpec[] = [
     // guard compares numeric cores only, and a 4.0.0 boundary would also pin
     // patched 4.0.0. (The same advisory's 0.1.0 … <0.97.1 range belongs to
     // `@effect/platform`, which this tree does not contain.) The
-    // `overrides` floor (`effect: "^3.22.1"`, #1670) keeps the tree off the 4.x
-    // line entirely, which is also why the floor is caret-bounded instead of a
-    // bare `>=3.22.1`: its only consumer, @prisma/config, pins effect exactly and
-    // has never been resolved against an effect major it does not ship.
+    // `@prisma/config`-scoped override (`effect: "^3.22.1"`, #1670) keeps the
+    // transitive copy on the patched 3.x line. Effect 4 cannot replace it:
+    // @prisma/config 7.10.1 uses Effect 3 APIs (`Either`,
+    // `Schema.decodeUnknownEither`) that effect 4 removed, so the consumer must
+    // stay on 3.x. `renovate.json` holds this override below 4.0.0 until a
+    // stable Prisma release ships a compatible, patched effect pin.
     name: "effect",
     ranges: [{ from: "0.0.0", to: "3.22.1" }],
     advisories: ["GHSA-7589-6fvf-x4pw", "GHSA-38f7-945m-qr2g"],
     scope: "prod",
     vulnerableProbes: ["3.20.0", "3.22.0"],
     patchedProbes: ["3.22.1"],
+  },
+  {
+    // minimatch: globparts-amplification DoS (GHSA-g3hv-75wg-m249, >=7.0.0
+    // <11.0.1, first patched 11.0.1) together with the earlier ReDoS
+    // advisories. Unlike the other specs, the feed's boundaries differ per
+    // advisory inside a major line — 3.x closes at 3.0.2 / 3.0.5 / 3.1.3 /
+    // 3.1.4 across the four advisories that touch it, 4.x at 4.2.4/4.2.5, 5.x
+    // at 5.1.7/5.1.8, 6.x at 6.2.1/6.2.2 — so each pinned range extends to the
+    // **latest** first-patched release of its line: a copy is clean only once
+    // no live advisory flags it, not merely one. The 7.x-11.x span collapses
+    // into a single range because the live advisories overlap continuously:
+    // GHSA-g3hv-75wg-m249 runs from 7.0.0 to just under 11.0.1, and three
+    // advisories the publisher maintains in
+    // `repos/isaacs/minimatch/security-advisories` (published 2026-11-10/11)
+    // carry the vulnerable span on to 11.0.8:
+    //   GHSA-cf2h-pxjq-68xw  >= 11.0.0, <= 11.0.6  (patched 11.0.7)
+    //   GHSA-c859-jr93-m5j4  >= 7.4.0,  <= 11.0.7  (patched 11.0.8)
+    //   GHSA-hqmv-qgp3-jx75  >= 11.0.3, <= 11.0.7  (patched 11.0.8)
+    // Their union with GHSA-g3hv makes every release below 11.0.8 vulnerable,
+    // so 11.0.8 is the first clean 11.x release and this pin ends there.
+    //
+    // Scope `dev` like `undici`: the package is dev-only here (eslint chain)
+    // and ships in no published image (#1173). The copy under
+    // @typescript-eslint/typescript-estree resolved to 10.2.6 until the #1673
+    // lockfile refresh bumped the toolchain to 8.73.0, which drops the nested
+    // copy and dedupes onto the patched top-level minimatch (11.0.8 at the
+    // time; 11.0.9 after a later Renovate bump); eslint-config-next's
+    // nested 3.1.5 predates the 7.x line and sits above every 3.x boundary.
+    //
+    // Those three 11.x advisories exist only in the publisher's repository
+    // advisory DB: the GitHub *global* advisory endpoint returns 404 for them
+    // and npm's bulk audit endpoint reports nothing for 11.0.1 … 11.0.9, so an
+    // earlier revision of this spec wrongly recorded them as nonexistent and
+    // treated 11.0.5 / 11.0.6 as patched probes. A guard against silent
+    // re-resolution pins what upstream actually published, not only what
+    // `npm audit` surfaces today; `npm audit --include=dev` stays clean
+    // because the resolved copy is past this union (11.0.9 in the current
+    // lock).
+    name: "minimatch",
+    ranges: [
+      { from: "0.0.0", to: "3.1.4" },
+      { from: "4.0.0", to: "4.2.5" },
+      { from: "5.0.0", to: "5.1.8" },
+      { from: "6.0.0", to: "6.2.2" },
+      { from: "7.0.0", to: "11.0.8" },
+    ],
+    advisories: [
+      "GHSA-g3hv-75wg-m249",
+      "GHSA-7r86-cg39-jmmj",
+      "GHSA-23c5-xmqv-rm74",
+      "GHSA-3ppc-4f35-3m26",
+      "GHSA-f8q6-p94x-37v3",
+      "GHSA-hxm2-r34f-qmc5",
+      "GHSA-cf2h-pxjq-68xw",
+      "GHSA-c859-jr93-m5j4",
+      "GHSA-hqmv-qgp3-jx75",
+    ],
+    scope: "dev",
+    vulnerableProbes: [
+      "3.1.3",
+      "4.2.4",
+      "5.1.7",
+      "6.2.1",
+      "10.2.6",
+      "11.0.1",
+      "11.0.5",
+      "11.0.6",
+      "11.0.7",
+    ],
+    patchedProbes: ["3.1.4", "4.2.5", "5.1.8", "6.2.2", "11.0.8", "11.0.9"],
   },
 ];
 

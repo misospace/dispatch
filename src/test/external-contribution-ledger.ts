@@ -40,6 +40,21 @@ export interface ContributionLedgerRow {
   lastAttemptAt: Date | null;
   inFlightUntil: Date | null;
   attemptToken: string | null;
+  // #1538 lifecycle-tracking columns (observations from Courier status reads).
+  trackingState: string | null;
+  courierPhase: string | null;
+  courierCiParked: boolean | null;
+  courierCauseCategory: string | null;
+  courierCauseOutcome: string | null;
+  courierPrUrl: string | null;
+  courierPrBranch: string | null;
+  courierPrHeadRepo: string | null;
+  courierPrHeadSha: string | null;
+  courierObservedAt: Date | null;
+  courierPhaseEnteredAt: Date | null;
+  courierFinishedAt: Date | null;
+  trackingCheckedAt: Date | null;
+  trackingError: string | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -98,6 +113,7 @@ export interface ContributionLedger {
   /** Prisma-delegate-shaped store for `externalContributionRequest`. */
   delegate: {
     findUnique(args: { where: Where }): Promise<ContributionLedgerRow | null>;
+    findMany(args: { where?: Where; orderBy?: { createdAt: "asc" | "desc" }; take?: number }): Promise<ContributionLedgerRow[]>;
     create(args: { data: Where }): Promise<ContributionLedgerRow>;
     update(args: { where: { id: string }; data: Where }): Promise<ContributionLedgerRow>;
     updateMany(args: { where: Where; data: Where }): Promise<{ count: number }>;
@@ -164,6 +180,20 @@ export function createContributionLedger(): ContributionLedger {
         lastAttemptAt: null,
         inFlightUntil: null,
         attemptToken: null,
+        trackingState: null,
+        courierPhase: null,
+        courierCiParked: null,
+        courierCauseCategory: null,
+        courierCauseOutcome: null,
+        courierPrUrl: null,
+        courierPrBranch: null,
+        courierPrHeadRepo: null,
+        courierPrHeadSha: null,
+        courierObservedAt: null,
+        courierPhaseEnteredAt: null,
+        courierFinishedAt: null,
+        trackingCheckedAt: null,
+        trackingError: null,
         createdAt: now,
         updatedAt: now,
         ...overrides,
@@ -178,6 +208,13 @@ export function createContributionLedger(): ContributionLedger {
     },
     delegate: {
       findUnique,
+      async findMany({ where, orderBy, take }: { where?: Where; orderBy?: { createdAt: "asc" | "desc" }; take?: number }) {
+        let out = rows.filter((r) => (where ? matchesWhere(r as Row, where) : true));
+        if (orderBy && "createdAt" in orderBy) {
+          out = [...out].sort((a, b) => compare(a.createdAt, b.createdAt) * (orderBy.createdAt === "desc" ? -1 : 1));
+        }
+        return take !== undefined ? out.slice(0, take) : [...out];
+      },
       async create({ data }: { data: Where }) {
         calls.push("create");
         if (rows.some((r) => r.idempotencyKey === data.idempotencyKey)) {
@@ -199,6 +236,20 @@ export function createContributionLedger(): ContributionLedger {
           lastAttemptAt: null,
           inFlightUntil: null,
           attemptToken: null,
+          trackingState: null,
+          courierPhase: null,
+          courierCiParked: null,
+          courierCauseCategory: null,
+          courierCauseOutcome: null,
+          courierPrUrl: null,
+          courierPrBranch: null,
+          courierPrHeadRepo: null,
+          courierPrHeadSha: null,
+          courierObservedAt: null,
+          courierPhaseEnteredAt: null,
+          courierFinishedAt: null,
+          trackingCheckedAt: null,
+          trackingError: null,
           ...data,
           createdAt: now,
           updatedAt: now,

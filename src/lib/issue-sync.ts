@@ -2,7 +2,8 @@ import { ACTIVE_STATUS_LABELS, GitHubIssue } from "@/types";
 import { Prisma } from "@prisma/client";
 import { isIssueExcludedByLabels } from "@/lib/issue-filters";
 import { isEscalationLabel } from "@/lib/issue-lane";
-import { prisma } from "@/lib/prisma";
+import { prisma, asPrFixQueueClient } from "@/lib/prisma";
+import { invalidateStaleAgentLabelClaimants } from "./pr-fix-queue/claimant-invalidation";
 import { fetchIssues } from "@/lib/github";
 import { getEscalationLane, assertValidLaneForWrite, defaultCurrentLane, getBacklogLane, getUnconfiguredLaneInfo } from "@/lib/lane-config";
 import { recordSyncedIssueEvents } from "@/lib/issue-lifecycle";
@@ -665,6 +666,17 @@ export function makePrismaIssueStore(): IssueStore {
       }
 
       await prisma.issue.update({ where: { id }, data });
+      if (repoFullName) {
+        try {
+          await invalidateStaleAgentLabelClaimants(asPrFixQueueClient(prisma), {
+            repo: repoFullName,
+            issue: data.number,
+            labelsAfter: data.labels,
+          });
+        } catch (error) {
+          console.error(`[pr-fix-queue] claimant invalidation failed for ${repoFullName}#${data.number} (#1695):`, error);
+        }
+      }
     },
     async deleteIssue(id: string): Promise<boolean> {
       // #1587 excluded-reconcile delete. The Issue row is the cache's

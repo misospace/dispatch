@@ -50,6 +50,24 @@ export interface PrFixItemIdentity {
    * branch without parsing prose.
    */
   fixType?: PrFixType;
+  /**
+   * #1582: the ORIGINAL CLAIMANT inlined on every hand-out, mirroring the
+   * `originalClaimant` of the capability-negotiated `ownership` evidence
+   * block (#1569). A consumer that enforces the ownership gate but predates
+   * (or cannot perform) the #1532 capability negotiation reads only this
+   * field, so the same evidence heals a deployed fleet without a client
+   * release. Present whenever the gate authorized the hand-out — which
+   * refuses an unresolved claimant in every mode — so a shipped hand-out
+   * always names one. Additive: consumers that ignore it are unaffected.
+   */
+  originalClaimant?: string;
+  /**
+   * How the inline claimant was established (see `PrFixOwnershipEvidence.provenance`).
+   * Omitted on a legacy row (no recorded source): an inline-only consumer
+   * cannot distinguish legacy provenance from a resolved one and must treat
+   * the claimant identically. The claimant, not the source, is the authority.
+   */
+  claimantSource?: string;
 }
 
 export interface IdleTask {
@@ -101,7 +119,10 @@ export interface FollowupPrTask {
    *
    * Present only when the polling client was granted the
    * `pr-ownership-evidence:1` intake capability (#1532 negotiation);
-   * an un-negotiated consumer's task stays byte-identical.
+   * the versioned block itself stays invisible to an un-negotiated
+   * consumer. #1582 additionally mirrors the claimant inline on
+   * `prFixItem.originalClaimant` for every hand-out, so a gate-enforcing
+   * consumer that never negotiated still receives the evidence.
    */
   ownership?: PrFixOwnershipEvidence;
   issue?: OptionalIssueRef;

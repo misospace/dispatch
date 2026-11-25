@@ -97,6 +97,34 @@ files, which shows up as `repository exploration hit its byte budget` in a
 run's `contextWarnings`. The resolved budget and which path produced it are
 recorded on every run under `contextSummary.exploration.budget`.
 
+## Model session affinity (#1677)
+
+One grooming run makes several model calls. The exploration loop makes one call
+per tool round. The planning call can add a fallback call and a repair turn.
+LiteLLM routes each request on its own, so these calls land on different
+backends, and a later call loses the context an earlier call left warm.
+
+The groomer sends one session id on every model call of one run. It uses the
+header `x-litellm-session-id`, which the LiteLLM proxy reads natively. The
+proxy pins the session: the backend that serves the first request also serves
+the later ones, while that backend stays healthy.
+
+The id comes from the `GroomingRun` row. `groomerSessionId()`
+(`src/lib/groomer/session-affinity.ts`) returns the run id when it is already a
+safe header value (`[A-Za-z0-9_-]`, 8 to 128 characters), and a short digest of
+it otherwise. Two runs therefore never share an id, and no run gets a value a
+proxy could reject.
+
+Two paths must keep carrying the id, and tests cover both:
+
+- `src/lib/groomer/explore.ts` sends it on every round of the tool loop.
+- `src/lib/groomer/llm.ts` sends it on the planning call, its `json_object`
+  fallback, every retry, and the repair turn.
+
+One-shot calls stay unpinned on purpose. The lesson feed
+(`src/lib/lesson-feed.ts`) makes a single stateless call per fix outcome, so it
+sends no session id and keeps normal per-request routing.
+
 ## Endpoint
 
 ```http
