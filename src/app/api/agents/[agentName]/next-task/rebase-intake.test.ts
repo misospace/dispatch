@@ -967,6 +967,71 @@ describe("model-assisted rebase — the parent-classification boundary (#1674 re
     info.mockRestore();
   });
 
+  it("an ABSENT parent row under the locked read defers a model-required row (fail closed)", async () => {
+    const row = { ...modelRequiredRebaseRow(), issue: 7 };
+    mocks.prFixRows.push(row);
+    // The fail-fast lookup finds the parent and reads it as local; the
+    // authoritative locked read finds no row at all. `SELECT ... FOR SHARE` on
+    // an absent row locks nothing, so a sync INSERT could land inside the
+    // window — there is no serialized authority, hence UNKNOWN.
+    mocks.issueFindFirst.mockResolvedValue({ currentLane: "local" });
+    mocks.issueFindFirstLocked.mockResolvedValue(null);
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+
+    const body = await (await poll(NEW_COURIER_REBASE_ONLY)).json();
+
+    expect(body.type).toBe("idle");
+    expect(body.prFixItem).toBeUndefined();
+    expect(row.agentHandouts).toEqual([]);
+    expect(info.mock.calls.flat().join(" ")).toContain("UNKNOWN, fail closed");
+    info.mockRestore();
+  });
+
+  it("an ABSENT parent row under the locked read still issues an initially-mechanical row, on the mechanical wall", async () => {
+    const row = rebaseRow(93, { issue: 7 });
+    mocks.prFixRows.push(row);
+    mocks.issueFindFirst.mockResolvedValue({ currentLane: "local" });
+    mocks.issueFindFirstLocked.mockResolvedValue(null);
+
+    const body = await (await poll(NEW_COURIER_REBASE_ONLY)).json();
+
+    // The deterministic exception stays supported; only the model path is
+    // withheld.
+    expect(body.type).toBe("followup-pr");
+    expect(row.agentHandouts).toEqual([`${AGENT}@1`]);
+    expect("rebaseModel" in body).toBe(false);
+    expect(JSON.stringify(body.reasons)).not.toContain("CONFIGURED MODEL COORDINATOR");
+  });
+
+  it("a model-required row with no linked parent keeps the model path (nothing to serialize)", async () => {
+    const row = modelRequiredRebaseRow(94); // issue: null
+    mocks.prFixRows.push(row);
+
+    const body = await (await poll(NEW_COURIER_REBASE_ONLY)).json();
+
+    expect(body.type).toBe("followup-pr");
+    expect(body.rebaseModel).toBeTruthy();
+    // No linked issue means no authority read is issued at all.
+    expect(mocks.issueFindFirstLocked).not.toHaveBeenCalled();
+  });
+
+  it("a deployment with no declared escalation lane keeps the model path (nothing to serialize)", async () => {
+    // Local-only topology: no lane carries role "escalation", so no parent can
+    // be escalation-classified (#1503) and the locked read is not needed.
+    setLaneConfig({
+      lanes: [{ id: "local", title: "Local", claimable: true, role: "default" }],
+    });
+    const row = { ...modelRequiredRebaseRow(95), issue: 7 };
+    mocks.prFixRows.push(row);
+    mocks.issueFindFirst.mockResolvedValue({ currentLane: "local" });
+
+    const body = await (await poll(NEW_COURIER_REBASE_ONLY)).json();
+
+    expect(body.type).toBe("followup-pr");
+    expect(body.rebaseModel).toBeTruthy();
+    expect(mocks.issueFindFirstLocked).not.toHaveBeenCalled();
+  });
+
   it("a stored ESCALATED row never reaches the model path even when its linked issue reads NOT_ESCALATED", async () => {
     const row = { ...modelRequiredRebaseRow(79), lane: "ESCALATED", issue: null };
     mocks.prFixRows.push(row);

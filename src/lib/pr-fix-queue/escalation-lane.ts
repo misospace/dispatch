@@ -105,10 +105,17 @@ export function preserveEscalationLane(lane: unknown): PrFixLane {
  * share lock until the issuance transaction commits (the hand-out was valid at
  * its commit).
  *
- * FAIL CLOSED: a missing locked-read surface or a thrown read is `UNKNOWN`,
- * never `NOT_ESCALATED` — an unserializable authority read must not authorize
- * the model-capable path (callers may still take the deterministic mechanical
- * exception on it, with the mechanical wall only).
+ * FAIL CLOSED: a missing locked-read surface, a thrown read, or an ABSENT row
+ * is `UNKNOWN`, never `NOT_ESCALATED` — an unestablished authority must not
+ * authorize the model-capable path (callers may still take the deterministic
+ * mechanical exception on it, with the mechanical wall only). The absent-row
+ * case matters even though the plain lookup treats "no row" as definitive:
+ * `SELECT ... FOR SHARE` on a missing row locks nothing, so a concurrent sync
+ * can INSERT an escalation-classified row inside this transaction's window
+ * without blocking. There is then no serialized authority to rely on, which
+ * is exactly what UNKNOWN means here. (An unlinked item and a deployment with
+ * no declared escalation lane are still positive `NOT_ESCALATED` answers:
+ * neither has a parent classification to serialise.)
  */
 export async function linkedIssueEscalationClassifiedLocked(
   client: Pick<PrFixQueueClient, "issue">,
@@ -129,9 +136,14 @@ export async function linkedIssueEscalationClassifiedLocked(
     // The lock wrapper folds repo casing itself (LOWER()=LOWER()); pass the
     // queue-normalized repo exactly as the #1503 fence does.
     const row = await client.issue.findFirstLocked(repo, issue);
-    return row
-      ? (laneMatchesConfigured(row.currentLane ?? null, escalationLane.id) ? "ESCALATED" : "NOT_ESCALATED")
-      : "NOT_ESCALATED"; // missing row = definitive read (see the plain lookup)
+    if (!row) {
+      console.warn(
+        "[pr-fix-queue] linked issue row absent under the locked read; deferring classification as UNKNOWN (#1674)",
+        { repo, issue },
+      );
+      return "UNKNOWN";
+    }
+    return laneMatchesConfigured(row.currentLane ?? null, escalationLane.id) ? "ESCALATED" : "NOT_ESCALATED";
   } catch (error) {
     console.warn("[pr-fix-queue] locked linked-issue escalation lookup failed; deferring classification as UNKNOWN (#1674)", {
       repo,

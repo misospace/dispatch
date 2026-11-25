@@ -106,8 +106,11 @@ Three gates authorize model execution, and ALL must pass:
    (`issue.findFirstLocked`), so the decision is serialized against a
    concurrent parent reclassification. Only `NOT_ESCALATED` authorizes the
    model wall and the `rebaseModel` transport block. `ESCALATED` and
-   `UNKNOWN` (including a missing or failed locked read — fail closed) withhold
-   both. A model-REQUIRED item defers in that case; an initially-mechanical
+   `UNKNOWN` withhold both. `UNKNOWN` covers a missing locked-read surface, a
+   failed read, and an **absent parent row**: `SELECT ... FOR SHARE` on a
+   missing row locks nothing, so a concurrent sync could insert an
+   escalation-classified row before the hand-out commits. A model-REQUIRED item
+   defers in that case; an initially-mechanical
    item still takes the deterministic REBASE exception, but with the
    mechanical wall only. This is the same ordering guarantee the #1503 lane
    fence uses: a parent flip either commits before the locked read (it sees the
