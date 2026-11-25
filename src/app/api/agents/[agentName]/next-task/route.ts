@@ -10,7 +10,7 @@ import {
 } from "@/lib/agent-task";
 import { isBacklogLane, prFixLaneForRequest } from "@/lib/lane-config";
 import { fetchAgentQueueData } from "@/lib/agent-queue-fetch";
-import { agentAlreadyHanded, agentHandoutToken, backfillPrFixClaimant, createLinkedPrFixItem, enforcePrFixHandoutLaneExclusivity, evaluatePrFixHandoutOwnership, handoutReceipt, hasInFlightRebaseHandout, isHeadRepoOfBaseRepo, isRebaseLaneAgent, isRebaseModelLaneAgent, linkedIssueEscalationClassified, newHandoutToken, normalizeQueueRepo, prFixOwnershipMode, withHandoutLaneExclusivityFence, withRebaseLaneAdmission, type LinkedIssueEscalationClassification, type PrFixQueueClient } from "@/lib/pr-fix-queue";
+import { agentAlreadyHanded, agentHandoutToken, backfillPrFixClaimant, createLinkedPrFixItem, enforcePrFixHandoutLaneExclusivity, evaluatePrFixHandoutOwnership, handoutReceipt, hasInFlightRebaseHandout, isHeadRepoOfBaseRepo, isRebaseLaneAgent, isRebaseModelLaneAgent, linkedIssueEscalationClassified, linkedIssueEscalationClassifiedLocked, newHandoutToken, normalizeQueueRepo, prFixOwnershipMode, withHandoutLaneExclusivityFence, withRebaseLaneAdmission, type LinkedIssueEscalationClassification, type PrFixQueueClient } from "@/lib/pr-fix-queue";
 import { prFixOwnershipEvidence } from "@/lib/pr-fix-ownership";
 import { fetchPullRequestLabels, fetchPullRequestHeadSha, fetchPullRequestHeadRepo } from "@/lib/github";
 import { NEEDS_HUMAN_LABEL } from "@/lib/pr-fix-surfacing";
@@ -100,6 +100,21 @@ async function rebaseModelParentClass(
 ): Promise<LinkedIssueEscalationClassification> {
   if (candidate.lane === "ESCALATED") return "ESCALATED";
   return linkedIssueEscalationClassified(client, candidate.repo, candidate.issue);
+}
+
+/**
+ * The LOCKED form of the same decision (#1674 review TOCTOU fix): run inside
+ * the REBASE admission transaction so the parent classification is
+ * serialized against a concurrent reclassification until the hand-out
+ * commits. A missing lock surface or a failed read is UNKNOWN (fail closed),
+ * which never authorizes the model path.
+ */
+async function rebaseModelParentClassLocked(
+  client: Pick<PrFixQueueClient, "issue">,
+  candidate: Pick<PrFixCandidate, "repo" | "pr" | "issue" | "lane">,
+): Promise<LinkedIssueEscalationClassification> {
+  if (candidate.lane === "ESCALATED") return "ESCALATED";
+  return linkedIssueEscalationClassifiedLocked(client, candidate.repo, candidate.issue);
 }
 
 /**
@@ -677,7 +692,10 @@ export async function GET(
           });
           issuanceToRecord = null;
         };
-        const issueHandout = async (client: PrFixQueueClient) => {
+        const issueHandout = async (
+          client: PrFixQueueClient,
+          lockedParentClass: LinkedIssueEscalationClassification | null = null,
+        ) => {
          issuanceToRecord = null;
          const confirmed = await confirmPrFixHandOut(candidate, agentName, excluded, client);
          if (!confirmed) return null;
@@ -803,29 +821,23 @@ export async function GET(
          // transport block carries the granted capability identity and the
          // item's bounded semantic-conflict context, so a real model call is
          // possible for a semantic case.
+         // #1674 review (TOCTOU, second pass): the model-capable decision is
+         // the parent classification read with `SELECT ... FOR SHARE` INSIDE
+         // the REBASE admission transaction (`lockedParentClass`), not the
+         // pre-admission lookup. The mechanical REBASE exemption from #1503
+         // lane exclusivity authorizes DETERMINISTIC work only — it is not a
+         // frontier bypass for the local model. Capability + pool + a
+         // NOT_ESCALATED locked read are all required; ESCALATED, UNKNOWN and
+         // a missing locked decision all ship the persisted mechanical wall
+         // with no `rebaseModel` block, so a parent flip cannot cross into
+         // model authorization. `null` means this hand-out never qualified for
+         // the model path (non-REBASE lane, or a model-incapable poll), so no
+         // read is issued at all.
          const modelAssistRebase =
            dispatchedLane === "REBASE" &&
            negotiation.rebaseModelExecutorGranted &&
            isRebaseModelLaneAgent(agentName) &&
-           // #1674 review blocker: the fail-closed parent-classification gate
-           // for the MODEL-CAPABLE path. The mechanical REBASE exemption from
-           // #1503 lane exclusivity (this route skips
-           // `enforcePrFixHandoutLaneExclusivity` whenever dispatchedLane is
-           // REBASE) authorizes DETERMINISTIC work only — it is not a frontier
-           // bypass for the local model. Capability + pool alone (the checks
-           // above) must never cross a parent whose classification is
-           // ESCALATED or UNKNOWN (fail closed); only a NOT_ESCALATED parent
-           // authorizes the model wall and transport block below. The read
-           // runs on the ISSUANCE client — the admission transaction during a
-           // REBASE hand-out — so the decision lands as close to the write as
-           // this lane's boundary allows, and short-circuits to no query at
-           // all for non-REBASE hand-outs and for model-incapable polls.
-           // Deliberate failure direction: a parent that flips
-           // NORMAL→frontier after the pre-admission wall read drops ONLY the
-           // model path here; the hand-out proceeds on the persisted
-           // mechanical wall (the deterministic exception stays intentionally
-           // supported on frontier work), so no model ever runs on it.
-           (await rebaseModelParentClass(client, candidate)) === "NOT_ESCALATED";
+           lockedParentClass === "NOT_ESCALATED";
          const taskReasons = modelAssistRebase
            ? [confirmed.reason, ...rebaseModelAssistFeedback()]
            : reasons;
@@ -935,7 +947,10 @@ export async function GET(
             // the local model worker through the mechanical REBASE
             // exemption's skip of lane exclusivity, and the item is deferred
             // rather than downgraded to the mechanical wall it cannot be
-            // executed under. The classification read runs only for a
+            // executed under. This read is a FAIL-FAST only; the authoritative
+            // decision is re-made with a locking read inside the admission
+            // transaction below, so a flip after this lookup cannot authorize
+            // the model path. The classification read runs only for a
             // model-authorized poll: an unauthorized poll's disposition is
             // exactly what it was before this gate, at the same cost.
             const modelAuthorized =
@@ -959,7 +974,28 @@ export async function GET(
                console.info(`[next-task-pr-fix] deferring REBASE ${candidate.repo}#${candidate.pr}: another rebase hand-out is live (concurrency 1, #1327)`);
                return null;
              }
-             return await issueHandout(tx);
+             // #1674 review (TOCTOU): the AUTHORITATIVE parent decision for
+             // the model-capable path runs HERE, as a `SELECT ... FOR SHARE`
+             // read whose lock is held until this issuance transaction
+             // commits. The pre-admission read above is only a fail-fast: a
+             // parent NORMAL→frontier flip that committed after it is visible
+             // in this locked read, and a flip still in flight BLOCKS on the
+             // share lock until the hand-out commits — the same two-ordering
+             // guarantee the #1503 fence relies on. A model-required row that
+             // no longer reads NOT_ESCALATED here is DEFERRED, never
+             // downgraded to the mechanical wall it cannot be executed under.
+             const lockedParentClass =
+               negotiation.rebaseModelExecutorGranted && isRebaseModelLaneAgent(agentName)
+                 ? await rebaseModelParentClassLocked(tx, candidate)
+                 : null;
+             if (candidate.semanticConflict != null && lockedParentClass !== "NOT_ESCALATED") {
+               rebaseModelDeferredCount += 1;
+               console.info(
+                 `[next-task-pr-fix] deferring model-required REBASE ${candidate.repo}#${candidate.pr}: the locked parent classification at issuance is ${lockedParentClass === "ESCALATED" ? "frontier-owned (ESCALATED)" : "of unverifiable classification (UNKNOWN, fail closed)"}; model-assisted rebase must not use the mechanical REBASE exception as a frontier bypass (#1674)`,
+               );
+               return null;
+             }
+             return await issueHandout(tx, lockedParentClass);
            });
            // #1491: the admission transaction has COMMITTED — record the
            // issuance outside it (best-effort, never fails the hand-out).

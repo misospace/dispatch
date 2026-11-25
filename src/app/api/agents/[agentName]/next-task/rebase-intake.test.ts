@@ -820,6 +820,7 @@ describe("model-assisted rebase — the parent-classification boundary (#1674 re
     const row = { ...modelRequiredRebaseRow(), issue: 7 };
     mocks.prFixRows.push(row);
     mocks.issueFindFirst.mockResolvedValue({ currentLane: "frontier" });
+    mocks.issueFindFirstLocked.mockResolvedValue({ currentLane: "frontier" });
     const info = vi.spyOn(console, "info").mockImplementation(() => {});
 
     const body = await (await poll(NEW_COURIER_REBASE_ONLY)).json();
@@ -839,7 +840,7 @@ describe("model-assisted rebase — the parent-classification boundary (#1674 re
   it("frontier-owned parent + initially-mechanical row: the deterministic exception stays supported, on the MECHANICAL wall only", async () => {
     const row = rebaseRow(88, { issue: 7 });
     mocks.prFixRows.push(row);
-    mocks.issueFindFirst.mockResolvedValue({ currentLane: "frontier" });
+    mocks.issueFindFirstLocked.mockResolvedValue({ currentLane: "frontier" });
 
     const body = await (await poll(NEW_COURIER_REBASE_ONLY)).json();
 
@@ -862,6 +863,7 @@ describe("model-assisted rebase — the parent-classification boundary (#1674 re
     const row = { ...modelRequiredRebaseRow(), issue: 7 };
     mocks.prFixRows.push(row);
     mocks.issueFindFirst.mockRejectedValue(new Error("classification read failed"));
+    mocks.issueFindFirstLocked.mockRejectedValue(new Error("classification read failed"));
     const info = vi.spyOn(console, "info").mockImplementation(() => {});
 
     const body = await (await poll(NEW_COURIER_REBASE_ONLY)).json();
@@ -877,7 +879,7 @@ describe("model-assisted rebase — the parent-classification boundary (#1674 re
   it("UNKNOWN parent + initially-mechanical row still dispatches mechanically (fail closed toward the model path only)", async () => {
     const row = rebaseRow(89, { issue: 7 });
     mocks.prFixRows.push(row);
-    mocks.issueFindFirst.mockRejectedValue(new Error("classification read failed"));
+    mocks.issueFindFirstLocked.mockRejectedValue(new Error("classification read failed"));
 
     const body = await (await poll(NEW_COURIER_REBASE_ONLY)).json();
 
@@ -891,6 +893,7 @@ describe("model-assisted rebase — the parent-classification boundary (#1674 re
     const row = { ...modelRequiredRebaseRow(), issue: 7 };
     mocks.prFixRows.push(row);
     mocks.issueFindFirst.mockResolvedValue({ currentLane: "local" });
+    mocks.issueFindFirstLocked.mockResolvedValue({ currentLane: "local" });
 
     const body = await (await poll(NEW_COURIER_REBASE_ONLY)).json();
 
@@ -908,6 +911,60 @@ describe("model-assisted rebase — the parent-classification boundary (#1674 re
       },
     });
     expect(body.reasons.join("\n")).toContain("CONFIGURED MODEL COORDINATOR");
+  });
+
+  it("a parent flip between the pre-admission read and the locked issuance read defers a model-required row", async () => {
+    const row = { ...modelRequiredRebaseRow(), issue: 7 };
+    mocks.prFixRows.push(row);
+    // The fail-fast read sees the local parent; the parent flips to frontier
+    // before the admission transaction's locking read, which is the
+    // authoritative decision. The hand-out must not cross into the model path.
+    mocks.issueFindFirst.mockResolvedValue({ currentLane: "local" });
+    mocks.issueFindFirstLocked.mockResolvedValue({ currentLane: "frontier" });
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+
+    const body = await (await poll(NEW_COURIER_REBASE_ONLY)).json();
+
+    expect(body.type).toBe("idle");
+    expect(body.prFixItem).toBeUndefined();
+    expect(row.agentHandouts).toEqual([]);
+    expect(row.dispatchedGeneration).toBeNull();
+    expect(body.reason).toContain("model-required rebase candidate");
+    expect(info.mock.calls.flat().join(" ")).toContain("locked parent classification at issuance");
+    expect(mocks.issueFindFirstLocked).toHaveBeenCalled();
+    info.mockRestore();
+  });
+
+  it("a parent flip before the locked issuance read cannot cross into model authorization for an initially-mechanical row", async () => {
+    const row = rebaseRow(90, { issue: 7 });
+    mocks.prFixRows.push(row);
+    mocks.issueFindFirst.mockResolvedValue({ currentLane: "local" });
+    mocks.issueFindFirstLocked.mockResolvedValue({ currentLane: "frontier" });
+
+    const body = await (await poll(NEW_COURIER_REBASE_ONLY)).json();
+
+    // The deterministic exception still issues the hand-out, but only with the
+    // persisted mechanical wall and no transport block.
+    expect(body.type).toBe("followup-pr");
+    expect(row.agentHandouts).toEqual([`${AGENT}@1`]);
+    expect(JSON.stringify(body.reasons)).not.toContain("CONFIGURED MODEL COORDINATOR");
+    expect("rebaseModel" in body).toBe(false);
+    expect(mocks.issueFindFirstLocked).toHaveBeenCalled();
+  });
+
+  it("an unavailable locked read fails the model path closed even when the fail-fast read is local", async () => {
+    const row = { ...modelRequiredRebaseRow(), issue: 7 };
+    mocks.prFixRows.push(row);
+    mocks.issueFindFirst.mockResolvedValue({ currentLane: "local" });
+    mocks.issueFindFirstLocked.mockRejectedValue(new Error("lock timeout"));
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+
+    const body = await (await poll(NEW_COURIER_REBASE_ONLY)).json();
+
+    expect(body.type).toBe("idle");
+    expect(row.agentHandouts).toEqual([]);
+    expect(info.mock.calls.flat().join(" ")).toContain("UNKNOWN, fail closed");
+    info.mockRestore();
   });
 
   it("a stored ESCALATED row never reaches the model path even when its linked issue reads NOT_ESCALATED", async () => {
