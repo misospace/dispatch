@@ -271,7 +271,7 @@ describe("authenticateWebhookDelivery", () => {
       expect(capped.response.status).toBe(429);
     });
 
-    it("accepts a GUID at the length-cap boundary and trims surrounding whitespace", async () => {
+    it("accepts a GUID at the length-cap boundary (Headers already strips header OWS)", async () => {
       const capped = "a".repeat(128);
       const { request, payload } = signedDelivery(undefined, {
         headers: { "x-github-delivery": `  ${capped}  ` },

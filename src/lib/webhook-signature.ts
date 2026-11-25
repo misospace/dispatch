@@ -217,7 +217,12 @@ export async function authenticateWebhookDelivery(
  * and grow the limiter's key space without bound; the aggregate ceiling
  * (`WEBHOOK_AGGREGATE_RATE_LIMIT`, keyed on the secret's fingerprint) is
  * what bounds that path. Reaching this limiter still requires a valid HMAC,
- * so per-GUID capacity only widens holders of a valid signature.
+ * so per-GUID capacity only widens holders of a valid signature. Trade-off
+ * note: the aggregate raises the accepted-delivery ceiling for such a
+ * captured pair from 3/s (the old shared bucket) to a bounded 100/s; if an
+ * operator ever needs the tighter ceiling, keying the bucket on a digest of
+ * the HMAC-covered body instead of the GUID holds it at 3/s while keeping
+ * burst tolerance.
  *
  * A verified delivery without a usable GUID is not shaped like a real
  * GitHub delivery: it keeps the old shared "webhook" bucket, so GUID-less
