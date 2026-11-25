@@ -8,12 +8,14 @@ import { join } from "node:path";
 const lockfilePath = join(process.cwd(), "package-lock.json");
 const acceptedRisksPath = join(process.cwd(), "SECURITY-ACCEPTED-RISKS.md");
 
-// The vulnerable version ranges below are the **union of every advisory the
-// npm advisory feed lists for these packages** (fetched per-package on
+// The vulnerable version ranges below are the **union of every advisory
+// published for these packages** — npm's advisory feed, plus the publisher's
+// repository advisories where they exist — fetched per-package on
 // 2026-10-24, for `effect` on 2026-11-20, for `minimatch` on 2026-11-20 and
-// re-verified on 2026-11-21 against both the npm audit feed's bulk advisory
-// endpoint and the GitHub global advisory DB),
-// not only the advisories named in #1386: the blocking gate flags any
+// re-verified on 2026-11-25 against the npm audit feed's bulk advisory
+// endpoint, the GitHub global advisory DB and the publisher's repository
+// advisory DB (`minimatch`'s live 11.x advisories exist only in the last
+// one), not only the advisories named in #1386: the blocking gate flags any
 // vulnerable resolution, so pinning a subset of a package's advisory history
 // would let a re-resolution into an older advisory through.
 //
@@ -159,35 +161,39 @@ const ADVISORY_SPECS: AdvisorySpec[] = [
     // at 5.1.7/5.1.8, 6.x at 6.2.1/6.2.2 — so each pinned range extends to the
     // **latest** first-patched release of its line: a copy is clean only once
     // no live advisory flags it, not merely one. The 7.x-11.x span collapses
-    // into a single range because GHSA-g3hv-75wg-m249 stretches continuously
-    // from 7.0.0 to just under 11.0.1 across those majors. Scope `dev` like
-    // `undici`: the package is dev-only here (eslint chain) and ships in no
-    // published image (#1173). The copy under @typescript-eslint/
-    // typescript-estree resolved to 10.2.6 until the #1673 lockfile refresh
-    // bumped the toolchain to 8.73.0, which drops the nested copy and dedupes
-    // onto the patched top-level 11.0.8; eslint-config-next's nested 3.1.5
-    // predates the 7.x line and sits above every 3.x boundary.
+    // into a single range because the live advisories overlap continuously:
+    // GHSA-g3hv-75wg-m249 runs from 7.0.0 to just under 11.0.1, and three
+    // advisories the publisher maintains in
+    // `repos/isaacs/minimatch/security-advisories` (published 2026-11-10/11)
+    // carry the vulnerable span on to 11.0.8:
+    //   GHSA-cf2h-pxjq-68xw  >= 11.0.0, <= 11.0.6  (patched 11.0.7)
+    //   GHSA-c859-jr93-m5j4  >= 7.4.0,  <= 11.0.7  (patched 11.0.8)
+    //   GHSA-hqmv-qgp3-jx75  >= 11.0.3, <= 11.0.7  (patched 11.0.8)
+    // Their union with GHSA-g3hv makes every release below 11.0.8 vulnerable,
+    // so 11.0.8 is the first clean 11.x release and this pin ends there.
     //
-    // The 11.x line above 11.0.1 is deliberately unpinned: re-verified on
-    // 2026-11-21, the feed carries no advisory touching any `>= 11.0.1`
-    // release — npm's bulk advisory endpoint reports no advisory for
-    // minimatch 11.0.1 / 11.0.5 / 11.0.6 / 11.0.7 / 11.0.8 / 11.0.9, and the
-    // GitHub global advisory DB lists exactly the six advisories pinned here
-    // (reviewed and malware both). A PR-review finding alleged two live 11.x
-    // advisories (GHSA-cf2h-pxjq-68xw covering `>= 11.0.0 <= 11.0.6` patched
-    // 11.0.7, and GHSA-c859-jr93-m5j4 on 11.0.5); both IDs resolve HTTP 404
-    // on the advisory DB (`GET /advisories/{ghsa_id}`), so no 11.x boundary
-    // exists to pin — inventing one would mark a clean release vulnerable.
-    // `patchedProbes` carries 11.0.5 / 11.0.6 as negative probes so any such
-    // invented span fails the self-check, and if a real 11.x advisory ever
-    // lands the probes move to `vulnerableProbes` with its boundary.
+    // Scope `dev` like `undici`: the package is dev-only here (eslint chain)
+    // and ships in no published image (#1173). The copy under
+    // @typescript-eslint/typescript-estree resolved to 10.2.6 until the #1673
+    // lockfile refresh bumped the toolchain to 8.73.0, which drops the nested
+    // copy and dedupes onto the patched top-level 11.0.8; eslint-config-next's
+    // nested 3.1.5 predates the 7.x line and sits above every 3.x boundary.
+    //
+    // Those three 11.x advisories exist only in the publisher's repository
+    // advisory DB: the GitHub *global* advisory endpoint returns 404 for them
+    // and npm's bulk audit endpoint reports nothing for 11.0.1 … 11.0.9, so an
+    // earlier revision of this spec wrongly recorded them as nonexistent and
+    // treated 11.0.5 / 11.0.6 as patched probes. A guard against silent
+    // re-resolution pins what upstream actually published, not only what
+    // `npm audit` surfaces today; `npm audit --include=dev` stays clean
+    // because the resolved copy, 11.0.8, is the first release past this union.
     name: "minimatch",
     ranges: [
       { from: "0.0.0", to: "3.1.4" },
       { from: "4.0.0", to: "4.2.5" },
       { from: "5.0.0", to: "5.1.8" },
       { from: "6.0.0", to: "6.2.2" },
-      { from: "7.0.0", to: "11.0.1" },
+      { from: "7.0.0", to: "11.0.8" },
     ],
     advisories: [
       "GHSA-g3hv-75wg-m249",
@@ -196,10 +202,23 @@ const ADVISORY_SPECS: AdvisorySpec[] = [
       "GHSA-3ppc-4f35-3m26",
       "GHSA-f8q6-p94x-37v3",
       "GHSA-hxm2-r34f-qmc5",
+      "GHSA-cf2h-pxjq-68xw",
+      "GHSA-c859-jr93-m5j4",
+      "GHSA-hqmv-qgp3-jx75",
     ],
     scope: "dev",
-    vulnerableProbes: ["3.1.3", "4.2.4", "5.1.7", "6.2.1", "10.2.6"],
-    patchedProbes: ["3.1.4", "4.2.5", "5.1.8", "6.2.2", "11.0.1", "11.0.5", "11.0.6"],
+    vulnerableProbes: [
+      "3.1.3",
+      "4.2.4",
+      "5.1.7",
+      "6.2.1",
+      "10.2.6",
+      "11.0.1",
+      "11.0.5",
+      "11.0.6",
+      "11.0.7",
+    ],
+    patchedProbes: ["3.1.4", "4.2.5", "5.1.8", "6.2.2", "11.0.8", "11.0.9"],
   },
 ];
 
