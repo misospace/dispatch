@@ -75,10 +75,11 @@ A capability that is not granted never unlocks rebase work and never widens the 
 
 > **Issue:** [misospace/dispatch#1674](https://github.com/misospace/dispatch/issues/1674)
 >
-> **Status: dark server preparation.** Dispatch implements its half of the
-> contract only. Do not enable the model worker pool until the client grant
-> gate lands ([misospace/courier#924](https://github.com/misospace/courier/issues/924));
-> see [Enablement status](#enablement-status-dark-server-preparation).
+> **Status: Dispatch side implemented.** Model execution also requires a
+> *compatible peer* that declares `rebase-model-executor:1` and honors the
+> per-hand-out `rebaseModel` grant; see
+> [Enablement: compatible peers](#enablement-compatible-peers-and-valid-grants).
+> Peer readiness is a deployment choice, not a release-order dependency.
 
 `rebase-model-executor:1` is the advertised client-side execution contract of a
 model-assisted rebase worker (Courier's configured-model rebase executor,
@@ -230,7 +231,7 @@ The rebase worker pool is fail-closed. An unset or empty `DISPATCH_REBASE_AGENTS
 | New Courier with an old Dispatch | The old server ignores `work_scope` and answers with ordinary work and no `intake` acknowledgment. The client must treat the missing acknowledgment as "this server does not support the contract". The client must not execute the ordinary task it received. The client must not poll again in a loop. |
 | New Courier declaring `rebase-model-executor:1` with an old Dispatch (pre-#1674) | The old server answers the model verdict `granted: false, reason: "unknown-capability"` and fails no request. The client must treat the not-granted verdict as "model-assisted rebase is unavailable here" and behave as deterministic-only. |
 | New Dispatch with a Courier declaring `rebase-model-executor:2` | The verdict is `granted: false, reason: "unsupported-version"`. The poll succeeds; model-required work defers for it. |
-| New Dispatch with a model-configured Courier that does not gate on the grant | Dispatch withholds the model wall and the `rebaseModel` block on mechanical offers (including frontier parents), but the client's resolver is created from local deployment config and can still run its configured model. This is the open client-side gap tracked by [misospace/courier#924](https://github.com/misospace/courier/issues/924); keep `DISPATCH_REBASE_MODEL_AGENTS` unset until it closes. |
+| New Dispatch with a model-configured Courier that does not gate on the grant | Dispatch withholds the model wall and the `rebaseModel` block on mechanical offers (including frontier parents), but a resolver created from local deployment config can still run its configured model. Such a client is not a compatible peer for this contract: pair it with the model pool only after it validates the grant. |
 
 The rebase lane stays disabled until both peers support the contract.
 
@@ -282,31 +283,43 @@ A REBASE item is the declared mechanical exception to that gate. A conflicted PR
 
 The exception never routes escalation-classified issue work to the local rebase lane.
 
-## Enablement status: dark server preparation
+## Enablement: compatible peers and valid grants
 
-**Do not set `DISPATCH_REBASE_MODEL_AGENTS` yet.** This repository delivers the
-Dispatch half of the contract only, and it is deliberately dark until its
-Courier companion lands ([misospace/courier#924](https://github.com/misospace/courier/issues/924)).
+Dispatch ships its half of the contract in this change. Whether model-assisted
+rebase actually runs is a property of the **peer deployment**, and it is stated
+in capability terms rather than in release-order or issue-state terms.
 
-The gap is client-side and is not closable from Dispatch: Courier currently
-enables its configured-model rebase resolver from deployment configuration
-(`RebaseModelAssist` + `ModeRebase`) rather than from an affirmative
-per-hand-out `rebaseModel` grant, and declares only
-`rebase-executor:1,pr-ownership-evidence:1`. A model-enabled Courier therefore
-resolves a semantic conflict with its configured model on **any** REBASE offer
-it receives — including one Dispatch issued on a frontier-owned parent, or one
-offered by a pre-#1674 Dispatch, which never shipped the wall or the block at
-all. Withholding the model wall and the `rebaseModel` block is an honest
-Dispatch-side decision, but it does not disable a client that never needed it.
+A peer is compatible with this contract when it:
 
-So the negotiation and locked-parent gates above describe exactly what Dispatch
-sends and withholds; they become end-to-end guarantees only when Courier
-(a) declares `rebase-model-executor:1`, and (b) creates the resolver — and its
-pod env — only for a hand-out carrying an affirmative `rebaseModel` grant at
-version 1, refusing every other offer regardless of local configuration.
-While the pool stays unset this path adds no operator risk: no item can be
-handed out with a model wall, and every offer still carries the mechanical
-refusal wall.
+- declares `rebase-model-executor:1` alongside `rebase-executor:1`, and
+- treats a hand-out without an affirmative `rebaseModel` grant at version 1 as
+  mechanical work: it does not create a model resolver and does not call a
+  model, regardless of local configuration, and
+- uses the transported `semanticConflict` context only as evidence, never as
+  authorization.
+
+A model-enabled peer that creates its resolver from local deployment
+configuration alone is **not** a compatible peer for this contract: Dispatch
+withholds the model wall and the `rebaseModel` block on mechanical and
+frontier-owned offers, but it cannot disable a resolver the client built
+anyway. Operators pair a model worker pool with a peer that validates the
+grant; that check is local to the deployment, not a cross-repository gate.
+
+Named compatibility facts:
+
+- Old Dispatch + new Courier: the server answers `granted: false,
+  reason: "unknown-capability"`; the client behaves deterministically. No
+  request fails and no queue widens.
+- New Dispatch + old Courier: the old client's exact declaration bytes stay
+  fully granted and its hand-outs keep the mechanical wall with no
+  `rebaseModel` field.
+- New Dispatch + new Courier: the three authorization gates above decide, and
+  an authorized semantic case is transported with the model wall and the
+  bounded context.
+
+Feature availability therefore depends on **both peers supporting the
+negotiated contract**, never on another repository's PR, issue, release, or
+deployment completing.
 
 ## Enablement steps
 
@@ -317,17 +330,15 @@ These steps enable one rebase agent. This document changes no production configu
 3. The agent runs with a Courier lane profile that uses the coordinator `litellm/qwen3.8-27b` and concurrency 1. This profile is a Courier setting. Dispatch does not read it.
 4. The agent polls with the `capabilities` declaration. A poll without it receives no rebase work.
 
-Model-assisted rebase (#1674) adds two more steps, and step 5 blocks step 6:
+Model-assisted rebase (#1674) adds two more steps:
 
-5. The Courier peer must implement the model-assist contract
-   (misospace/courier#732) **and its per-hand-out grant gate**
-   ([misospace/courier#924](https://github.com/misospace/courier/issues/924)):
-   it declares `rebase-model-executor:1` on the rebase polls, and it creates
-   its model resolver only when the received hand-out carries an affirmative
-   `rebaseModel` grant. Until that companion lands, enabling step 6 would
-   authorize model execution Dispatch cannot actually forbid — see
-   [Enablement status](#enablement-status-dark-server-preparation).
-6. The operator names the model worker pool. Set `DISPATCH_REBASE_MODEL_AGENTS=courier-rebase` (the worker whose lane is configured for the one coordinator). Until this variable names an agent, model-required items defer for every poll and the lane stays deterministic-only. Leave it unset until step 5 is true.
+5. The Courier peer implements both the model-assist contract
+   (misospace/courier#732) and the grant gate: it declares
+   `rebase-model-executor:1` on rebase polls, and it creates its model resolver
+   only when the hand-out carries an affirmative `rebaseModel` grant. Old or
+   un-gated peers are simply deterministic-only; see
+   [Enablement: compatible peers](#enablement-compatible-peers-and-valid-grants).
+6. The operator names the model worker pool. Set `DISPATCH_REBASE_MODEL_AGENTS=courier-rebase` (the worker whose lane is configured for the one coordinator). Until this variable names an agent, model-required items defer for every poll and the lane stays deterministic-only. Enable it only for a peer from step 5.
 
 ## Examples
 
