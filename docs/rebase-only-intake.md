@@ -74,6 +74,11 @@ A capability that is not granted never unlocks rebase work and never widens the 
 ## The model-assisted rebase capability (#1674)
 
 > **Issue:** [misospace/dispatch#1674](https://github.com/misospace/dispatch/issues/1674)
+>
+> **Status: dark server preparation.** Dispatch implements its half of the
+> contract only. Do not enable the model worker pool until the client grant
+> gate lands ([misospace/courier#924](https://github.com/misospace/courier/issues/924));
+> see [Enablement status](#enablement-status-dark-server-preparation).
 
 `rebase-model-executor:1` is the advertised client-side execution contract of a
 model-assisted rebase worker (Courier's configured-model rebase executor,
@@ -149,10 +154,13 @@ authorization.
   operator-visible count: `N model-required rebase candidates deferred: this
   poll is not authorized for model-assisted rebase (rebase-model-executor:1 +
   DISPATCH_REBASE_MODEL_AGENTS)`. Nothing pretends a configured model ran.
-- Provider/head/branch authorization, ownership evidence, and the original
-  parent issue classification are untouched. Model work rides the SAME
-  serialized concurrency-1 rebase lane admission as mechanical work; it is
-  not a second lane and not a bypass of frontier exclusivity.
+- Provider/head/branch authorization and ownership evidence are untouched. The
+  parent issue classification is now read at issuance under a share lock (see
+  the third authorization gate above); that read can only WITHHOLD the model
+  path — the deterministic REBASE exception keeps working on `ESCALATED` and
+  `UNKNOWN`. Model work rides the SAME serialized concurrency-1 rebase lane
+  admission as mechanical work; it is not a second lane and not a bypass of
+  frontier exclusivity.
 
 ## The acknowledgment
 
