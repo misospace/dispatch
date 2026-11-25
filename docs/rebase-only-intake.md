@@ -230,6 +230,7 @@ The rebase worker pool is fail-closed. An unset or empty `DISPATCH_REBASE_AGENTS
 | New Courier with an old Dispatch | The old server ignores `work_scope` and answers with ordinary work and no `intake` acknowledgment. The client must treat the missing acknowledgment as "this server does not support the contract". The client must not execute the ordinary task it received. The client must not poll again in a loop. |
 | New Courier declaring `rebase-model-executor:1` with an old Dispatch (pre-#1674) | The old server answers the model verdict `granted: false, reason: "unknown-capability"` and fails no request. The client must treat the not-granted verdict as "model-assisted rebase is unavailable here" and behave as deterministic-only. |
 | New Dispatch with a Courier declaring `rebase-model-executor:2` | The verdict is `granted: false, reason: "unsupported-version"`. The poll succeeds; model-required work defers for it. |
+| New Dispatch with a model-configured Courier that does not gate on the grant | Dispatch withholds the model wall and the `rebaseModel` block on mechanical offers (including frontier parents), but the client's resolver is created from local deployment config and can still run its configured model. This is the open client-side gap tracked by [misospace/courier#924](https://github.com/misospace/courier/issues/924); keep `DISPATCH_REBASE_MODEL_AGENTS` unset until it closes. |
 
 The rebase lane stays disabled until both peers support the contract.
 
