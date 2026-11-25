@@ -77,11 +77,21 @@ export function verifyWebhookSignature(secret: string, payload: Buffer, signatur
 const WEBHOOK_RATE_LIMIT = { limit: 30, windowMs: 10_000 } as const;
 
 /**
+ * Upper bound on the delivery-GUID segment of a rate-limit key (#1698).
+ * GitHub sends a UUID; the cap only stops a secret-holding client from
+ * inflating limiter memory with oversized header values.
+ */
+const DELIVERY_GUID_MAX_LENGTH = 128;
+
+/**
  * Result of authenticating an inbound webhook delivery.
  *
- * On success the resolved `actor` identifies the delivery for the
- * rate-limit bucket; on failure `response` is the ready-to-send error
- * response the route should return verbatim.
+ * On success the resolved `actor` keys the delivery's rate-limit bucket: in
+ * verify mode it is the GitHub delivery GUID (`delivery:<guid>`) or the
+ * shared `webhook` fallback when no usable GUID header is present; in
+ * gateway mode it is the credential-derived throttle key. On failure
+ * `response` is the ready-to-send error response the route should return
+ * verbatim.
  */
 export type WebhookDeliveryAuthentication =
   | { authenticated: true; actor: string }
@@ -103,7 +113,11 @@ export type WebhookDeliveryAuthentication =
  *   Authorization header), so `authorizeRequest` is skipped to let
  *   signature-only GitHub deliveries through in oidc/legacy/basic auth
  *   modes. In every other mode the normal auth layer still applies.
- * - Actor resolution and the per-route rate-limit bucket.
+ * - Actor resolution and the per-route rate-limit bucket. In verify mode
+ *   the bucket is keyed per delivery (see `verifiedDeliveryActor`, #1698):
+ *   every HMAC-verified delivery sharing one bucket throttled legitimate
+ *   GitHub delivery bursts at 30/10s. Gateway mode keeps the per-credential
+ *   bucket.
  *
  * `payload` must be the raw request body bytes, read before this call:
  * `authorizeRequest` may consume the body stream, so the HMAC check has to
@@ -145,10 +159,12 @@ export async function authenticateWebhookDelivery(
   }
 
   // In verify mode the HMAC check above is the authentication gate, so
-  // authorizeRequest is skipped and the delivery is attributed to the
-  // webhook itself. Otherwise the normal auth layer decides.
-  let actor = "webhook";
-  if (verification.mode !== "verify") {
+  // authorizeRequest is skipped and the bucket is keyed per delivery
+  // (#1698). Otherwise the normal auth layer decides the throttle key.
+  let actor: string;
+  if (verification.mode === "verify") {
+    actor = verifiedDeliveryActor(request);
+  } else {
     const auth = await authorizeRequest(request);
     if (!auth.authorized) {
       return { authenticated: false, response: authErrorResponse(auth) };
@@ -160,4 +176,29 @@ export async function authenticateWebhookDelivery(
   if (limited) return { authenticated: false, response: limited };
 
   return { authenticated: true, actor };
+}
+
+/**
+ * Rate-limit actor for an HMAC-verified delivery (#1698).
+ *
+ * Keying every verified delivery on the constant "webhook" put them all in
+ * one 30/10s bucket, so a legitimate GitHub burst — one delivery per event
+ * during an automation storm across many issues on a tracked repo — was
+ * throttled. Key the bucket on the `x-github-delivery` GUID instead: GitHub
+ * sends one GUID per delivery and reuses it for redeliveries, so distinct
+ * deliveries each get room while a same-GUID replay flood stays throttled
+ * together. Downstream idempotency (#1220/#1202 delivery identity) already
+ * dedupes replays, so per-GUID capacity is safe to spend.
+ *
+ * The GUID header is not covered by the HMAC (GitHub signs only the body),
+ * but reaching this limiter in verify mode already required the secret, so
+ * per-GUID capacity only widens a sender that is trusted by construction.
+ * A verified delivery without a usable GUID is not shaped like a real
+ * GitHub delivery: it keeps the old shared "webhook" bucket, so GUID-less
+ * senders stay throttled together.
+ */
+function verifiedDeliveryActor(request: Request): string {
+  const guid = request.headers.get("x-github-delivery")?.trim() ?? "";
+  if (!guid || guid.length > DELIVERY_GUID_MAX_LENGTH) return "webhook";
+  return `delivery:${guid}`;
 }
