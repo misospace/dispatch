@@ -36,6 +36,7 @@ Configuration:
 | Env Var | Description | Default |
 |---------|-------------|---------|
 | `PR_FOLLOWUP_BOT_IDENTITIES` | Comma-separated GitHub logins whose PRs are eligible | `github-actions[bot]` |
+| `PR_FOLLOWUP_BOT_IDENTITY_SCOPES` | JSON object narrowing a configured login to PRs whose head repository is the base repository AND whose head branch starts with one of its prefixes, e.g. `{"renovate[bot]": ["renovate/"]}`. Fail closed when the head repo or branch is missing. Unscoped logins in `PR_FOLLOWUP_BOT_IDENTITIES` keep the legacy behavior. | Unset (no scopes) |
 | `PR_FOLLOWUP_BRANCH_OWNERS` | Comma-separated repo owners allowed for queueing | All (opt-in safety) |
 
 ### Real-time webhooks
@@ -147,7 +148,8 @@ cannot take frontier work; frontier cannot take normal work; an unverifiable
 classification refuses both declared lanes), and a row whose ownership is
 unresolved ("missing", "ambiguous", or legacy) is never auto-handed out in
 any rollout mode — resolution comes from re-ingestion, an operator requeue, or
-`POST /api/pr-fix-queue/claimant`. Rollout mode:
+`POST /api/pr-fix-queue/claimant` (`action: "clear" | "transfer"`); #1695
+sync invalidates stale `agent-label` evidence independent of mode. Rollout mode:
 `DISPATCH_PR_FIX_OWNERSHIP_MODE` (default `enforce`); the mode changes the log
 marker and whether the issuance-side backfill runs, never the refusal. Full
 contract, provenance order, and the capability-gated `ownership` payload on the
@@ -263,6 +265,7 @@ Each queue item carries a Dispatch-owned `generation` (integer, starts at `1`). 
 
 - `prFixItem.id` — stable for the persistent `PrFixQueueItem` row.
 - `prFixItem.generation` — changes only when Dispatch creates a fresh dispatchable attempt: an explicit requeue from `BLOCKED` or `FIXED`, genuinely new evidence reopening a resolved item, recovery from a no-progress `FIXED` tombstone (#940), or the refused-`FIXED` head-SHA rollback. Repeated reads, repeated sync of known evidence, and updates that stay within the same active attempt never change it.
+- `prFixItem.originalClaimant` / `prFixItem.claimantSource` (#1582) — additive: the identity that originally owned the work, mirrored inline on every hand-out so a gate-enforcing consumer that never negotiated the `pr-ownership-evidence:1` capability still receives it. See [PR-fix ownership evidence contract](./pr-fix-ownership-contract.md).
 
 Together the pair answers "which distinct unit of PR-fix work is this". Consumers should treat `(id, generation)` as opaque work identity — for example, to key their own per-attempt records — and must not derive queue policy from the number. `generation` is an integer; the SHA-256 hex derivation from this change's first revision was superseded before ever shipping, so no released contract exposed a string form. Follow-up tasks discovered by linked-PR health are materialized into a `PrFixQueueItem` before hand-out and therefore always carry `prFixItem` (see "Linked-PR follow-up ownership" below); a hand-out never ships without one.
 

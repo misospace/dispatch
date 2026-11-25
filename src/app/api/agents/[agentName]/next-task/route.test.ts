@@ -4255,8 +4255,9 @@ describe("GET next-task escalation-lane exclusivity (#1503)", () => {
 // evidence (Lease → agent label → owner label → PR author; the first single
 // surviving candidate wins, conflicts stay ambiguous). Capability-negotiated
 // polls (`pr-ownership-evidence:1`, #1532 intake) additionally receive the
-// versioned, non-secret evidence block; un-negotiated tasks stay
-// byte-identical. Lane isolation is bidirectional (#1503 + #1569): a
+// versioned, non-secret evidence block; un-negotiated tasks never see the
+// block itself (#1582 mirrors the claimant inline on `prFixItem` for every
+// hand-out). Lane isolation is bidirectional (#1503 + #1569): a
 // NON-escalation row is refused for the escalation lane, and an
 // unverifiable (UNKNOWN) parent classification refuses BOTH declared lanes.
 // Linked-PR materialization defers on UNKNOWN (no row is manufactured from
@@ -4324,6 +4325,10 @@ describe("GET next-task PR-fix ownership evidence (#1569)", () => {
     ).json();
     expect(body.type).toBe("followup-pr");
     expect(body.prFixItem.id).toBe(row.id);
+    // #1582: the claimant is ALSO mirrored inline on the item identity, so a
+    // gate-enforcing consumer that never negotiated reads the same evidence.
+    expect(body.prFixItem.originalClaimant).toBe("worker-7");
+    expect(body.prFixItem.claimantSource).toBe("agent-label");
     expect(body.ownership).toEqual({
       contract: 1,
       owningLane: "NORMAL",
@@ -4337,7 +4342,7 @@ describe("GET next-task PR-fix ownership evidence (#1569)", () => {
     ]);
   });
 
-  it("keeps the hand-out byte-identical for a poll that never negotiated the capability", async () => {
+  it("omits the versioned ownership block but still ships the inline claimant for a poll that never negotiated the capability", async () => {
     const row = ownershipRow(51, { claimant: "worker-7", claimantSource: "agent-label" });
     mocks.prFixFindMany.mockResolvedValue([row]);
     scriptConfirmed(row);
@@ -4347,8 +4352,37 @@ describe("GET next-task PR-fix ownership evidence (#1569)", () => {
       })
     ).json();
     expect(body.type).toBe("followup-pr");
+    // The versioned block stays negotiation-gated (#1569/#1532)...
     expect(body.ownership).toBeUndefined();
     expect(body.intake).toBeUndefined();
+    // ...while the inline claimant evidence (#1582) reaches every consumer,
+    // including the deployed pre-negotiation client.
+    expect(body.prFixItem).toEqual({
+      id: row.id,
+      generation: 1,
+      handoutToken: expect.any(String),
+      fixType: "OTHER",
+      originalClaimant: "worker-7",
+      claimantSource: "agent-label",
+    });
+  });
+
+  it("ships the inline claimant and omits the source for a legacy claimant-bearing row (#1582)", async () => {
+    // A row predating the contract: claimant recorded, no recorded source.
+    // It still dispatches (provenance "legacy"), and the inline mirror ships
+    // the claimant with NO claimantSource key.
+    const row = ownershipRow(59, { claimant: "worker-7", claimantSource: null });
+    mocks.prFixFindMany.mockResolvedValue([row]);
+    scriptConfirmed(row);
+    const body = await (
+      await GET(request("/api/agents/example-agent/next-task?lane=local"), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })
+    ).json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.ownership).toBeUndefined();
+    expect(body.prFixItem.originalClaimant).toBe("worker-7");
+    expect(body.prFixItem).not.toHaveProperty("claimantSource");
   });
 
   it("refuses an unresolved (legacy) row in enforce mode — no automatic hand-out, no backfill write", async () => {
@@ -4466,6 +4500,10 @@ describe("GET next-task PR-fix ownership evidence (#1569)", () => {
       provenance: "agent-label",
       prAuthor: "bot",
     });
+    // #1582: the inline mirror carries the RESOLVED claimant too — never the
+    // stale unresolved row state the gate started from.
+    expect(body.prFixItem.originalClaimant).toBe("worker-7");
+    expect(body.prFixItem.claimantSource).toBe("agent-label");
     // The lazy backfill pinned the pre-write state (claimant: null) so a
     // concurrent resolution cannot be clobbered.
     const backfill = handoutWrites().find((args) => args.data?.claimant !== undefined);

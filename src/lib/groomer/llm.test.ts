@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { callGroomerLLM, buildGroomerResponseSchema, GroomerOutputParseError, MAX_REPAIR_ECHO_BYTES } from "./llm";
+import { LITELLM_SESSION_HEADER } from "./session-affinity";
 import { PLAN_LABELS } from "./plan";
 import { buildEvidenceCatalog } from "./plan-evidence";
 import { getLaneIds } from "@/lib/lane-config";
@@ -637,5 +638,94 @@ describe("callGroomerLLM repair turn (dispatch#1126)", () => {
     const body = JSON.parse(fetchMock.mock.calls[0][1].body as string);
     expect(body.messages[2].content.length).toBeLessThan(MAX_REPAIR_ECHO_BYTES + 32);
     expect(body.messages[2].content).toMatch(/… \(truncated\)$/);
+  });
+});
+
+describe("callGroomerLLM session affinity (dispatch#1677)", () => {
+  const SESSION_ID = "ckzq8t2v10000ab12cd34ef56";
+  const baseOptions = {
+    baseUrl: "https://llm.example.com/v1",
+    apiKey: "sk-test",
+    model: "local-pool",
+    prompt: "Issue #1677: one grooming run's turns land on different backends",
+    timeoutMs: 60_000,
+    sessionId: SESSION_ID,
+  };
+
+  function okResponse() {
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({ verdict: { lane: { id: "local", confidence: "high", reason: "r" } } }),
+            },
+          },
+        ],
+      }),
+      text: async () => "",
+    };
+  }
+
+  function sessionIdsOf(fetchMock: ReturnType<typeof vi.fn>): (string | undefined)[] {
+    return fetchMock.mock.calls.map(
+      ([, init]) => (init as { headers: Record<string, string> }).headers[LITELLM_SESSION_HEADER],
+    );
+  }
+
+  it("pins the plan request with the run's session id", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(okResponse());
+    vi.stubGlobal("fetch", fetchMock);
+    await callGroomerLLM(baseOptions);
+    vi.unstubAllGlobals();
+
+    expect(sessionIdsOf(fetchMock)).toEqual([SESSION_ID]);
+  });
+
+  it("keeps the session id on the json_object fallback and on a transient retry", async () => {
+    // The 400 is the deliberate schema downgrade and the 503 the transient
+    // retry. Both are still this run asking the same question, so both must
+    // carry the same pin, or the run hops backends mid-answer and pays for a
+    // cold context on the way.
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: false, status: 400, text: async () => "unsupported response_format" })
+      .mockResolvedValueOnce({ ok: false, status: 503, text: async () => "upstream unavailable" })
+      .mockResolvedValueOnce(okResponse());
+    vi.stubGlobal("fetch", fetchMock);
+
+    const promise = callGroomerLLM(baseOptions);
+    await vi.advanceTimersByTimeAsync(5_000);
+    await promise;
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+
+    // json_schema (400) → json_object (503) → json_schema (ok).
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(sessionIdsOf(fetchMock)).toEqual([SESSION_ID, SESSION_ID, SESSION_ID]);
+  });
+
+  it("keeps the session id on the repair turn", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(okResponse());
+    vi.stubGlobal("fetch", fetchMock);
+    await callGroomerLLM({
+      ...baseOptions,
+      repair: { previousResponse: "not json", errors: ["the answer was not JSON"] },
+    });
+    vi.unstubAllGlobals();
+
+    expect(sessionIdsOf(fetchMock)).toEqual([SESSION_ID]);
+  });
+
+  it("sends no session header when the caller has no run session", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(okResponse());
+    vi.stubGlobal("fetch", fetchMock);
+    await callGroomerLLM({ ...baseOptions, sessionId: undefined });
+    vi.unstubAllGlobals();
+
+    expect(sessionIdsOf(fetchMock)).toEqual([undefined]);
   });
 });

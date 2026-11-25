@@ -16,6 +16,8 @@ const { WORKER_TOKEN, mocks } = vi.hoisted(() => ({
   WORKER_TOKEN: "worker-tier-token-1569",
   mocks: {
     setPrFixClaimant: vi.fn(),
+    clearPrFixClaimant: vi.fn(),
+    transferPrFixClaimant: vi.fn(),
     // Faithful stand-in for the real `normalizeQueueRepo` (trim + lowercase).
     normalizeQueueRepo: vi.fn((repo: string) => repo.trim().toLowerCase()),
   },
@@ -32,6 +34,8 @@ vi.mock("@/lib/prisma", () => ({
 
 vi.mock("@/lib/pr-fix-queue", () => ({
   setPrFixClaimant: mocks.setPrFixClaimant,
+  clearPrFixClaimant: mocks.clearPrFixClaimant,
+  transferPrFixClaimant: mocks.transferPrFixClaimant,
   normalizeQueueRepo: mocks.normalizeQueueRepo,
 }));
 
@@ -70,6 +74,8 @@ describe("POST /api/pr-fix-queue/claimant", () => {
     resetRateLimits();
     vi.clearAllMocks();
     mocks.setPrFixClaimant.mockResolvedValue({ updated: true });
+    mocks.clearPrFixClaimant.mockResolvedValue({ updated: true, previousClaimant: null, previousSource: null });
+    mocks.transferPrFixClaimant.mockResolvedValue({ updated: true, previousClaimant: null, previousSource: null });
   });
 
   afterEach(() => {
@@ -290,6 +296,37 @@ describe("POST /api/pr-fix-queue/claimant", () => {
     expect(res.status).toBe(409);
     const body = await res.json();
     expect(body.error).toMatch(/already has a recorded claimant/);
+  });
+
+  it("clears and transfers through the operator helpers", async () => {
+    const cleared = await postRequest({ repo: "org/repo", pr: 42, action: "clear" });
+    expect(cleared.status).toBe(200);
+    expect(mocks.clearPrFixClaimant).toHaveBeenCalledWith(expect.anything(), { repo: "org/repo", pr: 42 });
+    expect(await cleared.json()).toEqual({ ok: true, action: "clear", repo: "org/repo", pr: 42, previousClaimant: null, previousSource: null });
+
+    const transferred = await postRequest({ repo: "org/repo", pr: 42, action: "transfer", claimant: " operator-x " });
+    expect(transferred.status).toBe(200);
+    expect(mocks.transferPrFixClaimant).toHaveBeenCalledWith(expect.anything(), { repo: "org/repo", pr: 42, claimant: "operator-x" });
+    expect(await transferred.json()).toEqual({ ok: true, action: "transfer", repo: "org/repo", pr: 42, claimant: "operator-x", previousClaimant: null, previousSource: null });
+  });
+
+  it("validates clear, transfer, and unknown actions", async () => {
+    expect((await postRequest({ repo: "org/repo", pr: 42, action: "clear", claimant: "smurf" })).status).toBe(400);
+    expect((await postRequest({ repo: "org/repo", pr: 42, action: "transfer" })).status).toBe(400);
+    expect((await postRequest({ repo: "org/repo", pr: 42, action: "transfer", claimant: "   " })).status).toBe(400);
+    expect((await postRequest({ repo: "org/repo", pr: 42, action: "unknown", claimant: "smurf" })).status).toBe(400);
+    expect((await postRequest({ repo: "org/repo", pr: 42, action: "transfer", claimant: "smurf\n" })).status).toBe(400);
+  });
+
+  it("maps missing and contended clear/transfer results", async () => {
+    mocks.clearPrFixClaimant.mockResolvedValue({ updated: false, reason: "not_found", previousClaimant: null, previousSource: null });
+    expect((await postRequest({ repo: "org/repo", pr: 42, action: "clear" })).status).toBe(404);
+    mocks.transferPrFixClaimant.mockResolvedValue({ updated: false, reason: "not_found", previousClaimant: null, previousSource: null });
+    expect((await postRequest({ repo: "org/repo", pr: 42, action: "transfer", claimant: "smurf" })).status).toBe(404);
+    mocks.clearPrFixClaimant.mockResolvedValue({ updated: false, reason: "contended", previousClaimant: null, previousSource: null });
+    expect((await postRequest({ repo: "org/repo", pr: 42, action: "clear" })).status).toBe(503);
+    mocks.transferPrFixClaimant.mockResolvedValue({ updated: false, reason: "contended", previousClaimant: null, previousSource: null });
+    expect((await postRequest({ repo: "org/repo", pr: 42, action: "transfer", claimant: "smurf" })).status).toBe(503);
   });
 
   it("returns 500 when the stamp throws", async () => {

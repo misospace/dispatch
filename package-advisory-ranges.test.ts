@@ -141,10 +141,12 @@ const ADVISORY_SPECS: AdvisorySpec[] = [
     // guard compares numeric cores only, and a 4.0.0 boundary would also pin
     // patched 4.0.0. (The same advisory's 0.1.0 … <0.97.1 range belongs to
     // `@effect/platform`, which this tree does not contain.) The
-    // `overrides` floor (`effect: "^3.22.1"`, #1670) keeps the tree off the 4.x
-    // line entirely, which is also why the floor is caret-bounded instead of a
-    // bare `>=3.22.1`: its only consumer, @prisma/config, pins effect exactly and
-    // has never been resolved against an effect major it does not ship.
+    // `@prisma/config`-scoped override (`effect: "^3.22.1"`, #1670) keeps the
+    // transitive copy on the patched 3.x line. Effect 4 cannot replace it:
+    // @prisma/config 7.10.1 uses Effect 3 APIs (`Either`,
+    // `Schema.decodeUnknownEither`) that effect 4 removed, so the consumer must
+    // stay on 3.x. `renovate.json` holds this override below 4.0.0 until a
+    // stable Prisma release ships a compatible, patched effect pin.
     name: "effect",
     ranges: [{ from: "0.0.0", to: "3.22.1" }],
     advisories: ["GHSA-7589-6fvf-x4pw", "GHSA-38f7-945m-qr2g"],
@@ -176,7 +178,8 @@ const ADVISORY_SPECS: AdvisorySpec[] = [
     // and ships in no published image (#1173). The copy under
     // @typescript-eslint/typescript-estree resolved to 10.2.6 until the #1673
     // lockfile refresh bumped the toolchain to 8.73.0, which drops the nested
-    // copy and dedupes onto the patched top-level 11.0.8; eslint-config-next's
+    // copy and dedupes onto the patched top-level minimatch (11.0.8 at the
+    // time; 11.0.9 after a later Renovate bump); eslint-config-next's
     // nested 3.1.5 predates the 7.x line and sits above every 3.x boundary.
     //
     // Those three 11.x advisories exist only in the publisher's repository
@@ -186,7 +189,8 @@ const ADVISORY_SPECS: AdvisorySpec[] = [
     // treated 11.0.5 / 11.0.6 as patched probes. A guard against silent
     // re-resolution pins what upstream actually published, not only what
     // `npm audit` surfaces today; `npm audit --include=dev` stays clean
-    // because the resolved copy, 11.0.8, is the first release past this union.
+    // because the resolved copy is past this union (11.0.9 in the current
+    // lock).
     name: "minimatch",
     ranges: [
       { from: "0.0.0", to: "3.1.4" },

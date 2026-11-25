@@ -84,7 +84,7 @@ vi.mock("@/lib/prisma", async () => {
   return { prisma: harnessHolder.current.prisma };
 });
 
-import { POST } from "./route";
+import { GET, POST } from "./route";
 import { resetAuthCaches } from "@/lib/auth";
 import { resetRateLimits } from "@/lib/rate-limit";
 import { canonicalAdmissionFields, computePayloadDigest } from "@/lib/external-contribution";
@@ -451,5 +451,84 @@ describe("POST /api/external-contributions", () => {
     expect(harness.audits[0].action).toBe("external_contribution_submit");
     expect(harness.audits[0].repoFullName).toBe("acme/widgets");
     expect(harness.audits[0].success).toBe(true);
+  });
+});
+
+// #1538: GET /api/external-contributions — the stored-evidence listing. Pure
+// ledger read: newest first, bounded, and never a network call.
+describe("GET /api/external-contributions", () => {
+  function list(query = "", opts: { includeAuth?: boolean; token?: string } = {}) {
+    const { includeAuth = true, token = mockToken } = opts;
+    return GET(
+      authedRequest(`http://localhost/api/external-contributions${query}`, { includeAuth, token }) as any,
+    );
+  }
+
+  beforeEach(() => {
+    resetAuthCaches();
+    resetRateLimits();
+    vi.clearAllMocks();
+    harness.rows.splice(0, harness.rows.length);
+    harness.audits.splice(0, harness.audits.length);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => {
+        throw new Error("the stored-evidence listing must never touch the network");
+      }),
+    );
+  });
+
+  afterEach(() => {
+    resetAuthCaches();
+    resetRateLimits();
+    vi.unstubAllGlobals();
+  });
+
+  it("returns 401 without credentials and 403 for a worker-tier token", async () => {
+    expect((await list("", { includeAuth: false })).status).toBe(401);
+    expect((await list("", { token: "test-worker-token" })).status).toBe(403);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("lists stored requests newest-first with their lifecycle projections, offline", async () => {
+    const older = harness.plantRow({
+      idempotencyKey: "key-old",
+      createdAt: new Date("2026-11-19T00:00:00.000Z"),
+      deliveryStatus: "accepted",
+      courierRun: "run-old",
+      trackingState: "failed",
+      courierPhase: "Failed",
+      courierCauseCategory: "verifier-rejection",
+    });
+    const newer = harness.plantRow({
+      idempotencyKey: "key-new",
+      createdAt: new Date("2026-11-20T00:00:00.000Z"),
+      deliveryStatus: "accepted",
+      courierRun: "run-new",
+    });
+
+    const res = await list();
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.requests.map((r: any) => r.id)).toEqual([newer.id, older.id]);
+    expect(body.requests[0].tracking.state).toBe("admitted");
+    expect(body.requests[1].tracking).toMatchObject({ state: "failed", phase: "Failed" });
+    expect(body.requests[1].tracking.cause).toMatchObject({ category: "verifier-rejection" });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("bounds the listing (default 50, max 200) and rejects nonsense limits", async () => {
+    for (let i = 0; i < 60; i += 1) {
+      harness.plantRow({ idempotencyKey: `key-${i}` });
+    }
+    const res = await list();
+    expect(res.status).toBe(200);
+    expect(((await res.json()).requests as unknown[]).length).toBe(50);
+
+    expect((await list("?limit=5")).status).toBe(200);
+    expect(((await list("?limit=5").then((r) => r.json())).requests as unknown[]).length).toBe(5);
+    for (const bad of ["?limit=0", "?limit=-1", "?limit=201", "?limit=abc", "?limit=1.5"]) {
+      expect((await list(bad)).status).toBe(400);
+    }
   });
 });

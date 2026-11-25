@@ -111,12 +111,12 @@ For `REBASE` the one-attempt bound is enforced server-side, not only in prose (#
 
 ### Ownership evidence (#1569)
 
-A `followup-pr` task carries an `ownership` block **only** when the poll declared and was granted `pr-ownership-evidence:1`: `{ contract: 1, owningLane, originalClaimant, provenance, prAuthor? }`. An un-negotiated poll receives the byte-identical legacy task.
+A `followup-pr` task carries an `ownership` block **only** when the poll declared and was granted `pr-ownership-evidence:1`: `{ contract: 1, owningLane, originalClaimant, provenance, prAuthor? }`. An un-negotiated poll never sees that block; the original claimant additionally rides on **every** hand-out as the additive inline fields `prFixItem.originalClaimant` (always present on a shipped hand-out) and `prFixItem.claimantSource` (present when a source was recorded), so a gate-enforcing consumer that never negotiated still receives the evidence (#1582).
 
 - `originalClaimant` is the identity that originally owned the work (live Lease → single `agent/*` label → single `owner/*` label → PR author). It is never a hand-out recipient, and a lane re-classification never transfers it.
 - `owningLane` is the queue ROW's lane, not the dispatched lane (`prFixItem.fixType` names the dispatched lane).
 - `provenance` records why the value is what it is, including the failure states `missing`, `ambiguous`, and `legacy` (a row predating the contract). `legacy` on a claimant-bearing row still dispatches — read `originalClaimant`, not `provenance`, to decide ownership.
-- A row whose claimant is unresolved is never auto-handed out, in every mode of `DISPATCH_PR_FIX_OWNERSHIP_MODE` (`enforce` is the default). Recovery is re-ingestion, an operator requeue, or `POST /api/pr-fix-queue/claimant` (maintainer tier). The ownership gate applies to every lane, `REBASE` included.
+- A row whose claimant is unresolved is never auto-handed out, in every mode of `DISPATCH_PR_FIX_OWNERSHIP_MODE` (`enforce` is the default). Recovery is re-ingestion, an operator requeue, or `POST /api/pr-fix-queue/claimant` (maintainer tier), including `action: "clear" | "transfer"`; #1695 label-cache writers also auditably invalidate stale `agent-label` claimants. The ownership gate applies to every lane, `REBASE` included.
 - The ownership block rides on a granted hand-out only. The gate refuses a row with no resolvable claimant in every mode, so a shipped block always names an identity. The queue listing shows the null claimant of a row that still needs recovery. A capability grant is not a promise of a claimant.
 
 Full contract: [docs/pr-fix-ownership-contract.md](../../../docs/pr-fix-ownership-contract.md).

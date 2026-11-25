@@ -390,7 +390,9 @@ export async function GET(
   const negotiation = intake.negotiation;
   const rebaseOnly = negotiation.scope === REBASE_ONLY_SCOPE;
   // The acknowledgment rides only on responses of a client that declared an
-  // intake contract; an ordinary consumer's response stays byte-identical.
+  // intake contract; an ordinary consumer's response stays byte-identical,
+  // apart from the additive PR-fix inline claimant fields on followup-pr
+  // hand-outs (#1582, docs/pr-fix-ownership-contract.md).
   const intakeAck = negotiation.optedIn ? buildIntakeAck(negotiation) : undefined;
   const skipped = new Map<string, {
     repoFullName: string; pullRequestNumber: number; generation: number;
@@ -753,8 +755,9 @@ export async function GET(
             // original claimant, provenance-tagged), re-decided against the
             // confirmed row above. Shipped only when this poll was granted
             // the `pr-ownership-evidence:1` intake capability (#1532
-            // negotiation), so an un-negotiated consumer's task stays
-            // byte-identical to the pre-contract shape.
+            // negotiation), so the versioned block itself stays invisible to
+            // an un-negotiated consumer; the claimant alone is mirrored
+            // inline on `prFixItem` below for every hand-out (#1582).
             ownership: negotiation.prOwnershipEvidenceGranted ? liveOwnership.evidence : undefined,
             pullRequest: {
              repoFullName: candidate.repo,
@@ -764,11 +767,19 @@ export async function GET(
            issue: candidate.issue
              ? { repoFullName: candidate.repo, number: candidate.issue }
              : undefined,
-           // #1327 review: ship the PERSISTED dispatched lane (the same
-           // derivation settlement keys on), not the candidate's mutable
-           // type — a mid-attempt re-observation flip must not change the
-           // lane identity the worker and the server agree on.
-           prFixItem: { id: candidate.id, generation: confirmed.generation, handoutToken, fixType: confirmed.attemptType ?? candidate.fixType },
+            // #1327 review: ship the PERSISTED dispatched lane (the same
+            // derivation settlement keys on), not the candidate's mutable
+            // type — a mid-attempt re-observation flip must not change the
+            // lane identity the worker and the server agree on.
+            // #1582: mirror the ORIGINAL CLAIMANT inline for every hand-out,
+            // from the same gate inputs (the claimant the hand-out was
+            // authorized with; the gate refuses an unresolved one in every
+            // mode, so a shipped hand-out always names one). A consumer that
+            // enforces the ownership gate but predates the #1532 capability
+            // negotiation reads only this field; a negotiated consumer keeps
+            // the versioned `ownership` block above as authoritative.
+            // Additive for every other consumer.
+            prFixItem: { id: candidate.id, generation: confirmed.generation, handoutToken, fixType: confirmed.attemptType ?? candidate.fixType, originalClaimant: ownershipClaimant ?? undefined, claimantSource: ownershipClaimantSource ?? undefined },
            reasons,
             intake: intakeAck,
           });
