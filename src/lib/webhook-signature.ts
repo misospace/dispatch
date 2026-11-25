@@ -1,7 +1,7 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import type { NextResponse } from "next/server";
 import { errorResponse } from "./api-errors";
-import { authorizeRequest, authErrorResponse } from "./auth";
+import { authorizeRequest, authErrorResponse, credentialFingerprint } from "./auth";
 import { enforceRateLimit } from "./rate-limit";
 
 /**
@@ -77,11 +77,31 @@ export function verifyWebhookSignature(secret: string, payload: Buffer, signatur
 const WEBHOOK_RATE_LIMIT = { limit: 30, windowMs: 10_000 } as const;
 
 /**
+ * Aggregate ceiling over all HMAC-verified deliveries of a route (#1698).
+ *
+ * Generous headroom above any legitimate GitHub storm (the pre-#1698 shared
+ * bucket was 30/10s and that was the complaint). With per-body keying
+ * (`verifiedDeliveryActor`) a captured `(body, signature)` pair replayed
+ * under unlimited fresh `x-github-delivery` GUIDs lands in one shared
+ * bucket capped at 3/s, so GUID rotation can no longer mint fresh
+ * rate-limit buckets. This ceiling remains as the backstop against a
+ * secret-holder minting unlimited distinct signed bodies, which would
+ * otherwise grow the limiter's live key space without bound (the limiter
+ * prunes expired windows, not never-seen-again keys — see the rate-limit
+ * module note, #1322). The key is the shared secret's fingerprint — the
+ * only value the HMAC actually authenticates — so nothing caller-supplied
+ * can rotate it to open a fresh window (#1322 invariant).
+ */
+const WEBHOOK_AGGREGATE_RATE_LIMIT = { limit: 1000, windowMs: 10_000 } as const;
+
+/**
  * Result of authenticating an inbound webhook delivery.
  *
- * On success the resolved `actor` identifies the delivery for the
- * rate-limit bucket; on failure `response` is the ready-to-send error
- * response the route should return verbatim.
+ * On success the resolved `actor` keys the delivery's rate-limit bucket: in
+ * verify mode it is a digest of the HMAC-covered body (`body:<sha256-hex>`,
+ * see `verifiedDeliveryActor`); in gateway mode it is the credential-derived
+ * throttle key. On failure `response` is the ready-to-send error response
+ * the route should return verbatim.
  */
 export type WebhookDeliveryAuthentication =
   | { authenticated: true; actor: string }
@@ -103,7 +123,12 @@ export type WebhookDeliveryAuthentication =
  *   Authorization header), so `authorizeRequest` is skipped to let
  *   signature-only GitHub deliveries through in oidc/legacy/basic auth
  *   modes. In every other mode the normal auth layer still applies.
- * - Actor resolution and the per-route rate-limit bucket.
+ * - Actor resolution and the per-route rate-limit bucket. In verify mode
+ *   the bucket is keyed on the HMAC-covered body behind an aggregate
+ *   ceiling (see `verifiedDeliveryActor` and `WEBHOOK_AGGREGATE_RATE_LIMIT`,
+ *   #1698): one shared bucket throttled legitimate GitHub delivery bursts
+ *   at 30/10s, while a caller-supplied delivery GUID is never part of the
+ *   key. Gateway mode keeps the per-credential bucket.
  *
  * `payload` must be the raw request body bytes, read before this call:
  * `authorizeRequest` may consume the body stream, so the HMAC check has to
@@ -145,10 +170,19 @@ export async function authenticateWebhookDelivery(
   }
 
   // In verify mode the HMAC check above is the authentication gate, so
-  // authorizeRequest is skipped and the delivery is attributed to the
-  // webhook itself. Otherwise the normal auth layer decides.
-  let actor = "webhook";
-  if (verification.mode !== "verify") {
+  // authorizeRequest is skipped. The aggregate ceiling runs first — it is
+  // keyed on the secret's fingerprint, so a rejected request never creates
+  // a per-body bucket (see #1698). Otherwise the normal auth layer decides
+  // the throttle key.
+  let actor: string;
+  if (verification.mode === "verify") {
+    const aggregate = enforceRateLimit(
+      `${rateLimitKeyPrefix}:aggregate:${credentialFingerprint(verification.secret)}`,
+      { ...WEBHOOK_AGGREGATE_RATE_LIMIT },
+    );
+    if (aggregate) return { authenticated: false, response: aggregate };
+    actor = verifiedDeliveryActor(payload);
+  } else {
     const auth = await authorizeRequest(request);
     if (!auth.authorized) {
       return { authenticated: false, response: authErrorResponse(auth) };
@@ -160,4 +194,29 @@ export async function authenticateWebhookDelivery(
   if (limited) return { authenticated: false, response: limited };
 
   return { authenticated: true, actor };
+}
+
+/**
+ * Rate-limit actor for an HMAC-verified delivery (#1698).
+ *
+ * Keying every verified delivery on the constant "webhook" put them all in
+ * one 30/10s bucket, so a legitimate GitHub burst — one delivery per event
+ * during an automation storm across many issues on a tracked repo — was
+ * throttled. Key the bucket on a SHA-256 digest of the HMAC-covered body
+ * instead: distinct events carry distinct bodies, so each gets its own
+ * bucket and a burst keeps its room.
+ *
+ * The body is the right key because it is what the HMAC actually
+ * authenticates (#1322). GitHub redeliveries resend the same delivery —
+ * same GUID and same body — so they share one bucket, and a captured
+ * `(body, signature)` pair replayed under fresh GUIDs also lands in that
+ * one body bucket: capped at 3/s per captured pair, exactly the old
+ * shared-bucket bound, instead of minting a fresh bucket per rotated GUID.
+ * A caller-supplied `x-github-delivery` header is never part of the key, so
+ * GUID rotation cannot grow the limiter's key space; the aggregate ceiling
+ * (keyed on the secret's fingerprint) remains as the backstop against a
+ * secret-holder minting unlimited distinct signed bodies.
+ */
+function verifiedDeliveryActor(payload: Buffer): string {
+  return `body:${createHash("sha256").update(payload).digest("hex")}`;
 }

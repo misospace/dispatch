@@ -11,7 +11,7 @@ vi.mock("@/lib/prisma", () => ({
 
 import { authenticateWebhookDelivery } from "./webhook-signature";
 import { resetAuthCaches } from "@/lib/auth";
-import { resetRateLimits } from "@/lib/rate-limit";
+import { resetRateLimitKey, resetRateLimits } from "@/lib/rate-limit";
 
 const WEBHOOK_SECRET = "test-secret";
 const NOT_CONFIGURED_ERROR =
@@ -103,7 +103,30 @@ describe("authenticateWebhookDelivery", () => {
 
       expect(result.authenticated).toBe(true);
       if (!result.authenticated) throw new Error("expected authentication");
-      expect(result.actor).toBe("webhook");
+      expect(result.actor).toMatch(/^body:[0-9a-f]{64}$/);
+    });
+
+    it("attributes verified deliveries by their HMAC-covered body, not the caller-supplied GUID (#1698)", async () => {
+      const first = signedDelivery(undefined, {
+        headers: { "x-github-delivery": "0f9d7d10-b3ea-4f28-8f6e-2f5f21d3a111" },
+      });
+      const sameBody = signedDelivery(undefined, {
+        headers: { "x-github-delivery": "aaaaaaaa-b3ea-4f28-8f6e-2f5f21d3a222" },
+      });
+      const otherBody = signedDelivery({ ok: false });
+
+      const result = await authenticateWebhookDelivery(first.request, first.payload, "issues-webhook");
+      expect(result.authenticated).toBe(true);
+      if (!result.authenticated) throw new Error("expected authentication");
+      expect(result.actor).toMatch(/^body:[0-9a-f]{64}$/);
+
+      const same = await authenticateWebhookDelivery(sameBody.request, sameBody.payload, "issues-webhook");
+      const other = await authenticateWebhookDelivery(otherBody.request, otherBody.payload, "issues-webhook");
+      if (!same.authenticated) throw new Error("expected authentication");
+      if (!other.authenticated) throw new Error("expected authentication");
+      // Same body → same bucket; the GUID never enters the key.
+      expect(same.actor).toBe(result.actor);
+      expect(other.actor).not.toBe(result.actor);
     });
 
     it("rejects a signature computed over a different payload", async () => {
@@ -171,6 +194,27 @@ describe("authenticateWebhookDelivery", () => {
       if (!result.authenticated) throw new Error("expected authentication");
       expect(result.actor).not.toContain("spoofed-agent");
     });
+
+    // Gateway mode keeps the per-credential bucket unchanged (#1698): only
+    // verify-mode actor resolution moved to per-delivery keying.
+    it("still 429s the same credential after 30 gateway-mode deliveries", async () => {
+      for (let i = 0; i < 30; i++) {
+        const { request, payload } = signedDelivery(undefined, {
+          headers: { Authorization: `Bearer ${mockToken}`, "x-github-delivery": crypto.randomUUID() },
+        });
+        const result = await authenticateWebhookDelivery(request, payload, "issues-webhook");
+        expect(result.authenticated).toBe(true);
+      }
+
+      const { request, payload } = signedDelivery(undefined, {
+        headers: { Authorization: `Bearer ${mockToken}`, "x-github-delivery": crypto.randomUUID() },
+      });
+      const limited = await authenticateWebhookDelivery(request, payload, "issues-webhook");
+
+      expect(limited.authenticated).toBe(false);
+      if (limited.authenticated) throw new Error("expected rejection");
+      expect(limited.response.status).toBe(429);
+    });
   });
 
   describe("rate limiting", () => {
@@ -178,7 +222,9 @@ describe("authenticateWebhookDelivery", () => {
       process.env.WEBHOOK_SECRET = WEBHOOK_SECRET;
     });
 
-    it("returns 429 with Retry-After once 30 deliveries land in the window", async () => {
+    // These deliveries all carry the same body, so they share one per-body
+    // bucket and the 31st is throttled (#1698).
+    it("returns 429 with Retry-After once 30 same-body deliveries land in the window", async () => {
       for (let i = 0; i < 30; i++) {
         const { request, payload } = signedDelivery();
         const result = await authenticateWebhookDelivery(request, payload, "issues-webhook");
@@ -196,6 +242,151 @@ describe("authenticateWebhookDelivery", () => {
       expect(retryAfter).toBeGreaterThanOrEqual(1);
       // The window is 10 seconds, so the wait can never exceed it.
       expect(retryAfter).toBeLessThanOrEqual(10);
+    });
+
+    it("keys distinct deliveries per body, so a burst of valid signed deliveries is not throttled even under one GUID (#1698)", async () => {
+      // Distinct bodies each get their own bucket. Sharing one GUID across
+      // the burst pins that the GUID is not the key: GUID keying would have
+      // 429'd the 31st delivery.
+      for (let i = 0; i < 35; i++) {
+        const { request, payload } = signedDelivery({ n: i }, {
+          headers: { "x-github-delivery": "same-guid-across-the-burst" },
+        });
+        const result = await authenticateWebhookDelivery(request, payload, "issues-webhook");
+        expect(result.authenticated).toBe(true);
+      }
+    });
+
+    it("caps a captured (body, signature) pair replayed under fresh GUIDs at the per-body bucket (#1698)", async () => {
+      // The body digest is the bucket key, so GUID rotation cannot mint
+      // fresh buckets: the whole replay lands in one 30/10s bucket — the
+      // old shared-bucket bound (3/s) — far below the aggregate ceiling.
+      const captured = signedDelivery({ ok: true });
+      const capturedSignature = captured.request.headers.get("x-hub-signature-256") as string;
+
+      for (let i = 0; i < 30; i++) {
+        const { request, payload } = signedDelivery({ ok: true }, {
+          signature: capturedSignature,
+          headers: { "x-github-delivery": crypto.randomUUID() },
+        });
+        const result = await authenticateWebhookDelivery(request, payload, "issues-webhook");
+        expect(result.authenticated).toBe(true);
+      }
+
+      const { request, payload } = signedDelivery({ ok: true }, {
+        signature: capturedSignature,
+        headers: { "x-github-delivery": crypto.randomUUID() },
+      });
+      const capped = await authenticateWebhookDelivery(request, payload, "issues-webhook");
+
+      expect(capped.authenticated).toBe(false);
+      if (capped.authenticated) throw new Error("expected rejection");
+      expect(capped.response.status).toBe(429);
+    });
+
+    it("keys the bucket on a digest of the exact HMAC-covered payload bytes", async () => {
+      const { request, payload } = signedDelivery({ ok: true });
+
+      const result = await authenticateWebhookDelivery(request, payload, "issues-webhook");
+
+      expect(result.authenticated).toBe(true);
+      if (!result.authenticated) throw new Error("expected authentication");
+      expect(result.actor).toBe(`body:${crypto.createHash("sha256").update(payload).digest("hex")}`);
+    });
+
+    it("keeps the aggregate ceiling over distinct signed bodies so a secret-holder cannot grow the key space unbounded", async () => {
+      // Distinct bodies never fill a per-body bucket (one delivery each),
+      // so the 1001st distinct signed body can only be rejected by the
+      // aggregate ceiling.
+      for (let i = 0; i < 1000; i++) {
+        const { request, payload } = signedDelivery({ n: i });
+        const result = await authenticateWebhookDelivery(request, payload, "issues-webhook");
+        expect(result.authenticated).toBe(true);
+      }
+
+      const { request, payload } = signedDelivery({ n: 1000 });
+      const capped = await authenticateWebhookDelivery(request, payload, "issues-webhook");
+
+      expect(capped.authenticated).toBe(false);
+      if (capped.authenticated) throw new Error("expected rejection");
+      expect(capped.response.status).toBe(429);
+    });
+
+    it("creates no per-body bucket for a delivery the aggregate ceiling rejects", async () => {
+      for (let i = 0; i < 1000; i++) {
+        const { request, payload } = signedDelivery({ n: i });
+        const result = await authenticateWebhookDelivery(request, payload, "issues-webhook");
+        expect(result.authenticated).toBe(true);
+      }
+
+      const rejected = signedDelivery({ rejected: true });
+      const capped = await authenticateWebhookDelivery(rejected.request, rejected.payload, "issues-webhook");
+      expect(capped.authenticated).toBe(false);
+      if (capped.authenticated) throw new Error("expected rejection");
+      expect(capped.response.status).toBe(429);
+
+      // The aggregate runs before the body key is ever created, so the
+      // rejected delivery left no per-body window behind.
+      const digest = crypto.createHash("sha256").update(rejected.payload).digest("hex");
+      expect(resetRateLimitKey(`issues-webhook:body:${digest}`)).toBe(false);
+    });
+
+    it("scopes the aggregate ceiling per route and per secret", async () => {
+      for (let i = 0; i < 1000; i++) {
+        const { request, payload } = signedDelivery({ n: i });
+        await authenticateWebhookDelivery(request, payload, "issues-webhook");
+      }
+
+      // A different route prefix gets a fresh aggregate bucket...
+      const otherRoute = signedDelivery({ n: "other-route" });
+      const other = await authenticateWebhookDelivery(otherRoute.request, otherRoute.payload, "pr-followup-webhook");
+      expect(other.authenticated).toBe(true);
+
+      // ...as does the same route under a different shared secret.
+      process.env.WEBHOOK_SECRET = "other-secret";
+      const otherSecret = signedDelivery({ n: "other-secret" }, { secret: "other-secret" });
+      const fresh = await authenticateWebhookDelivery(otherSecret.request, otherSecret.payload, "issues-webhook");
+      expect(fresh.authenticated).toBe(true);
+    });
+
+    it("does not let the GUID header value change the bucket key (oversized GUIDs share the body bucket)", async () => {
+      const oversized = "g".repeat(129);
+      for (let i = 0; i < 30; i++) {
+        const { request, payload } = signedDelivery(undefined, {
+          headers: { "x-github-delivery": oversized },
+        });
+        const result = await authenticateWebhookDelivery(request, payload, "issues-webhook");
+        expect(result.authenticated).toBe(true);
+      }
+
+      // A GUID-less delivery with the same body contends on the same
+      // bucket — the header is not part of the key at all.
+      const { request, payload } = signedDelivery();
+      const limited = await authenticateWebhookDelivery(request, payload, "issues-webhook");
+
+      expect(limited.authenticated).toBe(false);
+      if (limited.authenticated) throw new Error("expected rejection");
+      expect(limited.response.status).toBe(429);
+    });
+
+    it("throttles same-body redeliveries together (GitHub redeliveries resend the same body)", async () => {
+      const guid = "11111111-2222-3333-4444-555555555555";
+      for (let i = 0; i < 30; i++) {
+        const { request, payload } = signedDelivery(undefined, {
+          headers: { "x-github-delivery": guid },
+        });
+        const result = await authenticateWebhookDelivery(request, payload, "issues-webhook");
+        expect(result.authenticated).toBe(true);
+      }
+
+      const { request, payload } = signedDelivery(undefined, {
+        headers: { "x-github-delivery": guid },
+      });
+      const replay = await authenticateWebhookDelivery(request, payload, "issues-webhook");
+
+      expect(replay.authenticated).toBe(false);
+      if (replay.authenticated) throw new Error("expected rejection");
+      expect(replay.response.status).toBe(429);
     });
 
     it("keeps each route's bucket separate", async () => {

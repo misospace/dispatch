@@ -15,7 +15,13 @@
  *   if (limited) return limited;
  *
  * Expired windows are pruned lazily on write (no timers), so the map stays
- * bounded even if callers use many distinct keys.
+ * bounded even if callers use many distinct keys. That pruning is O(live
+ * entries) and only runs when a new window opens, so callers must keep the
+ * key space itself bounded — key on credential- or aggregate-derived
+ * identities, never on an unbounded caller-supplied value (#1322). The one
+ * exception is a caller-supplied value gated by an aggregate ceiling that
+ * bounds how many distinct keys a window can mint at all (the webhook
+ * body-digest buckets behind `WEBHOOK_AGGREGATE_RATE_LIMIT`, #1698).
  */
 
 import { NextResponse } from "next/server";
