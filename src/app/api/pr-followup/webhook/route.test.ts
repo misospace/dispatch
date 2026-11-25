@@ -431,12 +431,13 @@ describe("POST /api/pr-followup/webhook", () => {
   });
 });
 
-function signedRequest(event: string, body: unknown, signature?: string) {
+function signedRequest(event: string, body: unknown, signature?: string, deliveryGuid?: string) {
   const bodyStr = JSON.stringify(body);
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     "x-github-event": event,
   };
+  if (deliveryGuid !== undefined) headers["x-github-delivery"] = deliveryGuid;
   headers["x-hub-signature-256"] =
     signature ?? "sha256=" + crypto.createHmac("sha256", "test-secret").update(bodyStr).digest("hex");
   return POST(
@@ -1060,6 +1061,30 @@ describe("POST /api/pr-followup/webhook — rate limit", () => {
 
     const res = await signedRequest("pull_request_review", { action: "submitted" });
     expect(res.status).toBe(200);
+  });
+
+  // Route-boundary pin for #1698: a legitimate GitHub burst (distinct
+  // deliveries — distinct bodies and GUIDs) must not contend for one bucket.
+  it("does not 429 a burst of distinct GUID-keyed signed deliveries", async () => {
+    for (let i = 0; i < 35; i++) {
+      const res = await signedRequest(
+        "pull_request_review",
+        {
+          review: { id: i, body: `Fix this ${i}`, state: "CHANGES_REQUESTED" },
+          pull_request: {
+            number: 42,
+            html_url: "https://github.com/org/repo/pull/42",
+            title: "Fix bug",
+            head: { ref: "fix/issue-1", repo: { full_name: "org/repo" } },
+            base: { repo: { full_name: "org/repo" } },
+          },
+        },
+        undefined,
+        crypto.randomUUID(),
+      );
+      expect(res.status).toBe(200);
+    }
+    expect(mocks.processPrFollowupEvents).toHaveBeenCalledTimes(35);
   });
 });
 

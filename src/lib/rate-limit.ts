@@ -15,7 +15,10 @@
  *   if (limited) return limited;
  *
  * Expired windows are pruned lazily on write (no timers), so the map stays
- * bounded even if callers use many distinct keys.
+ * bounded even if callers use many distinct keys. That pruning is O(live
+ * entries) and only runs when a new window opens, so callers must keep the
+ * key space itself bounded — key on credential- or aggregate-derived
+ * identities, never on an unbounded caller-supplied value (#1322, #1698).
  */
 
 import { NextResponse } from "next/server";

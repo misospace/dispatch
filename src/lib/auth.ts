@@ -263,11 +263,15 @@ export function requiredTierForRoute(pathname: string, method: string): TokenTie
 const THROTTLE_FINGERPRINT_SALT = randomBytes(16).toString("hex");
 
 /**
- * Salted, one-way (SHA-256) fingerprint of a bearer token, used as the
- * throttle identity for credentials that carry no bound agent name. The raw
- * token never appears in a limiter key, a log line, or an audit row.
+ * Salted, one-way (SHA-256) fingerprint of a shared credential (a bearer
+ * token or the webhook HMAC secret), used as a rate-limit key segment. The
+ * raw credential never appears in a limiter key, a log line, or an audit
+ * row. The rate limiter is a module-level in-memory map, so fingerprint keys
+ * only need to be stable within this process — and a salt that never leaves
+ * it means a leaked bucket key cannot be checked against guessed credentials
+ * offline. Never log or export the salt.
  */
-function credentialFingerprint(token: string): string {
+export function credentialFingerprint(token: string): string {
   return createHash("sha256")
     .update(`${THROTTLE_FINGERPRINT_SALT}:${token}`)
     .digest("hex")

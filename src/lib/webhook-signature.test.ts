@@ -236,14 +236,52 @@ describe("authenticateWebhookDelivery", () => {
 
     it("keys each distinct delivery on its GitHub GUID, so a burst of valid signed deliveries is not throttled (#1698)", async () => {
       for (let i = 0; i < 35; i++) {
-        const { request, payload } = signedDelivery(undefined, {
+        const { request, payload } = signedDelivery({ n: i }, {
           headers: { "x-github-delivery": crypto.randomUUID() },
         });
         const result = await authenticateWebhookDelivery(request, payload, "issues-webhook");
         expect(result.authenticated).toBe(true);
-        if (result.authenticated) continue;
-        expect(result.response.status).not.toBe(429);
       }
+    });
+
+    it("caps GUID rotation of one captured signed delivery at the aggregate ceiling (#1698)", async () => {
+      // A captured (body, signature) pair replayed under fresh GUIDs must
+      // not mint unlimited fresh buckets: the aggregate ceiling (keyed on
+      // the secret's fingerprint) is what bounds that path.
+      const captured = signedDelivery({ ok: true });
+      const capturedSignature = captured.request.headers.get("x-hub-signature-256") as string;
+
+      for (let i = 0; i < 1000; i++) {
+        const { request, payload } = signedDelivery({ ok: true }, {
+          signature: capturedSignature,
+          headers: { "x-github-delivery": crypto.randomUUID() },
+        });
+        const result = await authenticateWebhookDelivery(request, payload, "issues-webhook");
+        expect(result.authenticated).toBe(true);
+      }
+
+      const { request, payload } = signedDelivery({ ok: true }, {
+        signature: capturedSignature,
+        headers: { "x-github-delivery": crypto.randomUUID() },
+      });
+      const capped = await authenticateWebhookDelivery(request, payload, "issues-webhook");
+
+      expect(capped.authenticated).toBe(false);
+      if (capped.authenticated) throw new Error("expected rejection");
+      expect(capped.response.status).toBe(429);
+    });
+
+    it("accepts a GUID at the length-cap boundary and trims surrounding whitespace", async () => {
+      const capped = "a".repeat(128);
+      const { request, payload } = signedDelivery(undefined, {
+        headers: { "x-github-delivery": `  ${capped}  ` },
+      });
+
+      const result = await authenticateWebhookDelivery(request, payload, "issues-webhook");
+
+      expect(result.authenticated).toBe(true);
+      if (!result.authenticated) throw new Error("expected authentication");
+      expect(result.actor).toBe(`delivery:${capped}`);
     });
 
     it("throttles a same-GUID replay flood together (GitHub redeliveries reuse the GUID)", async () => {
