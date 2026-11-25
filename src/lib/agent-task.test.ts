@@ -238,6 +238,27 @@ describe("createFollowupPrTask", () => {
     expect("harness" in task).toBe(false);
     expect("workflowRepo" in task).toBe(false);
   });
+
+  it("forwards the model-assist transport block when provided (#1674)", () => {
+    const task = createFollowupPrTask({
+      ...baseInput,
+      rebaseModel: {
+        capability: "rebase-model-executor",
+        version: 1,
+        semanticConflict: { base: "main", files: ["src/a.go"], reason: "two-sided code edit" },
+      },
+    });
+    expect(task.rebaseModel).toEqual({
+      capability: "rebase-model-executor",
+      version: 1,
+      semanticConflict: { base: "main", files: ["src/a.go"], reason: "two-sided code edit" },
+    });
+  });
+
+  it("omits the model-assist transport block when not provided (#1674)", () => {
+    const task = createFollowupPrTask(baseInput);
+    expect("rebaseModel" in task).toBe(false);
+  });
 });
 
 describe("AgentTask discriminated union", () => {

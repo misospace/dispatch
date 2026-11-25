@@ -45,6 +45,42 @@ export function isRebaseLaneAgent(agentName: string): boolean {
 }
 
 /**
+ * #1674: the operator-declared MODEL-ASSISTED rebase worker pool
+ * (`DISPATCH_REBASE_MODEL_AGENTS`). The declared capability alone proves the
+ * client implements the model-assist contract; it does not authorize THIS
+ * deployment to run model execution. The operator names the worker(s) whose
+ * lane is configured for the ONE coordinator model (the Qwen3.8-27B
+ * coordinator), concurrency one (the shared rebase-lane admission), no
+ * delegation. Only an agent in this pool may receive model-required REBASE
+ * items or a model-assist hand-out.
+ *
+ * FAIL CLOSED with the same semantics as the rebase-executor pool: an unset,
+ * empty, or whitespace-only value admits NOBODY (no model-required item is
+ * ever handed out until the operator names the worker), and a bare `*` value
+ * is the explicit unrestricted opt-in.
+ */
+export function parseRebaseModelAgentPool(raw: string | undefined): Set<string> | null {
+  if (raw?.trim() === "*") return null;
+  const names = (raw ?? "")
+    .split(/[\s,]+/)
+    .map((name) => name.trim().toLowerCase())
+    .filter(Boolean);
+  return new Set(names);
+}
+
+/**
+ * Whether `agentName` may receive a model-required REBASE hand-out or a
+ * model-assist instruction wall (see `parseRebaseModelAgentPool`). The
+ * negotiation (`rebase-model-executor:1` granted) and this pool must BOTH
+ * authorize the poll — the capability is the client's claim, the pool is the
+ * operator's authorization.
+ */
+export function isRebaseModelLaneAgent(agentName: string): boolean {
+  const pool = parseRebaseModelAgentPool(process.env.DISPATCH_REBASE_MODEL_AGENTS);
+  return pool === null || pool.has(agentName.trim().toLowerCase());
+}
+
+/**
  * #1615: the operator-declared rebase-executor pool as a plain lowercase
  * name set, for CLAIMANT classification (distinct from lane eligibility).
  * A rebase executor is a mechanical-rebase worker by contract (#1327), so

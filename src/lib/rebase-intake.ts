@@ -30,6 +30,31 @@ export const REBASE_EXECUTOR_CAPABILITY = "rebase-executor";
 export const REBASE_EXECUTOR_CAPABILITY_VERSION = 1;
 
 /**
+ * #1674: the model-assisted rebase execution capability. A client that
+ * declares it claims the configured-model rebase executor contract
+ * (misospace/courier#732): non-mechanical (semantic) conflicts are resolved
+ * by the lane's ONE configured coordinator model, concurrency one, no
+ * delegation, no silent cloud substitution — the deterministic rules stay
+ * the fast path, and publication authority (existing approved branch,
+ * `--force-with-lease`, expected-head lease) is unchanged.
+ *
+ * The declaration is negotiated, never inferred from a lane name or an agent
+ * name: a grant requires the exact capability version below AND the
+ * operator-declared model-worker pool (`DISPATCH_REBASE_MODEL_AGENTS`,
+ * see `isRebaseModelLaneAgent`). A deterministic-only consumer (no grant)
+ * never receives model-required work and keeps the mechanical instruction
+ * wall; missing or ambiguous support fails closed with a clear disposition.
+ *
+ * It is declared ALONGSIDE `rebase-executor:1`, never instead of it: the
+ * mechanical execution contract remains the base capability, and the model
+ * assist is an authorized extension of that lane.
+ */
+export const REBASE_MODEL_EXECUTOR_CAPABILITY = "rebase-model-executor";
+
+/** The supported version of the `rebase-model-executor` capability. */
+export const REBASE_MODEL_EXECUTOR_CAPABILITY_VERSION = 1;
+
+/**
  * #1569: the PR-fix ownership-evidence capability. A poll that declares and
  * is granted `pr-ownership-evidence:1` receives the versioned ownership
  * evidence block on every followup-pr task and can require it before
@@ -120,37 +145,75 @@ export interface IntakeNegotiation {
    * to it at issuance.
    */
   prOwnershipEvidenceGranted: boolean;
+  /**
+   * #1674: whether the `rebase-model-executor` v1 capability was declared
+   * AND granted. A granted poll is a candidate for model-assisted rebase
+   * work: it may receive model-required REBASE items and its REBASE
+   * hand-outs carry the model-assist contract, provided the agent is also
+   * in the operator-declared model-worker pool (`DISPATCH_REBASE_MODEL_AGENTS`).
+   * The negotiation alone never authorizes model execution.
+   */
+  rebaseModelExecutorGranted: boolean;
 }
 
 /**
- * The verdict for one declared capability.
+ * The capability versions THIS deployment knows, keyed by capability name.
+ * Adding a capability is additive: a poll that declares a name this table
+ * lacks gets an `unknown-capability` verdict and grants nothing — which is
+ * exactly what an older Dispatch answers a newer client, so the mixed-order
+ * behavior is pinned by the same code path (`negotiateCapabilityAgainst`).
+ */
+const KNOWN_CAPABILITIES: Record<string, number> = {
+  [REBASE_EXECUTOR_CAPABILITY]: REBASE_EXECUTOR_CAPABILITY_VERSION,
+  [PR_OWNERSHIP_EVIDENCE_CAPABILITY]: PR_OWNERSHIP_EVIDENCE_CAPABILITY_VERSION,
+  [REBASE_MODEL_EXECUTOR_CAPABILITY]: REBASE_MODEL_EXECUTOR_CAPABILITY_VERSION,
+};
+
+/**
+ * The capability knowledge set of the PREVIOUS release (through #1569), kept
+ * as an exported constant so the mixed-version contract tests can drive the
+ * SAME negotiation code an old Dispatch runs and pin its exact verdicts for
+ * a new-Courier declaration (#1674). Never mutate this table.
+ */
+export const LEGACY_KNOWN_CAPABILITIES: Record<string, number> = {
+  [REBASE_EXECUTOR_CAPABILITY]: REBASE_EXECUTOR_CAPABILITY_VERSION,
+  [PR_OWNERSHIP_EVIDENCE_CAPABILITY]: PR_OWNERSHIP_EVIDENCE_CAPABILITY_VERSION,
+};
+
+/**
+ * The verdict for one declared capability against a knowledge set.
  *
- * - `rebase-executor` v1 → granted. This is the ONLY grant: it is the
- *   mechanical-rebase execution contract.
- * - `rebase-executor` at any other version → NOT granted
- *   (`unsupported-version`). Fail closed: an unknown capability version must
- *   never unlock REBASE work, and must never broaden the queue either.
- * - Any other name → NOT granted (`unknown-capability`). Forward
+ * - A known name at its exact supported version → granted.
+ * - A known name at any other version → NOT granted (`unsupported-version`).
+ *   Fail closed: an unknown capability version must never unlock REBASE
+ *   work, and must never broaden the queue either.
+ * - Any unknown name → NOT granted (`unknown-capability`). Forward
  *   compatibility: a newer client may declare capabilities this server does
  *   not know yet, and an unknown name is not an error — it simply grants
- *   nothing.
+ *   nothing. This arm is precisely what an older Dispatch answers a newer
+ *   client, which is why the knowledge set is a parameter.
+ */
+export function negotiateCapabilityAgainst(
+  known: Record<string, number>,
+  name: string,
+  version: number,
+): CapabilityNegotiation {
+  const supported = known[name];
+  if (supported === undefined) {
+    return { name, requested: version, granted: false, reason: "unknown-capability" };
+  }
+  if (version !== supported) {
+    return { name, requested: version, granted: false, reason: "unsupported-version" };
+  }
+  return { name, requested: version, granted: true };
+}
+
+/**
+ * The verdict for one declared capability against THIS deployment's
+ * knowledge set (see `negotiateCapabilityAgainst`).
  */
 function negotiateCapability(name: string, version: number): CapabilityNegotiation {
-  if (name === REBASE_EXECUTOR_CAPABILITY) {
-    if (version === REBASE_EXECUTOR_CAPABILITY_VERSION) {
-      return { name, requested: version, granted: true };
-    }
-    return { name, requested: version, granted: false, reason: "unsupported-version" };
-  }
-  // #1569: the ownership-evidence contract. Same fail-closed versioning:
-  // an unsupported version grants nothing and never broadens the queue.
-  if (name === PR_OWNERSHIP_EVIDENCE_CAPABILITY) {
-    if (version === PR_OWNERSHIP_EVIDENCE_CAPABILITY_VERSION) {
-      return { name, requested: version, granted: true };
-    }
-    return { name, requested: version, granted: false, reason: "unsupported-version" };
-  }
-  return { name, requested: version, granted: false, reason: "unknown-capability" };
+  return negotiateCapabilityAgainst(KNOWN_CAPABILITIES, name, version);
 }
 
 /**
@@ -275,6 +338,8 @@ export function parseIntakeRequest(
       rebaseExecutorGranted: rebaseExecutor?.granted === true,
       prOwnershipEvidenceGranted:
         capabilities.find((capability) => capability.name === PR_OWNERSHIP_EVIDENCE_CAPABILITY)?.granted === true,
+      rebaseModelExecutorGranted:
+        capabilities.find((capability) => capability.name === REBASE_MODEL_EXECUTOR_CAPABILITY)?.granted === true,
     },
   };
 }
