@@ -91,10 +91,21 @@ ONE bounded model-assisted attempt per episode, no delegation, and no silent
 substitution of another provider; publication authority is unchanged (the
 existing approved branch, `--force-with-lease`, the repo's own checks).
 
-Two gates authorize model execution, and BOTH must pass:
+Three gates authorize model execution, and ALL must pass:
 
 1. The negotiation: the poll declared `rebase-model-executor` at exactly version 1 and Dispatch granted it.
 2. The operator pool: the agent name is in `DISPATCH_REBASE_MODEL_AGENTS` — the operator-declared list of workers whose lane is configured for the one coordinator model, concurrency one (the shared rebase-lane admission), no delegation. Fail closed like `DISPATCH_REBASE_AGENTS`: unset or empty admits nobody; a bare `*` is the explicit opt-in.
+3. The parent classification at issuance: inside the REBASE admission
+   transaction, Dispatch reads the linked issue with `SELECT ... FOR SHARE`
+   (`issue.findFirstLocked`), so the decision is serialized against a
+   concurrent parent reclassification. Only `NOT_ESCALATED` authorizes the
+   model wall and the `rebaseModel` transport block. `ESCALATED` and
+   `UNKNOWN` (including a missing or failed locked read — fail closed) withhold
+   both. A model-REQUIRED item defers in that case; an initially-mechanical
+   item still takes the deterministic REBASE exception, but with the
+   mechanical wall only. This is the same ordering guarantee the #1503 lane
+   fence uses: a parent flip either commits before the locked read (it sees the
+   frontier lane) or blocks on the share lock until the hand-out commits.
 
 ### What changes for an authorized poll
 
@@ -262,6 +273,32 @@ A REBASE item is the declared mechanical exception to that gate. A conflicted PR
 
 The exception never routes escalation-classified issue work to the local rebase lane.
 
+## Enablement status: dark server preparation
+
+**Do not set `DISPATCH_REBASE_MODEL_AGENTS` yet.** This repository delivers the
+Dispatch half of the contract only, and it is deliberately dark until its
+Courier companion lands ([misospace/courier#924](https://github.com/misospace/courier/issues/924)).
+
+The gap is client-side and is not closable from Dispatch: Courier currently
+enables its configured-model rebase resolver from deployment configuration
+(`RebaseModelAssist` + `ModeRebase`) rather than from an affirmative
+per-hand-out `rebaseModel` grant, and declares only
+`rebase-executor:1,pr-ownership-evidence:1`. A model-enabled Courier therefore
+resolves a semantic conflict with its configured model on **any** REBASE offer
+it receives — including one Dispatch issued on a frontier-owned parent, or one
+offered by a pre-#1674 Dispatch, which never shipped the wall or the block at
+all. Withholding the model wall and the `rebaseModel` block is an honest
+Dispatch-side decision, but it does not disable a client that never needed it.
+
+So the negotiation and locked-parent gates above describe exactly what Dispatch
+sends and withholds; they become end-to-end guarantees only when Courier
+(a) declares `rebase-model-executor:1`, and (b) creates the resolver — and its
+pod env — only for a hand-out carrying an affirmative `rebaseModel` grant at
+version 1, refusing every other offer regardless of local configuration.
+While the pool stays unset this path adds no operator risk: no item can be
+handed out with a model wall, and every offer still carries the mechanical
+refusal wall.
+
 ## Enablement steps
 
 These steps enable one rebase agent. This document changes no production configuration.
@@ -271,10 +308,17 @@ These steps enable one rebase agent. This document changes no production configu
 3. The agent runs with a Courier lane profile that uses the coordinator `litellm/qwen3.8-27b` and concurrency 1. This profile is a Courier setting. Dispatch does not read it.
 4. The agent polls with the `capabilities` declaration. A poll without it receives no rebase work.
 
-Model-assisted rebase (#1674) adds two more steps:
+Model-assisted rebase (#1674) adds two more steps, and step 5 blocks step 6:
 
-5. The Courier peer must implement the model-assist contract (misospace/courier#732) and declare `rebase-model-executor:1` on the rebase polls.
-6. The operator names the model worker pool. Set `DISPATCH_REBASE_MODEL_AGENTS=courier-rebase` (the worker whose lane is configured for the one coordinator). Until this variable names an agent, model-required items defer for every poll and the lane stays deterministic-only.
+5. The Courier peer must implement the model-assist contract
+   (misospace/courier#732) **and its per-hand-out grant gate**
+   ([misospace/courier#924](https://github.com/misospace/courier/issues/924)):
+   it declares `rebase-model-executor:1` on the rebase polls, and it creates
+   its model resolver only when the received hand-out carries an affirmative
+   `rebaseModel` grant. Until that companion lands, enabling step 6 would
+   authorize model execution Dispatch cannot actually forbid — see
+   [Enablement status](#enablement-status-dark-server-preparation).
+6. The operator names the model worker pool. Set `DISPATCH_REBASE_MODEL_AGENTS=courier-rebase` (the worker whose lane is configured for the one coordinator). Until this variable names an agent, model-required items defer for every poll and the lane stays deterministic-only. Leave it unset until step 5 is true.
 
 ## Examples
 
