@@ -4,6 +4,17 @@
 
 Dispatch is a self-hosted Next.js/TypeScript Kanban and work dispatch layer for AI agents. It uses Prisma with PostgreSQL as its database.
 
+## Repository Independence
+
+Dispatch is an **optional Courier connector**, not a hard dependency. Dispatch and Courier must remain independently mergeable, releasable, and deployable.
+
+- Neither repository's PR may block on the other's PR, issue, release, or deployment.
+- Cross-repository feature availability is **not** a merge gate. Breaking compatibility **is**.
+- When a change spans both repositories, each half ships complete in its own repository: versioned capability/field negotiation (declare and grant; fail closed on unknown or unsupported values), and local contract fixtures covering both release orders — never a test that requires checking out or running the other repository.
+- Document enablement in terms of **compatible peers and valid capability grants**, never "wait for `<other repo>#N`". A peer that does not support the negotiated contract keeps its previous, deterministic behavior.
+- A shared umbrella/parent tracker may reference both halves, but it must not gate either implementation.
+- When filing or grooming issues: scope the ask to this repository's own behavior, and never record another repository's open work as a blocker or a `depends on` gate.
+
 ## Tech Stack
 
 - **Framework**: Next.js 16 (App Router)

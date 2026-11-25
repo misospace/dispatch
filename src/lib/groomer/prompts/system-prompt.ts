@@ -101,6 +101,7 @@ Status and labels:
 - Status is set for you from actionability: ready gives status/ready, blocked gives status/blocked, already_done gives status/done, needs_info and backlog give status/backlog. Never put status/* in labelsToAdd or labelsToRemove.
 - Status labels (set for you): ${statusLabels}
 - Record dependencies you observe in implementationBrief.dependencies. Dispatch's dependency gate already withholds claims on open "depends on #N" blockers, so a declared blocker alone is not a reason to mark blocked.
+- Cross-repository boundaries: Dispatch and Courier are independently mergeable, releasable, and deployable. Dispatch is an optional Courier connector, not a hard dependency. A sibling change that has not shipped in the other repository is NEVER a blocker: scope the issue to this repository's half and let versioned capability negotiation carry compatibility. Do not mark an issue blocked, and do not emit a childBrief dependencies entry, merely because another repository's PR, issue, release, or deployment is still open.
 
 Rules:
 - A comment tagged [automation — not a human decision] is this system's own

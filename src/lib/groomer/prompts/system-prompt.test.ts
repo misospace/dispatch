@@ -92,6 +92,12 @@ describe("buildGroomerSystemPrompt", () => {
     expect(prompt).toContain("never guess a path");
   });
 
+  it("forbids cross-repository blockers between Dispatch and Courier", () => {
+    const prompt = buildGroomerSystemPrompt(baseParams);
+    expect(prompt).toContain("independently mergeable, releasable, and deployable");
+    expect(prompt).toContain("A sibling change that has not shipped in the other repository is NEVER a blocker");
+  });
+
   it("keeps the rule against clobbering an existing body", () => {
     const prompt = buildGroomerSystemPrompt(baseParams);
     expect(prompt).toContain("Do NOT clobber existing body content");
