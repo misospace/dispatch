@@ -11,7 +11,7 @@ vi.mock("@/lib/prisma", () => ({
 
 import { authenticateWebhookDelivery } from "./webhook-signature";
 import { resetAuthCaches } from "@/lib/auth";
-import { resetRateLimits } from "@/lib/rate-limit";
+import { resetRateLimitKey, resetRateLimits } from "@/lib/rate-limit";
 
 const WEBHOOK_SECRET = "test-secret";
 const NOT_CONFIGURED_ERROR =
@@ -284,6 +284,16 @@ describe("authenticateWebhookDelivery", () => {
       expect(capped.response.status).toBe(429);
     });
 
+    it("keys the bucket on a digest of the exact HMAC-covered payload bytes", async () => {
+      const { request, payload } = signedDelivery({ ok: true });
+
+      const result = await authenticateWebhookDelivery(request, payload, "issues-webhook");
+
+      expect(result.authenticated).toBe(true);
+      if (!result.authenticated) throw new Error("expected authentication");
+      expect(result.actor).toBe(`body:${crypto.createHash("sha256").update(payload).digest("hex")}`);
+    });
+
     it("keeps the aggregate ceiling over distinct signed bodies so a secret-holder cannot grow the key space unbounded", async () => {
       // Distinct bodies never fill a per-body bucket (one delivery each),
       // so the 1001st distinct signed body can only be rejected by the
@@ -300,6 +310,43 @@ describe("authenticateWebhookDelivery", () => {
       expect(capped.authenticated).toBe(false);
       if (capped.authenticated) throw new Error("expected rejection");
       expect(capped.response.status).toBe(429);
+    });
+
+    it("creates no per-body bucket for a delivery the aggregate ceiling rejects", async () => {
+      for (let i = 0; i < 1000; i++) {
+        const { request, payload } = signedDelivery({ n: i });
+        const result = await authenticateWebhookDelivery(request, payload, "issues-webhook");
+        expect(result.authenticated).toBe(true);
+      }
+
+      const rejected = signedDelivery({ rejected: true });
+      const capped = await authenticateWebhookDelivery(rejected.request, rejected.payload, "issues-webhook");
+      expect(capped.authenticated).toBe(false);
+      if (capped.authenticated) throw new Error("expected rejection");
+      expect(capped.response.status).toBe(429);
+
+      // The aggregate runs before the body key is ever created, so the
+      // rejected delivery left no per-body window behind.
+      const digest = crypto.createHash("sha256").update(rejected.payload).digest("hex");
+      expect(resetRateLimitKey(`issues-webhook:body:${digest}`)).toBe(false);
+    });
+
+    it("scopes the aggregate ceiling per route and per secret", async () => {
+      for (let i = 0; i < 1000; i++) {
+        const { request, payload } = signedDelivery({ n: i });
+        await authenticateWebhookDelivery(request, payload, "issues-webhook");
+      }
+
+      // A different route prefix gets a fresh aggregate bucket...
+      const otherRoute = signedDelivery({ n: "other-route" });
+      const other = await authenticateWebhookDelivery(otherRoute.request, otherRoute.payload, "pr-followup-webhook");
+      expect(other.authenticated).toBe(true);
+
+      // ...as does the same route under a different shared secret.
+      process.env.WEBHOOK_SECRET = "other-secret";
+      const otherSecret = signedDelivery({ n: "other-secret" }, { secret: "other-secret" });
+      const fresh = await authenticateWebhookDelivery(otherSecret.request, otherSecret.payload, "issues-webhook");
+      expect(fresh.authenticated).toBe(true);
     });
 
     it("does not let the GUID header value change the bucket key (oversized GUIDs share the body bucket)", async () => {

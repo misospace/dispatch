@@ -79,16 +79,18 @@ const WEBHOOK_RATE_LIMIT = { limit: 30, windowMs: 10_000 } as const;
 /**
  * Aggregate ceiling over all HMAC-verified deliveries of a route (#1698).
  *
- * With per-body keying (`verifiedDeliveryActor`) a captured `(body,
- * signature)` pair replayed under unlimited fresh `x-github-delivery` GUIDs
- * lands in one shared bucket capped at 3/s, so GUID rotation can no longer
- * mint fresh rate-limit buckets. This ceiling remains as the backstop
- * against a secret-holder minting unlimited distinct signed bodies, which
- * would otherwise grow the limiter's live key space without bound (the
- * limiter prunes expired windows, not never-seen-again keys — see the
- * rate-limit module note, #1322). The key is the shared secret's
- * fingerprint — the only value the HMAC actually authenticates — so it
- * never rotates (#1322 invariant).
+ * Generous headroom above any legitimate GitHub storm (the pre-#1698 shared
+ * bucket was 30/10s and that was the complaint). With per-body keying
+ * (`verifiedDeliveryActor`) a captured `(body, signature)` pair replayed
+ * under unlimited fresh `x-github-delivery` GUIDs lands in one shared
+ * bucket capped at 3/s, so GUID rotation can no longer mint fresh
+ * rate-limit buckets. This ceiling remains as the backstop against a
+ * secret-holder minting unlimited distinct signed bodies, which would
+ * otherwise grow the limiter's live key space without bound (the limiter
+ * prunes expired windows, not never-seen-again keys — see the rate-limit
+ * module note, #1322). The key is the shared secret's fingerprint — the
+ * only value the HMAC actually authenticates — so nothing caller-supplied
+ * can rotate it to open a fresh window (#1322 invariant).
  */
 const WEBHOOK_AGGREGATE_RATE_LIMIT = { limit: 1000, windowMs: 10_000 } as const;
 
@@ -208,12 +210,12 @@ export async function authenticateWebhookDelivery(
  * authenticates (#1322). GitHub redeliveries resend the same delivery —
  * same GUID and same body — so they share one bucket, and a captured
  * `(body, signature)` pair replayed under fresh GUIDs also lands in that
- * one body bucket: capped at 3/s, exactly the old shared-bucket bound,
- * instead of minting a fresh bucket per rotated GUID. A caller-supplied
- * `x-github-delivery` header is never part of the key, so GUID rotation
- * cannot grow the limiter's key space; the aggregate ceiling (keyed on the
- * secret's fingerprint) remains as the backstop against a secret-holder
- * minting unlimited distinct signed bodies.
+ * one body bucket: capped at 3/s per captured pair, exactly the old
+ * shared-bucket bound, instead of minting a fresh bucket per rotated GUID.
+ * A caller-supplied `x-github-delivery` header is never part of the key, so
+ * GUID rotation cannot grow the limiter's key space; the aggregate ceiling
+ * (keyed on the secret's fingerprint) remains as the backstop against a
+ * secret-holder minting unlimited distinct signed bodies.
  */
 function verifiedDeliveryActor(payload: Buffer): string {
   return `body:${createHash("sha256").update(payload).digest("hex")}`;
