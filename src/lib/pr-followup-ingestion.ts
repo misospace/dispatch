@@ -1222,9 +1222,19 @@ export async function clearResolvedConflictItems(
 
   // Only clear if it is a conflicts item and still queued. New items are
   // type REBASE (#1327); MERGE_CONFLICT covers legacy rows the fix loop may
-  // still hold. A REBASE row clearing here is the lane's success path when
-  // GitHub's merge-state recomputes lag the pushed rebase.
-  if (existing.type !== "REBASE" && existing.type !== "MERGE_CONFLICT") return false;
+  // still hold. A #1675 transferred repair row is typed as an ordinary fix
+  // lane (its type left the conflict lanes), but its episode record keeps it
+  // a conflicts item for clearing: the repair's success path is the conflict
+  // clearing, exactly like the mechanical lanes. A REBASE row clearing here
+  // is the lane's success path when GitHub's merge-state recomputes lag the
+  // pushed rebase.
+  if (
+    existing.type !== "REBASE" &&
+    existing.type !== "MERGE_CONFLICT" &&
+    existing.rebaseEpisodeTransferred !== true
+  ) {
+    return false;
+  }
   if (existing.status !== "QUEUED") return false;
 
   // #1276 review: settle nothing before the ledger says the condition cleared.

@@ -120,12 +120,12 @@ vi.mock("@prisma/client", () => ({
   },
 }));
 
-vi.mock("@/lib/pr-fix-queue", () => ({
+// The barrel mock keeps the REAL exports (the #1675 rebaseRefusal shape gate
+// runs the real parser from rebase-transfer.ts) and overrides only the
+// resolver.
+vi.mock("@/lib/pr-fix-queue", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/pr-fix-queue")>()),
   resolvePrFixFromAgentReport: prFixResolveMock,
-  // Real folding semantics: the route's fix-round stamp verification compares
-  // the queue row's repo against normalizeQueueRepo(repoFullName).
-  normalizeQueueRepo: (repo: string) => repo.trim().toLowerCase(),
-  MAX_EVIDENCE_LENGTH: 2000,
 }));
 
 vi.mock("@/lib/report-close", () => ({
@@ -616,6 +616,86 @@ describe("POST /api/agents/[agentName]/tasks/report — structured block outcome
       expect.objectContaining({
         decision: { question: "Which?", options: ["A", "B"], evidence: "ctx" },
       }),
+    );
+  });
+});
+
+describe("POST /api/agents/[agentName]/tasks/report — rebaseRefusal (#1675)", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+  });
+
+  const blockedReport = {
+    taskType: "followup-pr",
+    outcome: "blocked",
+    repoFullName: "o/r",
+    pullRequestNumber: 5,
+    prFixItem: { id: "item-1", generation: 1 },
+  };
+
+  const refusal = {
+    kind: "nonmechanical_conflict",
+    conflictingFiles: ["package-lock.json", "src/lib/a.ts"],
+    explanation: "two-sided edit of the same retry loop",
+    baseRef: "main",
+    expectedRemoteHead: "54b9b7c",
+  };
+
+  it("passes a well-formed rebaseRefusal through to the resolver", async () => {
+    const res = await postRequest({ ...blockedReport, blockReason: "human_decision", rebaseRefusal: refusal });
+
+    expect(res.status).toBe(200);
+    expect(prFixResolveMock).toHaveBeenCalledWith(
+      expect.objectContaining({ blockReason: "human_decision", rebaseRefusal: refusal }),
+    );
+  });
+
+  it("returns 400 for a non-object rebaseRefusal", async () => {
+    const asString = await postRequest({ ...blockedReport, rebaseRefusal: "conflict" });
+    expect(asString.status).toBe(400);
+    expect((await asString.json()).error).toMatch(/rebaseRefusal must be an object/);
+
+    const asArray = await postRequest({ ...blockedReport, rebaseRefusal: ["a"] });
+    expect(asArray.status).toBe(400);
+    expect((await asArray.json()).error).toMatch(/rebaseRefusal must be an object/);
+  });
+
+  it("returns 400 when the refusal kind or bounds are malformed", async () => {
+    const noKind = await postRequest({ ...blockedReport, rebaseRefusal: { conflictingFiles: [] } });
+    expect(noKind.status).toBe(400);
+    expect((await noKind.json()).error).toMatch(/rebaseRefusal\.kind/);
+
+    const tooManyFiles = await postRequest({
+      ...blockedReport,
+      rebaseRefusal: { kind: "nonmechanical_conflict", conflictingFiles: Array.from({ length: 21 }, () => "a.ts") },
+    });
+    expect(tooManyFiles.status).toBe(400);
+    expect((await tooManyFiles.json()).error).toMatch(/rebaseRefusal\.conflictingFiles/);
+
+    const longExplanation = await postRequest({
+      ...blockedReport,
+      rebaseRefusal: { kind: "nonmechanical_conflict", explanation: "x".repeat(1001) },
+    });
+    expect(longExplanation.status).toBe(400);
+    expect((await longExplanation.json()).error).toMatch(/rebaseRefusal\.explanation/);
+  });
+
+  it("returns 400 for a control character in a conflicting-file entry (a NUL must fail closed, not break the report write)", async () => {
+    const nulPath = await postRequest({
+      ...blockedReport,
+      rebaseRefusal: { kind: "nonmechanical_conflict", conflictingFiles: ["src/lib/a\u0000.ts"] },
+    });
+    expect(nulPath.status).toBe(400);
+    expect((await nulPath.json()).error).toMatch(/must not contain control characters/);
+  });
+
+  it("accepts other refusal kinds (they settle ordinarily; the resolver gates the transfer)", async () => {
+    const res = await postRequest({ ...blockedReport, blockReason: "human_decision", rebaseRefusal: { kind: "auth_failure" } });
+    expect(res.status).toBe(200);
+    expect(prFixResolveMock).toHaveBeenCalledWith(
+      expect.objectContaining({ rebaseRefusal: { kind: "auth_failure" } }),
     );
   });
 });

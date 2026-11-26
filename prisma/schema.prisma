@@ -430,6 +430,36 @@ model PrFixQueueItem {
   // never a freshness or satisfaction predicate; NULL = never considered, so
   // the row is due immediately.
   prPresenceCheckedAt      DateTime?
+  // #1675: durable semantic-conflict episode accounting. When the mechanical
+  // REBASE lane reports the bounded, structured nonmechanical-conflict refusal
+  // and the exact rebase receipt/generation is settled, the episode transfers
+  // ONE way onto an ordinary fix attempt: these columns record WHICH conflict
+  // episode was transferred so a repeat observation of the same conflict
+  // (resync, restart, a re-read of the still-conflicting PR) never bounces the
+  // row back onto the REBASE lane, duplicates a repair, or resets budgets.
+  //
+  // `rebaseEpisodeId` is the stable episode identity, derived from
+  // authoritative Dispatch state only — base repo + PR + head ref + head sha —
+  // never from poll timestamps or the worker's free text (see
+  // rebaseEpisodeIdentity in pr-fix-queue/rebase-transfer.ts). The worker's
+  // claimed PR/base/head are bounded evidence on the refusal, never identity
+  // inputs. `rebaseEpisodeGeneration` records the settled rebase attempt
+  // generation the transfer was authorized by (audit + traceability: the
+  // authorization is the exact live hand-out receipt, which dies with the
+  // transfer write).
+  //
+  // `rebaseEpisodeTransferred` is the one-way flag the enqueue-side gate reads:
+  // while it is true AND the re-observed conflict matches the recorded
+  // episode, a REBASE enqueue must not rewrite the row's `type` back onto the
+  // mechanical lane. A new conflict at a NEW head is a NEW episode (the id
+  // changes), which releases the gate and lets the REBASE lane run again. The
+  // flag is cleared nowhere automatically: it describes the row's LAST
+  // transferred episode, and the id comparison decides whether it still
+  // applies. Written only by the single transfer writer in rebase-transfer.ts.
+  rebaseEpisodeId            String?
+  rebaseEpisodeTransferred   Boolean   @default(false)
+  rebaseEpisodeTransferredAt DateTime?
+  rebaseEpisodeGeneration    Int?
   author                   String?
   // #1569: ORIGINAL CLAIMANT of the PR-fix work — the agent/owner identity
   // that owned the work when the row was ingested. Distinct boundaries:

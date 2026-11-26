@@ -8,6 +8,7 @@ import { authorizeRequest, authErrorResponse, getBoundWorkerAgent } from "@/lib/
 import { enforceWorkerAgentScope } from "@/lib/worker-identity";
 import {
   resolvePrFixFromAgentReport,
+  parseRebaseRefusal,
   normalizeQueueRepo,
   MAX_EVIDENCE_LENGTH,
   type ResolvePrFixFromAgentReportResult,
@@ -98,6 +99,13 @@ export interface TaskReportBody {
   // contract fails closed to PARKED/`invalid_wait` rather than a cooldown
   // wait. Part of the report's payload identity (idempotency hash).
   externalWait?: Record<string, unknown>;
+  // #1675: structured nonmechanical-conflict refusal from the mechanical
+  // rebase executor, attached to a `blocked` report. Shape-validated (bounded)
+  // here so a malformed value is a 400; only an explicit
+  // `nonmechanical_conflict` kind authorizes the one-way REBASE→fix episode
+  // transfer — every other value settles ordinarily. Part of the report's
+  // payload identity (idempotency hash).
+  rebaseRefusal?: Record<string, unknown>;
   // #1183: optional worker-supplied execution metadata (worker product,
   // model, effective reasoning effort, runtime/config revision, cohort
   // label). Validated fail-closed by parseExecutionMetadata; the parsed bag
@@ -466,6 +474,24 @@ export async function POST(
     externalWait = raw.externalWait as Record<string, unknown>;
   }
 
+  // #1675: a `blocked` report from the mechanical rebase executor may carry
+  // the structured nonmechanical-conflict refusal. Bounded shape validation
+  // here (400 on malformed — an oversized or wrong-typed evidence bag is a
+  // malformed report, not a negotiation); the KIND gate that decides transfer
+  // eligibility and every precondition check live in rebase-transfer.ts, so
+  // all transfer authority stays in one module.
+  let rebaseRefusal: Record<string, unknown> | undefined;
+  if (raw.rebaseRefusal !== undefined && raw.rebaseRefusal !== null) {
+    if (typeof raw.rebaseRefusal !== "object" || Array.isArray(raw.rebaseRefusal)) {
+      return errorResponse("rebaseRefusal must be an object", 400);
+    }
+    const parsed = parseRebaseRefusal(raw.rebaseRefusal);
+    if (!parsed.ok) {
+      return errorResponse(parsed.reason, 400);
+    }
+    rebaseRefusal = raw.rebaseRefusal as Record<string, unknown>;
+  }
+
   // #1183: optional worker-supplied execution metadata. Validated fail-closed
   // here, but the validation is STRUCTURAL ONLY (recognized keys only, values
   // trimmed non-empty single-line printable ASCII of at most 128 chars) — it
@@ -652,6 +678,9 @@ export async function POST(
     // #1250: structured external-wait contract; participates in the
     // idempotency payload hash like the other report fields.
     externalWait,
+    // #1675: structured nonmechanical-conflict refusal; participates in the
+    // idempotency payload hash like the other report fields.
+    rebaseRefusal,
     close: closeCriteria ? { criteria: closeCriteria } : undefined,
     // #1120: normalized worker start time; undefined → report time (now).
     startedAt: resolveReportedStartedAt(raw.startedAt, now),
@@ -791,6 +820,9 @@ export async function POST(
         blockReason: report.blockReason,
         decision: report.decision,
         externalWait: report.externalWait,
+        // #1675: the structured nonmechanical-conflict refusal; the resolver
+        // ignores it for any outcome other than an eligible `blocked` report.
+        rebaseRefusal: report.rebaseRefusal,
         capacity: report.capacity,
         agentName,
         // #1074: settlement is authorized by the attempt token the worker was
