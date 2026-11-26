@@ -249,11 +249,17 @@ export interface TransferRebaseEpisodeInput {
  * - the #1543 consecutive-stagnation budget still has room — an exhausted
  *   budget parks instead of minting the repair attempt.
  *
- * The write itself is one pinned `updateMany` (status + generation + dispatch
- * stamps + exact hand-out arrays + dispatched lane + episode flag) so a
- * concurrent hand-out, ack, reclaim, requeue or settlement landing in the
- * read→write gap no-ops the whole transfer. The episode record, the fresh
- * fix attempt and the hand-out-record release commit atomically.
+ * The write itself is one pinned `updateMany` pinning the FULL decision-input
+ * set (status + generation + dispatch stamps + exact hand-out arrays +
+ * dispatched lane + episode inputs + post-dispatch evidence list + the
+ * identity columns the enqueue metadata patch refreshes + the claimant pair),
+ * so a concurrent hand-out, ack, reclaim, requeue, re-observation, or
+ * settlement landing in the read→write gap no-ops the whole transfer. The
+ * episode record, the fresh fix attempt and the hand-out-record release
+ * commit atomically. On a lost race the re-read must find the verified
+ * identity unchanged — a moved headSha/branch/issue/author STOPS the transfer
+ * (declined) rather than re-deciding a stale refusal onto the newer
+ * observation.
  */
 export async function transferRebaseEpisodeToFix(
   client: PrFixQueueClient,
@@ -267,6 +273,17 @@ export async function transferRebaseEpisodeToFix(
     return { action: "declined", reason: "transfer requires the issued prFixItem.handoutToken receipt and the reporting agent (exact source-attempt fencing)" };
   }
   const maxPasses = 2;
+  // #1675 re-review: the identity tuple the PREVIOUS pass's verified read was
+  // computed from. A CAS loss whose re-read finds a moved identity declines
+  // the whole transfer (below) — a stale refusal is never re-based onto a
+  // newer observation; only non-identity races (hand-out arrays, acks,
+  // post-dispatch appends) are re-decided.
+  let lastVerifiedIdentity: {
+    headSha: string | null;
+    branch: string | null;
+    issue: number | null;
+    author: string | null;
+  } | null = null;
   for (let pass = 0; pass < maxPasses; pass++) {
     const row = await client.prFixQueueItem.findUnique({ where: { id: input.itemId } });
     if (!row) {
@@ -277,6 +294,19 @@ export async function transferRebaseEpisodeToFix(
         action: "skipped",
         reason: `rebase transfer skipped: item is ${row.status} at generation ${row.generation} (dispatched ${row.dispatchedGeneration ?? "never"}), not QUEUED and dispatched at the reported generation ${input.generation}`,
       };
+    }
+    if (lastVerifiedIdentity) {
+      const moved: string[] = [];
+      if ((row.headSha ?? null) !== lastVerifiedIdentity.headSha) moved.push("headSha");
+      if ((row.branch ?? null) !== lastVerifiedIdentity.branch) moved.push("branch");
+      if ((row.issue ?? null) !== lastVerifiedIdentity.issue) moved.push("issue");
+      if ((row.author ?? null) !== lastVerifiedIdentity.author) moved.push("author");
+      if (moved.length > 0) {
+        return {
+          action: "declined",
+          reason: `transfer refused: the row's authoritative identity moved since the verified read (${moved.join(", ")}); a newer observation supersedes what this refusal described, and a stale refusal is never re-based onto a new identity — the ordinary blocked treatment settles the report`,
+        };
+      }
     }
     // Only a REBASE-dispatched attempt may transfer (#1327): the dispatched
     // lane is authoritative because the row's mutable `type` can be rewritten
@@ -359,7 +389,6 @@ export async function transferRebaseEpisodeToFix(
     const priorClaimant = (rawClaimant ?? "").trim();
     const priorClaimantSource = row.claimantSource ?? null;
     let claimantTransition: {
-      pin: { claimant: string | null; claimantSource: string | null };
       data: Record<string, unknown>;
       note: string;
     } | null = null;
@@ -381,16 +410,55 @@ export async function transferRebaseEpisodeToFix(
       claimantTransition =
         resolution.state === "resolved"
           ? {
-              pin: { claimant: rawClaimant, claimantSource: priorClaimantSource },
               data: { claimant: resolution.claimant, claimantSource: resolution.source },
               note: ` Claimant transition: ${priorClaimant} (provenance "${priorClaimantSource ?? "none"}") -> ${resolution.claimant} (provenance "${resolution.source}"): a rebase-executor claimant cannot own an ordinary fix attempt (#1615).`,
             }
           : {
-              pin: { claimant: rawClaimant, claimantSource: priorClaimantSource },
               data: { claimant: null, claimantSource: resolution.state },
               note: ` Claimant transition: ${priorClaimant} (provenance "${priorClaimantSource ?? "none"}") -> unresolved (${resolution.state}): no non-rebase claimant resolved from the authoritative records; the row follows the standard #1569 unresolved recovery (issuance-side backfill / operator stamp) with zero attempt burn (#1615).`,
             };
     }
+    // #1675 re-review: the CAS pins the FULL decision-input set, not just the
+    // generation/dispatch/hand-out state. The enqueue-side metadataPatch
+    // refreshes headSha/branch/issue/author and appends post-dispatch evidence
+    // on a QUEUED row WITHOUT touching the generation or the hand-out arrays,
+    // so a newer observation could otherwise slip into the read→write gap and
+    // the transfer would commit a decision derived from the superseded
+    // identity observation and clear post-dispatch evidence it never saw.
+    // Every column this pass's decision read is pinned; a lost race re-reads,
+    // and an identity that MOVED since this verified read STOPS (top of the
+    // loop) instead of silently re-basing the stale refusal onto the new
+    // identity.
+    const decisionIdentity = {
+      headSha: row.headSha ?? null,
+      branch: row.branch ?? null,
+      issue: row.issue ?? null,
+      author: row.author ?? null,
+    };
+    lastVerifiedIdentity = decisionIdentity;
+    const casWhere = {
+      id: row.id,
+      status: "QUEUED",
+      generation: input.generation,
+      dispatchedGeneration: input.generation,
+      attemptType: row.attemptType ?? null,
+      handoutReceipts: { equals: receipts },
+      agentHandouts: { equals: handouts },
+      handoutAcks: { equals: acks },
+      postDispatchEvidenceKeys: {
+        equals: Array.isArray(row.postDispatchEvidenceKeys) ? row.postDispatchEvidenceKeys : [],
+      },
+      headSha: decisionIdentity.headSha,
+      attemptHeadSha: row.attemptHeadSha ?? null,
+      branch: decisionIdentity.branch,
+      issue: decisionIdentity.issue,
+      author: decisionIdentity.author,
+      // The claimant pair is decision input too (the #1615 transition above
+      // read it): an operator stamp or a lazy backfill landing in the gap
+      // loses THIS write and survives to be re-decided on the fresh read.
+      claimant: row.claimant ?? null,
+      claimantSource: row.claimantSource ?? null,
+    };
     // Budget (#1543): the consumed rebase attempt provably made NO progress
     // (the head is verified unchanged), so it consumes one unit of the
     // consecutive-stagnation budget. An exhausted budget parks the row
@@ -420,16 +488,7 @@ export async function transferRebaseEpisodeToFix(
     };
     if (capped) {
       const { count } = await client.prFixQueueItem.updateMany({
-        where: {
-          id: row.id,
-          status: "QUEUED",
-          generation: input.generation,
-          dispatchedGeneration: input.generation,
-          attemptType: row.attemptType ?? null,
-          handoutReceipts: { equals: receipts },
-          agentHandouts: { equals: handouts },
-          handoutAcks: { equals: acks },
-        },
+        where: casWhere,
         data: cappedData,
       });
       if (count !== 1) {
@@ -512,20 +571,7 @@ export async function transferRebaseEpisodeToFix(
       ...(claimantTransition ? claimantTransition.data : {}),
     };
     const { count } = await client.prFixQueueItem.updateMany({
-      where: {
-        id: row.id,
-        status: "QUEUED",
-        generation: input.generation,
-        dispatchedGeneration: input.generation,
-        attemptType: row.attemptType ?? null,
-        handoutReceipts: { equals: receipts },
-        agentHandouts: { equals: handouts },
-        handoutAcks: { equals: acks },
-        // Pin the claimant pair the transition re-decided: an operator
-        // stamp/transfer landing in the read→write gap loses OUR write and
-        // survives, and the next pass re-decides against the persisted pair.
-        ...(claimantTransition ? claimantTransition.pin : {}),
-      },
+      where: casWhere,
       data: transferData,
     });
     if (count !== 1) {

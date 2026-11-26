@@ -125,8 +125,13 @@ function makeClient(): PrFixQueueClient & { items: any[]; ledger: any[]; history
     issue: { findFirst: async () => null },
     prFixQueueItem: {
       findUnique: async ({ where }: any) => {
-        if (where.repo_pr) return items.find((r) => r.repo === where.repo_pr.repo && r.pr === where.repo_pr.pr) ?? null;
-        return items.find((r) => r.id === where.id) ?? null;
+        // Detached snapshot copy (Prisma read semantics): a concurrent write
+        // landing after a read must NOT retroactively change the values the
+        // reader derived its pinned CAS from.
+        const hit = where.repo_pr
+          ? items.find((r) => r.repo === where.repo_pr.repo && r.pr === where.repo_pr.pr)
+          : items.find((r) => r.id === where.id);
+        return hit ? { ...hit } : null;
       },
       create: async ({ data }: any) => {
         const row = {
@@ -616,7 +621,140 @@ describe("transferRebaseEpisodeToFix (#1675)", () => {
   });
 });
 
-// ─── Resolution integration ──────────────────────────────────────────────────
+// ─── Contention with concurrent enqueue observations (#1675 re-review) ──────
+
+describe("REBASE observation vs transfer interleaving (#1675 re-review)", () => {
+  it("a repeat CONFLICTING observation that read before the transfer can never write after it", async () => {
+    // The exact review interleaving: the periodic sync reads the dispatched
+    // QUEUED REBASE row at generation g (NO episode marker) and decides the
+    // REBASE type + mechanical instruction wall; the transfer then commits
+    // generation g+1 OTHER with the marker; the stale observation write lands
+    // AFTER. The generation/episode pins must turn the stale write into a
+    // miss and the in-transaction re-decide must see the marker — the row
+    // stays the ordinary repair attempt, with no mechanical re-entry and no
+    // rebase hand-out for the transferred episode.
+    const client = makeClient();
+    seedRebaseRow(client);
+    let interleaved = false;
+    const originalUpdateMany = client.prFixQueueItem.updateMany;
+    const originalUpdate = client.prFixQueueItem.update;
+    const intercept = async (args: any, next: (a: any) => Promise<any>) => {
+      if (!interleaved && args.data?.type === "REBASE") {
+        // The enqueue has computed its decision from the marker-less snapshot
+        // and is about to write: run the WHOLE transfer in that gap.
+        interleaved = true;
+        const transfer = await transferRebaseEpisodeToFix(client, transferInput(client));
+        expect(transfer.action).toBe("transferred");
+      }
+      return next(args);
+    };
+    client.prFixQueueItem.updateMany = (args: any) => intercept(args, originalUpdateMany);
+    client.prFixQueueItem.update = (args: any) => intercept(args, originalUpdate);
+    await ingestMergeConflict(client as any, {
+      repoFullName: REPO,
+      prNumber: PR,
+      branch: BRANCH,
+      headRepoFullName: REPO,
+      url: `https://github.com/${REPO}/pull/${PR}`,
+      title: "feat: add retry",
+      author: "itsmiso-ai",
+      mergeable: "CONFLICTING",
+      headSha: HEAD,
+      source: "sync",
+    });
+    expect(interleaved).toBe(true);
+    const row = client.items[0];
+    // The transferred identity survived: ordinary repair attempt, one
+    // generation bump (the transfer's), marker intact.
+    expect(row.type).toBe("OTHER");
+    expect(row.status).toBe("QUEUED");
+    expect(row.generation).toBe(GENERATION + 1);
+    expect(row.rebaseEpisodeTransferred).toBe(true);
+    expect(row.rebaseEpisodeId).toBe(rebaseEpisodeIdentity(REPO, PR, BRANCH, HEAD));
+    // The mechanical instruction wall was NOT restored; the repair contract
+    // is what the next hand-out carries.
+    expect(row.feedback.filter((line: string) => isMechanicalRebaseInstruction(line))).toHaveLength(0);
+    expect(row.feedback.some((line: string) => line.includes("single authorized repair attempt"))).toBe(true);
+    // No mechanical re-entry was issued: no hand-out/receipt/dispatch state.
+    expect(row.agentHandouts).toEqual([]);
+    expect(row.handoutReceipts).toEqual([]);
+    expect(row.attemptType).toBeNull();
+    // Exactly one transfer audit row; the observation re-decided to the
+    // suppressed-gate path (its note explains why nothing changed).
+    expect(client.history.filter((h: any) => h.action === "rebase_transfer")).toHaveLength(1);
+    expect(
+      client.history.filter(
+        (h: any) => h.action === "enqueue" && String(h.note ?? "").includes("REBASE type write was suppressed"),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("a concurrent newer observation that moved the row's head stops the transfer (declined, zero mutation)", async () => {
+    // The reciprocal fence: enqueue's metadataPatch refreshes headSha (and
+    // post-dispatch evidence) on the dispatched QUEUED row WITHOUT bumping the
+    // generation. A sync observation landing between the transfer's verified
+    // head read and its CAS write must make the write miss, and the re-read
+    // must find the identity MOVED — the transfer declines rather than
+    // re-basing a stale refusal onto the newer identity observation.
+    const client = makeClient();
+    const row = seedRebaseRow(client);
+    const newHead = "f".repeat(40);
+    let raced = false;
+    githubPrsMocks.fetchPullRequestHeadSha.mockImplementation(async () => {
+      if (!raced) {
+        // A newer sync observation commits right after our verification read:
+        // the mutable identity moves, generation/hand-outs untouched — the
+        // shape the old transfer CAS could not see.
+        raced = true;
+        row.headSha = newHead;
+        (row as any).postDispatchEvidenceKeys = [`merge_state@${newHead}`];
+      }
+      return HEAD;
+    });
+    const result = await transferRebaseEpisodeToFix(client, transferInput(client));
+    expect(raced).toBe(true);
+    expect(result.action).toBe("declined");
+    expect(result.reason).toContain("identity moved");
+    expect(result.reason).toContain("headSha");
+    // Zero mutation: the newer observation survives, nothing was transferred.
+    expect(row.type).toBe("REBASE");
+    expect(row.status).toBe("QUEUED");
+    expect(row.generation).toBe(GENERATION);
+    expect(row.headSha).toBe(newHead);
+    expect(row.postDispatchEvidenceKeys).toEqual([`merge_state@${newHead}`]); // NOT cleared
+    expect(row.rebaseEpisodeTransferred).toBe(false);
+    expect(row.handoutReceipts).toHaveLength(1); // receipt not consumed
+    expect(client.history.filter((h: any) => h.action === "rebase_transfer")).toHaveLength(0);
+  });
+
+  it("a non-identity concurrent append still re-decides: the transfer commits on the fresh read", async () => {
+    // The re-decide path stays available for races that do NOT move the
+    // decision identity: a post-dispatch evidence append landing in the gap
+    // misses the pinned write once, and the fresh re-read re-decides the same
+    // verified episode and commits.
+    const client = makeClient();
+    const row = seedRebaseRow(client);
+    let raced = false;
+    githubPrsMocks.fetchPullRequestHeadSha.mockImplementation(async () => {
+      if (!raced) {
+        raced = true;
+        (row as any).postDispatchEvidenceKeys = [`review@${HEAD}`];
+      }
+      return HEAD;
+    });
+    const result = await transferRebaseEpisodeToFix(client, transferInput(client));
+    expect(raced).toBe(true);
+    expect(result.action).toBe("transferred");
+    expect(row.type).toBe("OTHER");
+    expect(row.generation).toBe(GENERATION + 1);
+    expect(row.rebaseEpisodeTransferred).toBe(true);
+    // The fresh attempt resets the post-dispatch list (the append belonged to
+    // the dead generation either way).
+    expect(row.postDispatchEvidenceKeys).toEqual([]);
+  });
+});
+
+// ─── #1615 ownership transition on the transferred attempt ───────────────────
 
 describe("#1615 ownership transition on the transferred attempt (#1675 review)", () => {
   const REBASE_EXECUTOR = "courier-rebase";
@@ -763,6 +901,8 @@ describe("#1615 ownership transition on the transferred attempt (#1675 review)",
     expect(row.claimantSource).toBe("operator");
   });
 });
+
+// ─── Resolution integration ──────────────────────────────────────────────────
 
 describe("resolvePrFixFromAgentReport: REBASE→fix transfer (#1675)", () => {
   it("one transition: an eligible refusal settles the report as requeued with the transfer", async () => {

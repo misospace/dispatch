@@ -595,7 +595,24 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           // pinned on the generation it decided from — a concurrent
           // requeue/settlement that bumped the generation in the read→write
           // gap misses the pin and the loop re-decides from the fresh row.
-          pinnedGeneration: snapshot.status !== "QUEUED" ? (snapshot.generation ?? null) : null,
+          // #1675 review: a REBASE conflict observation ALWAYS pins, QUEUED
+          // snapshots included. The no-bounce gate is only sound if a decision
+          // computed WITHOUT the transferred-episode marker can never land
+          // after the transfer commits: the transfer's write bumps the
+          // generation atomically with the marker, so the generation pin turns
+          // the stale write into a miss and the re-decide sees the marker.
+          pinnedGeneration:
+            snapshot.status !== "QUEUED" || type === "REBASE" ? (snapshot.generation ?? null) : null,
+          // #1675 review: the conflict decision's full read-set pins. `status`
+          // covers the transfer's bounded-exhaustion PARK (no generation bump)
+          // and any disposition landing in the gap — a stale replay computed
+          // from a QUEUED snapshot must never resurrect a dispositioned row.
+          // `rebaseEpisodeId` pins the episode the no-bounce gate compared;
+          // every marker writer touches it in its write. Both apply only to
+          // conflict observations — the mechanical lane is the only decision
+          // that consumes them.
+          pinnedConflictStatus: type === "REBASE" ? snapshot.status : null,
+          pinnedEpisodeId: type === "REBASE" ? (snapshot.rebaseEpisodeId ?? null) : null,
         };
       };
 
@@ -617,14 +634,23 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
       // True when the exhausted-loop fallback below wrote the item without its
       // pins; suppresses the ledger record for that write (see there).
       let unpinnedLedgerWrite = false;
+      // #1675 review: the loop's row-existence bookkeeping — the exhausted
+      // fallback must distinguish "kept losing the pin" from "the row was
+      // deleted mid-loop" (the latter must keep throwing P2025 exactly like
+      // the pre-#1134 path).
+      let loopRowDeleted = false;
       if (
         decided.pinnedKeys !== null ||
         decided.pinnedEvidenceSequence !== null ||
-        decided.pinnedGeneration !== null
+        decided.pinnedGeneration !== null ||
+        decided.pinnedConflictStatus !== null ||
+        decided.pinnedEpisodeId !== null
       ) {
         let pinnedKeys: string[] | null = decided.pinnedKeys;
         let pinnedEvidenceSequence: number | null = decided.pinnedEvidenceSequence;
         let pinnedGeneration: number | null = decided.pinnedGeneration;
+        let pinnedConflictStatus: string | null = decided.pinnedConflictStatus;
+        let pinnedEpisodeId: string | null = decided.pinnedEpisodeId;
         for (let i = 0; i < maxPinnedEnqueueWrites; i += 1) {
           const { count } = await tx.prFixQueueItem.updateMany({
             where: {
@@ -632,6 +658,10 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
               ...(pinnedKeys !== null ? { postDispatchEvidenceKeys: { equals: pinnedKeys } } : {}),
               ...(pinnedEvidenceSequence !== null ? { evidenceSequence: pinnedEvidenceSequence } : {}),
               ...(pinnedGeneration !== null ? { generation: pinnedGeneration } : {}),
+              // #1675 review: the conflict decision's read-set pins (status
+              // covers dispositions that land without a generation bump; the
+              // episode id pins the marker the no-bounce gate compared).
+              ...(type === "REBASE" ? { status: pinnedConflictStatus, rebaseEpisodeId: pinnedEpisodeId } : {}),
             },
             data: decided.data,
           });
@@ -648,7 +678,10 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           // Row deleted mid-loop: stop re-deciding; the exhausted-loop fallback
           // below runs its plain `update`, which surfaces Prisma's P2025 exactly
           // like the pre-#1134 path did for a deleted row.
-          if (!fresh) break;
+          if (!fresh) {
+            loopRowDeleted = true;
+            break;
+          }
           snapshot = fresh;
           // Re-read the ledger alongside the fresh row so a concurrent
           // transition that landed in the gap re-decides known/version
@@ -661,8 +694,40 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           pinnedKeys = decided.pinnedKeys;
           pinnedEvidenceSequence = decided.pinnedEvidenceSequence;
           pinnedGeneration = decided.pinnedGeneration;
+          pinnedConflictStatus = decided.pinnedConflictStatus;
+          pinnedEpisodeId = decided.pinnedEpisodeId;
         }
         if (updated === undefined) {
+          // #1675 review: a REBASE conflict decision that would WRITE the
+          // mechanical lane (`type: REBASE` plus its instruction wall — one
+          // computed WITHOUT the transferred-episode marker) never falls back
+          // to an unpinned write. Sustained contention means the row is moving
+          // under us, and the one-way transfer fence outranks recording this
+          // one observation: the conflict condition is re-observed
+          // periodically, and the next observation re-derives the decision
+          // from the fresh row — seeing the transferred marker, the new
+          // disposition, or the genuinely new episode it is meant to see. The
+          // ledger row is suppressed with the write (the `unpinnedLedgerWrite`
+          // posture below), so nothing claims a sequence it did not pin;
+          // skipping is self-healing. A suppressed decision (marker matched —
+          // the write carries no type/wall) keeps the degraded fallback: it
+          // cannot re-enter the mechanical lane either way.
+          if (type === "REBASE" && !decided.transferredEpisodeReobserved && !loopRowDeleted) {
+            console.info(
+              `[pr-fix-queue] REBASE conflict write skipped on ${input.repo}#${input.pr} after ${maxPinnedEnqueueWrites} lost pinned writes (#1675): the mechanical-lane write is never applied unpinned`,
+            );
+            await tx.prFixHistory.create({
+              data: {
+                itemId: existing.id,
+                action: "enqueue",
+                lane: snapshot.lane,
+                reason: input.reason,
+                evidenceKey: input.evidenceKey,
+                note: `Repeat CONFLICTING observation skipped after sustained contention (${maxPinnedEnqueueWrites} pinned writes lost): the REBASE type/instruction-wall write is never applied unpinned (#1675). The condition is re-observed on the next cycle.`,
+              },
+            });
+            return snapshot;
+          }
           // The pin kept missing under sustained contention, or the row was
           // deleted mid-loop (then this plain `update` throws P2025, as the
           // pre-#1134 path did). Otherwise: fall back to ONE plain unpinned
