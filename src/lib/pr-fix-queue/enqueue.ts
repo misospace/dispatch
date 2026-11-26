@@ -227,10 +227,15 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
         // `type` write below is suppressed (the row keeps the fix lane it was
         // transferred to) and a note records why. A new head derives a
         // DIFFERENT id (a new DIRTY episode, #1327), which releases the gate
-        // and lets the rebase lane run again. The row's own branch folds in
-        // when the observation carries none, so a partially-observed resync
-        // still derives the SAME identity the transfer stored (fail toward
-        // no-bounce, never toward a rebase re-entry).
+        // and lets the rebase lane run again. The row's own authoritative
+        // state folds in when the observation carries neither a head ref nor
+        // a head sha: the stored `branch`, and the row's last authoritative
+        // head observation (`attemptHeadSha`, legacy `headSha` fallback — the
+        // same #1543 baseline derivation the transfer writer keyed on), so a
+        // partially-observed resync still derives the SAME identity the
+        // transfer stored (fail toward no-bounce, never toward a rebase
+        // re-entry). An observation that does carry a moved head still
+        // derives the DIFFERENT id and re-opens the mechanical lane.
         const transferredEpisodeId =
           snapshot.rebaseEpisodeTransferred === true && typeof snapshot.rebaseEpisodeId === "string"
             ? snapshot.rebaseEpisodeId
@@ -241,7 +246,7 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
                 snapshot.repo ?? normalizeQueueRepo(input.repo),
                 snapshot.pr ?? input.pr,
                 input.branch ?? snapshot.branch ?? null,
-                input.headSha ?? null,
+                input.headSha ?? snapshot.attemptHeadSha ?? snapshot.headSha ?? null,
               )
             : null;
         const transferredEpisodeReobserved =

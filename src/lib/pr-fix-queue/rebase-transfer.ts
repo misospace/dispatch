@@ -2,11 +2,13 @@ import { fetchPullRequestHeadSha } from "../github-prs";
 import { normalizePrFixType } from "@/types";
 import { sanitizeForStorage } from "../groomer/sanitize";
 import { isMechanicalRebaseInstruction } from "../pr-fix-rebase";
+import { resolveIngestionClaimant } from "../pr-fix-ownership";
 import { type PrFixQueueClient } from "./client";
 import { uniqueAppend } from "./shared";
 import { linkedIssueEscalationClassified, preserveEscalationLane, releaseLaneFromParentClass } from "./escalation-lane";
 import { maxPrFixStagnation } from "./external-wait";
 import { findHandoutReceipt, freshAttemptGeneration } from "./handout";
+import { rebaseExecutorAgentNames, rebaseExecutorClaimantExclusion } from "./lane-admission";
 
 /**
  * #1675: durable semantic-conflict episode accounting and the bounded
@@ -56,6 +58,16 @@ import { findHandoutReceipt, freshAttemptGeneration } from "./handout";
  *    (resync, restart, lost-ack re-dispatch, duplicate report) keeps the row
  *    on the fix lane and never rewrites it back onto REBASE; only a NEW
  *    episode (new head) re-opens the mechanical lane.
+ * 7. OWNERSHIP (#1615/#1569) — the transferred row is an ordinary fix
+ *    attempt, so it must never carry a rebase-executor pool claimant: the
+ *    hand-out gate deterministically refuses that pair and a recorded
+ *    claimant is immutable to the issuance-side backfill — the exact
+ *    structurally unroutable class #1615 exists for. The transfer
+ *    re-resolves the repair claimant under the SAME non-REBASE exclusion the
+ *    backfill uses and commits the transition (or an honest unresolved
+ *    state, recoverable through the standard #1569 operator paths with zero
+ *    attempt burn) in the same pinned CAS write; a failed authoritative
+ *    read declines the whole transfer to the ordinary safe hold.
  *
  * Failure classification: ONLY an explicit, well-formed, in-bounds
  * `kind: "nonmechanical_conflict"` refusal on a verifiable, exclusively-owned,
@@ -324,6 +336,61 @@ export async function transferRebaseEpisodeToFix(
         reason: `transfer refused: the PR remote head (${remote || "unknown"}) no longer matches the rebase attempt baseline (${expected || "unknown"}); a changed remote head must stop, never silently transfer`,
       };
     }
+    // Ownership transition invariant (#1615/#1569, #1675 review): the
+    // transferred row is now an ORDINARY fix attempt, and the #1615 gate
+    // deterministically refuses a rebase-executor pool member as the claimant
+    // of a non-REBASE row — fix connectors decline the lane-mismatched
+    // identity, and the row cannot self-heal, because the issuance-side
+    // backfill never re-resolves a RECORDED claimant. That is exactly the
+    // structurally unroutable failure class #1615 names, so a transfer must
+    // never leave a pool-member claimant on the row. The repair claimant is
+    // re-resolved from the authoritative records under the SAME non-REBASE
+    // exclusion the issuance-side backfill uses. A resolvable owner
+    // transitions in the same CAS write — pinned on the observed claimant
+    // pair, so a concurrent operator stamp never silently loses to the
+    // transfer. When nothing resolves, the row records the honest failure
+    // state and enters the standard #1569 unresolved recovery (issuance-side
+    // lazy backfill / operator stamp): a zero-attempt recoverable hold, never
+    // poison. And a failed authoritative read (`unavailable`) cannot safely
+    // re-decide ownership at all: the WHOLE transfer declines — the ordinary
+    // blocked safe hold leaves the row intact for a later retry, and an infra
+    // failure never mints either an unroutable transfer or a semantic verdict.
+    const rawClaimant = typeof row.claimant === "string" ? row.claimant : null;
+    const priorClaimant = (rawClaimant ?? "").trim();
+    const priorClaimantSource = row.claimantSource ?? null;
+    let claimantTransition: {
+      pin: { claimant: string | null; claimantSource: string | null };
+      data: Record<string, unknown>;
+      note: string;
+    } | null = null;
+    if (priorClaimant !== "" && rebaseExecutorAgentNames().has(priorClaimant.toLowerCase())) {
+      const resolution = await resolveIngestionClaimant(
+        client,
+        row.repo,
+        row.issue ?? null,
+        row.author,
+        new Date(),
+        rebaseExecutorClaimantExclusion("OTHER"),
+      );
+      if (resolution.state === "unavailable") {
+        return {
+          action: "declined",
+          reason: `transfer refused: the transferred attempt's ownership could not be re-established — the recorded claimant (${priorClaimant}) is a rebase-executor pool member and cannot own ordinary fix work (#1615), and the authoritative claimant records are unreadable; infra failure mints no transfer, the ordinary blocked safe hold settles the report for a later retry`,
+        };
+      }
+      claimantTransition =
+        resolution.state === "resolved"
+          ? {
+              pin: { claimant: rawClaimant, claimantSource: priorClaimantSource },
+              data: { claimant: resolution.claimant, claimantSource: resolution.source },
+              note: ` Claimant transition: ${priorClaimant} (provenance "${priorClaimantSource ?? "none"}") -> ${resolution.claimant} (provenance "${resolution.source}"): a rebase-executor claimant cannot own an ordinary fix attempt (#1615).`,
+            }
+          : {
+              pin: { claimant: rawClaimant, claimantSource: priorClaimantSource },
+              data: { claimant: null, claimantSource: resolution.state },
+              note: ` Claimant transition: ${priorClaimant} (provenance "${priorClaimantSource ?? "none"}") -> unresolved (${resolution.state}): no non-rebase claimant resolved from the authoritative records; the row follows the standard #1569 unresolved recovery (issuance-side backfill / operator stamp) with zero attempt burn (#1615).`,
+            };
+    }
     // Budget (#1543): the consumed rebase attempt provably made NO progress
     // (the head is verified unchanged), so it consumes one unit of the
     // consecutive-stagnation budget. An exhausted budget parks the row
@@ -333,7 +400,7 @@ export async function transferRebaseEpisodeToFix(
     const capped = nextStagnation >= maxPrFixStagnation();
     const historyNote = capped
       ? `Agent reported a non-mechanical (semantic) conflict from the mechanical rebase attempt; the consecutive-stagnation budget is exhausted at ${nextStagnation} (PR_FIX_MAX_STAGNATION=${maxPrFixStagnation()}), so the REBASE→fix transfer is declined and the row parks instead (#1675, #1543). Receipt settled: ${owned}. Episode: ${episodeId}.`
-      : `Agent reported a non-mechanical (semantic) conflict from the mechanical rebase attempt; the exact rebase receipt/generation (${input.generation}) is settled and ONE ordinary fix attempt is authorized with the bounded refusal evidence (#1675). Episode: ${episodeId}. Conflicting files: ${input.refusal.conflictingFiles.length ? input.refusal.conflictingFiles.join(", ") : "none reported"}.`;
+      : `Agent reported a non-mechanical (semantic) conflict from the mechanical rebase attempt; the exact rebase receipt/generation (${input.generation}) is settled and ONE ordinary fix attempt is authorized with the bounded refusal evidence (#1675). Episode: ${episodeId}. Conflicting files: ${input.refusal.conflictingFiles.length ? input.refusal.conflictingFiles.join(", ") : "none reported"}.${claimantTransition?.note ?? ""}`;
     const cappedData: Record<string, unknown> = {
       status: "PARKED",
       // #1503: a bounded-exhaustion park never demotes the exclusive lane.
@@ -438,6 +505,11 @@ export async function transferRebaseEpisodeToFix(
       rebaseEpisodeTransferred: true,
       rebaseEpisodeTransferredAt: new Date(),
       rebaseEpisodeGeneration: input.generation,
+      // The #1615 ownership transition: a pool-member claimant is replaced by
+      // the re-resolved repair owner (or an honest unresolved state) in the
+      // SAME atomic write, so the transferred generation can never exist as a
+      // row the ownership gate structurally refuses.
+      ...(claimantTransition ? claimantTransition.data : {}),
     };
     const { count } = await client.prFixQueueItem.updateMany({
       where: {
@@ -449,6 +521,10 @@ export async function transferRebaseEpisodeToFix(
         handoutReceipts: { equals: receipts },
         agentHandouts: { equals: handouts },
         handoutAcks: { equals: acks },
+        // Pin the claimant pair the transition re-decided: an operator
+        // stamp/transfer landing in the read→write gap loses OUR write and
+        // survives, and the next pass re-decides against the persisted pair.
+        ...(claimantTransition ? claimantTransition.pin : {}),
       },
       data: transferData,
     });

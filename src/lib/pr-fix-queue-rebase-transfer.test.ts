@@ -71,6 +71,7 @@ import {
   NONMECHANICAL_CONFLICT_KIND,
 } from "./pr-fix-queue/rebase-transfer";
 import { resolvePrFixFromAgentReport } from "./pr-fix-queue/report-resolution";
+import { evaluatePrFixHandoutOwnership } from "./pr-fix-queue/handout-ownership";
 import { maxPrFixStagnation } from "./pr-fix-queue/external-wait";
 import { type PrFixQueueClient } from "./pr-fix-queue/client";
 
@@ -617,6 +618,152 @@ describe("transferRebaseEpisodeToFix (#1675)", () => {
 
 // ─── Resolution integration ──────────────────────────────────────────────────
 
+describe("#1615 ownership transition on the transferred attempt (#1675 review)", () => {
+  const REBASE_EXECUTOR = "courier-rebase";
+  const FIXER = "fixbot";
+
+  beforeEach(() => {
+    // The operator-declared pools: `courier-rebase` may run mechanical rebases
+    // but is NOT a fix-work owner; `fixbot` is the intended repair consumer.
+    vi.stubEnv("DISPATCH_REBASE_AGENTS", REBASE_EXECUTOR);
+    vi.stubEnv("DISPATCH_PR_FIX_AGENTS", FIXER);
+  });
+
+  it("re-resolves a DISPATCH_REBASE_AGENTS claimant: the transferred OTHER generation is hand-out eligible", async () => {
+    const client = makeClient();
+    seedRebaseRow(client, { issue: 99, claimant: REBASE_EXECUTOR, claimantSource: "agent-label" });
+    // The authoritative records name an ordinary fix owner via the issue's
+    // agent label; resolution runs under the #1615 non-REBASE exclusion, so
+    // the pool name can never come back out of ANY source.
+    (client.issue as any).findFirst = async () => ({ id: "iss-99", labels: [`agent/${FIXER}`] });
+    const result = await transferRebaseEpisodeToFix(client, transferInput(client));
+    expect(result.action).toBe("transferred");
+    const row = client.items[0];
+    // The un-routable identity is gone; the row carries the re-resolved owner.
+    expect(row.claimant).toBe(FIXER);
+    expect(row.claimantSource).toBe("agent-label");
+    // The transition is audited on the settlement note.
+    const transfer = client.history.find((h: any) => h.action === "rebase_transfer");
+    expect(transfer.note).toContain("Claimant transition");
+    expect(transfer.note).toContain(`${REBASE_EXECUTOR} (provenance "agent-label") -> ${FIXER}`);
+    // Without the transition this exact pair is the #1615 poison — with the
+    // worker space undeclared (so Part A is inert) the gate refuses it
+    // deterministically on the ordinary fix lane as the rebase-executor arm:
+    expect(
+      evaluatePrFixHandoutOwnership(
+        {
+          repo: REPO,
+          pr: PR,
+          claimant: REBASE_EXECUTOR,
+          claimantSource: "agent-label",
+          fixType: "OTHER",
+        },
+        "enforce",
+        new Set<string>(),
+      ),
+    ).toMatchObject({ decision: "refuse", refusal: "rebase-executor-claimant" });
+    // …and the transferred generation as it is NOW passes the very same
+    // issuance gate (fixType derived like next-task: attemptType ?? type).
+    const ownership = evaluatePrFixHandoutOwnership({
+      repo: row.repo,
+      pr: row.pr,
+      generation: row.generation,
+      claimant: row.claimant,
+      claimantSource: row.claimantSource,
+      fixType: row.attemptType ?? row.type,
+    });
+    expect(ownership.decision).toBe("eligible");
+    expect(ownership.refusal).toBeNull();
+  });
+
+  it("an unresolvable repair claimant lands as the honest unresolved state (#1569 recovery), never as the refused pair", async () => {
+    const client = makeClient();
+    seedRebaseRow(client, { issue: 99, claimant: REBASE_EXECUTOR, claimantSource: "lease" });
+    // No issue row: no lease, no labels, no linked-issue source at all.
+    (client.issue as any).findFirst = async () => null;
+    const result = await transferRebaseEpisodeToFix(client, transferInput(client));
+    expect(result.action).toBe("transferred");
+    const row = client.items[0];
+    expect(row.claimant).toBeNull();
+    expect(row.claimantSource).toBe("missing");
+    const transfer = client.history.find((h: any) => h.action === "rebase_transfer");
+    expect(transfer.note).toContain(`-> unresolved (missing)`);
+    // The gate now refuses as the recoverable #1569 "unresolved" class — the
+    // lazy issuance backfill (claimant IS NULL) or an operator stamp can heal
+    // it with zero attempt burn — NEVER the structurally stuck
+    // rebase-executor pair.
+    const ownership = evaluatePrFixHandoutOwnership({
+      repo: row.repo,
+      pr: row.pr,
+      claimant: row.claimant,
+      claimantSource: row.claimantSource,
+      fixType: row.attemptType ?? row.type,
+    });
+    expect(ownership.decision).toBe("refuse");
+    expect(ownership.refusal).toBe("unresolved");
+  });
+
+  it("a failed authoritative claimant read declines the WHOLE transfer: zero mutation, safe hold", async () => {
+    const client = makeClient();
+    seedRebaseRow(client, { issue: 99, claimant: REBASE_EXECUTOR, claimantSource: "agent-label" });
+    (client.issue as any).findFirst = async () => {
+      throw new Error("database unreachable");
+    };
+    const result = await transferRebaseEpisodeToFix(client, transferInput(client));
+    expect(result.action).toBe("declined");
+    expect(result.reason).toContain("ownership could not be re-established");
+    const row = client.items[0];
+    expect(row.status).toBe("QUEUED");
+    expect(row.type).toBe("REBASE");
+    expect(row.claimant).toBe(REBASE_EXECUTOR);
+    expect(row.rebaseEpisodeTransferred).toBe(false);
+    expect(row.handoutReceipts).toHaveLength(1); // receipt NOT consumed
+    expect(client.history.filter((h: any) => h.action === "rebase_transfer")).toHaveLength(0);
+  });
+
+  it("leaves a claimant outside the rebase pool untouched: no fact read, no rewrite", async () => {
+    const client = makeClient();
+    seedRebaseRow(client, { claimant: "alice", claimantSource: "owner-label" });
+    const findFirst = vi.fn(async () => null);
+    (client.issue as any).findFirst = findFirst;
+    const result = await transferRebaseEpisodeToFix(client, transferInput(client));
+    expect(result.action).toBe("transferred");
+    const row = client.items[0];
+    expect(row.claimant).toBe("alice");
+    expect(row.claimantSource).toBe("owner-label");
+    // No linked issue and no pool membership: the transfer never reads claimant
+    // facts and never touches the recorded identity.
+    expect(findFirst).not.toHaveBeenCalled();
+  });
+
+  it("a concurrent operator stamp wins the pin: the re-pass preserves it", async () => {
+    const client = makeClient();
+    seedRebaseRow(client, { issue: 99, claimant: REBASE_EXECUTOR, claimantSource: "agent-label" });
+    (client.issue as any).findFirst = async () => ({ id: "iss-99", labels: [`agent/${FIXER}`] });
+    const originalUpdateMany = client.prFixQueueItem.updateMany;
+    let stamped = false;
+    client.prFixQueueItem.updateMany = async (args: any) => {
+      if (args.data?.rebaseEpisodeTransferred !== undefined && !stamped) {
+        // An operator claimant transfer commits between our read and our
+        // pinned CAS write.
+        stamped = true;
+        client.items[0].claimant = "ops-picker";
+        client.items[0].claimantSource = "operator";
+      }
+      return originalUpdateMany(args);
+    };
+    const result = await transferRebaseEpisodeToFix(client, transferInput(client));
+    expect(result.action).toBe("transferred");
+    const row = client.items[0];
+    // Pass 1 lost the claimant pin; pass 2 re-reads the operator identity —
+    // outside the pool, so the transfer preserves it untouched.
+    expect(stamped).toBe(true);
+    expect(row.rebaseEpisodeTransferred).toBe(true);
+    expect(row.claimant).toBe("ops-picker");
+    expect(row.claimantSource).toBe("operator");
+  });
+});
+
 describe("resolvePrFixFromAgentReport: REBASE→fix transfer (#1675)", () => {
   it("one transition: an eligible refusal settles the report as requeued with the transfer", async () => {
     const client = makeClient();
@@ -704,6 +851,38 @@ describe("resolvePrFixFromAgentReport: REBASE→fix transfer (#1675)", () => {
     });
     expect(client.items[0].type).toBe("OTHER");
     expect(client.items[0].rebaseEpisodeTransferred).toBe(true);
+  });
+
+  it("restart/resync with a head-less observation falls back to the row's stored head (no bounce)", async () => {
+    // The metadata keeps the row's LAST authoritative head observation when a
+    // resync cannot read one; the episode comparison must fail toward
+    // no-bounce, never mint the `:unknown` identity that would rewrite the
+    // active transferred OTHER row back onto REBASE.
+    const client = makeClient();
+    seedRebaseRow(client);
+    await resolvePrFixFromAgentReport(reportInput(client) as any);
+    expect(client.items[0].type).toBe("OTHER");
+    await ingestMergeConflict(client as any, {
+      repoFullName: REPO,
+      prNumber: PR,
+      branch: BRANCH,
+      headRepoFullName: REPO,
+      url: `https://github.com/${REPO}/pull/${PR}`,
+      title: "feat: add retry",
+      author: "itsmiso-ai",
+      mergeable: "CONFLICTING",
+      // headSha deliberately absent: this observation could not read it.
+      source: "sync",
+    });
+    const row = client.items[0];
+    expect(row.type).toBe("OTHER");
+    expect(row.status).toBe("QUEUED");
+    expect(row.generation).toBe(GENERATION + 1);
+    expect(row.rebaseEpisodeTransferred).toBe(true);
+    const suppressionNotes = client.history.filter(
+      (h: any) => h.action === "enqueue" && String(h.note ?? "").includes("REBASE type write was suppressed"),
+    );
+    expect(suppressionNotes).toHaveLength(1);
   });
 
   it("a NEW head is a NEW episode: the rebase lane re-opens (and the stale gate releases)", async () => {
