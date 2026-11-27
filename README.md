@@ -751,3 +751,7 @@ docker run -p 3000:3000 \
   # -e NEXTAUTH_SECRET="$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")" \
   ghcr.io/misospace/dispatch:local
 ```
+
+## License
+
+[AGPL-3.0-only](LICENSE). See [licensing and corresponding source](docs/licensing.md).
