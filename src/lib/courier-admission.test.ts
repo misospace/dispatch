@@ -5,6 +5,7 @@ import {
   courierAdmissionTimeoutMs,
   getCourierAdmissionConfig,
   redactSecret,
+  scrubEndpoint,
   submitAdmission,
   type AdmissionRequestFields,
 } from "./courier-admission";
@@ -132,6 +133,61 @@ describe("redactSecret", () => {
     expect(redacted).toContain("[redacted]");
     expect(redacted.length).toBeLessThanOrEqual(500 + "[truncated]…".length);
     expect(redactSecret("x".repeat(900), "s")).toMatch(/\[truncated\]$/);
+  });
+});
+
+describe("scrubEndpoint", () => {
+  it("removes origin, userinfo, and query from an echoed request URL", () => {
+    const endpoint = new URL("https://user:secretpw@courier.internal:8443/v1/contributions?token=***");
+    const echo = `TypeError: fetch failed: could not load ${endpoint.href} (ECONNREFUSED)`;
+    const scrubbed = scrubEndpoint(echo, endpoint);
+    expect(scrubbed).not.toContain("secretpw");
+    expect(scrubbed).not.toContain("supersecret");
+    expect(scrubbed).not.toContain("user:secretpw@");
+    expect(scrubbed).not.toContain("courier.internal");
+    expect(scrubbed).toContain("[scrubbed-endpoint]");
+    expect(scrubbed).toContain("ECONNREFUSED");
+  });
+
+  it("scrubs a scheme-less-authority and origin echo", () => {
+    const endpoint = new URL("https://user:secretpw@courier.internal:8443/v1/contributions");
+    expect(scrubEndpoint("auth rejected for user:secretpw@courier.internal:8443", endpoint)).not.toContain("secretpw");
+    expect(scrubEndpoint("via https://courier.internal:8443 only", endpoint)).not.toContain("courier.internal");
+  });
+
+  it("keeps a bare host a connect error names (not a secret) but scrubs the scheme origin", () => {
+    // A DNS/connect error names only the host; that is not credential-bearing,
+    // and scrubbing a bare `localhost` would mangle unrelated diagnostics.
+    const endpoint = new URL("http://localhost:3000/v1/contributions");
+    expect(scrubEndpoint("connect ECONNREFUSED localhost:3000", endpoint)).toBe("connect ECONNREFUSED localhost:3000");
+    expect(scrubEndpoint("could not reach http://localhost:3000", endpoint)).not.toContain("localhost");
+  });
+
+  it("covers the raw (decoded) userinfo the operator typed", () => {
+    const endpoint = new URL("https://user:p%40ss@courier.internal/v1/contributions");
+    expect(scrubEndpoint("failed for user:p@ss@courier.internal", endpoint)).not.toContain("p@ss");
+  });
+
+  it("leaves unrelated text untouched, is idempotent, and no-ops on empty", () => {
+    const endpoint = new URL("https://courier.internal/v1/contributions");
+    const plain = "courier admission rejected with HTTP 422: lane unknown";
+    expect(scrubEndpoint(plain, endpoint)).toBe(plain);
+    const once = scrubEndpoint("at https://courier.internal/v1/contributions boom", endpoint);
+    expect(once).toContain("[scrubbed-endpoint]");
+    expect(scrubEndpoint(once, endpoint)).toBe(once);
+    expect(scrubEndpoint("", endpoint)).toBe("");
+  });
+});
+
+describe("redactSecret with an endpoint", () => {
+  it("scrubs the endpoint URL and the bearer secret together", () => {
+    const endpoint = new URL("https://user:secretpw@courier.internal/v1/contributions?token=***");
+    const leaky = `request to ${endpoint.href} with ${TOKEN} failed`;
+    const redacted = redactSecret(leaky, TOKEN, endpoint);
+    expect(redacted).not.toContain(TOKEN);
+    expect(redacted).not.toContain("secretpw");
+    expect(redacted).not.toContain("supersecret");
+    expect(redacted).toContain("[scrubbed-endpoint]");
   });
 });
 
@@ -293,6 +349,25 @@ describe("submitAdmission", () => {
     if (result.outcome === "uncertain") {
       expect(result.diagnostic).toMatch(/\[truncated\]$/);
       expect(result.diagnostic.length).toBeLessThanOrEqual(500 + "…[truncated]".length);
+    }
+  });
+
+  // #1690: a runtime may echo the whole request URL in a fetch error; a
+  // credential-bearing endpoint (userinfo + token query) must not survive.
+  it("scrubs a credential-bearing endpoint URL echoed in a fetch failure", async () => {
+    const credEndpoint = new URL("https://user:secretpw@courier.internal:8443/v1/contributions?token=***");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockRejectedValue(new TypeError(`Failed to fetch ${credEndpoint.href} — redirect refused`)),
+    );
+    const result = await submitAdmission(FIELDS, { ...config, endpoint: credEndpoint });
+    expect(result).toMatchObject({ outcome: "uncertain", timeout: false });
+    if (result.outcome === "uncertain") {
+      expect(result.diagnostic).not.toContain("secretpw");
+      expect(result.diagnostic).not.toContain("supersecret");
+      expect(result.diagnostic).not.toContain("courier.internal");
+      expect(result.diagnostic).toContain("[scrubbed-endpoint]");
+      expect(result.diagnostic).toContain("redirect refused");
     }
   });
 });

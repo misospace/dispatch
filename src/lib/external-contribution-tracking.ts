@@ -43,8 +43,8 @@
  *   remaining cooldown — no network call, no Courier pressure, and a refresh
  *   never re-submits the contribution.
  * - Credential hygiene. The READ token lives only in `courier-tracking.ts`;
- *   everything this module may store goes through that module's already
- *   redacted diagnostics.
+ *   a stored diagnostic is either that module's already-redacted answer or a
+ *   string redacted here via `redactSecret`, which also scrubs the surface URL.
  */
 import type { Prisma, PrismaClient } from "@prisma/client";
 import type { CourierTrackingConfig, TrackingReadResult } from "./courier-tracking";
@@ -327,6 +327,7 @@ export async function refreshExternalContributionTracking(
         trackingError: redactSecret(
           `courier status identity mismatch on ${mismatched}; the observation was refused and nothing was recorded`,
           config.token,
+          config.statusBase,
         ),
       });
       if (!applied) return supersededOutcome(client, row.id);
@@ -378,6 +379,7 @@ export async function refreshExternalContributionTracking(
           ? `courier no longer reports this run (reaped or lost); the recorded ${current.trackingState} evidence is kept — a 404 is never completion`
           : `${result.diagnostic}; recorded as expired, not completion — re-ingestion would require a new request identity`,
         config.token,
+        config.statusBase,
       ),
     });
     if (!applied) return supersededOutcome(client, row.id);
@@ -386,7 +388,7 @@ export async function refreshExternalContributionTracking(
 
   if (result.outcome === "refused") {
     const applied = await settle(client, row.id, now, {
-      trackingError: result.diagnostic,
+      trackingError: redactSecret(result.diagnostic, config.token, config.statusBase),
       ...(current.trackingState === null ? { trackingState: "unavailable" as TrackingState } : {}),
     });
     if (!applied) return supersededOutcome(client, row.id);
@@ -394,7 +396,7 @@ export async function refreshExternalContributionTracking(
   }
 
   const applied = await settle(client, row.id, now, {
-    trackingError: result.diagnostic,
+    trackingError: redactSecret(result.diagnostic, config.token, config.statusBase),
     ...(current.trackingState === null ? { trackingState: "unavailable" as TrackingState } : {}),
   });
   if (!applied) return supersededOutcome(client, row.id);

@@ -15,7 +15,9 @@
  * handed read-only authority. When no read token is configured, tracking is
  * UNAVAILABLE and submission is untouched — a missing capability is named,
  * never guessed. The token is never logged, stored, or returned; every
- * diagnostic passes through `redactSecret` first.
+ * diagnostic passes through `redactSecret` first, which also scrubs the
+ * configured surface URL's origin/userinfo/query — the read URL keeps that URL's
+ * userinfo, and a runtime may echo the whole thing in a fetch error string.
  *
  * Endpoint boundary: the status URL is derived from the operator-configured
  * `DISPATCH_COURIER_ADMISSION_URL` (the same `/v1/contributions` surface) plus
@@ -195,15 +197,15 @@ function parseDateOrNull(value: unknown): Date | null {
  * partial guess). Unknown EXTRA fields are ignored (the allowlist is the
  * frontend's protection, per Courier #819).
  */
-export function parseContributionStatus(bodyText: string, httpStatus: number, token: string): TrackingReadResult {
+export function parseContributionStatus(bodyText: string, httpStatus: number, token: string, endpoint?: URL): TrackingReadResult {
   let parsed: unknown;
   try {
     parsed = JSON.parse(bodyText);
   } catch {
-    return incompatibleShape(httpStatus, token, "body was not JSON");
+    return incompatibleShape(httpStatus, token, "body was not JSON", endpoint);
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    return incompatibleShape(httpStatus, token, "body was not a JSON object");
+    return incompatibleShape(httpStatus, token, "body was not a JSON object", endpoint);
   }
   const body = parsed as Record<string, unknown>;
 
@@ -215,16 +217,16 @@ export function parseContributionStatus(bodyText: string, httpStatus: number, to
   const phase = optionalString(body.phase);
   const observedAt = parseDateOrNull(body.observedAt);
   if (!run || !namespace || !lane || !baseRepo || !workRepo || !phase || !observedAt) {
-    return incompatibleShape(httpStatus, token, "body is missing one of run/namespace/lane/baseRepo/workRepo/phase/observedAt");
+    return incompatibleShape(httpStatus, token, "body is missing one of run/namespace/lane/baseRepo/workRepo/phase/observedAt", endpoint);
   }
   if (typeof body.ciParked !== "boolean") {
-    return incompatibleShape(httpStatus, token, "body ciParked is not a boolean");
+    return incompatibleShape(httpStatus, token, "body ciParked is not a boolean", endpoint);
   }
 
   let publication: CourierPublication | null = null;
   if (body.publication !== undefined && body.publication !== null) {
     if (typeof body.publication !== "object" || Array.isArray(body.publication)) {
-      return incompatibleShape(httpStatus, token, "body publication is not an object");
+      return incompatibleShape(httpStatus, token, "body publication is not an object", endpoint);
     }
     const p = body.publication as Record<string, unknown>;
     publication = {
@@ -238,7 +240,7 @@ export function parseContributionStatus(bodyText: string, httpStatus: number, to
   let cause: CourierCause | null = null;
   if (body.cause !== undefined && body.cause !== null) {
     if (typeof body.cause !== "object" || Array.isArray(body.cause)) {
-      return incompatibleShape(httpStatus, token, "body cause is not an object");
+      return incompatibleShape(httpStatus, token, "body cause is not an object", endpoint);
     }
     const c = body.cause as Record<string, unknown>;
     cause = { category: optionalString(c.category), outcome: optionalString(c.outcome) };
@@ -263,13 +265,14 @@ export function parseContributionStatus(bodyText: string, httpStatus: number, to
   };
 }
 
-function incompatibleShape(httpStatus: number, token: string, detail: string): TrackingReadResult {
+function incompatibleShape(httpStatus: number, token: string, detail: string, endpoint?: URL): TrackingReadResult {
   return {
     outcome: "unavailable",
     httpStatus,
     diagnostic: redactSecret(
       `courier status returned HTTP ${httpStatus} in an unrecognized shape (${detail}); the /v1 contract refuses silent reshapes, so the response is refused rather than guessed`,
       token,
+      endpoint,
     ),
     timeout: false,
   };
@@ -307,11 +310,15 @@ export async function fetchContributionStatus(
   namespace: string,
   config: Extract<CourierTrackingConfig, { ok: true }>,
 ): Promise<TrackingReadResult> {
+  // Bound every retained/returned diagnostic to this read credential + surface:
+  // strip the READ token AND the credential-bearing status URL (its userinfo
+  // survives into the derived request) that a runtime may echo in a fetch error.
+  const scrub = (text: string) => redactSecret(text, config.token, config.statusBase);
   if (!isAddressableRunName(run)) {
     return {
       outcome: "refused",
       httpStatus: 400,
-      diagnostic: redactSecret("stored courier run name is not an addressable run identifier; the status read was not sent", config.token),
+      diagnostic: scrub("stored courier run name is not an addressable run identifier; the status read was not sent"),
     };
   }
   const url = contributionStatusUrl(config, run, namespace);
@@ -333,13 +340,13 @@ export async function fetchContributionStatus(
     if (name === "TimeoutError" || name === "AbortError") {
       return {
         outcome: "unavailable",
-        diagnostic: redactSecret(`courier status read timed out after ${config.timeoutMs}ms`, config.token),
+        diagnostic: scrub(`courier status read timed out after ${config.timeoutMs}ms`),
         timeout: true,
       };
     }
     return {
       outcome: "unavailable",
-      diagnostic: redactSecret(`courier status read failed: ${errorMessage(error)}`, config.token),
+      diagnostic: scrub(`courier status read failed: ${errorMessage(error)}`),
       timeout: false,
     };
   }
@@ -356,11 +363,10 @@ export async function fetchContributionStatus(
     return {
       outcome: "unavailable",
       httpStatus: response.status,
-      diagnostic: redactSecret(
+      diagnostic: scrub(
         timedOut
           ? `courier status response body read timed out after ${config.timeoutMs}ms`
           : `courier status response body read failed: ${errorMessage(error)}`,
-        config.token,
       ),
       timeout: timedOut,
     };
@@ -371,24 +377,24 @@ export async function fetchContributionStatus(
     // maps it for a previously-admitted run to an explicit expired state.
     return {
       outcome: "notFound",
-      diagnostic: redactSecret(`${diagnosticFromErrorBody(bodyText, 404)} — the run was never admitted here, was reaped after retention, or is not a contribution run`, config.token),
+      diagnostic: scrub(`${diagnosticFromErrorBody(bodyText, 404)} — the run was never admitted here, was reaped after retention, or is not a contribution run`),
     };
   }
   if (response.status === 200) {
-    return parseContributionStatus(bodyText, response.status, config.token);
+    return parseContributionStatus(bodyText, response.status, config.token, config.statusBase);
   }
   if (response.status >= 400 && response.status < 500) {
     return {
       outcome: "refused",
       httpStatus: response.status,
-      diagnostic: redactSecret(diagnosticFromErrorBody(bodyText, response.status), config.token),
+      diagnostic: scrub(diagnosticFromErrorBody(bodyText, response.status)),
     };
   }
   const retryAfterMs = parseRetryAfterMs(response);
   return {
     outcome: "unavailable",
     httpStatus: response.status,
-    diagnostic: redactSecret(`${diagnosticFromErrorBody(bodyText, response.status)}${retryAfterMs !== undefined ? ` (retry after ${retryAfterMs}ms)` : ""}`, config.token),
+    diagnostic: scrub(`${diagnosticFromErrorBody(bodyText, response.status)}${retryAfterMs !== undefined ? ` (retry after ${retryAfterMs}ms)` : ""}`),
     timeout: false,
     ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
   };

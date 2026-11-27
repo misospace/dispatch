@@ -13,6 +13,10 @@
  * single configured endpoint, and never logged, stored, or returned. Every
  * diagnostic that could echo server or body text goes through
  * `redactSecret` before it can reach a log line, the ledger, or a response.
+ * The endpoint URL is itself credential-bearing (an operator may configure
+ * userinfo or a token-like query), so `redactSecret` also scrubs the endpoint's
+ * origin/userinfo/query via `scrubEndpoint`: some runtimes echo the full request
+ * URL in a fetch error string, and the bearer token is only one secret in it.
  *
  * Endpoint boundary: the endpoint is operator configuration only. Fetch runs
  * with `redirect: "error"`, so a misconfigured or compromised endpoint cannot
@@ -163,13 +167,85 @@ export type AdmissionResult =
 /** Upper bound for any stored/logged diagnostic (keeps ledger rows bounded). */
 const MAX_DIAGNOSTIC_LENGTH = 500;
 
+/** Marker left where a credential-bearing endpoint component was removed. */
+const SCRUBBED_ENDPOINT = "[scrubbed-endpoint]";
+
+/** Decode a WHATWG URL component (already a valid percent-encoding); never throws. */
+function tryDecodeComponent(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 /**
- * Bound a diagnostic and strip any occurrence of `secret` from it. Applied to
- * every string this module (and the submission route) may store or log, so
- * the credential cannot leak into the ledger, the audit log, or a response.
+ * Remove the configured endpoint's credential-bearing components from a
+ * diagnostic: its origin, userinfo, and query. The URL is operator configuration
+ * and may carry `user:pass@` or `?token=***`; a runtime fetch error can echo the
+ * whole request URL, and `redactSecret`'s exact-token strip alone cannot cover
+ * the other secrets inside that URL.
+ *
+ * Every candidate form carries structural context (a scheme, `@host`, or `?`),
+ * so scrubbing removes the URL without mangling unrelated diagnostic text — a
+ * bare host is never scrubbed, since it is not a secret and a DNS/connect error
+ * that names only the host carries no credential. Forms are removed longest-first
+ * so a whole-URL echo is gone before its parts. Both the normalized (`URL.href`)
+ * and the operator-typed (decoded userinfo) spellings are covered, since a
+ * runtime may echo the raw configuration string. Idempotent: every form holds a
+ * `:`, `@`, or `?`, and the `[scrubbed-endpoint]` placeholder holds none.
  */
-export function redactSecret(text: string, secret: string): string {
+export function scrubEndpoint(text: string, endpoint: URL): string {
+  if (!text) return text;
+  // Only a configured http(s) surface can carry a credential here; the config
+  // resolvers already enforce this, and `.origin` is opaque (`"null"`) otherwise.
+  if (endpoint.protocol !== "https:" && endpoint.protocol !== "http:") return text;
+  const hasUserinfo = Boolean(endpoint.username || endpoint.password);
+  const authority = hasUserinfo
+    ? `${endpoint.username}${endpoint.password ? `:${endpoint.password}` : ""}@${endpoint.host}`
+    : endpoint.host;
+  const forms: string[] = [];
+  const add = (form: string) => {
+    if (form && !forms.includes(form)) forms.push(form);
+  };
+  add(endpoint.href);
+  add(`${endpoint.protocol}//${authority}`);
+  if (hasUserinfo) {
+    add(`${authority}${endpoint.pathname}${endpoint.search}`);
+    add(`//${authority}`);
+    add(authority);
+    // Raw echo: the userinfo the operator typed, before the URL parser
+    // percent-encoded it (e.g. `p%40ss` vs `p@ss`).
+    const rawAuthority = `${tryDecodeComponent(endpoint.username)}${
+      endpoint.password ? `:${tryDecodeComponent(endpoint.password)}` : ""
+    }@${endpoint.host}`;
+    add(`${rawAuthority}${endpoint.pathname}${endpoint.search}`);
+    add(`${endpoint.protocol}//${rawAuthority}`);
+    add(rawAuthority);
+    add(`//${rawAuthority}`);
+  }
+  add(endpoint.origin);
+  // Query is scrubbed WITH its leading `?` only: a scheme-less/`?`-less token
+  // would be a bare substring with no structural anchor to bound it.
+  if (endpoint.search) add(endpoint.search);
+  let scrubbed = text;
+  for (const form of forms.sort((a, b) => b.length - a.length)) {
+    scrubbed = scrubbed.split(form).join(SCRUBBED_ENDPOINT);
+  }
+  return scrubbed;
+}
+
+/**
+ * Bound a diagnostic, strip any occurrence of `secret`, and — when the
+ * configured endpoint is supplied — scrub its origin/userinfo/query. Applied to
+ * every string this module (and the submission/tracking routes) may store or
+ * log, so neither the credential nor the credential-bearing URL can leak into
+ * the ledger, the audit log, or a response. Scrub runs before the length bound
+ * so a truncated tail can never split a URL fragment past a removed component.
+ */
+export function redactSecret(text: string, secret: string, endpoint?: URL): string {
   let redacted = text;
+  if (endpoint) redacted = scrubEndpoint(redacted, endpoint);
   if (secret) redacted = redacted.split(secret).join("[redacted]");
   if (redacted.length > MAX_DIAGNOSTIC_LENGTH) {
     redacted = `${redacted.slice(0, MAX_DIAGNOSTIC_LENGTH)}…[truncated]`;
@@ -177,8 +253,8 @@ export function redactSecret(text: string, secret: string): string {
   return redacted;
 }
 
-/** Pull a bounded, token-redacted error string out of a Courier error body. */
-function diagnosticFromErrorBody(bodyText: string, status: number, token: string): string {
+/** Compose an error-body diagnostic; the caller scrubs it before it is retained. */
+function diagnosticFromErrorBody(bodyText: string, status: number): string {
   const base = `courier admission rejected with HTTP ${status}`;
   try {
     const parsed = JSON.parse(bodyText) as { error?: unknown };
@@ -252,6 +328,10 @@ export function errorMessage(error: unknown): string {
  */
 export async function submitAdmission(fields: AdmissionRequestFields, config: Extract<CourierAdmissionConfig, { ok: true }>): Promise<AdmissionResult> {
   const payload = buildAdmissionPayload(fields);
+  // Bound every retained/returned diagnostic to this endpoint + token: strip
+  // the bearer secret AND the credential-bearing request URL that a runtime may
+  // echo in a fetch error string, before it can reach the ledger or a response.
+  const scrub = (text: string) => redactSecret(text, config.token, config.endpoint);
   let response: Response;
   try {
     // `redirect: "error"` is the credential guard: a redirect would be a
@@ -285,7 +365,7 @@ export async function submitAdmission(fields: AdmissionRequestFields, config: Ex
     }
     return {
       outcome: "uncertain",
-      diagnostic: redactSecret(`courier admission request failed: ${errorMessage(error)}`, config.token),
+      diagnostic: scrub(`courier admission request failed: ${errorMessage(error)}`),
       timeout: false,
     };
   }
@@ -304,11 +384,10 @@ export async function submitAdmission(fields: AdmissionRequestFields, config: Ex
     return {
       outcome: "uncertain",
       httpStatus: response.status,
-      diagnostic: redactSecret(
+      diagnostic: scrub(
         timedOut
           ? `courier admission response body read timed out after ${config.timeoutMs}ms; delivery outcome unknown`
           : `courier admission response body read failed: ${errorMessage(error)}; delivery outcome unknown`,
-        config.token,
       ),
       timeout: timedOut,
     };
@@ -317,16 +396,15 @@ export async function submitAdmission(fields: AdmissionRequestFields, config: Ex
   if (response.status === 200 || response.status === 201) {
     return parseAdmissionIdentity(response.status, bodyText);
   }
-  const diagnostic = redactSecret(diagnosticFromErrorBody(bodyText, response.status, config.token), config.token);
+  const diagnostic = scrub(diagnosticFromErrorBody(bodyText, response.status));
   if (response.status >= 400 && response.status < 500) {
     return { outcome: "rejected", httpStatus: response.status, diagnostic };
   }
   return {
     outcome: "uncertain",
     httpStatus: response.status,
-    diagnostic: redactSecret(
+    diagnostic: scrub(
       `courier admission returned HTTP ${response.status}; delivery outcome unknown${bodyText.trim() ? `: ${bodyText.trim()}` : ""}`,
-      config.token,
     ),
     timeout: false,
   };

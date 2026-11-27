@@ -459,7 +459,7 @@ export async function submitExternalContribution(
     const applied = await settleAttempt(client, row.id, attemptToken, {
       deliveryStatus: "rejected",
       courierHttpStatus: result.httpStatus,
-      lastError: redactSecret(result.diagnostic, config.token),
+      lastError: redactSecret(result.diagnostic, config.token, config.endpoint),
       inFlightUntil: null,
     });
     if (!applied) return lostOwnershipOutcome(client, row.idempotencyKey, digest);
@@ -469,7 +469,7 @@ export async function submitExternalContribution(
   const applied = await settleAttempt(client, row.id, attemptToken, {
     deliveryStatus: "uncertain",
     ...(result.httpStatus !== undefined ? { courierHttpStatus: result.httpStatus } : {}),
-    lastError: redactSecret(result.diagnostic, config.token),
+    lastError: redactSecret(result.diagnostic, config.token, config.endpoint),
     inFlightUntil: null,
   });
   if (!applied) return lostOwnershipOutcome(client, row.idempotencyKey, digest);

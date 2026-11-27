@@ -241,4 +241,24 @@ describe("fetchContributionStatus", () => {
     const result = await fetchContributionStatus("run-1", "ns", okConfig);
     expect(result).toMatchObject({ outcome: "unavailable", httpStatus: 200, timeout: false });
   });
+
+  // #1690: the read URL keeps the configured surface's userinfo, and a runtime
+  // may echo it in a fetch error; the credential-bearing prefix must not survive.
+  it("scrubs a credential-bearing surface URL echoed in a fetch failure", async () => {
+    const credConfig = {
+      ...okConfig,
+      statusBase: new URL("https://user:secretpw@courier.internal:8443/v1/contributions?token=***"),
+    };
+    const echoed =
+      "Failed to fetch https://user:secretpw@courier.internal:8443/v1/contributions/courier-3f2a?namespace=team-alpha";
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError(echoed)));
+    const result = await fetchContributionStatus("courier-3f2a", "team-alpha", credConfig);
+    expect(result).toMatchObject({ outcome: "unavailable", timeout: false });
+    if (result.outcome === "unavailable") {
+      expect(result.diagnostic).not.toContain("secretpw");
+      expect(result.diagnostic).not.toContain("supersecret");
+      expect(result.diagnostic).not.toContain("user:secretpw@");
+      expect(result.diagnostic).toContain("[scrubbed-endpoint]");
+    }
+  });
 });
