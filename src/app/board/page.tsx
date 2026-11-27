@@ -17,8 +17,7 @@ import { withDependencyBlockReasons } from "@/lib/issue-dependency-annotation";
 import { withAdmissionAnnotations } from "@/lib/queue-admission";
 import { withUnroutableLaneAnnotations } from "@/lib/lane-annotation";
 import { withNormalizedReleaseSignal } from "@/lib/groomer/plan";
-import { asReleaseDeltaState, collectReleasePulse } from "@/lib/release-pulse-read";
-import { deriveReleaseReadiness, releaseCiStatus } from "@/lib/release-readiness";
+import { collectRepoReleaseHealth } from "@/lib/release-pulse-read";
 import { buildReleasePulseView, releasePulseStripVisible, type ReleasePulseView } from "@/lib/release-pulse-view";
 import { ReleasePulseStrip } from "@/components/automation/release-pulse";
 
@@ -116,31 +115,8 @@ async function getReleasePulseStripView(repo: string | undefined): Promise<Relea
       where: { fullName: repo },
     });
     if (!automationRepo) return null;
-    const [failingRuns, runningRuns, succeededRuns, pulse] = await Promise.all([
-      prisma.githubWorkflowRun.count({
-        where: { workflow: { repoId: automationRepo.id }, conclusion: "failure" },
-      }),
-      prisma.githubWorkflowRun.count({
-        where: { workflow: { repoId: automationRepo.id }, status: "in_progress" },
-      }),
-      prisma.githubWorkflowRun.count({
-        where: { workflow: { repoId: automationRepo.id }, conclusion: "success" },
-      }),
-      collectReleasePulse({
-        fullName: automationRepo.fullName,
-        releaseState: asReleaseDeltaState(automationRepo.releaseState),
-        releaseBaselineTag: automationRepo.releaseBaselineTag,
-        releaseBaselineSha: automationRepo.releaseBaselineSha,
-        releaseBaselinePublishedAt: automationRepo.releaseBaselinePublishedAt,
-        releaseHeadSha: automationRepo.releaseHeadSha,
-        releaseAheadBy: automationRepo.releaseAheadBy,
-      }),
-    ]);
-    const readiness = deriveReleaseReadiness({
-      pulse,
-      now: new Date(),
-      ci: releaseCiStatus({ failingRuns, runningRuns, succeededRuns }),
-    });
+    // Same cached-only composition the automation routes use (#1483/#1484).
+    const { pulse, readiness } = await collectRepoReleaseHealth(automationRepo);
     return buildReleasePulseView({
       pulse,
       readiness,

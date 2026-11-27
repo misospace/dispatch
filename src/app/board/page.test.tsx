@@ -12,6 +12,7 @@ const { mocks } = vi.hoisted(() => ({
     countWorkflowRuns: vi.fn().mockResolvedValue(0),
     releasePulseStrip: vi.fn(() => null),
     collectReleasePulse: vi.fn(),
+    collectRepoReleaseHealth: vi.fn(),
     parseExcludedLabels: vi.fn().mockReturnValue([]),
   },
 }));
@@ -26,10 +27,10 @@ vi.mock("@/lib/prisma", () => ({
 }));
 
 // The strip derivation must not touch the issue/event queries the board's
-// own assertions index into — stub the reader with a deterministic snapshot.
+// own assertions index into — stub the health composition with a
+// deterministic pulse and the real readiness derivation over it.
 vi.mock("@/lib/release-pulse-read", () => ({
-  asReleaseDeltaState: (value: string) => value,
-  collectReleasePulse: mocks.collectReleasePulse,
+  collectRepoReleaseHealth: mocks.collectRepoReleaseHealth,
 }));
 vi.mock("@/components/automation/release-pulse", () => ({
   ReleasePulseStrip: mocks.releasePulseStrip,
@@ -56,6 +57,7 @@ vi.mock("@/components/ui/card", () => ({
 
 import BoardPage from "./page";
 import { KanbanBoardClient } from "./kanban-board-client";
+import { deriveReleaseReadiness } from "@/lib/release-readiness";
 
 function findElementByType(node: React.ReactNode, type: unknown): React.ReactElement | null {
   if (!React.isValidElement(node)) return null;
@@ -349,6 +351,20 @@ describe("BoardPage release pulse strip (#1484)", () => {
     mocks.findUniqueAutomationRepo.mockResolvedValue(null);
     mocks.countWorkflowRuns.mockResolvedValue(0);
     mocks.collectReleasePulse.mockResolvedValue(readyPulse());
+    mocks.collectRepoReleaseHealth.mockImplementation(async () => {
+      const pulse = await mocks.collectReleasePulse();
+      return {
+        failingRuns: 0,
+        runningRuns: 0,
+        succeededRuns: 0,
+        pulse,
+        readiness: deriveReleaseReadiness({
+          pulse,
+          now: new Date(),
+          ci: "unknown",
+        }),
+      };
+    });
     // Freeze the clock so staleness is deterministic.
     vi.useFakeTimers({ toFake: ["Date"], now: Date.parse("2026-10-30T12:00:00.000Z") });
   });

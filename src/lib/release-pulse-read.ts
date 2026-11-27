@@ -23,6 +23,11 @@ import {
   type ReleasePulseSnapshot,
 } from "@/lib/release-pulse";
 import { toLifecycleEventRecord } from "@/lib/issue-lifecycle-read";
+import {
+  deriveReleaseReadiness,
+  releaseCiStatus,
+  type ReleaseReadiness,
+} from "@/lib/release-readiness";
 
 import type { ReleaseDeltaState } from "./automation-sync";
 
@@ -133,4 +138,76 @@ export async function collectReleasePulse(
   }));
 
   return buildReleasePulse(repo, issues, events);
+}
+
+/**
+ * The automation-repo row fields the health composition reads: the row id for
+ * the workflow-run counts plus the raw release-delta columns the pulse takes.
+ */
+export interface RepoReleaseHealthInput {
+  id: string;
+  fullName: string;
+  releaseState: string;
+  releaseBaselineTag: string | null;
+  releaseBaselineSha: string | null;
+  releaseBaselinePublishedAt: Date | string | null;
+  releaseHeadSha: string | null;
+  releaseAheadBy: number | null;
+}
+
+export interface RepoReleaseHealth {
+  failingRuns: number;
+  runningRuns: number;
+  succeededRuns: number;
+  pulse: ReleasePulseSnapshot;
+  readiness: ReleaseReadiness;
+}
+
+/**
+ * The one composition of a repo's CI context, release pulse, and advisory
+ * readiness (#1483/#1484). The fleet route, the single-repo route, and the
+ * board strip all need the same triple; keeping the counts, the pulse inputs,
+ * and the CI→readiness policy here means the three readers cannot drift.
+ * Cached rows only — no forge calls, no model calls, no writes.
+ *
+ * Positive success evidence separates "CI green" from "no usable run
+ * evidence" for the readiness context, so `succeededRuns` is counted even
+ * where the caller does not render it.
+ */
+export async function collectRepoReleaseHealth(
+  repo: RepoReleaseHealthInput,
+  now: Date = new Date(),
+): Promise<RepoReleaseHealth> {
+  const [failingRuns, runningRuns, succeededRuns, pulse] = await Promise.all([
+    prisma.githubWorkflowRun.count({
+      where: { workflow: { repoId: repo.id }, conclusion: "failure" },
+    }),
+    prisma.githubWorkflowRun.count({
+      where: { workflow: { repoId: repo.id }, status: "in_progress" },
+    }),
+    prisma.githubWorkflowRun.count({
+      where: { workflow: { repoId: repo.id }, conclusion: "success" },
+    }),
+    collectReleasePulse({
+      fullName: repo.fullName,
+      releaseState: asReleaseDeltaState(repo.releaseState),
+      releaseBaselineTag: repo.releaseBaselineTag,
+      releaseBaselineSha: repo.releaseBaselineSha,
+      releaseBaselinePublishedAt: repo.releaseBaselinePublishedAt,
+      releaseHeadSha: repo.releaseHeadSha,
+      releaseAheadBy: repo.releaseAheadBy,
+    }),
+  ]);
+
+  return {
+    failingRuns,
+    runningRuns,
+    succeededRuns,
+    pulse,
+    readiness: deriveReleaseReadiness({
+      pulse,
+      now,
+      ci: releaseCiStatus({ failingRuns, runningRuns, succeededRuns }),
+    }),
+  };
 }

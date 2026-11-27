@@ -3,16 +3,19 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   eventFindMany: vi.fn(),
   issueFindMany: vi.fn(),
+  workflowRunCount: vi.fn(),
 }));
 
 vi.mock("@/lib/prisma", () => ({
   prisma: {
     issueLifecycleEvent: { findMany: mocks.eventFindMany },
     issue: { findMany: mocks.issueFindMany },
+    githubWorkflowRun: { count: mocks.workflowRunCount },
   },
 }));
 
-const { asReleaseDeltaState, collectReleasePulse } = await import("./release-pulse-read");
+const { asReleaseDeltaState, collectReleasePulse, collectRepoReleaseHealth } =
+  await import("./release-pulse-read");
 
 const BASELINE_PUBLISHED_AT = "2026-11-01T00:00:00.000Z";
 
@@ -139,5 +142,56 @@ describe("collectReleasePulse", () => {
       publishedAt: BASELINE_PUBLISHED_AT,
     });
     expect(mocks.issueFindMany).toHaveBeenCalled();
+  });
+});
+
+describe("collectRepoReleaseHealth", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.eventFindMany.mockResolvedValue([]);
+    mocks.issueFindMany.mockResolvedValue([]);
+  });
+
+  function automationRepo() {
+    return { id: "repo-1", ...repo() };
+  }
+
+  it("counts the workflow runs for this repo row and folds them into the readiness context", async () => {
+    mocks.workflowRunCount.mockImplementation(
+      async ({ where }: { where: { conclusion?: string; status?: string } }) => {
+        if (where.conclusion === "failure") return 2;
+        if (where.status === "in_progress") return 1;
+        return 4;
+      },
+    );
+
+    const health = await collectRepoReleaseHealth(automationRepo());
+
+    expect(mocks.workflowRunCount).toHaveBeenCalledWith({
+      where: { workflow: { repoId: "repo-1" }, conclusion: "failure" },
+    });
+    expect(health).toMatchObject({ failingRuns: 2, runningRuns: 1, succeededRuns: 4 });
+    expect(health.pulse.pulseState).toBe("ready");
+    expect(health.readiness.ci).toBe("failing");
+  });
+
+  it("reports green CI only from positive success evidence", async () => {
+    mocks.workflowRunCount.mockImplementation(
+      async ({ where }: { where: { conclusion?: string } }) =>
+        where.conclusion === "success" ? 3 : 0,
+    );
+
+    const health = await collectRepoReleaseHealth(automationRepo());
+
+    expect(health.readiness.ci).toBe("green");
+  });
+
+  it("reports unknown CI when the repo has no run evidence", async () => {
+    mocks.workflowRunCount.mockResolvedValue(0);
+
+    const health = await collectRepoReleaseHealth(automationRepo());
+
+    expect(health.readiness.ci).toBe("unknown");
+    expect(health.pulse).toMatchObject({ schema: "dispatch.release-pulse/v1" });
   });
 });
