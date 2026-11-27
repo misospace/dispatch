@@ -14,6 +14,8 @@ keywords:
   - agents
   - github
   - automation
+annotations:
+  artifacthub.io/license: AGPL-3.0-only
 dependencies:
   - name: common
     repository: https://bjw-s-labs.github.io/helm-charts

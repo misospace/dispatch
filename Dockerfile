@@ -55,7 +55,10 @@ ENV DATABASE_URL=${DATABASE_URL}
 RUN npm run build
 
 FROM base AS runner
+LABEL org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.source="https://github.com/misospace/dispatch"
 WORKDIR /app
+COPY LICENSE NOTICE /usr/share/doc/dispatch/
 
 ENV NODE_ENV=production
 
@@ -99,7 +102,10 @@ ENTRYPOINT ["/docker-entrypoint.sh"]
 # ship the runtime closure only, never the dev toolchain with its accepted
 # dev-only advisory chain (#1173, GHSA-vfj7-8cjw-p6xm).
 FROM base AS mcp
+LABEL org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.source="https://github.com/misospace/dispatch"
 WORKDIR /app
+COPY LICENSE NOTICE /usr/share/doc/dispatch/
 
 ENV NODE_ENV=production
 
