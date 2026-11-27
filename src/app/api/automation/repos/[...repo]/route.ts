@@ -4,8 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { jsonSafe } from "@/lib/json";
 import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rate-limit";
-import { collectReleasePulse, asReleaseDeltaState } from "@/lib/release-pulse-read";
-import { deriveReleaseReadiness, releaseCiStatus } from "@/lib/release-readiness";
+import { collectRepoReleaseHealth } from "@/lib/release-pulse-read";
 
 // DELETE cascades and hard-deletes tracked-repo state; this matches the
 // shared repos window #1307 gave POST /api/automation/repos
@@ -58,29 +57,10 @@ export async function GET(request: Request, context: RouteContext) {
       return errorResponse("Repo not found", 404);
     }
 
-    const failingRuns = await prisma.githubWorkflowRun.count({
-      where: {
-        workflow: { repoId: repo.id },
-        conclusion: "failure",
-      },
-    });
-
-    const runningRuns = await prisma.githubWorkflowRun.count({
-      where: {
-        workflow: { repoId: repo.id },
-        status: "in_progress",
-      },
-    });
-
-    // Positive success evidence separates "CI green" from "no usable run
-    // evidence" for the advisory readiness context (#1483), mirroring the
-    // fleet route.
-    const succeededRuns = await prisma.githubWorkflowRun.count({
-      where: {
-        workflow: { repoId: repo.id },
-        conclusion: "success",
-      },
-    });
+    // Same cached-only composition as the fleet route: CI run counts +
+    // release pulse + advisory readiness (#1483/#1484).
+    const { failingRuns, runningRuns, succeededRuns, pulse, readiness } =
+      await collectRepoReleaseHealth(repo);
 
     const lastSyncRun = await prisma.automationSyncRun.findFirst({
       where: { repoId: repo.id },
@@ -91,23 +71,6 @@ export async function GET(request: Request, context: RouteContext) {
       where: { repoId: repo.id },
       take: 10,
       orderBy: { createdAt: "desc" },
-    });
-
-    // Advisory release pulse + readiness (#1484), mirroring the fleet route:
-    // cached-data-only derivation, no forge call, no model call.
-    const pulse = await collectReleasePulse({
-      fullName: repo.fullName,
-      releaseState: asReleaseDeltaState(repo.releaseState),
-      releaseBaselineTag: repo.releaseBaselineTag,
-      releaseBaselineSha: repo.releaseBaselineSha,
-      releaseBaselinePublishedAt: repo.releaseBaselinePublishedAt,
-      releaseHeadSha: repo.releaseHeadSha,
-      releaseAheadBy: repo.releaseAheadBy,
-    });
-    const readiness = deriveReleaseReadiness({
-      pulse,
-      now: new Date(),
-      ci: releaseCiStatus({ failingRuns, runningRuns, succeededRuns }),
     });
 
     return NextResponse.json(jsonSafe({
