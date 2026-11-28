@@ -559,25 +559,40 @@ export async function POST(request: Request) {
         // holds a close newer than the merge until sync catches up). The
         // cached-close signal cannot date a reopen of an issue that closed
         // before the merge — that one waits for sync's `issue_reopened`
-        // event, bounded by the sync interval.
+        // event, bounded by the sync interval. A candidate with no cache row
+        // at all (never synced, or pruned after its close and reopened since)
+        // has no local history: it gets the same bounded timeline
+        // confirmation as an in-doubt stamp, and an unreadable read holds the
+        // close instead of letting the bare merge authority through
+        // (#1730 review).
+        const openIssueNumbers = new Set(
+          issues.filter((i) => i.state === "open").map((i) => i.number),
+        );
         const closeAuthorityIssueRows = new Map<number, (typeof existingIssues)[number]>();
+        const uncachedCloseCandidates: number[] = [];
         for (const issueNum of mergedCloseAuthority.keys()) {
           const row = existingIssueByNumber.get(issueNum);
           if (row) closeAuthorityIssueRows.set(issueNum, row);
+          else if (openIssueNumbers.has(issueNum)) uncachedCloseCandidates.push(issueNum);
         }
         let reopenEvidence = new Map<number, Date>();
         let reopenEvidenceError: string | null = null;
-        if (closeAuthorityIssueRows.size > 0) {
-          const idsByNumber = new Map<number, string>();
-          for (const [issueNum, row] of closeAuthorityIssueRows) idsByNumber.set(issueNum, row.id);
-          try {
-            reopenEvidence = await loadReopenEvidence(prisma, idsByNumber);
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            reopenEvidenceError = message;
-            console.warn(
-              `${repo.fullName}: reopen evidence lookup failed (${message}); closes are held until a pass can read it`,
-            );
+        // Candidates whose reopen history cannot be read at all — held like
+        // the failed-lookup case below, per issue.
+        const reopenUnreadable = new Set<number>();
+        if (closeAuthorityIssueRows.size > 0 || uncachedCloseCandidates.length > 0) {
+          if (closeAuthorityIssueRows.size > 0) {
+            const idsByNumber = new Map<number, string>();
+            for (const [issueNum, row] of closeAuthorityIssueRows) idsByNumber.set(issueNum, row.id);
+            try {
+              reopenEvidence = await loadReopenEvidence(prisma, idsByNumber);
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              reopenEvidenceError = message;
+              console.warn(
+                `${repo.fullName}: reopen evidence lookup failed (${message}); closes are held until a pass can read it`,
+              );
+            }
           }
           // A sync-recorded `issue_reopened` stamps `occurredAt` with the
           // issue's `updated_at` at observation: an upper bound, and a comment
@@ -592,7 +607,7 @@ export async function POST(request: Request) {
           // a read, and the reads are independent, so they run through a small
           // pool: a repo whose window holds many keyword merges shortens without
           // opening one GitHub request per candidate at once.
-          const needsConfirmation: Array<{ issueNum: number; mergedAtMs: number }> = [];
+          const needsConfirmation: Array<{ issueNum: number; mergedAtMs: number; uncached: boolean }> = [];
           for (const [issueNum] of closeAuthorityIssueRows) {
             const eventDate = reopenEvidence.get(issueNum);
             const mergedAtRaw = mergedCloseAuthority.get(issueNum)?.merged_at;
@@ -601,20 +616,37 @@ export async function POST(request: Request) {
             // bound in place and let `reconcileIssue` fail closed on it.
             if (!eventDate || Number.isNaN(mergedAtMs) || eventDate.getTime() <= mergedAtMs) continue;
             if ((closeAuthorityIssueRows.get(issueNum)?.closedAt?.getTime() ?? 0) > mergedAtMs) continue;
-            needsConfirmation.push({ issueNum, mergedAtMs });
+            needsConfirmation.push({ issueNum, mergedAtMs, uncached: false });
           }
-          await mapBounded(needsConfirmation, REOPEN_CONFIRM_CONCURRENCY, async ({ issueNum, mergedAtMs }) => {
+          for (const issueNum of uncachedCloseCandidates) {
+            const mergedAtRaw = mergedCloseAuthority.get(issueNum)?.merged_at;
+            const mergedAtMs = mergedAtRaw ? Date.parse(mergedAtRaw) : NaN;
+            // No merge time and no local history: nothing can show the close
+            // would not override a maintainer.
+            if (Number.isNaN(mergedAtMs)) {
+              reopenUnreadable.add(issueNum);
+              continue;
+            }
+            needsConfirmation.push({ issueNum, mergedAtMs, uncached: true });
+          }
+          await mapBounded(needsConfirmation, REOPEN_CONFIRM_CONCURRENCY, async ({ issueNum, mergedAtMs, uncached }) => {
             try {
               const confirmed = await fetchReopenAfter(repo.fullName, issueNum, new Date(mergedAtMs));
               if (confirmed) reopenEvidence.set(issueNum, confirmed);
-              else reopenEvidence.delete(issueNum);
+              // A clean timeline refutes a cached event's inflated upper
+              // bound; for an uncached candidate there is nothing to refute,
+              // and the close proceeds.
+              else if (!uncached) reopenEvidence.delete(issueNum);
             } catch (error) {
               // Fail closed: an unreadable or over-bound timeline cannot prove
-              // the reopen predates the merge, so the upper bound stands.
+              // the reopen predates the merge. With a cached row the upper
+              // bound stands; without one the candidate is marked unreadable
+              // and its close is held.
               const message = error instanceof Error ? error.message : String(error);
               console.warn(
                 `${repo.fullName}: reopen confirmation for #${issueNum} unavailable (${message}); close stays held`,
               );
+              if (uncached) reopenUnreadable.add(issueNum);
             }
           });
           for (const [issueNum, row] of closeAuthorityIssueRows) {
@@ -667,6 +699,15 @@ export async function POST(request: Request) {
             !closeSkippedReason &&
             reopenEvidenceError &&
             mergedCloseAuthority.has(issue.number) &&
+            result.actions.some((a) => a.type === "close_issue")
+          ) {
+            closeSkippedReason = "reopen evidence unavailable; holding close for a later pass";
+          }
+          // A candidate with no local history whose timeline read failed is
+          // held per issue: no evidence either way, so no close, no labels.
+          if (
+            !closeSkippedReason &&
+            reopenUnreadable.has(issue.number) &&
             result.actions.some((a) => a.type === "close_issue")
           ) {
             closeSkippedReason = "reopen evidence unavailable; holding close for a later pass";

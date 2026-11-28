@@ -1533,6 +1533,104 @@ describe("POST — close authority and reopen gate (#1727)", () => {
     expect(githubMocks.fetchReopenAfter).not.toHaveBeenCalled();
   });
 
+  it("confirms a close candidate with no cached row against the timeline and holds on a confirmed reopen", async () => {
+    // A close authority naming an issue Dispatch has never cached (or whose
+    // row was pruned after its close and reopened since) has no local reopen
+    // history: the bounded timeline read is its only evidence (#1730 review).
+    // A confirmed post-merge reopen goes through the gate, so the issue is
+    // also released to ready rather than parked.
+    mockBodyKeywordMerge();
+    githubMocks.fetchIssues.mockResolvedValue([
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: [{ name: "status/in-review" }] },
+    ]);
+    prismaMocks.issueFindMany.mockResolvedValue([]);
+    githubMocks.fetchReopenAfter.mockResolvedValueOnce(new Date("2026-10-04T12:00:00Z"));
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.issuesClosed).toBe(0);
+    expect(body.closesSkipped).toBe(1);
+    expect(githubMocks.fetchReopenAfter).toHaveBeenCalledWith(
+      "org/repo",
+      42,
+      new Date("2026-10-02T08:00:00Z"),
+    );
+    expect(reconciliationMocks.executeActions).toHaveBeenCalledWith(
+      [expect.objectContaining({ type: "set_status", label: "status/ready" })],
+      ["status/in-review"],
+    );
+    const skipAudit = prismaMocks.auditRows.find((row) => row.action === "reconcile_close_skipped");
+    expect(skipAudit?.notes).toContain("2026-10-04T12:00:00.000Z");
+  });
+
+  it("closes a close candidate with no cached row when the timeline holds no post-merge reopen", async () => {
+    // The timeline read answers: nothing reopened after the merge, so the
+    // uncached candidate closes like any other — with the live recheck still
+    // adjacent to the write.
+    mockBodyKeywordMerge();
+    githubMocks.fetchIssues.mockResolvedValue([
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: [{ name: "status/in-progress" }] },
+    ]);
+    prismaMocks.issueFindMany.mockResolvedValue([]);
+    githubMocks.fetchReopenAfter.mockResolvedValueOnce(null);
+    reconciliationMocks.executeActions.mockResolvedValue([
+      {
+        action: { type: "close_issue", issueNumber: 42, repoFullName: "org/repo", reason: "fixed" },
+        success: true,
+        beforeLabels: ["status/in-progress"],
+        afterLabels: [],
+      },
+    ]);
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.issuesClosed).toBe(1);
+    expect(body.closesSkipped).toBe(0);
+    expect(githubMocks.fetchReopenAfter).toHaveBeenCalledTimes(1);
+    expect(githubMocks.fetchIssue).toHaveBeenCalledWith("org/repo", 42);
+  });
+
+  it("holds a close candidate with no cached row when its timeline is unreadable", async () => {
+    // Fail closed: no cache row and no readable timeline means no evidence
+    // either way, so the bare merge authority gets no close and no label.
+    mockBodyKeywordMerge();
+    githubMocks.fetchIssues.mockResolvedValue([
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: [{ name: "status/in-progress" }] },
+    ]);
+    prismaMocks.issueFindMany.mockResolvedValue([]);
+    githubMocks.fetchReopenAfter.mockRejectedValueOnce(new Error("timeline 403"));
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.issuesClosed).toBe(0);
+    expect(body.closesSkipped).toBe(1);
+    expect(reconciliationMocks.executeActions).not.toHaveBeenCalled();
+    const skipAudit = prismaMocks.auditRows.find((row) => row.action === "reconcile_close_skipped");
+    expect(skipAudit?.notes).toContain("reopen evidence unavailable");
+    expect(skipAudit?.issueId).toBeNull();
+  });
+
+  it("holds a close candidate with no cached row and an unparseable merge time without a timeline read", async () => {
+    // No `since` bound to read and no local fallback: nothing can show the
+    // close would not override a maintainer, so it waits fail-closed.
+    mockBodyKeywordMerge({ merged_at: "not-a-date" });
+    githubMocks.fetchIssues.mockResolvedValue([
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: [{ name: "status/in-progress" }] },
+    ]);
+    prismaMocks.issueFindMany.mockResolvedValue([]);
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.closesSkipped).toBe(1);
+    expect(githubMocks.fetchReopenAfter).not.toHaveBeenCalled();
+    const skipAudit = prismaMocks.auditRows.find((row) => row.action === "reconcile_close_skipped");
+    expect(skipAudit?.notes).toContain("reopen evidence unavailable");
+  });
+
   it("skips a close the live issue already closed upstream", async () => {
     // The pass-start snapshot said open; the live re-read says otherwise.
     // Our close is redundant — it is dropped, recorded, and GitHub is not
@@ -1583,6 +1681,9 @@ describe("POST — close authority and reopen gate (#1727)", () => {
       { number: 42, title: "Crash on save", body: null, state: "open", labels: [{ name: "status/in-progress" }] },
     ]);
     prismaMocks.issueFindMany.mockResolvedValue([]);
+    // The uncached candidate first owes its bounded timeline read (#1730
+    // review); a clean timeline lets the close reach the live recheck.
+    githubMocks.fetchReopenAfter.mockResolvedValueOnce(null);
     githubMocks.fetchIssue.mockRejectedValueOnce(new Error("github 502"));
 
     const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));

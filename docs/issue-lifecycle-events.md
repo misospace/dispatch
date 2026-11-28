@@ -149,8 +149,12 @@ candidates that need it are read at most four at a time, since they are
 independent and a repo with many keyword merges should not serialize them): a
 confirmed reopen moves the evidence to the authoritative timestamp, the
 absence of one refutes the inflated stamp, and a timeline that cannot be
-read to completion leaves the withhold in place (fail closed). With that
-confirmation, the contract holds: a reopen that predates the merge does
+read to completion leaves the withhold in place (fail closed). A close
+candidate with no cached issue row at all (never synced, or pruned after its
+close and reopened since) has no local signal either way, so it gets that
+same bounded timeline confirmation before the close, and an unreadable read
+holds its close too — a missing cache row is never treated as "no reopen
+happened." With that confirmation, the contract holds: a reopen that predates the merge does
 not suppress, and one that postdates it withholds the close for that
 issue — no close is written, the pass records a `reconcile_close_skipped`
 audit row (keyed to the cached `issueId` when one exists, so it rides the
@@ -190,7 +194,8 @@ form and is accepted as a residual blind spot — sync never observed the closed
 state, so no `issue_reopened` event exists and the cached row carries no newer
 `closedAt`, and this pass closes again. The gate does not spend a timeline
 read per close candidate to cover it: a read is issued only where a stamp is
-actually in doubt, which bounds how many requests the pass can make, and those
+actually in doubt or no cache row exists at all, which bounds how many
+requests the pass can make, and those
 independent reads run through a pool of at most four so a repo with many
 keyword merges does not serialize the ones it does need. An erroneous
 re-close stays until a
