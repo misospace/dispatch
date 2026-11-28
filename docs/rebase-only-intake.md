@@ -143,9 +143,10 @@ deterministic-only consumer never sees:
 
 `semanticConflict` is the item's bounded semantic-conflict context (base ref,
 conflicted paths, bounded reason — the shape of the mechanical attempt's
-structured refusal). It is `null` until one is persisted on the row (the
-durable episode accounting). The context is transport evidence, never an
-authorization.
+structured refusal). The accepted mechanical refusal persists it (#1676, see
+[the model-repair phase](#the-model-repair-phase-and-the-ordinary-fallback-1676));
+an item without one ships `semanticConflict: null`. The context is transport
+evidence, never an authorization.
 
 ### What never changes
 
@@ -165,6 +166,89 @@ authorization.
   `UNKNOWN`. Model work rides the SAME serialized concurrency-1 rebase lane
   admission as mechanical work; it is not a second lane and not a bypass of
   frontier exclusivity.
+
+## The model-repair phase and the ordinary fallback (#1676)
+
+> **Issue:** [misospace/dispatch#1676](https://github.com/misospace/dispatch/issues/1676)
+>
+> **Date:** 2026-11-28
+
+A mechanical rebase worker stops when a conflict sits outside its rules. It
+reports a structured refusal, and Dispatch accepts the conflict as one episode.
+Issue #1675 settled that refusal and opened one ordinary fix attempt. This
+section puts the authorized model attempt in front of that ordinary attempt.
+
+### Two phases, in order
+
+1. **Model repair.** The deployment names a model worker
+   (`DISPATCH_REBASE_MODEL_AGENTS` holds at least one agent name, or a bare
+   `*`), and the linked parent issue classifies as `NOT_ESCALATED`. The first
+   accepted refusal then keeps the row on the REBASE lane. Dispatch settles the
+   mechanical receipt and stores the bounded conflict context in the new
+   `PrFixQueueItem.semanticConflict` column. That stored context is what marks
+   the row model-required, so the three authorization gates above defer it for
+   every other poll, and an authorized poll receives the model wall plus this
+   context. The named model worker must ALSO be in `DISPATCH_REBASE_AGENTS`:
+   the mechanical pool gates every REBASE hand-out, and the model pool only
+   widens what an eligible hand-out may do.
+2. **Ordinary fix-pr fallback.** A refusal that arrives while the CURRENT
+   episode already carries the stored context proves that a model-authorized
+   worker ran and could not resolve the conflict. Dispatch then transfers the
+   episode to one ordinary fix attempt, exactly as #1675 does, under the
+   existing attempt budgets.
+
+Dispatch takes the fallback on the FIRST refusal in three cases:
+
+- The deployment names no model worker. This is the pre-#1676 shape, and it
+  costs no extra parent read.
+- The parent classifies as `ESCALATED`, or the read cannot establish it
+  (`UNKNOWN`, fail closed). That includes a linked issue row that is no longer
+  present: an absent row proves nothing to a decision that commits a durable
+  model-required marker. The model path never touches frontier-classified work.
+- The refusal reports nothing usable: no file, no explanation, no base ref.
+
+### What each phase never does
+
+- A first refusal is never proof that a model attempted the work. The proof is
+  the stored context, and it counts only while it still matches the row's current
+  head. A new push is a new episode: it re-decides, the stale context stops
+  marking the row model-required, and it is never transported as current
+  evidence. Nothing bounces among deterministic rebase, model rebase, and
+  fix-pr for unchanged episode evidence.
+- The routing never crosses a frontier boundary. The model phase keeps the row's
+  lane, and the fallback re-derives it with `releaseLaneFromParentClass`, which
+  never demotes an exclusive lane. The transferred row is ordinary work, so its
+  own hand-out runs the #1503/#1569 lane gate. A deterministic failure grants no
+  frontier bypass.
+- Both phases share the #1675 fences: the exact live receipt, the unchanged
+  remote head, no other live writer, and one pinned compare-and-swap write. The
+  receipt dies with the write, so a duplicate report skips and mints nothing.
+- Both phases share one stagnation budget (#1543). Each consumed no-progress
+  attempt costs one unit, and exhaustion parks the row instead of opening
+  another attempt.
+- The episode writer stays the single writer of `semanticConflict`. Dispatch
+  never infers a conflict from a report's free text, and the context never
+  authorizes anything on its own.
+
+### What the worker and the operator see
+
+The report answer stays inside the vocabulary old clients already handle: a
+`blocked` report with `blockReason: "human_decision"` and a valid refusal
+answers `requeued` in both phases. The audit history separates them, so an
+operator can tell a model attempt apart from a model-free one.
+
+| History action | Meaning |
+|---|---|
+| `rebase_model_repair` | The mechanical attempt settled; the row is model-required and waits for an authorized poll. |
+| `rebase_transfer` | The episode moved to one ordinary fix attempt, either after the model phase or with no model worker authorized. |
+
+An operator who names a model pool but runs no authorized poller holds those
+rows in the REBASE lane on purpose: the conflict is outside the mechanical
+rules, so a mechanical offer would only refuse again. The idle reason of an
+ordinary poll names the deferred count (#1674). The operator ends the wait by
+running the authorized poller, or by taking the human decision themselves with
+`POST /api/pr-fix-queue/mark` (a `BLOCKED` or `PARKED` hold, which the standard
+needs-human and requeue paths already handle).
 
 ## The acknowledgment
 
@@ -235,6 +319,7 @@ The rebase worker pool is fail-closed. An unset or empty `DISPATCH_REBASE_AGENTS
 | New Courier declaring `rebase-model-executor:1` with an old Dispatch (pre-#1674) | The old server answers the model verdict `granted: false, reason: "unknown-capability"` and fails no request. The client must treat the not-granted verdict as "model-assisted rebase is unavailable here" and behave as deterministic-only. |
 | New Dispatch with a Courier declaring `rebase-model-executor:2` | The verdict is `granted: false, reason: "unsupported-version"`. The poll succeeds; model-required work defers for it. |
 | New Dispatch with a model-configured Courier that does not gate on the grant | Dispatch withholds the model wall and the `rebaseModel` block on mechanical offers (including frontier parents), but a resolver created from local deployment config can still run its configured model. Such a client is not a compatible peer for this contract: pair it with the model pool only after it validates the grant. |
+| New Dispatch (#1676) that names `DISPATCH_REBASE_MODEL_AGENTS`, with a Courier that never declares `rebase-model-executor:1` | The accepted refusal routes the episode to the model phase, and no poll can take it, so the row waits in the REBASE lane with `semanticConflict` persisted. Nothing hands model-required work to that client. Ordinary polls report the deferred count, and the operator either runs the authorized poller or takes the decision with `POST /api/pr-fix-queue/mark`. Name the pool only for a peer from step 5. |
 
 The rebase lane stays disabled until both peers support the contract.
 

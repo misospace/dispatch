@@ -63,16 +63,12 @@ export async function linkedIssueEscalationClassified(
   const escalationLane = getExplicitEscalationLane();
   if (!escalationLane) return "NOT_ESCALATED";
   try {
-    // The queue folds repo casing (#1145); Issue.repository.fullName keeps the
-    // GitHub casing — match case-insensitively instead of re-deriving the row.
-    const row = await client.issue?.findFirst({
-      where: {
-        repository: { fullName: { equals: normalizeQueueRepo(repo), mode: "insensitive" } },
-        number: issue,
-      },
-      select: { currentLane: true },
-    });
-    return row ? (laneMatchesConfigured(row.currentLane ?? null, escalationLane.id) ? "ESCALATED" : "NOT_ESCALATED") : "NOT_ESCALATED";
+    const currentLane = await findLinkedIssueLane(client, repo, issue);
+    return currentLane === undefined
+      ? "NOT_ESCALATED"
+      : laneMatchesConfigured(currentLane, escalationLane.id)
+        ? "ESCALATED"
+        : "NOT_ESCALATED";
   } catch (error) {
     console.warn("[pr-fix-queue] linked-issue escalation lookup failed; deferring classification as UNKNOWN (#1503)", {
       repo,
@@ -146,6 +142,79 @@ export async function linkedIssueEscalationClassifiedLocked(
     return laneMatchesConfigured(row.currentLane ?? null, escalationLane.id) ? "ESCALATED" : "NOT_ESCALATED";
   } catch (error) {
     console.warn("[pr-fix-queue] locked linked-issue escalation lookup failed; deferring classification as UNKNOWN (#1674)", {
+      repo,
+      issue,
+      errorType: error instanceof Error ? error.name : typeof error,
+    });
+    return "UNKNOWN";
+  }
+}
+
+/**
+ * The stored-lane fold the MODEL-capable rebase path applies before it reads the
+ * parent (#1674, shared with the #1676 episode routing): a row already carrying
+ * the exclusive lane is frontier-classified by itself, even when its linked
+ * issue row was pruned (the plain read treats a missing row as definitive
+ * NOT_ESCALATED). Returns null when the row's own lane says nothing, so the
+ * caller must read the parent. One implementation, because the two readers must
+ * never drift on what "frontier by its own authority" means.
+ */
+export function storedEscalatedParentClass(lane: unknown): LinkedIssueEscalationClassification | null {
+  return lane === "ESCALATED" ? "ESCALATED" : null;
+}
+
+/** The linked issue's stored lane; `undefined` when no row matches, `null` for a row without a lane. */
+async function findLinkedIssueLane(
+  client: Pick<PrFixQueueClient, "issue">,
+  repo: string,
+  issue: number,
+): Promise<string | null | undefined> {
+  // The queue folds repo casing (#1145); Issue.repository.fullName keeps the
+  // GitHub casing — match case-insensitively instead of re-deriving the row.
+  const row = await client.issue?.findFirst({
+    where: {
+      repository: { fullName: { equals: normalizeQueueRepo(repo), mode: "insensitive" } },
+      number: issue,
+    },
+    select: { currentLane: true },
+  });
+  return row ? (row.currentLane ?? null) : undefined;
+}
+
+/**
+ * The STRICT parent read the MODEL-repair phase commits on (#1676). Identical to
+ * the plain tri-state except that an ABSENT parent row is `UNKNOWN`, never
+ * `NOT_ESCALATED`. Absence is a definitive answer for the DETERMINISTIC paths (a
+ * pruned cache row cannot conceal a live frontier parent, and treating it as
+ * UNKNOWN there would strand QUEUED items forever), but the model phase writes a
+ * durable MODEL-REQUIRED marker that only the LOCKED issuance read releases —
+ * and that read already treats absence as UNKNOWN, because `SELECT ... FOR
+ * SHARE` on a missing row locks nothing. Deciding the phase on the lenient read
+ * would strand the row: model polls defer on the locked UNKNOWN while
+ * deterministic polls defer on the marker. This read carries no lock (it runs
+ * outside a transaction), so an absent parent simply proves nothing either way,
+ * and the phase declines.
+ */
+export async function linkedIssueEscalationClassifiedForModelPhase(
+  client: Pick<PrFixQueueClient, "issue">,
+  repo: string,
+  issue: number | null | undefined,
+): Promise<LinkedIssueEscalationClassification> {
+  if (issue === null || issue === undefined) return "NOT_ESCALATED";
+  const escalationLane = getExplicitEscalationLane();
+  if (!escalationLane) return "NOT_ESCALATED";
+  try {
+    const currentLane = await findLinkedIssueLane(client, repo, issue);
+    if (currentLane === undefined) {
+      console.warn("[pr-fix-queue] linked issue row absent; the model-repair phase declines it as UNKNOWN (#1676)", {
+        repo,
+        issue,
+      });
+      return "UNKNOWN";
+    }
+    return laneMatchesConfigured(currentLane, escalationLane.id) ? "ESCALATED" : "NOT_ESCALATED";
+  } catch (error) {
+    console.warn("[pr-fix-queue] linked-issue escalation lookup failed; the model-repair phase declines it as UNKNOWN (#1676)", {
       repo,
       issue,
       errorType: error instanceof Error ? error.name : typeof error,

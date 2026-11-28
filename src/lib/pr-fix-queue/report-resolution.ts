@@ -509,6 +509,18 @@ export async function resolvePrFixFromAgentReport(
           attemptGeneration: attempt.generation,
         };
       }
+      if (transfer.action === "model_repair") {
+        return {
+          matched: true,
+          // Not "blocked": the mechanical attempt is settled and the episode is
+          // re-queued as MODEL-REQUIRED work for a model-authorized poll. The
+          // report vocabulary stays what old clients already handle.
+          action: "requeued",
+          itemId: existing.id ?? null,
+          reason: transfer.reason,
+          attemptGeneration: attempt.generation,
+        };
+      }
       if (transfer.action === "transferred") {
         return {
           matched: true,

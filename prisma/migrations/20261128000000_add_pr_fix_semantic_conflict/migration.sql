@@ -1,0 +1,14 @@
+-- #1676: persist the accepted semantic-conflict episode context so the
+-- model-assisted rebase lane (#1674) has a producer. The mechanical executor's
+-- bounded refusal is written here by the single episode writer
+-- (pr-fix-queue/rebase-transfer.ts). Presence marks the REBASE row MODEL-REQUIRED:
+-- only a poll granted `rebase-model-executor:1` whose agent is in
+-- DISPATCH_REBASE_MODEL_AGENTS receives it, and that hand-out transports this
+-- context. Written with `rebaseEpisodeId` it also marks the episode's model
+-- phase, so a refusal for the SAME episode is the bounded ordinary fix-pr
+-- fallback rather than a second model attempt or a bounce.
+--
+-- Additive only: one nullable column, no drop or type change, so
+-- `prisma migrate deploy` is safe on a database already at
+-- 20261120000000_add_pr_fix_rebase_episode.
+ALTER TABLE "PrFixQueueItem" ADD COLUMN "semanticConflict" JSONB;

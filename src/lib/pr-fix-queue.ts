@@ -10,7 +10,7 @@ export { invalidateStaleAgentLabelClaimants } from "./pr-fix-queue/claimant-inva
 export type { PrFixOwnershipMode, PrFixOwnershipRow, PrFixOwnershipRefusal } from "./pr-fix-queue/handout-ownership";
 export { parseEnqueuePrFixInput, parseMarkPrFixInput, parseAckPrFixHandoutInput, parseRequeuePrFixInput } from "./pr-fix-queue/inputs";
 export type { EnqueuePrFixInput, CreateLinkedPrFixInput, MarkPrFixInput, RequeuePrFixInput, AckPrFixHandoutInput, AckPrFixHandoutResult } from "./pr-fix-queue/inputs";
-export { getExplicitEscalationLane, linkedIssueEscalationClassified, linkedIssueEscalationClassifiedLocked, enforcePrFixHandoutLaneExclusivity } from "./pr-fix-queue/escalation-lane";
+export { getExplicitEscalationLane, linkedIssueEscalationClassified, linkedIssueEscalationClassifiedForModelPhase, linkedIssueEscalationClassifiedLocked, storedEscalatedParentClass, enforcePrFixHandoutLaneExclusivity } from "./pr-fix-queue/escalation-lane";
 export type { LinkedIssueEscalationClassification } from "./pr-fix-queue/escalation-lane";
 export { buildPrFixBlockedContext } from "./pr-fix-queue/evidence";
 export type { EvidenceObservation } from "./pr-fix-queue/evidence";

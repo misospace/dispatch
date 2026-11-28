@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { normalizePrFixType } from "@/types";
 import { prFixOwnershipEvidence } from "../pr-fix-ownership";
-import { readRebaseSemanticConflict } from "../pr-fix-rebase";
+import { scopedRebaseSemanticConflict } from "../pr-fix-rebase";
 import { type PrFixQueueClient } from "./client";
 import { prFixAckLivenessMs, prFixHandoutTimeoutMs } from "./shared";
 
@@ -380,12 +380,14 @@ export function toAgentQueuePrFixItem(item: any) {
     // any polling agent; null/released/settled dispatch normally). Carried so
     // the next-task route can honor the deferral before any write.
     ciParkState: item.ciParkState ?? null,
-    // #1674: the item's bounded semantic-conflict context, read defensively
-    // (null on every row until a producer persists one). Marks the row
+    // #1674: the item's bounded semantic-conflict context, read defensively and
+    // scoped to the conflict it still describes (#1676) — a context left from a
+    // superseded episode reads as none, so it never marks a fresh mechanical
+    // item MODEL-REQUIRED and never ships as current evidence. Marks the row
     // MODEL-REQUIRED: only a poll granted `rebase-model-executor:1` whose
     // agent is in the operator model-worker pool may receive it, and the
     // granted hand-out transports the context to the model worker.
-    semanticConflict: readRebaseSemanticConflict(item),
+    semanticConflict: scopedRebaseSemanticConflict(item),
     queuedAt: item.queuedAt,
     updatedAt: item.updatedAt,
     rankingReason: `queued PR review-fix item (${fixType})`,

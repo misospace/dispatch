@@ -8,6 +8,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } from "@/test/route-helpers";
 import { resetLaneConfig, setLaneConfig } from "@/lib/lane-config";
+import { rebaseEpisodeIdentity } from "@/lib/pr-fix-queue";
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 // #1569: the ownership gate refuses a row with no recorded claimant in every
@@ -599,8 +600,13 @@ const MODEL_DECLARATION = "?capabilities=rebase-model-executor:1";
 
 /** A REBASE row carrying a bounded semantic-conflict context (model-required). */
 function modelRequiredRebaseRow(pr = 77) {
+  // A real REBASE row knows the head it conflicted at, and #1676 scopes the
+  // persisted context to that head, so the fixture carries both together —
+  // derived with the producer's own helper so it cannot drift.
+  const row = { ...rebaseRow(pr), headSha: "b".repeat(40) };
   return {
-    ...rebaseRow(pr),
+    ...row,
+    rebaseEpisodeId: rebaseEpisodeIdentity(row.repo, row.pr, row.branch, row.headSha),
     semanticConflict: {
       base: "main",
       files: ["src/enrich_flux.go"],
@@ -1046,5 +1052,81 @@ describe("model-assisted rebase — the parent-classification boundary (#1674 re
     expect(body.prFixItem).toBeUndefined();
     expect(row.agentHandouts).toEqual([]);
     expect(body.reason).toContain("model-required rebase candidate");
+  });
+});
+
+/**
+ * #1676 scoping regression: the persisted semantic-conflict context marks a
+ * row MODEL-REQUIRED only while its `rebaseEpisodeId` still matches the row's
+ * current head. A context left over from a superseded head (a new push is a
+ * new episode) reads as none, so the row is ordinary mechanical work again —
+ * never deferred behind a model gate it no longer needs, and never shipped
+ * with stale evidence to a model worker.
+ */
+describe("superseded-head context is not model-required (#1676 scoping)", () => {
+  afterEach(() => {
+    delete process.env.DISPATCH_REBASE_MODEL_AGENTS;
+  });
+
+  /** A REBASE row whose persisted context keys an OLDER head than the row's. */
+  function staleContextRebaseRow(pr = 97) {
+    const row = { ...rebaseRow(pr), headSha: "c".repeat(40) };
+    return {
+      ...row,
+      // Derived with the producer's own helper, pointing at the SUPERSEDED
+      // head — the shape a new push leaves behind before the next settlement.
+      rebaseEpisodeId: rebaseEpisodeIdentity(row.repo, row.pr, row.branch, "d".repeat(40)),
+      semanticConflict: {
+        base: "main",
+        files: ["src/stale_episode.go"],
+        reason: "context from a superseded conflict episode",
+      },
+    };
+  }
+
+  it("the deterministic-only poll receives it as ordinary mechanical work, with no model transport", async () => {
+    delete process.env.DISPATCH_REBASE_MODEL_AGENTS;
+    const row = staleContextRebaseRow();
+    mocks.prFixRows.push(row);
+
+    const body = await (await poll(OLD_COURIER_REBASE_ONLY)).json();
+
+    // Before the scoping fix this row was deferred as model-required
+    // (type idle) and starved the concurrency-1 rebase lane.
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem.fixType).toBe("REBASE");
+    expect("rebaseModel" in body).toBe(false);
+    expect(body.reasons).toEqual([
+      "Mechanical rebase: PR dirty against base (#1327)",
+      "MECHANICALLY ONLY",
+    ]);
+    expect(JSON.stringify(body.reasons)).not.toContain("CONFIGURED MODEL COORDINATOR");
+    expect(row.agentHandouts).toEqual([`${AGENT}@1`]);
+  });
+
+  it("an authorized model poll receives the row WITHOUT the stale context in its transport block", async () => {
+    process.env.DISPATCH_REBASE_MODEL_AGENTS = AGENT;
+    const row = staleContextRebaseRow(98);
+    mocks.prFixRows.push(row);
+
+    const body = await (await poll(NEW_COURIER_REBASE_ONLY)).json();
+
+    expect(body.type).toBe("followup-pr");
+    expect(row.agentHandouts).toEqual([`${AGENT}@1`]);
+    // The scoped read drops the superseded evidence: the model worker gets a
+    // null context, never the previous episode's stale file list.
+    expect(body.rebaseModel).toEqual({
+      capability: "rebase-model-executor",
+      version: 1,
+      semanticConflict: null,
+    });
+    const reasons = body.reasons.join("\n");
+    expect(reasons).not.toContain("src/stale_episode.go");
+    // Note (real behavior, not a regression): the MODEL wall itself is chosen
+    // by poll authorization + pool + a NOT_ESCALATED locked parent read
+    // (route.ts modelAssistRebase), not by the row's context — an authorized
+    // model poll may resolve even a mechanical conflict on the model. The
+    // scoping fix is what the transport block carries: no stale evidence.
+    expect(JSON.stringify(body.rebaseModel)).not.toContain("src/stale_episode.go");
   });
 });
