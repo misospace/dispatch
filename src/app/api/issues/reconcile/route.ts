@@ -22,6 +22,7 @@ import {
   type PrMergeObservation,
 } from "@/lib/issue-lifecycle";
 import { isBacklogLane, assertValidLaneForWrite } from "@/lib/lane-config";
+import { reconcileAnnotationReemitMs } from "@/lib/ownership-reconciliation";
 import { computeLinkedPrHealth, toPersistedLinkedPrHealth, type LinkedPrHealth } from "@/lib/linked-pr-health";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { reconcileStalePrFixItems, reconcileDeletedPrFixItems } from "@/lib/pr-fix-queue";
@@ -46,6 +47,58 @@ async function runDeletedPrFixReap(): Promise<{ checked: number; markedStale: nu
     console.warn(`[pr-fix-queue] deleted-PR reap failed: ${message}`);
     return { checked: 0, markedStale: 0, errored: 1 };
   }
+}
+
+/**
+ * Record a #1727 withheld close. The close authority stays in the fetched
+ * window and the issue stays open, so a deliberately-reopened issue would
+ * otherwise earn an identical skip row every pass. Mirrors the #1363
+ * annotation dedupe: an annotation identical to the issue's latest skip is
+ * suppressed until the shared re-emit window elapses, then re-emitted once
+ * as a fresh confirmation; a changed reason is always written. A failed
+ * lookup falls through to the write — the skip stays best-effort-logged,
+ * never skipped.
+ */
+async function recordCloseSkippedAudit(input: {
+  repoFullName: string;
+  issueNumber: number;
+  labels: string[];
+  reason: string;
+}): Promise<void> {
+  try {
+    const latest = await prisma.auditLog.findFirst({
+      where: {
+        actor: "reconciler",
+        action: "reconcile_close_skipped",
+        repoFullName: input.repoFullName,
+        issueNumber: input.issueNumber,
+      },
+      orderBy: { createdAt: "desc" },
+      select: { notes: true, createdAt: true },
+    });
+    if (
+      latest &&
+      latest.notes === input.reason &&
+      Date.now() - latest.createdAt.getTime() < reconcileAnnotationReemitMs()
+    ) {
+      return;
+    }
+  } catch {
+    // Dedupe is an optimization; never let its lookup mask the annotation.
+  }
+
+  await prisma.auditLog.create({
+    data: {
+      actor: "reconciler",
+      action: "reconcile_close_skipped",
+      repoFullName: input.repoFullName,
+      issueNumber: input.issueNumber,
+      beforeLabels: input.labels,
+      afterLabels: input.labels,
+      success: true,
+      notes: input.reason,
+    },
+  });
 }
 
 /**
@@ -465,15 +518,18 @@ export async function POST(request: Request) {
         // names before any close decision. Two observations prove a merge's
         // close was overridden: a sync-recorded `issue_reopened` lifecycle
         // event, and the cache row's own `closedAt` when sync has not seen
-        // the reopen yet (GitHub shows the issue open again while the cached
-        // close lingers — a reopen resets GitHub's `closed_at` to null, so
-        // the cache is the observation until sync catches up).
+        // the reopen yet (GitHub nulls `closed_at` on reopen, so the cache
+        // holds a close newer than the merge until sync catches up). The
+        // cached-close signal cannot date a reopen of an issue that closed
+        // before the merge — that one waits for sync's `issue_reopened`
+        // event, bounded by the sync interval.
         const closeAuthorityIssueRows = new Map<number, (typeof existingIssues)[number]>();
         for (const issueNum of mergedCloseAuthority.keys()) {
           const row = existingIssueByNumber.get(issueNum);
           if (row) closeAuthorityIssueRows.set(issueNum, row);
         }
         let reopenEvidence = new Map<number, Date>();
+        let reopenEvidenceError: string | null = null;
         if (closeAuthorityIssueRows.size > 0) {
           const idsByNumber = new Map<number, string>();
           for (const [issueNum, row] of closeAuthorityIssueRows) idsByNumber.set(issueNum, row.id);
@@ -481,8 +537,9 @@ export async function POST(request: Request) {
             reopenEvidence = await loadReopenEvidence(prisma, idsByNumber);
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
+            reopenEvidenceError = message;
             console.warn(
-              `${repo.fullName}: reopen evidence lookup failed (${message}); closes fall back to merge evidence alone`,
+              `${repo.fullName}: reopen evidence lookup failed (${message}); closes are held until a pass can read it`,
             );
           }
           for (const [issueNum, row] of closeAuthorityIssueRows) {
@@ -515,30 +572,40 @@ export async function POST(request: Request) {
             reopenEvidence,
           );
 
-          // #1727: a withheld close is recorded (audit + response count) and
-          // otherwise left alone — no GitHub write, no label churn. The
-          // merge itself still earns its `pr_merged` evidence below:
-          // correlation recording stays decoupled from the close.
-          if (result.closeSkippedReason) {
+          // #1727: a withheld close is recorded and otherwise left alone —
+          // no GitHub write, no label churn. The merge itself still earns
+          // its `pr_merged` evidence below: correlation recording stays
+          // decoupled from the close. Two sources withhold: the reopen gate
+          // inside `reconcileIssue`, and a failed reopen-evidence read —
+          // without the stream there is no proof the close would not
+          // override a maintainer, and a close held for one pass is retried
+          // by the next (waiting costs freshness, never correctness).
+          let closeSkippedReason = result.closeSkippedReason ?? null;
+          if (
+            !closeSkippedReason &&
+            reopenEvidenceError &&
+            mergedCloseAuthority.has(issue.number) &&
+            result.actions.some((a) => a.type === "close_issue")
+          ) {
+            closeSkippedReason = `reopen evidence unavailable (${reopenEvidenceError}); holding close for a later pass`;
+          }
+          const actions = closeSkippedReason
+            ? result.actions.filter((a) => a.type !== "close_issue")
+            : result.actions;
+          if (closeSkippedReason) {
             totalClosesSkipped++;
-            await prisma.auditLog.create({
-              data: {
-                actor: "reconciler",
-                action: "reconcile_close_skipped",
-                repoFullName: repo.fullName,
-                issueNumber: issue.number,
-                beforeLabels: currentLabels,
-                afterLabels: currentLabels,
-                success: true,
-                notes: result.closeSkippedReason,
-              },
+            await recordCloseSkippedAudit({
+              repoFullName: repo.fullName,
+              issueNumber: issue.number,
+              labels: currentLabels,
+              reason: closeSkippedReason,
             });
           }
 
           // Execute actions against GitHub
-          if (result.actions.length > 0) {
+          if (actions.length > 0) {
             const executed = await executeActions(
-              result.actions.map((a) => ({ ...a, repoFullName: repo.fullName })),
+              actions.map((a) => ({ ...a, repoFullName: repo.fullName })),
               currentLabels,
             );
 

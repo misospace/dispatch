@@ -135,14 +135,22 @@ A merge is completion evidence for the close it caused, not a standing
 license to close (#1727). Before closing, the reconciler checks for a
 reopen recorded after the merge: the newest `issue_reopened` lifecycle
 event, or the cached issue row's `closedAt` when sync has not yet observed
-the reopen (GitHub nulls `closed_at` on reopen, so the cache holds the
-observation until sync catches up). A reopen that postdates the close-
-authority merge withholds the close: no GitHub write happens, the pass
-records a `reconcile_close_skipped` audit row, and the response counts it
-in `closesSkipped`. The merge evidence still records — correlation
-recording stays decoupled from closing. The close authority per issue is
-the newest body-keyword merge, so an older merge cannot make a legitimate
-newer fix look like a re-close.
+the reopen (GitHub nulls `closed_at` on reopen, so the cache holds a close
+newer than the merge until sync catches up). Two bounds on that evidence:
+reopening an issue that closed *before* the merge stays invisible until
+sync records the `issue_reopened` event — bounded by the sync interval;
+and if the reopen read itself fails, every close the authority names is
+held for a later pass (fail closed — waiting costs freshness, never
+correctness). A reopen that postdates the close-authority merge withholds
+the close for that issue: no GitHub write happens, the pass records a
+`reconcile_close_skipped` audit row, and the response counts it in
+`closesSkipped`. The withheld pass also skips that issue's open-PR status
+labeling — the linked-PR health snapshot still persists. Identical skip
+annotations are suppressed until the shared #1363 re-emit window elapses,
+so a deliberately-reopened issue does not earn a row every pass. The merge
+evidence still records — correlation recording stays decoupled from
+closing. The close authority per issue is the newest body-keyword merge,
+so an older merge cannot make a legitimate newer fix look like a re-close.
 
 Merge recording is decoupled from the reconcile action loop: a linked merge
 records whether the issue is open or closed and whether the close action

@@ -21,6 +21,10 @@ const { mocks, prismaMocks, githubMocks, configMocks, reconciliationMocks } = vi
     issueLaneCreate: vi.fn((_args: { data: any }) => Promise.resolve({} as any)),
     transaction: vi.fn(async (ops: unknown[]) => Promise.all(ops as Promise<unknown>[])),
     auditLogCreate: vi.fn((_args: any) => Promise.resolve({} as any)),
+    // #1727: the skip-annotation dedupe read; defaults to "no prior skip" so
+    // the first annotation always writes.
+    auditLogFindFirst: vi.fn(async (_args?: any) => null as any),
+    auditRows: [] as Array<Record<string, any>>,
     prFixQueueItemFindMany: vi.fn(() => Promise.resolve([] as any)),
     prFixQueueItemUpdateMany: vi.fn(() => Promise.resolve({ count: 0 } as any)),
     lifecycleRows: [] as Array<Record<string, any>>,
@@ -47,7 +51,14 @@ const { mocks, prismaMocks, githubMocks, configMocks, reconciliationMocks } = vi
 
 vi.mock("@/lib/prisma", () => ({
   prisma: {
-    auditLog: { findMany: mocks.auditLogFindMany, create: prismaMocks.auditLogCreate },
+    auditLog: {
+      findMany: mocks.auditLogFindMany,
+      findFirst: prismaMocks.auditLogFindFirst,
+      create: vi.fn(async (args: any) => {
+        prismaMocks.auditRows.push({ ...args.data, createdAt: new Date() });
+        return prismaMocks.auditLogCreate(args);
+      }),
+    },
         issue: { findMany: prismaMocks.issueFindMany, update: prismaMocks.issueUpdate },
         issueLane: { create: prismaMocks.issueLaneCreate },
         $transaction: prismaMocks.transaction,
@@ -1070,6 +1081,7 @@ describe("POST — close authority and reopen gate (#1727)", () => {
     resetRateLimits();
     vi.clearAllMocks();
     prismaMocks.lifecycleRows.length = 0;
+    prismaMocks.auditRows.length = 0;
     mocks.acquireLock.mockResolvedValue({ locked: true, runId: "test-run" });
     mocks.releaseLock.mockResolvedValue(undefined);
     mocks.reconcileDeletedPrFixItems.mockResolvedValue({ checked: 0, markedStale: 0, errored: 0 });
@@ -1083,6 +1095,18 @@ describe("POST — close authority and reopen gate (#1727)", () => {
         .filter((row) => row.kind === where.kind && where.issueId.in.includes(row.issueId))
         .map((row) => ({ issueId: row.issueId, occurredAt: row.occurredAt })),
     );
+    // Faithful latest-skip read over the shared audit rows, backing the
+    // #1363-style annotation dedupe.
+    prismaMocks.auditLogFindFirst.mockImplementation(async ({ where }: any) => {
+      const matches = prismaMocks.auditRows.filter(
+        (row) =>
+          (where.actor === undefined || row.actor === where.actor) &&
+          (where.action === undefined || row.action === where.action) &&
+          (where.repoFullName === undefined || row.repoFullName === where.repoFullName) &&
+          (where.issueNumber === undefined || row.issueNumber === where.issueNumber),
+      );
+      return matches.length > 0 ? matches[matches.length - 1] : null;
+    });
   });
 
   function mockBodyKeywordMerge(overrides: Record<string, unknown> = {}) {
@@ -1186,14 +1210,19 @@ describe("POST — close authority and reopen gate (#1727)", () => {
     // Evidence stays decoupled: the merge still records despite the skip.
     expect(prismaMocks.lifecycleRows.filter((row) => row.kind === "pr_merged")).toHaveLength(1);
 
-    // A second pass replays the same decision: still no close, and the same
-    // single pr_merged row.
+    // A second pass replays the same decision: still no close, the same
+    // single pr_merged row, and — #1363-style — the identical skip
+    // annotation is not re-written every pass.
     const second = await (
       await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }))
     ).json();
     expect(second.issuesClosed).toBe(0);
+    expect(second.closesSkipped).toBe(1);
     expect(reconciliationMocks.executeActions).not.toHaveBeenCalled();
     expect(prismaMocks.lifecycleRows.filter((row) => row.kind === "pr_merged")).toHaveLength(1);
+    expect(
+      prismaMocks.auditRows.filter((row) => row.action === "reconcile_close_skipped"),
+    ).toHaveLength(1);
   });
 
   it("does not re-close when the cached row records a close after the merge", async () => {
@@ -1212,6 +1241,31 @@ describe("POST — close authority and reopen gate (#1727)", () => {
     expect(body.issuesClosed).toBe(0);
     expect(body.closesSkipped).toBe(1);
     expect(reconciliationMocks.executeActions).not.toHaveBeenCalled();
+  });
+
+  it("holds the close when the reopen-evidence read fails (fail closed)", async () => {
+    // Without the reopen stream there is no proof a close would not override
+    // a maintainer. The close is repeatable, so the pass holds it and the
+    // next pass retries; a lifecycle-table fault must not re-open the
+    // re-close window.
+    mockBodyKeywordMerge();
+    githubMocks.fetchIssues.mockResolvedValue([
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: ["status/in-review"] },
+    ]);
+    mockIssueRows([{ id: "issue-42", number: 42 }]);
+    prismaMocks.lifecycleEventFindMany.mockRejectedValueOnce(new Error("lifecycle table unavailable"));
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.issuesClosed).toBe(0);
+    expect(body.closesSkipped).toBe(1);
+    expect(reconciliationMocks.executeActions).not.toHaveBeenCalled();
+    const skipAudit = prismaMocks.auditRows.find((row) => row.action === "reconcile_close_skipped");
+    expect(skipAudit?.notes).toContain("reopen evidence unavailable");
+
+    // Merge evidence still records: the withhold touches only the close.
+    expect(prismaMocks.lifecycleRows.filter((row) => row.kind === "pr_merged")).toHaveLength(1);
   });
 
   it("closes when the recorded close predates the merge", async () => {
