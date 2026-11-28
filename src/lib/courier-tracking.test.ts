@@ -298,4 +298,44 @@ describe("fetchContributionStatus", () => {
       expect(result.diagnostic).toContain("[scrubbed-endpoint]");
     }
   });
+
+  // A derived-URL echo can recompose the query through `searchParams`, turning
+  // `%20` into `+`; the scrubber must know that serialization too.
+  it("scrubs a URLSearchParams-recomposed query credential echoed in a fetch failure", async () => {
+    const queryConfig = {
+      ...okConfig,
+      statusBase: new URL(SURFACE),
+      credentialSurface: new URL(`${SURFACE}?auth=demo%20secret`),
+    };
+    const echoed = new URL(`${SURFACE}/run-1?auth=demo%20secret`);
+    echoed.searchParams.set("namespace", "ns");
+    expect(echoed.search).toBe("?auth=demo+secret&namespace=ns");
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError(`Failed to fetch ${echoed.href}`)));
+    const result = await fetchContributionStatus("run-1", "ns", queryConfig);
+    expect(result).toMatchObject({ outcome: "unavailable" });
+    if (result.outcome === "unavailable") {
+      expect(result.diagnostic).not.toContain("demo+secret");
+      expect(result.diagnostic).not.toContain("demo%20secret");
+      expect(result.diagnostic).toContain("[scrubbed-endpoint]");
+    }
+  });
+
+  // Raw-configuration echoes can keep host spellings (case, default port) that
+  // the URL parser normalized away; the `@`-anchored userinfo form still scrubs.
+  it("scrubs userinfo echoed with host casing or a default port the parser normalized away", async () => {
+    const credConfig = {
+      ...okConfig,
+      statusBase: new URL("https://user:secretpw@courier.internal/v1/contributions"),
+      credentialSurface: new URL("https://user:secretpw@COURIER.internal:443/v1/contributions"),
+    };
+    const echoed =
+      "Failed to fetch https://user:secretpw@COURIER.internal:443/v1/contributions/run-1?namespace=ns";
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError(echoed)));
+    const result = await fetchContributionStatus("run-1", "ns", credConfig);
+    expect(result).toMatchObject({ outcome: "unavailable" });
+    if (result.outcome === "unavailable") {
+      expect(result.diagnostic).not.toContain("secretpw");
+      expect(result.diagnostic).toContain("[scrubbed-endpoint]");
+    }
+  });
 });

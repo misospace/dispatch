@@ -194,6 +194,30 @@ describe("scrubEndpoint", () => {
     );
   });
 
+  it("scrubs a URLSearchParams-recomposed echo of a configured pair", () => {
+    // `searchParams.set()` recomposes the whole query in form-urlencoded
+    // spelling, so a `%20` value echoes back as `+` and matches neither the
+    // configured nor the decoded form.
+    const endpoint = new URL("https://courier.internal/v1/contributions?auth=demo%20secret");
+    const echoed = new URL(endpoint.href);
+    echoed.searchParams.set("namespace", "prod");
+    expect(echoed.search).toBe("?auth=demo+secret&namespace=prod");
+    const scrubbed = scrubEndpoint(`request to ${echoed.href} failed`, endpoint);
+    expect(scrubbed).not.toContain("demo+secret");
+    expect(scrubbed).not.toContain("demo%20secret");
+    expect(scrubbed).not.toContain("demo secret");
+    expect(scrubbed).toContain("[scrubbed-endpoint]");
+  });
+
+  it("scrubs userinfo echoed in the raw host spelling the parser normalized away", () => {
+    // Uppercase host and an explicit default port are normalized off
+    // `endpoint.host`, so userinfo must scrub at its own `@` anchor.
+    const endpoint = new URL("https://user:secretpw@courier.internal:443/v1/contributions");
+    expect(
+      scrubEndpoint("failed for https://user:secretpw@COURIER.internal:443/v1/contributions", endpoint),
+    ).not.toContain("secretpw");
+  });
+
   it("leaves unrelated text untouched, is idempotent, and no-ops on empty", () => {
     const endpoint = new URL("https://courier.internal/v1/contributions");
     const plain = "courier admission rejected with HTTP 422: lane unknown";
@@ -394,6 +418,20 @@ describe("submitAdmission", () => {
       expect(result.diagnostic).not.toContain("courier.internal");
       expect(result.diagnostic).toContain("[scrubbed-endpoint]");
       expect(result.diagnostic).toContain("redirect refused");
+    }
+  });
+
+  it("scrubs a URLSearchParams-recomposed endpoint echo in a fetch failure", async () => {
+    const endpoint = new URL("https://courier.internal/v1/contributions?auth=demo%20secret");
+    const echoed = new URL(endpoint.href);
+    echoed.searchParams.set("namespace", "prod");
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError(`Failed to fetch ${echoed.href}`)));
+    const result = await submitAdmission(FIELDS, { ...config, endpoint });
+    expect(result).toMatchObject({ outcome: "uncertain", timeout: false });
+    if (result.outcome === "uncertain") {
+      expect(result.diagnostic).not.toContain("demo+secret");
+      expect(result.diagnostic).not.toContain("demo secret");
+      expect(result.diagnostic).toContain("Failed to fetch");
     }
   });
 });

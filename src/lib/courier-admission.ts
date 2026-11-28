@@ -186,17 +186,23 @@ function tryDecodeComponent(value: string): string {
  * whole request URL, and `redactSecret`'s exact-token strip alone cannot cover
  * the other secrets inside that URL.
  *
- * Every candidate form carries structural context (a scheme, `@host`, or `?`),
- * so scrubbing removes the URL without mangling unrelated diagnostic text — a
- * bare host is never scrubbed, since it is not a secret and a DNS/connect error
- * that names only the host carries no credential. Forms are removed longest-first
- * so a whole-URL echo is gone before its parts. Both the normalized (`URL.href`)
- * and the operator-typed (decoded userinfo) spellings are covered, since a
- * runtime may echo the raw configuration string. The query is scrubbed whole
- * AND pair-by-pair, because a derived-URL echo can carry a configured pair
- * behind another parameter (`?namespace=…&token=…`), where only the delimiter-
- * prefixed pair form matches. Idempotent: every form holds a `:`, `@`, `?`, or
- * `&`, and the `[scrubbed-endpoint]` placeholder holds none.
+ * Every candidate form carries structural context (a scheme, a trailing `@`, or
+ * `?`/`&`), so scrubbing removes the URL without mangling unrelated diagnostic
+ * text — a bare host is never scrubbed, since it is not a secret and a
+ * DNS/connect error that names only the host carries no credential. Forms are
+ * removed longest-first so a whole-URL echo is gone before its parts. Raw-
+ * configuration echoes are covered per credential-bearing component, not by
+ * matching the whole authority string: userinfo is scrubbed at its own `@`
+ * anchor (normalized AND operator-typed decoded spellings), so host casing or
+ * an explicit default port that the URL parser normalized away cannot spare it,
+ * and query pairs are scrubbed in every ordinary serialization the value can
+ * re-echo in — configured percent-encoded, fully decoded, and form-urlencoded
+ * (`searchParams.set()` recomposition, where a space becomes `+`). Query pairs
+ * stay delimiter-anchored (`?`/`&`), because a derived URL echo can carry a
+ * configured pair behind another parameter (`?namespace=…&token=…`). Arbitrary
+ * malicious re-encodings are out of scope.
+ * Idempotent: every form holds a `:`, `@`, `?`, or `&`, and the
+ * `[scrubbed-endpoint]` placeholder holds none.
  */
 export function scrubEndpoint(text: string, endpoint: URL): string {
   if (!text) return text;
@@ -226,6 +232,16 @@ export function scrubEndpoint(text: string, endpoint: URL): string {
     add(`${endpoint.protocol}//${rawAuthority}`);
     add(rawAuthority);
     add(`//${rawAuthority}`);
+    // Userinfo on its own `@` anchor: a raw echo can carry a host spelling the
+    // parser normalized away (case-folded, explicit default port), so the
+    // userinfo must not be bound to `endpoint.host` to be scrubbed. For a
+    // passwordless config the username IS the credential (token-as-user basic
+    // auth), so the bare `user@` form is intended; worst case it over-scrubs an
+    // email-shaped string, which is fail-safe for a diagnostic scrubber.
+    add(`${endpoint.username}${endpoint.password ? `:${endpoint.password}` : ""}@`);
+    add(`${tryDecodeComponent(endpoint.username)}${
+      endpoint.password ? `:${tryDecodeComponent(endpoint.password)}` : ""
+    }@`);
   }
   add(endpoint.origin);
   // Query forms keep a `?`/`&` anchor: a scheme-less/`?`-less token would be a
@@ -244,6 +260,15 @@ export function scrubEndpoint(text: string, endpoint: URL): string {
         add(`?${decodedPair}`);
         add(`&${decodedPair}`);
       }
+      // `searchParams.set()` recomposes the WHOLE query in form-urlencoded
+      // spelling (a `%20` value echoes back as `+`), which matches neither the
+      // configured nor the decoded form, so scrub that spelling at both
+      // delimiters too.
+      const recomposed = new URLSearchParams([
+        [tryDecodeComponent(pair.slice(0, separator)), tryDecodeComponent(pair.slice(separator + 1))],
+      ]).toString();
+      add(`?${recomposed}`);
+      add(`&${recomposed}`);
     }
   }
   let scrubbed = text;
@@ -289,7 +314,11 @@ function diagnosticFromErrorBody(bodyText: string, status: number): string {
 }
 
 /** Well-formed 2xx admission body (contract: run, namespace, workItemId, resumed). */
-function parseAdmissionIdentity(status: number, bodyText: string): AdmissionResult {
+function parseAdmissionIdentity(
+  status: number,
+  bodyText: string,
+  scrub: (text: string) => string,
+): AdmissionResult {
   let parsed: unknown;
   try {
     parsed = JSON.parse(bodyText);
@@ -297,7 +326,7 @@ function parseAdmissionIdentity(status: number, bodyText: string): AdmissionResu
     return {
       outcome: "uncertain",
       httpStatus: status,
-      diagnostic: `courier admission returned HTTP ${status} with a non-JSON body; delivery outcome unknown`,
+      diagnostic: scrub(`courier admission returned HTTP ${status} with a non-JSON body; delivery outcome unknown`),
       timeout: false,
     };
   }
@@ -305,7 +334,7 @@ function parseAdmissionIdentity(status: number, bodyText: string): AdmissionResu
     return {
       outcome: "uncertain",
       httpStatus: status,
-      diagnostic: `courier admission returned HTTP ${status} with a malformed body; delivery outcome unknown`,
+      diagnostic: scrub(`courier admission returned HTTP ${status} with a malformed body; delivery outcome unknown`),
       timeout: false,
     };
   }
@@ -318,7 +347,9 @@ function parseAdmissionIdentity(status: number, bodyText: string): AdmissionResu
     return {
       outcome: "uncertain",
       httpStatus: status,
-      diagnostic: `courier admission returned HTTP ${status} but the body is missing run/namespace/workItemId/resumed; delivery outcome unknown`,
+      diagnostic: scrub(
+        `courier admission returned HTTP ${status} but the body is missing run/namespace/workItemId/resumed; delivery outcome unknown`,
+      ),
       timeout: false,
     };
   }
@@ -413,7 +444,7 @@ export async function submitAdmission(fields: AdmissionRequestFields, config: Ex
   }
 
   if (response.status === 200 || response.status === 201) {
-    return parseAdmissionIdentity(response.status, bodyText);
+    return parseAdmissionIdentity(response.status, bodyText, scrub);
   }
   const diagnostic = scrub(diagnosticFromErrorBody(bodyText, response.status));
   if (response.status >= 400 && response.status < 500) {
