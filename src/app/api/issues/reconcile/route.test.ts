@@ -1190,7 +1190,7 @@ describe("POST — close authority and reopen gate (#1727)", () => {
   it("does not re-close an issue reopened after the merge, on any pass", async () => {
     mockBodyKeywordMerge();
     githubMocks.fetchIssues.mockResolvedValue([
-      { number: 42, title: "Crash on save", body: null, state: "open", labels: ["status/in-review"] },
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: [{ name: "status/in-review" }] },
     ]);
     mockIssueRows([{ id: "issue-42", number: 42 }]);
     // Sync observed the maintainer's reopen on 2026-10-05, after the merge.
@@ -1208,7 +1208,13 @@ describe("POST — close authority and reopen gate (#1727)", () => {
     ).json();
     expect(first.issuesClosed).toBe(0);
     expect(first.closesSkipped).toBe(1);
-    expect(reconciliationMocks.executeActions).not.toHaveBeenCalled();
+    // The withhold covers the close only. The issue's own status handling
+    // still runs, so an in-review issue with no open PR is released to ready
+    // instead of parking where no worker can see it.
+    expect(reconciliationMocks.executeActions).toHaveBeenCalledWith(
+      [expect.objectContaining({ type: "set_status", issueNumber: 42, label: "status/ready" })],
+      ["status/in-review"],
+    );
 
     // The withheld close is audited with a reason an operator can read, and
     // the row links to the cached issue so the #1363 composite index applies.
@@ -1229,7 +1235,11 @@ describe("POST — close authority and reopen gate (#1727)", () => {
     ).json();
     expect(second.issuesClosed).toBe(0);
     expect(second.closesSkipped).toBe(1);
-    expect(reconciliationMocks.executeActions).not.toHaveBeenCalled();
+    expect(
+      reconciliationMocks.executeActions.mock.calls
+        .flatMap((call) => call[0] as Array<{ type: string }>)
+        .some((action) => action.type === "close_issue"),
+    ).toBe(false);
     expect(prismaMocks.lifecycleRows.filter((row) => row.kind === "pr_merged")).toHaveLength(1);
     expect(
       prismaMocks.auditRows.filter((row) => row.action === "reconcile_close_skipped"),
@@ -1242,7 +1252,7 @@ describe("POST — close authority and reopen gate (#1727)", () => {
     // lifecycle event exists yet — the cached close is the reopen evidence.
     mockBodyKeywordMerge();
     githubMocks.fetchIssues.mockResolvedValue([
-      { number: 42, title: "Crash on save", body: null, state: "open", labels: ["status/in-review"] },
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: [{ name: "status/in-review" }] },
     ]);
     mockIssueRows([{ id: "issue-42", number: 42, closedAt: new Date("2026-10-04T00:00:00Z") }]);
 
@@ -1251,17 +1261,23 @@ describe("POST — close authority and reopen gate (#1727)", () => {
     const body = await res.json();
     expect(body.issuesClosed).toBe(0);
     expect(body.closesSkipped).toBe(1);
-    expect(reconciliationMocks.executeActions).not.toHaveBeenCalled();
+    // Cached-close evidence is a reopen like any other: the close is held and
+    // the in-review issue is released rather than parked.
+    expect(reconciliationMocks.executeActions).toHaveBeenCalledWith(
+      [expect.objectContaining({ type: "set_status", label: "status/ready" })],
+      ["status/in-review"],
+    );
   });
 
   it("holds the close when the reopen-evidence read fails (fail closed)", async () => {
     // Without the reopen stream there is no proof a close would not override
     // a maintainer. The close is repeatable, so the pass holds it and the
     // next pass retries; a lifecycle-table fault must not re-open the
-    // re-close window.
+    // re-close window. And because this withhold carries no evidence at all,
+    // no label is written either — an in-review issue stays as it is.
     mockBodyKeywordMerge();
     githubMocks.fetchIssues.mockResolvedValue([
-      { number: 42, title: "Crash on save", body: null, state: "open", labels: ["status/in-review"] },
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: [{ name: "status/in-review" }] },
     ]);
     mockIssueRows([{ id: "issue-42", number: 42 }]);
     prismaMocks.lifecycleEventFindMany.mockRejectedValueOnce(new Error("lifecycle table unavailable"));
@@ -1284,7 +1300,7 @@ describe("POST — close authority and reopen gate (#1727)", () => {
     // work again — the later merge is a new completion claim.
     mockBodyKeywordMerge();
     githubMocks.fetchIssues.mockResolvedValue([
-      { number: 42, title: "Crash on save", body: null, state: "open", labels: ["status/in-progress"] },
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: [{ name: "status/in-progress" }] },
     ]);
     mockIssueRows([{ id: "issue-42", number: 42, closedAt: new Date("2026-10-01T00:00:00Z") }]);
     reconciliationMocks.executeActions.mockResolvedValue([
@@ -1335,7 +1351,7 @@ describe("POST — close authority and reopen gate (#1727)", () => {
       },
     ]);
     githubMocks.fetchIssues.mockResolvedValue([
-      { number: 42, title: "Crash on save", body: null, state: "open", labels: ["status/in-review"] },
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: [{ name: "status/in-review" }] },
     ]);
     mockIssueRows([{ id: "issue-42", number: 42 }]);
     prismaMocks.lifecycleRows.push({
@@ -1374,7 +1390,7 @@ describe("POST — close authority and reopen gate (#1727)", () => {
     // "a reopen that predates the merge does not suppress" contract stands.
     mockBodyKeywordMerge();
     githubMocks.fetchIssues.mockResolvedValue([
-      { number: 42, title: "Crash on save", body: null, state: "open", labels: ["status/in-progress"] },
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: [{ name: "status/in-progress" }] },
     ]);
     mockIssueRows([{ id: "issue-42", number: 42 }]);
     prismaMocks.lifecycleRows.push({
@@ -1416,7 +1432,7 @@ describe("POST — close authority and reopen gate (#1727)", () => {
     // merge, so the close stays held — with the authoritative time noted.
     mockBodyKeywordMerge();
     githubMocks.fetchIssues.mockResolvedValue([
-      { number: 42, title: "Crash on save", body: null, state: "open", labels: ["status/in-review"] },
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: [{ name: "status/in-review" }] },
     ]);
     mockIssueRows([{ id: "issue-42", number: 42 }]);
     prismaMocks.lifecycleRows.push({
@@ -1433,7 +1449,12 @@ describe("POST — close authority and reopen gate (#1727)", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.closesSkipped).toBe(1);
-    expect(reconciliationMocks.executeActions).not.toHaveBeenCalled();
+    // Timeline-confirmed reopen: the close is held and the issue is released
+    // to ready rather than parked in in-review.
+    expect(reconciliationMocks.executeActions).toHaveBeenCalledWith(
+      [expect.objectContaining({ type: "set_status", label: "status/ready" })],
+      ["status/in-review"],
+    );
     const skipAudit = prismaMocks.auditRows.find((row) => row.action === "reconcile_close_skipped");
     expect(skipAudit?.notes).toContain("2026-10-04T12:00:00.000Z");
     expect(skipAudit?.notes).not.toContain("2026-10-05");
@@ -1444,7 +1465,7 @@ describe("POST — close authority and reopen gate (#1727)", () => {
     // event evidence wins fail-closed and the close stays held.
     mockBodyKeywordMerge({ merged_at: "not-a-date" });
     githubMocks.fetchIssues.mockResolvedValue([
-      { number: 42, title: "Crash on save", body: null, state: "open", labels: ["status/in-review"] },
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: [{ name: "status/in-review" }] },
     ]);
     mockIssueRows([{ id: "issue-42", number: 42 }]);
     prismaMocks.lifecycleRows.push({
@@ -1467,10 +1488,12 @@ describe("POST — close authority and reopen gate (#1727)", () => {
 
   it("holds the close when the reopen confirmation timeline is unreadable", async () => {
     // Fail closed: a timeline that cannot be read cannot prove the reopen
-    // predates the merge, so the upper bound stands and the close waits.
+    // predates the merge, so the upper bound stands and the close waits. The
+    // sync event is still reopen evidence, so this is the gate case: the
+    // status release runs even though the confirmation did not.
     mockBodyKeywordMerge();
     githubMocks.fetchIssues.mockResolvedValue([
-      { number: 42, title: "Crash on save", body: null, state: "open", labels: ["status/in-review"] },
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: [{ name: "status/in-review" }] },
     ]);
     mockIssueRows([{ id: "issue-42", number: 42 }]);
     prismaMocks.lifecycleRows.push({
@@ -1488,7 +1511,10 @@ describe("POST — close authority and reopen gate (#1727)", () => {
     const body = await res.json();
     expect(body.issuesClosed).toBe(0);
     expect(body.closesSkipped).toBe(1);
-    expect(reconciliationMocks.executeActions).not.toHaveBeenCalled();
+    const submitted = reconciliationMocks.executeActions.mock.calls[0]?.[0] as
+      | Array<{ type: string; label?: string }>
+      | undefined;
+    expect(submitted?.map((action) => action.label)).toEqual(["status/ready"]);
   });
 
   it("does not consult the timeline when a cached close already proves the override", async () => {
@@ -1496,7 +1522,7 @@ describe("POST — close authority and reopen gate (#1727)", () => {
     // later, so no forge confirmation is owed.
     mockBodyKeywordMerge();
     githubMocks.fetchIssues.mockResolvedValue([
-      { number: 42, title: "Crash on save", body: null, state: "open", labels: ["status/in-review"] },
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: [{ name: "status/in-review" }] },
     ]);
     mockIssueRows([{ id: "issue-42", number: 42, closedAt: new Date("2026-10-04T00:00:00Z") }]);
 
@@ -1513,7 +1539,7 @@ describe("POST — close authority and reopen gate (#1727)", () => {
     // written for this issue.
     mockBodyKeywordMerge();
     githubMocks.fetchIssues.mockResolvedValue([
-      { number: 42, title: "Crash on save", body: null, state: "open", labels: ["status/in-progress"] },
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: [{ name: "status/in-progress" }] },
     ]);
     mockIssueRows([{ id: "issue-42", number: 42 }]);
     githubMocks.fetchIssue.mockResolvedValueOnce({ state: "closed" });
@@ -1534,7 +1560,7 @@ describe("POST — close authority and reopen gate (#1727)", () => {
     // retries. The note is stable text; the raw error stays in the log.
     mockBodyKeywordMerge();
     githubMocks.fetchIssues.mockResolvedValue([
-      { number: 42, title: "Crash on save", body: null, state: "open", labels: ["status/in-progress"] },
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: [{ name: "status/in-progress" }] },
     ]);
     mockIssueRows([{ id: "issue-42", number: 42 }]);
     githubMocks.fetchIssue.mockRejectedValueOnce(new Error("github 502"));
@@ -1554,7 +1580,7 @@ describe("POST — close authority and reopen gate (#1727)", () => {
     // row still records, linked only by repo + number.
     mockBodyKeywordMerge();
     githubMocks.fetchIssues.mockResolvedValue([
-      { number: 42, title: "Crash on save", body: null, state: "open", labels: ["status/in-progress"] },
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: [{ name: "status/in-progress" }] },
     ]);
     prismaMocks.issueFindMany.mockResolvedValue([]);
     githubMocks.fetchIssue.mockRejectedValueOnce(new Error("github 502"));

@@ -144,13 +144,15 @@ and after the merge. A lifecycle event is an upper bound — sync stamps
 or label edit after the actual reopen inflates. So before honoring a
 withhold that rests on the event alone, the reconciler confirms it against
 the issue timeline, where the `reopened` activity carries its real time
-(`fetchReopenAfter`, bounded to 5 pages of events after the merge): a
+(`fetchReopenAfter`, bounded to 5 pages of events after the merge; the
+candidates that need it are read at most four at a time, since they are
+independent and a repo with many keyword merges should not serialize them): a
 confirmed reopen moves the evidence to the authoritative timestamp, the
 absence of one refutes the inflated stamp, and a timeline that cannot be
 read to completion leaves the withhold in place (fail closed). With that
 confirmation, the contract holds: a reopen that predates the merge does
 not suppress, and one that postdates it withholds the close for that
-issue — no GitHub write happens, the pass records a `reconcile_close_skipped`
+issue — no close is written, the pass records a `reconcile_close_skipped`
 audit row (keyed to the cached `issueId` when one exists, so it rides the
 #1363 composite index), and the response counts it in `closesSkipped`.
 Withholding the close does not freeze the issue: a reopen the gate honors is a
@@ -159,10 +161,12 @@ issue's ordinary status handling — an open PR is health-labeled, and an issue
 left in `status/in-review` with no open PR is released to `status/ready`, the
 same release that frees an issue whose PR vanished. Without that fall-through a
 deliberately reopened issue sat in `in-review` forever: claimed-looking, so the
-queue skipped it, with nothing left to advance it. A withhold resting only on
-an unreadable evidence read writes no label at all, because there an override
-cannot be told apart from a legitimate fix. The linked-PR health snapshot still
-persists either way. Identical skip annotations are
+queue skipped it, with nothing left to advance it. A withhold resting on no
+evidence at all — the lifecycle-stream read itself failed — writes no label,
+because there an override cannot be told apart from a legitimate fix. A failed
+timeline *confirmation* is not that case: the sync event stays as reopen
+evidence, so it is the gate case above and its status handling still runs. The
+linked-PR health snapshot persists either way. Identical skip annotations are
 suppressed until the shared #1363 re-emit window elapses, so a
 deliberately-reopened issue does not earn a row every pass. The merge
 evidence still records — correlation recording stays decoupled from
@@ -185,9 +189,11 @@ that both complete inside one sync interval is the same bound in its sharpest
 form and is accepted as a residual blind spot — sync never observed the closed
 state, so no `issue_reopened` event exists and the cached row carries no newer
 `closedAt`, and this pass closes again. The gate does not spend a timeline
-read per close candidate to cover it: the read is spent only where a stamp is
-actually in doubt, and that budget is what keeps a repo with many keyword
-merges from multiplying its pass. An erroneous re-close stays until a
+read per close candidate to cover it: a read is issued only where a stamp is
+actually in doubt, which bounds how many requests the pass can make, and those
+independent reads run through a pool of at most four so a repo with many
+keyword merges does not serialize the ones it does need. An erroneous
+re-close stays until a
 maintainer opens the issue again, and from that observation on the gate
 honors it. And if the reopen read itself fails, every close the authority
 names is held for a later pass (fail closed — waiting costs freshness, never
