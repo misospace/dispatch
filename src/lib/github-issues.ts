@@ -104,8 +104,9 @@ const REOPEN_TIMELINE_MAX_PAGES = 5;
  * `updated_at` at observation — an upper bound a comment can inflate past a
  * merge — so the timeline is the authoritative reopen time the reconciler
  * checks before withholding a close. Throws when the timeline cannot be read
- * to completion (API failure or more pages than the bound): an incomplete
- * read never proves "no reopen", and the caller fails closed.
+ * to completion (API failure or more pages than the bound) or carries a
+ * `reopened` event with no usable `created_at`: neither proves "no reopen",
+ * and the caller fails closed.
  */
 export async function fetchReopenAfter(
   repoFullName: string,
@@ -125,9 +126,12 @@ export async function fetchReopenAfter(
     for (const event of events) {
       if (event.event !== "reopened") continue;
       const at = event.created_at ? new Date(event.created_at) : null;
-      // A reopen with no usable timestamp cannot be placed after the merge,
-      // but silently skipping it would refute a real reopen. Unreadable data
-      // is an incomplete read: throw, and the caller keeps the withhold.
+      // A reopen with no usable `created_at` cannot be placed relative to the
+      // merge, and the query's `since` bound is not proof it predates it.
+      // Skipping it would refute a real reopen, so it counts as unreadable
+      // data: throw, and the caller keeps the withhold. That hold is audited
+      // and re-decided every pass — the alternative is silently re-closing
+      // over a maintainer.
       if (!at || Number.isNaN(at.getTime())) {
         throw new Error(`GitHub timeline for ${repoFullName}#${issueNumber} carries a reopen without a usable created_at`);
       }

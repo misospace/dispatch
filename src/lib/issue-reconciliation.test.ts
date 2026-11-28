@@ -647,9 +647,57 @@ describe("reconcileIssue", () => {
         reopenEvidence,
       );
 
-      expect(result.actions).toEqual([]);
+      expect(result.actions.some((action) => action.type === "close_issue")).toBe(false);
       expect(result.isClosedByMergedPr).toBe(false);
       expect(result.closeSkippedReason).toContain("reopened after merged PR #7");
+      // The withhold is not a freeze: the maintainer's reopen says the work is
+      // unfinished, so the in-review-with-no-PR release still runs.
+      expect(result.actions).toEqual([
+        {
+          type: "set_status",
+          issueNumber: 42,
+          repoFullName: "",
+          label: "status/ready",
+          reason: "reopened after its fixing PR merged, with no open PR — releasing to ready",
+        },
+      ]);
+    });
+
+    it("does not relabel an in-progress issue whose close is withheld", () => {
+      // Only in-review is reaped. An in-progress issue may have a live Workload
+      // that GitHub cannot show, and resetting it would double-dispatch.
+      const mergedPrs = new Map([[42, makeMergedPr()]]);
+      const reopenEvidence = new Map([[42, new Date("2026-01-05T00:00:00Z")]]);
+
+      const result = reconcileIssue(
+        { number: 42, title: "Bug fix", body: null, labels: ["status/in-progress"], state: "open" },
+        mergedPrs,
+        new Map(),
+        new Map(),
+        reopenEvidence,
+      );
+
+      expect(result.actions).toEqual([]);
+      expect(result.closeSkippedReason).toContain("reopened after merged PR #7");
+    });
+
+    it("tracks a new open PR on an issue whose close is withheld", () => {
+      // The reopen led to fresh work: the follow-up PR still gets its health
+      // label, and the ready release stays out of the way.
+      const mergedPrs = new Map([[42, makeMergedPr()]]);
+      const reopenEvidence = new Map([[42, new Date("2026-01-05T00:00:00Z")]]);
+
+      const result = reconcileIssue(
+        { number: 42, title: "Bug fix", body: null, labels: ["status/ready"], state: "open" },
+        mergedPrs,
+        new Map([[42, makeMergedPr({ number: 11, merged_at: null, state: "open" })]]),
+        new Map([[42, buildHealth()]]),
+        reopenEvidence,
+      );
+
+      expect(result.closeSkippedReason).toContain("reopened after merged PR #7");
+      expect(result.hasOpenPr).toBe(true);
+      expect(result.actions.map((action) => action.label)).toEqual(["status/in-review"]);
     });
 
     it("closes when the recorded reopen predates the merge", () => {

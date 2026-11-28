@@ -205,7 +205,8 @@ export interface IssueReconciliationResult {
   /**
    * Why a close was withheld (#1727): the merge stayed correlated to the
    * issue, but a recorded reopen/close observation postdates it, so closing
-   * would override a maintainer. The caller logs it; it never writes.
+   * would override a maintainer. The caller logs the skip and never closes;
+   * the issue's other status handling still applies.
    */
   closeSkippedReason?: string | null;
 }
@@ -286,8 +287,11 @@ export interface ReconciliationResult {
  * reopen-or-recorded-close observation per issue number; the caller refines
  * the sync event's upper-bound timestamp against the forge timeline before
  * passing it in. When the evidence postdates the authority PR's merge, the
- * close is withheld and reported in `closeSkippedReason` without any other
- * action for that issue.
+ * close is withheld and reported in `closeSkippedReason`. Withholding the
+ * close does not freeze the issue: a maintainer reopen asserts the work is
+ * unfinished, so the open-PR health paths still run — otherwise an issue
+ * parked in `status/in-review` with no open PR would stay invisible to every
+ * worker with nothing left to advance it.
  */
 export function reconcileIssue(
   issue: { number: number; title: string; body: string | null; labels: string[]; state: string },
@@ -301,6 +305,8 @@ export function reconcileIssue(
   let openPrNeedsWork = false;
   let isClosedByMergedPr = false;
 
+  let closeSkippedReason: string | null = null;
+
   // Check for merged closing PRs
   if (issue.state === "open" && mergedPrs.has(issue.number)) {
     const mergedPr = mergedPrs.get(issue.number)!;
@@ -309,33 +315,28 @@ export function reconcileIssue(
     // reopen observation cannot be proven to predate the merge.
     const mergedAtMs = mergedPr.merged_at ? Date.parse(mergedPr.merged_at) : NaN;
     if (reopenedAt && (Number.isNaN(mergedAtMs) || reopenedAt.getTime() > mergedAtMs)) {
+      closeSkippedReason =
+        `reopened after merged PR #${mergedPr.number} ` +
+        `(reopen recorded ${reopenedAt.toISOString()}, merge ${Number.isNaN(mergedAtMs) ? "unknown" : new Date(mergedAtMs).toISOString()})`;
+      // No close, and no early return: the reopened issue still needs its
+      // status handled below, or it strands in whatever column it was in.
+    } else {
+      actions.push({
+        type: "close_issue",
+        issueNumber: issue.number,
+        repoFullName: "", // caller provides this
+        reason: `Fixed by merged PR #${mergedPr.number} (${mergedPr.title})`,
+      });
+      isClosedByMergedPr = true;
       return {
         issueNumber: issue.number,
         repoFullName: "",
-        actions: [],
+        actions,
         hasOpenPr: false,
         openPrNeedsWork: false,
-        isClosedByMergedPr: false,
-        closeSkippedReason:
-          `reopened after merged PR #${mergedPr.number} ` +
-          `(reopen recorded ${reopenedAt.toISOString()}, merge ${Number.isNaN(mergedAtMs) ? "unknown" : new Date(mergedAtMs).toISOString()})`,
+        isClosedByMergedPr: true,
       };
     }
-    actions.push({
-      type: "close_issue",
-      issueNumber: issue.number,
-      repoFullName: "", // caller provides this
-      reason: `Fixed by merged PR #${mergedPr.number} (${mergedPr.title})`,
-    });
-    isClosedByMergedPr = true;
-    return {
-      issueNumber: issue.number,
-      repoFullName: "",
-      actions,
-      hasOpenPr: false,
-      openPrNeedsWork: false,
-      isClosedByMergedPr: true,
-    };
   }
 
   // Check for open PRs referencing this issue
@@ -386,6 +387,10 @@ export function reconcileIssue(
       // the branch) and nothing will ever advance this issue: it is claimed, so
       // the queue skips it, and no Workload backs it. Release it to ready.
       //
+      // The same release serves the #1727 withhold: there a merged PR exists but
+      // the maintainer's reopen voided it as completion, so an in-review issue
+      // with no open PR is unfinished work no worker can see.
+      //
       // Deliberately scoped to in-review only. in-progress is NOT reaped here:
       // a running Workload that has not opened its PR yet looks identical from
       // GitHub, and resetting it would double-dispatch. Only the bridge can see
@@ -395,7 +400,9 @@ export function reconcileIssue(
         issueNumber: issue.number,
         repoFullName: "",
         label: "status/ready",
-        reason: "in-review but no open or merged PR — releasing to ready",
+        reason: closeSkippedReason
+          ? "reopened after its fixing PR merged, with no open PR — releasing to ready"
+          : "in-review but no open or merged PR — releasing to ready",
       });
     }
   }
@@ -407,6 +414,7 @@ export function reconcileIssue(
     hasOpenPr,
     openPrNeedsWork,
     isClosedByMergedPr,
+    closeSkippedReason,
   };
 }
 

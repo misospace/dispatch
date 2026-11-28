@@ -31,6 +31,29 @@ import { acquireLock, releaseLock, type AcquiredLock, type LockConflict } from "
 
 const RATE_LIMIT = { limit: 10, windowMs: 60_000 };
 
+/** In-flight ceiling for the #1727 reopen-confirmation timeline reads. */
+const REOPEN_CONFIRM_CONCURRENCY = 4;
+
+/**
+ * Run independent reads with at most `limit` in flight. A task's own failure
+ * handling stays inside its `run`; the pool only bounds parallelism.
+ */
+async function mapBounded<T>(
+  items: readonly T[],
+  limit: number,
+  run: (item: T) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  const width = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(
+    Array.from({ length: width }, async () => {
+      while (next < items.length) {
+        await run(items[next++]);
+      }
+    }),
+  );
+}
+
 /**
  * Best-effort deleted-PR reap (#1641): a transient forge failure is reported,
  * never fatal — the response keeps `success` about the issues this route
@@ -47,6 +70,17 @@ async function runDeletedPrFixReap(): Promise<{ checked: number; markedStale: nu
     console.warn(`[pr-fix-queue] deleted-PR reap failed: ${message}`);
     return { checked: 0, markedStale: 0, errored: 1 };
   }
+}
+
+/**
+ * Merge instant for close-authority ordering. A lexicographic compare of the
+ * raw `merged_at` strings is chronological only while GitHub keeps its exact
+ * second-precision UTC shape, so compare parsed times; an unparseable value
+ * sorts below every dated merge instead of outranking one by punctuation.
+ */
+function mergeTimeMs(pr: { merged_at?: string | null }): number {
+  const ms = pr.merged_at ? Date.parse(pr.merged_at) : NaN;
+  return Number.isNaN(ms) ? -1 : ms;
 }
 
 /**
@@ -462,7 +496,7 @@ export async function POST(request: Request) {
           // 1. Body close keywords: the only close authority.
           for (const num of extractFixingIssueNumbers(pr.body ?? null)) {
             const incumbent = mergedCloseAuthority.get(num);
-            if (!incumbent || (pr.merged_at ?? "") > (incumbent.merged_at ?? "")) {
+            if (!incumbent || mergeTimeMs(pr) > mergeTimeMs(incumbent)) {
               mergedCloseAuthority.set(num, pr);
             }
             recordLinkEvidence(num, pr, "body-keyword");
@@ -553,12 +587,23 @@ export async function POST(request: Request) {
           // the `reopened` activity carries its real time (#1727 review). The
           // cached-`closedAt` signal needs no confirmation: a recorded close
           // newer than the merge proves the later reopen exactly.
+          //
+          // Only an inflated event that no cached close already explains needs
+          // a read, and the reads are independent, so they run through a small
+          // pool: a repo whose window holds many keyword merges shortens without
+          // opening one GitHub request per candidate at once.
+          const needsConfirmation: Array<{ issueNum: number; mergedAtMs: number }> = [];
           for (const [issueNum] of closeAuthorityIssueRows) {
             const eventDate = reopenEvidence.get(issueNum);
             const mergedAtRaw = mergedCloseAuthority.get(issueNum)?.merged_at;
             const mergedAtMs = mergedAtRaw ? Date.parse(mergedAtRaw) : NaN;
+            // No merge time means no `since` bound to read: leave the upper
+            // bound in place and let `reconcileIssue` fail closed on it.
             if (!eventDate || Number.isNaN(mergedAtMs) || eventDate.getTime() <= mergedAtMs) continue;
             if ((closeAuthorityIssueRows.get(issueNum)?.closedAt?.getTime() ?? 0) > mergedAtMs) continue;
+            needsConfirmation.push({ issueNum, mergedAtMs });
+          }
+          await mapBounded(needsConfirmation, REOPEN_CONFIRM_CONCURRENCY, async ({ issueNum, mergedAtMs }) => {
             try {
               const confirmed = await fetchReopenAfter(repo.fullName, issueNum, new Date(mergedAtMs));
               if (confirmed) reopenEvidence.set(issueNum, confirmed);
@@ -571,7 +616,7 @@ export async function POST(request: Request) {
                 `${repo.fullName}: reopen confirmation for #${issueNum} unavailable (${message}); close stays held`,
               );
             }
-          }
+          });
           for (const [issueNum, row] of closeAuthorityIssueRows) {
             if (row.closedAt && (!reopenEvidence.has(issueNum) || row.closedAt > reopenEvidence.get(issueNum)!)) {
               reopenEvidence.set(issueNum, row.closedAt);
@@ -602,14 +647,18 @@ export async function POST(request: Request) {
             reopenEvidence,
           );
 
-          // #1727: a withheld close is recorded and otherwise left alone —
-          // no GitHub write, no label churn. The merge itself still earns
-          // its `pr_merged` evidence below: correlation recording stays
-          // decoupled from the close. Two sources withhold: the reopen gate
-          // inside `reconcileIssue`, and a failed reopen-evidence read —
-          // without the stream there is no proof the close would not
-          // override a maintainer, and a close held for one pass is retried
-          // by the next (waiting costs freshness, never correctness).
+          // #1727: a withheld close means no close write and no merge-driven
+          // label churn, and the merge still earns its `pr_merged` evidence
+          // below — correlation stays decoupled from the close. Two sources
+          // withhold. (1) The reopen gate inside `reconcileIssue`: a reopen the
+          // pass cannot place before the merge. The issue's own status handling
+          // still runs, because the maintainer's reopen says the work is
+          // unfinished — open-PR health labels, and the in-review-with-no-PR
+          // release to ready. (2) A failed reopen-evidence read: without the
+          // stream there is no proof a close would not override a maintainer,
+          // and no evidence either, so it withholds the close and writes no
+          // label. A close held for one pass is retried by the next (waiting
+          // costs freshness, never correctness).
           let closeSkippedReason = result.closeSkippedReason ?? null;
           // Stable note: the raw error is logged, never embedded, so a
           // flapping fault with varying messages cannot defeat the
@@ -625,9 +674,13 @@ export async function POST(request: Request) {
           // The gate above is only as fresh as the pass-start snapshot, so
           // re-read the live issue immediately before the close write
           // (#1727 review): an upstream close makes ours redundant, and a
-          // failed read means we would be writing blind. The residual window
+          // failed read means we would be writing blind. This read costs one
+          // request per issue actually being closed and deliberately stays
+          // adjacent to the write rather than joining the parallel evidence
+          // pass above, where it would shrink nothing. The residual window
           // between this read and the PATCH is documented in
           // docs/issue-lifecycle-events.md.
+
           if (
             !closeSkippedReason &&
             result.actions.some((a) => a.type === "close_issue")

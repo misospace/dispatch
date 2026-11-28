@@ -52,7 +52,7 @@ const { mocks, prismaMocks, githubMocks, configMocks, reconciliationMocks } = vi
     getSyncRepos: vi.fn(() => Promise.resolve([] as any)),
   },
   reconciliationMocks: {
-    executeActions: vi.fn(() => Promise.resolve([] as any)),
+    executeActions: vi.fn((_actions: unknown, _labels: unknown) => Promise.resolve([] as any)),
   },
 }));
 
@@ -1572,5 +1572,155 @@ describe("POST — close authority and reopen gate (#1727)", () => {
       .find((where) => where.action === "reconcile_close_skipped");
     expect(lookup).toMatchObject({ repoFullName: "org/repo", issueNumber: 42 });
     expect(lookup).not.toHaveProperty("issueId");
+  });
+
+  it("releases a withheld in-review issue to ready so workers can see it again", async () => {
+    // Withholding the close is not a freeze: a maintainer reopened the issue
+    // over a merged PR, and an issue parked in `status/in-review` with no open
+    // PR is invisible to the queue with nothing left to advance it. The skip
+    // records, the close never happens, and the status release does.
+    mockBodyKeywordMerge();
+    githubMocks.fetchIssues.mockResolvedValue([
+      {
+        number: 42,
+        title: "Crash on save",
+        body: null,
+        state: "open",
+        labels: [{ name: "status/in-review" }],
+      },
+    ]);
+    mockIssueRows([{ id: "issue-42", number: 42 }]);
+    prismaMocks.lifecycleRows.push({
+      kind: "issue_reopened",
+      source: "sync",
+      issueId: "issue-42",
+      issueNumber: 42,
+      dedupeKey: "sync|org/repo|42|issue_reopened|2026-10-05",
+      occurredAt: new Date("2026-10-05T00:00:00Z"),
+    });
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.issuesClosed).toBe(0);
+    expect(body.closesSkipped).toBe(1);
+    expect(reconciliationMocks.executeActions).toHaveBeenCalledWith(
+      [expect.objectContaining({ type: "set_status", issueNumber: 42, label: "status/ready" })],
+      ["status/in-review"],
+    );
+    const submitted = reconciliationMocks.executeActions.mock.calls[0][0] as Array<{ type: string }>;
+    expect(submitted.some((action) => action.type === "close_issue")).toBe(false);
+  });
+
+  it("orders the close authority by parsed merge time, not raw-string order", async () => {
+    // GitHub's second-precision `...Z` shape sorts lexicographically like time,
+    // but an ISO offset form does not: #5 merged at 07:00Z yet its string
+    // outranks #8's 08:00Z. The reopen lands between them, so only a numeric
+    // comparison picks the newest merge (#8) and lets the legitimate close
+    // through.
+    githubMocks.fetchClosedPullRequests.mockResolvedValue([
+      {
+        number: 5,
+        state: "closed",
+        title: "First attempt",
+        body: "Fixes #42",
+        merged_at: "2026-10-02T10:00:00+03:00",
+        html_url: "https://github.com/org/repo/pull/5",
+        merge_commit_sha: "merge-sha-5",
+        head: { ref: "attempt-one", sha: "head-5" },
+      },
+      {
+        number: 8,
+        state: "closed",
+        title: "Real fix",
+        body: "Fixes #42",
+        merged_at: "2026-10-02T08:00:00Z",
+        html_url: "https://github.com/org/repo/pull/8",
+        merge_commit_sha: "merge-sha-8",
+        head: { ref: "attempt-two", sha: "head-8" },
+      },
+    ]);
+    githubMocks.fetchIssues.mockResolvedValue([
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: [] },
+    ]);
+    mockIssueRows([{ id: "issue-42", number: 42 }]);
+    prismaMocks.lifecycleRows.push({
+      kind: "issue_reopened",
+      source: "sync",
+      issueId: "issue-42",
+      issueNumber: 42,
+      dedupeKey: "sync|org/repo|42|issue_reopened|2026-10-02T07:30",
+      occurredAt: new Date("2026-10-02T07:30:00Z"),
+    });
+    reconciliationMocks.executeActions.mockResolvedValue([
+      {
+        action: { type: "close_issue", issueNumber: 42, repoFullName: "org/repo", reason: "fixed" },
+        success: true,
+        beforeLabels: [],
+        afterLabels: [],
+      },
+    ]);
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.issuesClosed).toBe(1);
+    expect(body.closesSkipped).toBe(0);
+    const closes = prismaMocks.lifecycleRows.filter((row) => row.kind === "issue_closed");
+    expect(closes).toHaveLength(1);
+    expect(closes[0].metadata).toMatchObject({ pullRequestNumber: 8 });
+  });
+
+  it("confirms reopen evidence for many candidates in parallel, capped at the pool bound", async () => {
+    // One bounded timeline read per candidate whose sync-recorded reopen
+    // outstamps the merge. The candidates are independent, so a repo holding
+    // many keyword merges must not pay for them one at a time — and must not
+    // fan out without limit either.
+    const numbers = [42, 43, 44, 45, 46, 47];
+    githubMocks.fetchClosedPullRequests.mockResolvedValue(
+      numbers.map((n, i) => ({
+        number: 100 + i,
+        state: "closed",
+        title: `Fix ${n}`,
+        body: `Fixes #${n}`,
+        merged_at: "2026-10-02T08:00:00Z",
+        html_url: `https://github.com/org/repo/pull/${100 + i}`,
+        merge_commit_sha: `merge-sha-${n}`,
+        head: { ref: `attempt-${n}`, sha: `head-${n}` },
+      })),
+    );
+    githubMocks.fetchIssues.mockResolvedValue(
+      numbers.map((n) => ({ number: n, title: `Issue ${n}`, body: null, state: "open", labels: [] })),
+    );
+    mockIssueRows(numbers.map((n) => ({ id: `issue-${n}`, number: n })));
+    for (const n of numbers) {
+      prismaMocks.lifecycleRows.push({
+        kind: "issue_reopened",
+        source: "sync",
+        issueId: `issue-${n}`,
+        issueNumber: n,
+        dedupeKey: `sync|org/repo|${n}|issue_reopened|2026-10-05`,
+        occurredAt: new Date("2026-10-05T00:00:00Z"),
+      });
+    }
+
+    let inFlight = 0;
+    let peak = 0;
+    githubMocks.fetchReopenAfter.mockImplementation(async () => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      inFlight -= 1;
+      return new Date("2026-10-04T00:00:00Z");
+    });
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(githubMocks.fetchReopenAfter).toHaveBeenCalledTimes(numbers.length);
+    expect(body.closesSkipped).toBe(numbers.length);
+    // More than one at a time, never more than the bound.
+    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBeLessThanOrEqual(4);
   });
 });

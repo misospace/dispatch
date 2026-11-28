@@ -152,9 +152,17 @@ confirmation, the contract holds: a reopen that predates the merge does
 not suppress, and one that postdates it withholds the close for that
 issue — no GitHub write happens, the pass records a `reconcile_close_skipped`
 audit row (keyed to the cached `issueId` when one exists, so it rides the
-#1363 composite index), and the response counts it in `closesSkipped`. The
-withheld pass also skips that issue's open-PR status labeling — the
-linked-PR health snapshot still persists. Identical skip annotations are
+#1363 composite index), and the response counts it in `closesSkipped`.
+Withholding the close does not freeze the issue: a reopen the gate honors is a
+maintainer asserting the work is unfinished, so the pass still runs that
+issue's ordinary status handling — an open PR is health-labeled, and an issue
+left in `status/in-review` with no open PR is released to `status/ready`, the
+same release that frees an issue whose PR vanished. Without that fall-through a
+deliberately reopened issue sat in `in-review` forever: claimed-looking, so the
+queue skipped it, with nothing left to advance it. A withhold resting only on
+an unreadable evidence read writes no label at all, because there an override
+cannot be told apart from a legitimate fix. The linked-PR health snapshot still
+persists either way. Identical skip annotations are
 suppressed until the shared #1363 re-emit window elapses, so a
 deliberately-reopened issue does not earn a row every pass. The merge
 evidence still records — correlation recording stays decoupled from
@@ -171,10 +179,20 @@ pass. A re-close that races in wins until the next sync records the
 reopen event, which the confirmation above then honors — bounded by the
 sync interval, retryable, and never silently repeated, because every
 withheld close is audited. Remaining bounds: a reopen of an issue that
-closed *before* the merge stays invisible to the gate until sync records
-the `issue_reopened` event — bounded by the sync interval; and if the
-reopen read itself fails, every close the authority names is held for a
-later pass (fail closed — waiting costs freshness, never correctness).
+closed *before* the merge stays invisible to the gate until sync records the
+`issue_reopened` event — bounded by the sync interval; a close *and* a reopen
+that both complete inside one sync interval is the same bound in its sharpest
+form and is accepted as a residual blind spot — sync never observed the closed
+state, so no `issue_reopened` event exists and the cached row carries no newer
+`closedAt`, and this pass closes again. The gate does not spend a timeline
+read per close candidate to cover it: the read is spent only where a stamp is
+actually in doubt, and that budget is what keeps a repo with many keyword
+merges from multiplying its pass. An erroneous re-close stays until a
+maintainer opens the issue again, and from that observation on the gate
+honors it. And if the reopen read itself fails, every close the authority
+names is held for a later pass (fail closed — waiting costs freshness, never
+correctness).
+
 
 Merge recording is decoupled from the reconcile action loop: a linked merge
 records whether the issue is open or closed and whether the close action
