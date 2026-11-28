@@ -37,6 +37,13 @@ const { mocks, prismaMocks, githubMocks, configMocks, reconciliationMocks } = vi
     fetchClosedPullRequests: vi.fn(() => Promise.resolve([] as any)),
     fetchIssues: vi.fn(() => Promise.resolve([] as any)),
     fetchLinkedPrHealthInput: vi.fn(),
+    // #1727 review: live re-read before a close — open by default so close
+    // suites keep closing.
+    fetchIssue: vi.fn(async () => ({ state: "open" } as any)),
+    // #1727 review: reopen confirmation over the timeline. Default confirms
+    // the lifecycle event, keeping the fail-closed reading for suites that
+    // pin a post-merge reopen; inflation/refutation tests override it.
+    fetchReopenAfter: vi.fn(async () => new Date("2026-12-31T00:00:00Z") as any),
     // The credential check in front of the no-tracked-repos reap (#1652
     // review): resolves by default so the reap runs; the skip test rejects it.
     getGitHubToken: vi.fn(async () => "test-token"),
@@ -84,6 +91,8 @@ vi.mock("@/lib/github", async (importOriginal) => ({
   fetchPullRequests: githubMocks.fetchPullRequests,
   fetchClosedPullRequests: githubMocks.fetchClosedPullRequests,
   fetchIssues: githubMocks.fetchIssues,
+  fetchIssue: githubMocks.fetchIssue,
+  fetchReopenAfter: githubMocks.fetchReopenAfter,
   fetchLinkedPrHealthInput: githubMocks.fetchLinkedPrHealthInput,
   getGitHubToken: githubMocks.getGitHubToken,
 }));
@@ -1103,7 +1112,8 @@ describe("POST — close authority and reopen gate (#1727)", () => {
           (where.actor === undefined || row.actor === where.actor) &&
           (where.action === undefined || row.action === where.action) &&
           (where.repoFullName === undefined || row.repoFullName === where.repoFullName) &&
-          (where.issueNumber === undefined || row.issueNumber === where.issueNumber),
+          (where.issueNumber === undefined || row.issueNumber === where.issueNumber) &&
+          (where.issueId === undefined || row.issueId === where.issueId),
       );
       return matches.length > 0 ? matches[matches.length - 1] : null;
     });
@@ -1200,11 +1210,12 @@ describe("POST — close authority and reopen gate (#1727)", () => {
     expect(first.closesSkipped).toBe(1);
     expect(reconciliationMocks.executeActions).not.toHaveBeenCalled();
 
-    // The withheld close is audited with a reason an operator can read.
+    // The withheld close is audited with a reason an operator can read, and
+    // the row links to the cached issue so the #1363 composite index applies.
     const skipAudit = prismaMocks.auditLogCreate.mock.calls
       .map((call) => call[0].data)
       .find((data) => data.action === "reconcile_close_skipped");
-    expect(skipAudit).toMatchObject({ actor: "reconciler", issueNumber: 42, success: true });
+    expect(skipAudit).toMatchObject({ actor: "reconciler", issueId: "issue-42", issueNumber: 42, success: true });
     expect(skipAudit.notes).toContain("reopened after merged PR #7");
 
     // Evidence stays decoupled: the merge still records despite the skip.
@@ -1353,5 +1364,187 @@ describe("POST — close authority and reopen gate (#1727)", () => {
     const closes = prismaMocks.lifecycleRows.filter((row) => row.kind === "issue_closed");
     expect(closes).toHaveLength(1);
     expect(closes[0].metadata).toMatchObject({ pullRequestNumber: 8 });
+  });
+
+  it("closes when the timeline refutes an inflated reopen stamp", async () => {
+    // The lifecycle event's occurredAt is the issue's updated_at at sync
+    // observation: a comment after the merge inflated it past the merge, and
+    // the gate alone would withhold forever. The timeline carries the real
+    // reopen time, and it holds no reopen after the merge — the documented
+    // "a reopen that predates the merge does not suppress" contract stands.
+    mockBodyKeywordMerge();
+    githubMocks.fetchIssues.mockResolvedValue([
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: ["status/in-progress"] },
+    ]);
+    mockIssueRows([{ id: "issue-42", number: 42 }]);
+    prismaMocks.lifecycleRows.push({
+      kind: "issue_reopened",
+      source: "sync",
+      issueId: "issue-42",
+      issueNumber: 42,
+      dedupeKey: "sync|org/repo|42|issue_reopened|2026-10-05",
+      occurredAt: new Date("2026-10-05T00:00:00Z"),
+    });
+    githubMocks.fetchReopenAfter.mockResolvedValueOnce(null);
+    reconciliationMocks.executeActions.mockResolvedValue([
+      {
+        action: { type: "close_issue", issueNumber: 42, repoFullName: "org/repo", reason: "fixed" },
+        success: true,
+        beforeLabels: ["status/in-progress"],
+        afterLabels: [],
+      },
+    ]);
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.issuesClosed).toBe(1);
+    expect(body.closesSkipped).toBe(0);
+    expect(githubMocks.fetchReopenAfter).toHaveBeenCalledWith(
+      "org/repo",
+      42,
+      new Date("2026-10-02T08:00:00Z"),
+    );
+    expect(
+      prismaMocks.auditRows.filter((row) => row.action === "reconcile_close_skipped"),
+    ).toHaveLength(0);
+  });
+
+  it("reports the timeline-confirmed reopen time in the skip reason", async () => {
+    // The event stamp (2026-10-05) was inflated by post-reopen activity; the
+    // timeline names the real reopen (2026-10-04). It still postdates the
+    // merge, so the close stays held — with the authoritative time noted.
+    mockBodyKeywordMerge();
+    githubMocks.fetchIssues.mockResolvedValue([
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: ["status/in-review"] },
+    ]);
+    mockIssueRows([{ id: "issue-42", number: 42 }]);
+    prismaMocks.lifecycleRows.push({
+      kind: "issue_reopened",
+      source: "sync",
+      issueId: "issue-42",
+      issueNumber: 42,
+      dedupeKey: "sync|org/repo|42|issue_reopened|2026-10-05",
+      occurredAt: new Date("2026-10-05T00:00:00Z"),
+    });
+    githubMocks.fetchReopenAfter.mockResolvedValueOnce(new Date("2026-10-04T12:00:00Z"));
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.closesSkipped).toBe(1);
+    expect(reconciliationMocks.executeActions).not.toHaveBeenCalled();
+    const skipAudit = prismaMocks.auditRows.find((row) => row.action === "reconcile_close_skipped");
+    expect(skipAudit?.notes).toContain("2026-10-04T12:00:00.000Z");
+    expect(skipAudit?.notes).not.toContain("2026-10-05");
+  });
+
+  it("holds the close when the reopen confirmation timeline is unreadable", async () => {
+    // Fail closed: a timeline that cannot be read cannot prove the reopen
+    // predates the merge, so the upper bound stands and the close waits.
+    mockBodyKeywordMerge();
+    githubMocks.fetchIssues.mockResolvedValue([
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: ["status/in-review"] },
+    ]);
+    mockIssueRows([{ id: "issue-42", number: 42 }]);
+    prismaMocks.lifecycleRows.push({
+      kind: "issue_reopened",
+      source: "sync",
+      issueId: "issue-42",
+      issueNumber: 42,
+      dedupeKey: "sync|org/repo|42|issue_reopened|2026-10-05",
+      occurredAt: new Date("2026-10-05T00:00:00Z"),
+    });
+    githubMocks.fetchReopenAfter.mockRejectedValueOnce(new Error("timeline 403"));
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.issuesClosed).toBe(0);
+    expect(body.closesSkipped).toBe(1);
+    expect(reconciliationMocks.executeActions).not.toHaveBeenCalled();
+  });
+
+  it("does not consult the timeline when a cached close already proves the override", async () => {
+    // closedAt after the merge is exact evidence: the reopen necessarily came
+    // later, so no forge confirmation is owed.
+    mockBodyKeywordMerge();
+    githubMocks.fetchIssues.mockResolvedValue([
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: ["status/in-review"] },
+    ]);
+    mockIssueRows([{ id: "issue-42", number: 42, closedAt: new Date("2026-10-04T00:00:00Z") }]);
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.closesSkipped).toBe(1);
+    expect(githubMocks.fetchReopenAfter).not.toHaveBeenCalled();
+  });
+
+  it("skips a close the live issue already closed upstream", async () => {
+    // The pass-start snapshot said open; the live re-read says otherwise.
+    // Our close is redundant — it is dropped, recorded, and GitHub is not
+    // written for this issue.
+    mockBodyKeywordMerge();
+    githubMocks.fetchIssues.mockResolvedValue([
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: ["status/in-progress"] },
+    ]);
+    mockIssueRows([{ id: "issue-42", number: 42 }]);
+    githubMocks.fetchIssue.mockResolvedValueOnce({ state: "closed" });
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.issuesClosed).toBe(0);
+    expect(body.closesSkipped).toBe(1);
+    expect(reconciliationMocks.executeActions).not.toHaveBeenCalled();
+    const skipAudit = prismaMocks.auditRows.find((row) => row.action === "reconcile_close_skipped");
+    expect(skipAudit?.notes).toContain("already closed upstream");
+    expect(skipAudit?.issueId).toBe("issue-42");
+  });
+
+  it("holds a close when the live issue re-read fails", async () => {
+    // Writing blind is not an option: the close is held and the next pass
+    // retries. The note is stable text; the raw error stays in the log.
+    mockBodyKeywordMerge();
+    githubMocks.fetchIssues.mockResolvedValue([
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: ["status/in-progress"] },
+    ]);
+    mockIssueRows([{ id: "issue-42", number: 42 }]);
+    githubMocks.fetchIssue.mockRejectedValueOnce(new Error("github 502"));
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.issuesClosed).toBe(0);
+    expect(body.closesSkipped).toBe(1);
+    expect(reconciliationMocks.executeActions).not.toHaveBeenCalled();
+    const skipAudit = prismaMocks.auditRows.find((row) => row.action === "reconcile_close_skipped");
+    expect(skipAudit?.notes).toContain("live issue recheck failed");
+  });
+
+  it("falls back to repo+number for the skip audit of an unsynced issue", async () => {
+    // No cached row means no issueId to key the #1363 dedupe on: the skip
+    // row still records, linked only by repo + number.
+    mockBodyKeywordMerge();
+    githubMocks.fetchIssues.mockResolvedValue([
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: ["status/in-progress"] },
+    ]);
+    prismaMocks.issueFindMany.mockResolvedValue([]);
+    githubMocks.fetchIssue.mockRejectedValueOnce(new Error("github 502"));
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.closesSkipped).toBe(1);
+    const skipAudit = prismaMocks.auditRows.find((row) => row.action === "reconcile_close_skipped");
+    expect(skipAudit?.issueId).toBeNull();
+    expect(skipAudit?.repoFullName).toBe("org/repo");
+    expect(skipAudit?.issueNumber).toBe(42);
+    const lookup = prismaMocks.auditLogFindFirst.mock.calls
+      .map((call) => call[0].where)
+      .find((where) => where.action === "reconcile_close_skipped");
+    expect(lookup).toMatchObject({ repoFullName: "org/repo", issueNumber: 42 });
+    expect(lookup).not.toHaveProperty("issueId");
   });
 });

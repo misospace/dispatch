@@ -22,6 +22,7 @@ export {
   removeIssueLabel,
   syncStatusLabels,
   closeIssue,
+  fetchReopenAfter,
 } from "./github-issues";
 
 export {

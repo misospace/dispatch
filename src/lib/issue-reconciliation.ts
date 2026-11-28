@@ -283,9 +283,11 @@ export interface ReconciliationResult {
  * `mergedPrs` carries only close-authority PRs (body Fixes/Closes/Resolves
  * keywords — correlation by branch name alone never reaches this function as
  * close evidence). `reopenEvidenceByIssue` is the latest authoritative
- * reopen-or-recorded-close observation per issue number; when it postdates
- * the authority PR's merge, the close is withheld and reported in
- * `closeSkippedReason` without any other action for that issue.
+ * reopen-or-recorded-close observation per issue number; the caller refines
+ * the sync event's upper-bound timestamp against the forge timeline before
+ * passing it in. When the evidence postdates the authority PR's merge, the
+ * close is withheld and reported in `closeSkippedReason` without any other
+ * action for that issue.
  */
 export function reconcileIssue(
   issue: { number: number; title: string; body: string | null; labels: string[]; state: string },

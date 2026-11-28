@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
-import { fetchPullRequests, fetchClosedPullRequests, fetchIssues, fetchLinkedPrHealthInput, getGitHubToken } from "@/lib/github";
+import { fetchPullRequests, fetchClosedPullRequests, fetchIssues, fetchIssue, fetchReopenAfter, fetchLinkedPrHealthInput, getGitHubToken } from "@/lib/github";
 import { getSyncRepos } from "@/lib/config";
 import {
   extractFixingIssueNumbers,
@@ -57,10 +57,13 @@ async function runDeletedPrFixReap(): Promise<{ checked: number; markedStale: nu
  * suppressed until the shared re-emit window elapses, then re-emitted once
  * as a fresh confirmation; a changed reason is always written. A failed
  * lookup falls through to the write — the skip stays best-effort-logged,
- * never skipped.
+ * never skipped. With a cached issue row the lookup keys on `issueId` so it
+ * rides the #1363 composite index and the row links to the issue; only an
+ * unsynced issue falls back to repo+number.
  */
 async function recordCloseSkippedAudit(input: {
   repoFullName: string;
+  issueId: string | null;
   issueNumber: number;
   labels: string[];
   reason: string;
@@ -70,8 +73,7 @@ async function recordCloseSkippedAudit(input: {
       where: {
         actor: "reconciler",
         action: "reconcile_close_skipped",
-        repoFullName: input.repoFullName,
-        issueNumber: input.issueNumber,
+        ...(input.issueId ? { issueId: input.issueId } : { repoFullName: input.repoFullName, issueNumber: input.issueNumber }),
       },
       orderBy: { createdAt: "desc" },
       select: { notes: true, createdAt: true },
@@ -92,6 +94,7 @@ async function recordCloseSkippedAudit(input: {
       actor: "reconciler",
       action: "reconcile_close_skipped",
       repoFullName: input.repoFullName,
+      issueId: input.issueId,
       issueNumber: input.issueNumber,
       beforeLabels: input.labels,
       afterLabels: input.labels,
@@ -542,6 +545,33 @@ export async function POST(request: Request) {
               `${repo.fullName}: reopen evidence lookup failed (${message}); closes are held until a pass can read it`,
             );
           }
+          // A sync-recorded `issue_reopened` stamps `occurredAt` with the
+          // issue's `updated_at` at observation: an upper bound, and a comment
+          // or label edit after a fresh merge can inflate it past that merge
+          // and withhold a legitimate close for good. Before honoring such a
+          // withhold, confirm the reopen against the issue timeline, where
+          // the `reopened` activity carries its real time (#1727 review). The
+          // cached-`closedAt` signal needs no confirmation: a recorded close
+          // newer than the merge proves the later reopen exactly.
+          for (const [issueNum] of closeAuthorityIssueRows) {
+            const eventDate = reopenEvidence.get(issueNum);
+            const mergedAtRaw = mergedCloseAuthority.get(issueNum)?.merged_at;
+            const mergedAtMs = mergedAtRaw ? Date.parse(mergedAtRaw) : NaN;
+            if (!eventDate || Number.isNaN(mergedAtMs) || eventDate.getTime() <= mergedAtMs) continue;
+            if ((closeAuthorityIssueRows.get(issueNum)?.closedAt?.getTime() ?? 0) > mergedAtMs) continue;
+            try {
+              const confirmed = await fetchReopenAfter(repo.fullName, issueNum, new Date(mergedAtMs));
+              if (confirmed) reopenEvidence.set(issueNum, confirmed);
+              else reopenEvidence.delete(issueNum);
+            } catch (error) {
+              // Fail closed: an unreadable or over-bound timeline cannot prove
+              // the reopen predates the merge, so the upper bound stands.
+              const message = error instanceof Error ? error.message : String(error);
+              console.warn(
+                `${repo.fullName}: reopen confirmation for #${issueNum} unavailable (${message}); close stays held`,
+              );
+            }
+          }
           for (const [issueNum, row] of closeAuthorityIssueRows) {
             if (row.closedAt && (!reopenEvidence.has(issueNum) || row.closedAt > reopenEvidence.get(issueNum)!)) {
               reopenEvidence.set(issueNum, row.closedAt);
@@ -592,6 +622,25 @@ export async function POST(request: Request) {
           ) {
             closeSkippedReason = "reopen evidence unavailable; holding close for a later pass";
           }
+          // The gate above is only as fresh as the pass-start snapshot, so
+          // re-read the live issue immediately before the close write
+          // (#1727 review): an upstream close makes ours redundant, and a
+          // failed read means we would be writing blind. The residual window
+          // between this read and the PATCH is documented in
+          // docs/issue-lifecycle-events.md.
+          if (
+            !closeSkippedReason &&
+            result.actions.some((a) => a.type === "close_issue")
+          ) {
+            try {
+              const live = await fetchIssue(repo.fullName, issue.number);
+              if (live.state !== "open") {
+                closeSkippedReason = "issue already closed upstream; no close needed";
+              }
+            } catch {
+              closeSkippedReason = "live issue recheck failed; holding close for a later pass";
+            }
+          }
           const actions = closeSkippedReason
             ? result.actions.filter((a) => a.type !== "close_issue")
             : result.actions;
@@ -599,6 +648,7 @@ export async function POST(request: Request) {
             totalClosesSkipped++;
             await recordCloseSkippedAudit({
               repoFullName: repo.fullName,
+              issueId: existingIssue?.id ?? null,
               issueNumber: issue.number,
               labels: currentLabels,
               reason: closeSkippedReason,

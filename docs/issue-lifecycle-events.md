@@ -136,21 +136,45 @@ license to close (#1727). Before closing, the reconciler checks for a
 reopen recorded after the merge: the newest `issue_reopened` lifecycle
 event, or the cached issue row's `closedAt` when sync has not yet observed
 the reopen (GitHub nulls `closed_at` on reopen, so the cache holds a close
-newer than the merge until sync catches up). Two bounds on that evidence:
-reopening an issue that closed *before* the merge stays invisible until
-sync records the `issue_reopened` event — bounded by the sync interval;
-and if the reopen read itself fails, every close the authority names is
-held for a later pass (fail closed — waiting costs freshness, never
-correctness). A reopen that postdates the close-authority merge withholds
-the close for that issue: no GitHub write happens, the pass records a
-`reconcile_close_skipped` audit row, and the response counts it in
-`closesSkipped`. The withheld pass also skips that issue's open-PR status
-labeling — the linked-PR health snapshot still persists. Identical skip
-annotations are suppressed until the shared #1363 re-emit window elapses,
-so a deliberately-reopened issue does not earn a row every pass. The merge
+newer than the merge until sync catches up). The two signals carry
+different precision. A cached `closedAt` newer than the merge is exact:
+the issue is open now, so its reopen necessarily came after that close,
+and after the merge. A lifecycle event is an upper bound — sync stamps
+`occurredAt` with the issue's `updated_at` at observation, which a comment
+or label edit after the actual reopen inflates. So before honoring a
+withhold that rests on the event alone, the reconciler confirms it against
+the issue timeline, where the `reopened` activity carries its real time
+(`fetchReopenAfter`, bounded to 5 pages of events after the merge): a
+confirmed reopen moves the evidence to the authoritative timestamp, the
+absence of one refutes the inflated stamp, and a timeline that cannot be
+read to completion leaves the withhold in place (fail closed). With that
+confirmation, the contract holds: a reopen that predates the merge does
+not suppress, and one that postdates it withholds the close for that
+issue — no GitHub write happens, the pass records a `reconcile_close_skipped`
+audit row (keyed to the cached `issueId` when one exists, so it rides the
+#1363 composite index), and the response counts it in `closesSkipped`. The
+withheld pass also skips that issue's open-PR status labeling — the
+linked-PR health snapshot still persists. Identical skip annotations are
+suppressed until the shared #1363 re-emit window elapses, so a
+deliberately-reopened issue does not earn a row every pass. The merge
 evidence still records — correlation recording stays decoupled from
 closing. The close authority per issue is the newest body-keyword merge,
 so an older merge cannot make a legitimate newer fix look like a re-close.
+
+Immediately before the close write, the reconciler re-reads the live issue
+(#1727 review): if GitHub already closed it, the close is dropped and
+skipped with `issue already closed upstream`; if the read fails, the close
+is held for a later pass rather than written blind. The residual race is
+deliberate and accepted: a maintainer who closes or reopens the issue
+*between the live re-read and the close request* is not observed by this
+pass. A re-close that races in wins until the next sync records the
+reopen event, which the confirmation above then honors — bounded by the
+sync interval, retryable, and never silently repeated, because every
+withheld close is audited. Remaining bounds: a reopen of an issue that
+closed *before* the merge stays invisible to the gate until sync records
+the `issue_reopened` event — bounded by the sync interval; and if the
+reopen read itself fails, every close the authority names is held for a
+later pass (fail closed — waiting costs freshness, never correctness).
 
 Merge recording is decoupled from the reconcile action loop: a linked merge
 records whether the issue is open or closed and whether the close action

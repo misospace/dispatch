@@ -1,5 +1,5 @@
 import { GitHubIssue } from "@/types";
-import { GITHUB_API, getHeadersAsync, fetchPaginated, fetchWithRetry } from "./github-auth";
+import { GITHUB_API, getHeadersAsync, getNextLink, fetchPaginated, fetchWithRetry } from "./github-auth";
 import { dependencyKey } from "./issue-dependencies";
 
 interface BlockedByItem {
@@ -90,6 +90,52 @@ export async function fetchIssue(
     return fetched === null ? data : { ...data, nativeBlockedBy: fetched };
   }
   return data;
+}
+
+// Bounded read for the reopen confirmation below: events AFTER the merge are
+// what matters, and an issue that busy is parked for the operator, not
+// paged through without end.
+const REOPEN_TIMELINE_MAX_PAGES = 5;
+
+/**
+ * Confirm a reopen against the issue timeline: the latest `reopened` activity
+ * strictly after `since`, or null when the bounded read holds none (#1727).
+ * A sync-recorded `issue_reopened` event stamps `occurredAt` with the issue's
+ * `updated_at` at observation — an upper bound a comment can inflate past a
+ * merge — so the timeline is the authoritative reopen time the reconciler
+ * checks before withholding a close. Throws when the timeline cannot be read
+ * to completion (API failure or more pages than the bound): an incomplete
+ * read never proves "no reopen", and the caller fails closed.
+ */
+export async function fetchReopenAfter(
+  repoFullName: string,
+  issueNumber: number,
+  since: Date,
+): Promise<Date | null> {
+  const [owner, repo] = repoFullName.split("/");
+  let url: string | null =
+    `${GITHUB_API}/repos/${owner}/${repo}/issues/${issueNumber}/timeline?since=${since.toISOString()}&per_page=100`;
+  let latest: Date | null = null;
+  for (let page = 0; page < REOPEN_TIMELINE_MAX_PAGES && url !== null; page++) {
+    const response = await fetchWithRetry(url, { headers: await getHeadersAsync() });
+    if (!response.ok) {
+      throw new Error(`GitHub timeline error for ${repoFullName}#${issueNumber}: ${response.status}`);
+    }
+    const events: Array<{ event?: string; created_at?: string }> = await response.json();
+    for (const event of events) {
+      if (event.event !== "reopened" || !event.created_at) continue;
+      const at = new Date(event.created_at);
+      if (Number.isNaN(at.getTime()) || at.getTime() <= since.getTime()) continue;
+      if (!latest || at > latest) latest = at;
+    }
+    url = getNextLink(response);
+  }
+  if (url !== null) {
+    throw new Error(
+      `GitHub timeline for ${repoFullName}#${issueNumber} exceeded the bounded reopen-confirmation window`,
+    );
+  }
+  return latest;
 }
 
 /**
