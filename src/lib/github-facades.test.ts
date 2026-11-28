@@ -39,6 +39,7 @@ describe("github domain modules expose expected exports", () => {
       "fetchIssueLabels",
       "fetchIssueNativeBlockers",
       "fetchIssues",
+      "fetchReopenAfter",
       "removeIssueLabel",
       "repoLabelExists",
       "syncStatusLabels",
@@ -105,7 +106,7 @@ describe("github domain modules expose expected exports", () => {
     const barrelKeys = Object.keys(Barrel).sort();
     const expected = [
       "getGitHubToken", "__resetGitHubAppState", "fetchPaginated", "validateGitHubToken",
-      "fetchIssues", "fetchIssue", "updateIssueLabels", "fetchIssueComments",
+      "fetchIssues", "fetchIssue", "updateIssueLabels", "fetchIssueComments", "fetchReopenAfter",
       "addIssueComment", "addIssueLabel", "updateIssueComment",
       "updateIssueTitleAndBody", "removeIssueLabel", "syncStatusLabels", "closeIssue",
       "fetchRepo", "fetchWorkflows", "fetchWorkflowRuns", "fetchRecentRunsAllWorkflows",

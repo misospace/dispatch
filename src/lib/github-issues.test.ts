@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { GitHubIssue } from "@/types";
-import { fetchCollaboratorPermission, fetchIssue, fetchIssueLabels, fetchIssueNativeBlockers, fetchIssues, repoLabelExists } from "./github-issues";
+import { fetchCollaboratorPermission, fetchIssue, fetchIssueLabels, fetchIssueNativeBlockers, fetchIssues, fetchReopenAfter, repoLabelExists } from "./github-issues";
 
 const fetchWithRetry = vi.fn();
 const fetchPaginated = vi.fn();
@@ -11,6 +11,10 @@ vi.mock("./github-auth", () => ({
   getHeadersAsync: async () => ({}),
   fetchPaginated: (...args: unknown[]) => fetchPaginated(...args),
   fetchWithRetry: (...args: unknown[]) => fetchWithRetry(...args),
+  getNextLink: (response: { headers: { get(name: string): string | null } }) => {
+    const match = response.headers.get("Link")?.match(/<([^>]+)>;\s*rel="next"/);
+    return match ? match[1] : null;
+  },
 }));
 
 const okJson = (data: unknown) => ({ ok: true, status: 200, json: async () => data });
@@ -380,5 +384,76 @@ describe("repoLabelExists", () => {
   it("returns null on a network failure", async () => {
     fetchWithRetry.mockRejectedValue(new Error("socket hang up"));
     await expect(repoLabelExists("acme/app", "agent/courier-hyper")).resolves.toBeNull();
+  });
+});
+
+describe("fetchReopenAfter", () => {
+  const since = new Date("2026-10-02T08:00:00Z");
+  const timelineUrl = `https://api.github.com/repos/acme/app/issues/42/timeline?since=${since.toISOString()}&per_page=100`;
+  const okTimeline = (data: unknown, nextUrl?: string) => ({
+    ok: true,
+    status: 200,
+    json: async () => data,
+    headers: {
+      get: (name: string) =>
+        name === "Link" && nextUrl ? `<${nextUrl}>; rel="next"` : null,
+    },
+  });
+
+  it("returns the latest reopened activity strictly after `since`, ignoring other events", async () => {
+    fetchWithRetry.mockResolvedValue(okTimeline([
+      { event: "reopened", created_at: "2026-09-01T00:00:00Z" },
+      { event: "commented", created_at: "2026-10-04T00:00:00Z" },
+      { event: "reopened", created_at: "2026-10-03T00:00:00Z" },
+      { event: "reopened", created_at: "2026-10-05T00:00:00Z" },
+    ]));
+
+    const result = await fetchReopenAfter("acme/app", 42, since);
+
+    expect(fetchWithRetry.mock.calls[0][0]).toBe(timelineUrl);
+    expect(result).toEqual(new Date("2026-10-05T00:00:00Z"));
+  });
+
+  it("returns null when the read holds no reopened activity after `since`", async () => {
+    fetchWithRetry.mockResolvedValue(okTimeline([
+      // A reopen at exactly `since` is not after the merge.
+      { event: "reopened", created_at: "2026-10-02T08:00:00Z" },
+      { event: "labeled", created_at: "2026-10-04T00:00:00Z" },
+    ]));
+
+    await expect(fetchReopenAfter("acme/app", 42, since)).resolves.toBeNull();
+  });
+
+  it("throws when a reopened activity carries no usable created_at", async () => {
+    // Skipping it would refute a real reopen; unreadable data is an
+    // incomplete read, and the caller fails closed.
+    fetchWithRetry.mockResolvedValue(okTimeline([{ event: "reopened" }]));
+
+    await expect(fetchReopenAfter("acme/app", 42, since)).rejects.toThrow(/without a usable created_at/);
+  });
+
+  it("follows rel=next pages until the end", async () => {
+    fetchWithRetry
+      .mockResolvedValueOnce(okTimeline([{ event: "commented", created_at: "2026-10-03T00:00:00Z" }], "https://api.github.com/page-2"))
+      .mockResolvedValueOnce(okTimeline([{ event: "reopened", created_at: "2026-10-06T00:00:00Z" }]));
+
+    const result = await fetchReopenAfter("acme/app", 42, since);
+
+    expect(result).toEqual(new Date("2026-10-06T00:00:00Z"));
+    expect(fetchWithRetry).toHaveBeenCalledTimes(2);
+    expect(fetchWithRetry.mock.calls[1][0]).toBe("https://api.github.com/page-2");
+  });
+
+  it("throws on a failed page — an unreadable timeline never proves 'no reopen'", async () => {
+    fetchWithRetry.mockResolvedValue({ ok: false, status: 403, json: async () => ({}) });
+
+    await expect(fetchReopenAfter("acme/app", 42, since)).rejects.toThrow(/403/);
+  });
+
+  it("throws when the timeline exceeds the bounded page window", async () => {
+    fetchWithRetry.mockResolvedValue(okTimeline([], "https://api.github.com/next"));
+
+    await expect(fetchReopenAfter("acme/app", 42, since)).rejects.toThrow(/bounded reopen-confirmation window/);
+    expect(fetchWithRetry).toHaveBeenCalledTimes(5);
   });
 });

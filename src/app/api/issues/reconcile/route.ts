@@ -1,11 +1,12 @@
 import { NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
-import { fetchPullRequests, fetchClosedPullRequests, fetchIssues, fetchLinkedPrHealthInput, getGitHubToken } from "@/lib/github";
+import { fetchPullRequests, fetchClosedPullRequests, fetchIssues, fetchIssue, fetchReopenAfter, fetchLinkedPrHealthInput, getGitHubToken } from "@/lib/github";
 import { getSyncRepos } from "@/lib/config";
 import {
   extractFixingIssueNumbers,
   reconcileIssue,
+  loadReopenEvidence,
   classifyLaneByHeuristics,
   shouldReclassifyStaleBacklog,
   executeActions,
@@ -21,6 +22,7 @@ import {
   type PrMergeObservation,
 } from "@/lib/issue-lifecycle";
 import { isBacklogLane, assertValidLaneForWrite } from "@/lib/lane-config";
+import { reconcileAnnotationReemitMs } from "@/lib/ownership-reconciliation";
 import { computeLinkedPrHealth, toPersistedLinkedPrHealth, type LinkedPrHealth } from "@/lib/linked-pr-health";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { reconcileStalePrFixItems, reconcileDeletedPrFixItems } from "@/lib/pr-fix-queue";
@@ -28,6 +30,29 @@ import { enforceRateLimit } from "@/lib/rate-limit";
 import { acquireLock, releaseLock, type AcquiredLock, type LockConflict } from "@/lib/sync-lock";
 
 const RATE_LIMIT = { limit: 10, windowMs: 60_000 };
+
+/** In-flight ceiling for the #1727 reopen-confirmation timeline reads. */
+const REOPEN_CONFIRM_CONCURRENCY = 4;
+
+/**
+ * Run independent reads with at most `limit` in flight. A task's own failure
+ * handling stays inside its `run`; the pool only bounds parallelism.
+ */
+async function mapBounded<T>(
+  items: readonly T[],
+  limit: number,
+  run: (item: T) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  const width = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(
+    Array.from({ length: width }, async () => {
+      while (next < items.length) {
+        await run(items[next++]);
+      }
+    }),
+  );
+}
 
 /**
  * Best-effort deleted-PR reap (#1641): a transient forge failure is reported,
@@ -45,6 +70,72 @@ async function runDeletedPrFixReap(): Promise<{ checked: number; markedStale: nu
     console.warn(`[pr-fix-queue] deleted-PR reap failed: ${message}`);
     return { checked: 0, markedStale: 0, errored: 1 };
   }
+}
+
+/**
+ * Merge instant for close-authority ordering. A lexicographic compare of the
+ * raw `merged_at` strings is chronological only while GitHub keeps its exact
+ * second-precision UTC shape, so compare parsed times; an unparseable value
+ * sorts below every dated merge instead of outranking one by punctuation.
+ */
+function mergeTimeMs(pr: { merged_at?: string | null }): number {
+  const ms = pr.merged_at ? Date.parse(pr.merged_at) : NaN;
+  return Number.isNaN(ms) ? -1 : ms;
+}
+
+/**
+ * Record a #1727 withheld close. The close authority stays in the fetched
+ * window and the issue stays open, so a deliberately-reopened issue would
+ * otherwise earn an identical skip row every pass. Mirrors the #1363
+ * annotation dedupe: an annotation identical to the issue's latest skip is
+ * suppressed until the shared re-emit window elapses, then re-emitted once
+ * as a fresh confirmation; a changed reason is always written. A failed
+ * lookup falls through to the write — the skip stays best-effort-logged,
+ * never skipped. With a cached issue row the lookup keys on `issueId` so it
+ * rides the #1363 composite index and the row links to the issue; only an
+ * unsynced issue falls back to repo+number.
+ */
+async function recordCloseSkippedAudit(input: {
+  repoFullName: string;
+  issueId: string | null;
+  issueNumber: number;
+  labels: string[];
+  reason: string;
+}): Promise<void> {
+  try {
+    const latest = await prisma.auditLog.findFirst({
+      where: {
+        actor: "reconciler",
+        action: "reconcile_close_skipped",
+        ...(input.issueId ? { issueId: input.issueId } : { repoFullName: input.repoFullName, issueNumber: input.issueNumber }),
+      },
+      orderBy: { createdAt: "desc" },
+      select: { notes: true, createdAt: true },
+    });
+    if (
+      latest &&
+      latest.notes === input.reason &&
+      Date.now() - latest.createdAt.getTime() < reconcileAnnotationReemitMs()
+    ) {
+      return;
+    }
+  } catch {
+    // Dedupe is an optimization; never let its lookup mask the annotation.
+  }
+
+  await prisma.auditLog.create({
+    data: {
+      actor: "reconciler",
+      action: "reconcile_close_skipped",
+      repoFullName: input.repoFullName,
+      issueId: input.issueId,
+      issueNumber: input.issueNumber,
+      beforeLabels: input.labels,
+      afterLabels: input.labels,
+      success: true,
+      notes: input.reason,
+    },
+  });
 }
 
 /**
@@ -255,7 +346,8 @@ export async function recordLinkedMergeEvidence(input: {
  *
  * This endpoint replaces the grooming logic that previously lived in
  * Saffron's project_groom.py scripts. It:
- * 1. Detects merged PRs that fix issues → closes them on GitHub
+ * 1. Detects merged PRs that close issues → closes them on GitHub, unless a
+ *    recorded reopen observation postdates the merge (#1727)
  * 2. Detects open PRs and checks their health → applies labels via GitHub API
  * 3. Classifies lanes using heuristics when model calls are unavailable
  *
@@ -335,6 +427,7 @@ export async function POST(request: Request) {
     let totalMergedPrsFound = 0;
     let totalOpenPrsChecked = 0;
     let totalIssuesClosed = 0;
+    let totalClosesSkipped = 0;
     let totalLabelsChanged = 0;
     let totalLaneClassified = 0;
     const errors: string[] = [];
@@ -366,25 +459,24 @@ export async function POST(request: Request) {
         totalMergedPrsFound += mergedPrsMap.size;
         totalOpenPrsChecked += openPrsMap.size;
 
-        // Extract issue numbers from merged PRs: scan PR bodies for the
-        // "Fixes #NNN", "Closes #NNN", "Resolves #NNN" keywords workers write,
-        // then collect branch name patterns.
-        // `mergedFixingIssues` stays first-PR-wins because it drives the close
-        // decision. `mergedPrLinkEvidence` keeps *every* merged PR per issue
-        // with its link provenance (#1203): merge evidence records one event
-        // per linked PR. Branch-name evidence is collected independently of
-        // the close-decision map — a PR whose own number collides with an
-        // issue number already in that map still records its branch link.
-        // The branch claim still feeds the close decision, so the collision
-        // case widens the reconciler's close reach: the branch-linked issue
-        // number is closed by the same branch heuristic, under the same
-        // first-PR-wins-per-issue-number rule. Only explicit correlations
-        // qualify — a body Fixes/Closes/Resolves keyword or a branch-name
-        // pattern. PR titles are deliberately not consulted (#1203,
-        // review-required): a title-only match is neither close evidence nor
-        // link evidence, so a merged PR that only names an issue in its title
-        // neither closes it nor records a merge for it.
-        const mergedFixingIssues = new Map<number, typeof allPrs[number]>();
+        // Extract close authority and correlation evidence from merged PRs.
+        // They are deliberately separate (#1727):
+        // - `mergedCloseAuthority` holds only PRs whose *body* carries the
+        //   "Fixes/Closes/Resolves #NNN" keywords workers write, and it is
+        //   the sole input to the close decision. A branch name that matches
+        //   an issue number is correlation, not completion evidence, and no
+        //   longer feeds the close map.
+        // - `mergedPrLinkEvidence` keeps *every* merged PR per issue with its
+        //   link provenance (#1203): merge evidence records one event per
+        //   linked PR — body-keyword or branch-name — whether or not the
+        //   issue is closed, decoupled from any close.
+        // The authority map keeps the newest merge per issue: the #1727
+        // reopen check compares the issue's reopen observation against the
+        // merge, and it is the freshest keyword merge — not the first one the
+        // window happened to yield — that carries the current completion
+        // claim. PR titles are never consulted as evidence (#1203): a
+        // title-only match neither closes an issue nor records a merge for it.
+        const mergedCloseAuthority = new Map<number, typeof allPrs[number]>();
         const mergedPrLinkEvidence = new Map<number, PrMergeObservation[]>();
         const recordLinkEvidence = (num: number, pr: (typeof allPrs)[number], linkSource: string) => {
           const existing = mergedPrLinkEvidence.get(num);
@@ -401,29 +493,22 @@ export async function POST(request: Request) {
           else mergedPrLinkEvidence.set(num, [observation]);
         };
         for (const [, pr] of mergedPrsMap) {
-          // 1. Check PR body for keyword references (Fixes #, Closes #, Resolves #)
+          // 1. Body close keywords: the only close authority.
           for (const num of extractFixingIssueNumbers(pr.body ?? null)) {
-            if (!mergedFixingIssues.has(num)) {
-              mergedFixingIssues.set(num, pr);
+            const incumbent = mergedCloseAuthority.get(num);
+            if (!incumbent || mergeTimeMs(pr) > mergeTimeMs(incumbent)) {
+              mergedCloseAuthority.set(num, pr);
             }
             recordLinkEvidence(num, pr, "body-keyword");
           }
-          // 2. Branch name pattern — collected for every merged PR, not only
-          // for one whose own number is free in the close-decision map: the
-          // link evidence a branch name carries is independent of which PR
-          // the close decision picked for an issue number. The claim still
-          // feeds the close decision, so in the collision case the
-          // branch-linked issue is closed by the same branch heuristic.
+          // 2. Branch name pattern: correlation only (#1727). It records link
+          // evidence for the merged PR but never authorizes a close, even
+          // when the branch number collides with an issue in no other way.
           const branch = pr.head?.ref ?? "";
           const match = branch.match(/issue[-_/]?(\d+)/i);
           if (match) {
             const issueNum = parseInt(match[1], 10);
-            if (!isNaN(issueNum)) {
-              if (!mergedFixingIssues.has(issueNum)) {
-                mergedFixingIssues.set(issueNum, pr);
-              }
-              recordLinkEvidence(issueNum, pr, "branch-name");
-            }
+            if (!isNaN(issueNum)) recordLinkEvidence(issueNum, pr, "branch-name");
           }
         }
 
@@ -466,6 +551,111 @@ export async function POST(request: Request) {
         });
         const existingIssueByNumber = new Map(existingIssues.map((i) => [i.number, i]));
 
+        // #1727: load the reopen evidence for the issues the close authority
+        // names before any close decision. Two observations prove a merge's
+        // close was overridden: a sync-recorded `issue_reopened` lifecycle
+        // event, and the cache row's own `closedAt` when sync has not seen
+        // the reopen yet (GitHub nulls `closed_at` on reopen, so the cache
+        // holds a close newer than the merge until sync catches up). The
+        // cached-close signal cannot date a reopen of an issue that closed
+        // before the merge — that one waits for sync's `issue_reopened`
+        // event, bounded by the sync interval. A candidate with no cache row
+        // at all (never synced, or pruned after its close and reopened since)
+        // has no local history: it gets the same bounded timeline
+        // confirmation as an in-doubt stamp, and an unreadable read holds the
+        // close instead of letting the bare merge authority through
+        // (#1730 review).
+        const openIssueNumbers = new Set(
+          issues.filter((i) => i.state === "open").map((i) => i.number),
+        );
+        const closeAuthorityIssueRows = new Map<number, (typeof existingIssues)[number]>();
+        const uncachedCloseCandidates: number[] = [];
+        for (const issueNum of mergedCloseAuthority.keys()) {
+          const row = existingIssueByNumber.get(issueNum);
+          if (row) closeAuthorityIssueRows.set(issueNum, row);
+          else if (openIssueNumbers.has(issueNum)) uncachedCloseCandidates.push(issueNum);
+        }
+        let reopenEvidence = new Map<number, Date>();
+        let reopenEvidenceError: string | null = null;
+        // Candidates whose reopen history cannot be read at all — held like
+        // the failed-lookup case below, per issue.
+        const reopenUnreadable = new Set<number>();
+        if (closeAuthorityIssueRows.size > 0 || uncachedCloseCandidates.length > 0) {
+          if (closeAuthorityIssueRows.size > 0) {
+            const idsByNumber = new Map<number, string>();
+            for (const [issueNum, row] of closeAuthorityIssueRows) idsByNumber.set(issueNum, row.id);
+            try {
+              reopenEvidence = await loadReopenEvidence(prisma, idsByNumber);
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              reopenEvidenceError = message;
+              console.warn(
+                `${repo.fullName}: reopen evidence lookup failed (${message}); closes are held until a pass can read it`,
+              );
+            }
+          }
+          // A sync-recorded `issue_reopened` stamps `occurredAt` with the
+          // issue's `updated_at` at observation: an upper bound, and a comment
+          // or label edit after a fresh merge can inflate it past that merge
+          // and withhold a legitimate close for good. Before honoring such a
+          // withhold, confirm the reopen against the issue timeline, where
+          // the `reopened` activity carries its real time (#1727 review). The
+          // cached-`closedAt` signal needs no confirmation: a recorded close
+          // newer than the merge proves the later reopen exactly.
+          //
+          // Only an inflated event that no cached close already explains needs
+          // a read, and the reads are independent, so they run through a small
+          // pool: a repo whose window holds many keyword merges shortens without
+          // opening one GitHub request per candidate at once.
+          const needsConfirmation: Array<{ issueNum: number; mergedAtMs: number; uncached: boolean }> = [];
+          for (const [issueNum] of closeAuthorityIssueRows) {
+            const eventDate = reopenEvidence.get(issueNum);
+            const mergedAtRaw = mergedCloseAuthority.get(issueNum)?.merged_at;
+            const mergedAtMs = mergedAtRaw ? Date.parse(mergedAtRaw) : NaN;
+            // No merge time means no `since` bound to read: leave the upper
+            // bound in place and let `reconcileIssue` fail closed on it.
+            if (!eventDate || Number.isNaN(mergedAtMs) || eventDate.getTime() <= mergedAtMs) continue;
+            if ((closeAuthorityIssueRows.get(issueNum)?.closedAt?.getTime() ?? 0) > mergedAtMs) continue;
+            needsConfirmation.push({ issueNum, mergedAtMs, uncached: false });
+          }
+          for (const issueNum of uncachedCloseCandidates) {
+            const mergedAtRaw = mergedCloseAuthority.get(issueNum)?.merged_at;
+            const mergedAtMs = mergedAtRaw ? Date.parse(mergedAtRaw) : NaN;
+            // No merge time and no local history: nothing can show the close
+            // would not override a maintainer.
+            if (Number.isNaN(mergedAtMs)) {
+              reopenUnreadable.add(issueNum);
+              continue;
+            }
+            needsConfirmation.push({ issueNum, mergedAtMs, uncached: true });
+          }
+          await mapBounded(needsConfirmation, REOPEN_CONFIRM_CONCURRENCY, async ({ issueNum, mergedAtMs, uncached }) => {
+            try {
+              const confirmed = await fetchReopenAfter(repo.fullName, issueNum, new Date(mergedAtMs));
+              if (confirmed) reopenEvidence.set(issueNum, confirmed);
+              // A clean timeline refutes a cached event's inflated upper
+              // bound; for an uncached candidate there is nothing to refute,
+              // and the close proceeds.
+              else if (!uncached) reopenEvidence.delete(issueNum);
+            } catch (error) {
+              // Fail closed: an unreadable or over-bound timeline cannot prove
+              // the reopen predates the merge. With a cached row the upper
+              // bound stands; without one the candidate is marked unreadable
+              // and its close is held.
+              const message = error instanceof Error ? error.message : String(error);
+              console.warn(
+                `${repo.fullName}: reopen confirmation for #${issueNum} unavailable (${message}); close stays held`,
+              );
+              if (uncached) reopenUnreadable.add(issueNum);
+            }
+          });
+          for (const [issueNum, row] of closeAuthorityIssueRows) {
+            if (row.closedAt && (!reopenEvidence.has(issueNum) || row.closedAt > reopenEvidence.get(issueNum)!)) {
+              reopenEvidence.set(issueNum, row.closedAt);
+            }
+          }
+        }
+
         // Reconcile each issue
         for (const issue of issues) {
           if (issue.state !== "open") continue;
@@ -483,15 +673,88 @@ export async function POST(request: Request) {
               labels: currentLabels,
               state: issue.state,
             },
-            mergedFixingIssues,
+            mergedCloseAuthority,
             openPrToIssue,
             linkedPrHealthByIssue,
+            reopenEvidence,
           );
 
+          // #1727: a withheld close means no close write and no merge-driven
+          // label churn, and the merge still earns its `pr_merged` evidence
+          // below — correlation stays decoupled from the close. Two sources
+          // withhold. (1) The reopen gate inside `reconcileIssue`: a reopen the
+          // pass cannot place before the merge. The issue's own status handling
+          // still runs, because the maintainer's reopen says the work is
+          // unfinished — open-PR health labels, and the in-review-with-no-PR
+          // release to ready. (2) A failed reopen-evidence read: without the
+          // stream there is no proof a close would not override a maintainer,
+          // and no evidence either, so it withholds the close and writes no
+          // label. A close held for one pass is retried by the next (waiting
+          // costs freshness, never correctness).
+          let closeSkippedReason = result.closeSkippedReason ?? null;
+          // Stable note: the raw error is logged, never embedded, so a
+          // flapping fault with varying messages cannot defeat the
+          // annotation dedupe for the duration of an outage.
+          if (
+            !closeSkippedReason &&
+            reopenEvidenceError &&
+            mergedCloseAuthority.has(issue.number) &&
+            result.actions.some((a) => a.type === "close_issue")
+          ) {
+            closeSkippedReason = "reopen evidence unavailable; holding close for a later pass";
+          }
+          // A candidate with no local history whose timeline read failed is
+          // held per issue: no evidence either way, so no close, no labels.
+          if (
+            !closeSkippedReason &&
+            reopenUnreadable.has(issue.number) &&
+            result.actions.some((a) => a.type === "close_issue")
+          ) {
+            closeSkippedReason = "reopen evidence unavailable; holding close for a later pass";
+          }
+          // The gate above is only as fresh as the pass-start snapshot, so
+          // re-read the live issue immediately before the close write
+          // (#1727 review): an upstream close makes ours redundant, and a
+          // failed read means we would be writing blind. This read costs one
+          // request per issue actually being closed and deliberately stays
+          // adjacent to the write rather than joining the parallel evidence
+          // pass above, where it would shrink nothing. The residual window
+          // between this read and the PATCH is documented in
+          // docs/issue-lifecycle-events.md.
+
+          if (
+            !closeSkippedReason &&
+            result.actions.some((a) => a.type === "close_issue")
+          ) {
+            try {
+              const live = await fetchIssue(repo.fullName, issue.number);
+              if (live.state !== "open") {
+                closeSkippedReason = "issue already closed upstream; no close needed";
+              }
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              console.warn(`${repo.fullName}: live issue recheck before close failed (${message}); close is held`);
+              closeSkippedReason = "live issue recheck failed; holding close for a later pass";
+            }
+          }
+          const actions = closeSkippedReason
+            ? result.actions.filter((a) => a.type !== "close_issue")
+            : result.actions;
+          if (closeSkippedReason) {
+            totalClosesSkipped++;
+            await recordCloseSkippedAudit({
+              repoFullName: repo.fullName,
+              issueId: existingIssue?.id ?? null,
+              issueNumber: issue.number,
+              labels: currentLabels,
+              reason: closeSkippedReason,
+            });
+          }
+
           // Execute actions against GitHub
-          if (result.actions.length > 0) {
+          if (actions.length > 0) {
             const executed = await executeActions(
-              result.actions.map((a) => ({ ...a, repoFullName: repo.fullName })),
+              actions.map((a) => ({ ...a, repoFullName: repo.fullName })),
               currentLabels,
             );
 
@@ -528,7 +791,7 @@ export async function POST(request: Request) {
                 issueNumber: exec.action.issueNumber,
                 existingIssue,
                 mergedPr:
-                  mergedFixingIssues.get(exec.action.issueNumber) ??
+                  mergedCloseAuthority.get(exec.action.issueNumber) ??
                   openPrToIssue.get(exec.action.issueNumber) ??
                   null,
                 mergedPrs: mergedPrLinkEvidence.get(exec.action.issueNumber) ?? null,
@@ -700,6 +963,7 @@ export async function POST(request: Request) {
       mergedPrsFound: totalMergedPrsFound,
       openPrsChecked: totalOpenPrsChecked,
       issuesClosed: totalIssuesClosed,
+      closesSkipped: totalClosesSkipped,
       labelsChanged: totalLabelsChanged,
       lanesClassified: totalLaneClassified,
       prFixQueueStaleChecked: totalPrFixStaleChecked,

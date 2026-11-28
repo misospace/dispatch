@@ -6,6 +6,7 @@ import {
   prBranchMatchesIssue,
   checkPrHealth,
   reconcileIssue,
+  loadReopenEvidence,
   executeAction,
   executeActions,
   shouldReclassifyStaleBacklog,
@@ -612,6 +613,185 @@ describe("reconcileIssue", () => {
     );
 
     expect(result.actions).toEqual([]);
+  });
+
+  // #1727: a merged PR is completion evidence for the close it caused, never
+  // a standing license to re-close an issue a maintainer reopened.
+  describe("reopen gate (#1727)", () => {
+    function makeMergedPr(overrides: Partial<GithubPR> = {}): GithubPR {
+      return {
+        number: 7,
+        url: "https://github.com/test/repo/pull/7",
+        title: "Fix the crash",
+        state: "closed",
+        user: { login: "bot" },
+        head: { ref: "fix/issue-42" },
+        base: { ref: "main" },
+        created_at: "2026-01-01T00:00:00Z",
+        updated_at: "2026-01-03T00:00:00Z",
+        merged_at: "2026-01-03T00:00:00Z",
+        draft: false,
+        ...overrides,
+      } as GithubPR;
+    }
+
+    it("withholds the close when a reopen is recorded after the merge", () => {
+      const mergedPrs = new Map([[42, makeMergedPr()]]);
+      const reopenEvidence = new Map([[42, new Date("2026-01-05T00:00:00Z")]]);
+
+      const result = reconcileIssue(
+        { number: 42, title: "Bug fix", body: null, labels: ["status/in-review"], state: "open" },
+        mergedPrs,
+        new Map(),
+        new Map(),
+        reopenEvidence,
+      );
+
+      expect(result.actions.some((action) => action.type === "close_issue")).toBe(false);
+      expect(result.isClosedByMergedPr).toBe(false);
+      expect(result.closeSkippedReason).toContain("reopened after merged PR #7");
+      // The withhold is not a freeze: the maintainer's reopen says the work is
+      // unfinished, so the in-review-with-no-PR release still runs.
+      expect(result.actions).toEqual([
+        {
+          type: "set_status",
+          issueNumber: 42,
+          repoFullName: "",
+          label: "status/ready",
+          reason: "reopened after its fixing PR merged, with no open PR — releasing to ready",
+        },
+      ]);
+    });
+
+    it("does not relabel an in-progress issue whose close is withheld", () => {
+      // Only in-review is reaped. An in-progress issue may have a live Workload
+      // that GitHub cannot show, and resetting it would double-dispatch.
+      const mergedPrs = new Map([[42, makeMergedPr()]]);
+      const reopenEvidence = new Map([[42, new Date("2026-01-05T00:00:00Z")]]);
+
+      const result = reconcileIssue(
+        { number: 42, title: "Bug fix", body: null, labels: ["status/in-progress"], state: "open" },
+        mergedPrs,
+        new Map(),
+        new Map(),
+        reopenEvidence,
+      );
+
+      expect(result.actions).toEqual([]);
+      expect(result.closeSkippedReason).toContain("reopened after merged PR #7");
+    });
+
+    it("tracks a new open PR on an issue whose close is withheld", () => {
+      // The reopen led to fresh work: the follow-up PR still gets its health
+      // label, and the ready release stays out of the way.
+      const mergedPrs = new Map([[42, makeMergedPr()]]);
+      const reopenEvidence = new Map([[42, new Date("2026-01-05T00:00:00Z")]]);
+
+      const result = reconcileIssue(
+        { number: 42, title: "Bug fix", body: null, labels: ["status/ready"], state: "open" },
+        mergedPrs,
+        new Map([[42, makeMergedPr({ number: 11, merged_at: null, state: "open" })]]),
+        new Map([[42, buildHealth()]]),
+        reopenEvidence,
+      );
+
+      expect(result.closeSkippedReason).toContain("reopened after merged PR #7");
+      expect(result.hasOpenPr).toBe(true);
+      expect(result.actions.map((action) => action.label)).toEqual(["status/in-review"]);
+    });
+
+    it("closes when the recorded reopen predates the merge", () => {
+      const mergedPrs = new Map([[42, makeMergedPr()]]);
+      const reopenEvidence = new Map([[42, new Date("2026-01-01T00:00:00Z")]]);
+
+      const result = reconcileIssue(
+        { number: 42, title: "Bug fix", body: null, labels: [], state: "open" },
+        mergedPrs,
+        new Map(),
+        new Map(),
+        reopenEvidence,
+      );
+
+      expect(result.actions).toHaveLength(1);
+      expect(result.actions[0]?.type).toBe("close_issue");
+      expect(result.isClosedByMergedPr).toBe(true);
+      expect(result.closeSkippedReason ?? null).toBeNull();
+    });
+
+    it("withholds the close when merge time is unknown but a reopen is recorded", () => {
+      // Fail closed: without a merge timestamp the reopen cannot be proven to
+      // predate the merge, so a maintainer's word wins.
+      const mergedPrs = new Map([[42, makeMergedPr({ merged_at: null })]]);
+      const reopenEvidence = new Map([[42, new Date("2026-01-05T00:00:00Z")]]);
+
+      const result = reconcileIssue(
+        { number: 42, title: "Bug fix", body: null, labels: [], state: "open" },
+        mergedPrs,
+        new Map(),
+        new Map(),
+        reopenEvidence,
+      );
+
+      expect(result.actions).toEqual([]);
+      expect(result.closeSkippedReason).toContain("merge unknown");
+    });
+
+    it("closes normally when no reopen evidence exists", () => {
+      const mergedPrs = new Map([[42, makeMergedPr()]]);
+
+      const result = reconcileIssue(
+        { number: 42, title: "Bug fix", body: null, labels: [], state: "open" },
+        mergedPrs,
+        new Map(),
+        new Map(),
+        new Map(),
+      );
+
+      expect(result.actions).toHaveLength(1);
+      expect(result.actions[0]?.type).toBe("close_issue");
+      expect(result.closeSkippedReason ?? null).toBeNull();
+    });
+  });
+});
+
+describe("loadReopenEvidence (#1727)", () => {
+  function makeClient(events: Array<{ issueId: string; occurredAt: Date }>) {
+    const findMany = vi.fn(async () => events);
+    return { client: { issueLifecycleEvent: { findMany } }, findMany };
+  }
+
+  it("returns the latest issue_reopened observation per issue number", async () => {
+    const { client } = makeClient([
+      { issueId: "issue-42", occurredAt: new Date("2026-01-02T00:00:00Z") },
+      { issueId: "issue-42", occurredAt: new Date("2026-01-09T00:00:00Z") },
+      { issueId: "issue-42", occurredAt: new Date("2026-01-05T00:00:00Z") },
+      { issueId: "issue-99", occurredAt: new Date("2026-01-03T00:00:00Z") },
+    ]);
+
+    const latest = await loadReopenEvidence(client, new Map([[42, "issue-42"], [99, "issue-99"]]));
+
+    expect(latest.get(42)).toEqual(new Date("2026-01-09T00:00:00Z"));
+    expect(latest.get(99)).toEqual(new Date("2026-01-03T00:00:00Z"));
+  });
+
+  it("skips the query entirely when no candidate issues exist", async () => {
+    const { client, findMany } = makeClient([]);
+
+    const latest = await loadReopenEvidence(client, new Map());
+
+    expect(latest.size).toBe(0);
+    expect(findMany).not.toHaveBeenCalled();
+  });
+
+  it("ignores events whose issue row is not in the candidate set", async () => {
+    const { client } = makeClient([
+      { issueId: "issue-42", occurredAt: new Date("2026-01-09T00:00:00Z") },
+      { issueId: "issue-stray", occurredAt: new Date("2026-01-09T00:00:00Z") },
+    ]);
+
+    const latest = await loadReopenEvidence(client, new Map([[42, "issue-42"]]));
+
+    expect([...latest.keys()]).toEqual([42]);
   });
 });
 
