@@ -21,6 +21,7 @@ const READ_TOKEN = "courier-read-token";
 const config = {
   ok: true as const,
   statusBase: new URL("https://courier.internal/v1/contributions"),
+  credentialSurface: new URL("https://courier.internal/v1/contributions"),
   token: READ_TOKEN,
   timeoutMs: 30_000,
 };

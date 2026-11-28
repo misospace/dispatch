@@ -53,6 +53,7 @@ function httpResponse(status: number, body: string, headers: Record<string, stri
 const okConfig = {
   ok: true as const,
   statusBase: new URL(SURFACE),
+  credentialSurface: new URL(SURFACE),
   token: READ_TOKEN,
   timeoutMs: 30_000,
 };
@@ -81,6 +82,21 @@ describe("getCourierTrackingConfig", () => {
     expect(getCourierTrackingConfig()).toMatchObject({ ok: false });
     setEnv({ DISPATCH_COURIER_ADMISSION_URL: "not a url" });
     expect(getCourierTrackingConfig()).toMatchObject({ ok: false });
+  });
+
+  it("drops a configured query and hash so no query credential rides the read path", () => {
+    setEnv({ DISPATCH_COURIER_ADMISSION_URL: `${SURFACE}?auth=querysecret#frag` });
+    const config = getCourierTrackingConfig();
+    expect(config.ok).toBe(true);
+    if (config.ok) {
+      expect(config.statusBase.toString()).toBe(SURFACE);
+      expect(config.statusBase.search).toBe("");
+      expect(config.statusBase.hash).toBe("");
+      // The scrub anchor keeps the configured query: the pair is a scrub form
+      // even though the read never sends it.
+      expect(config.credentialSurface.search).toBe("?auth=querysecret");
+      expect(config.credentialSurface.hash).toBe("#frag");
+    }
   });
 
   it("resolves a valid configuration and normalizes trailing slashes on the surface", () => {
@@ -138,7 +154,7 @@ describe("parseContributionStatus", () => {
       // EXTRA fields are ignored — the allowlist is the frontend's protection.
       unexpected: { huge: "payload" },
     });
-    const result = parseContributionStatus(body, 200, READ_TOKEN);
+    const result = parseContributionStatus(body, 200, READ_TOKEN, new URL(SURFACE));
     expect(result.outcome).toBe("ok");
     if (result.outcome === "ok") {
       expect(result.status.phase).toBe("Verifying");
@@ -159,7 +175,7 @@ describe("parseContributionStatus", () => {
       JSON.stringify({ ...OK_BODY, observedAt: "nonsense" }),
       JSON.stringify({ ...OK_BODY, publication: "pr-url" }),
     ]) {
-      const result = parseContributionStatus(mutation, 200, READ_TOKEN);
+      const result = parseContributionStatus(mutation, 200, READ_TOKEN, new URL(SURFACE));
       expect(result.outcome).toBe("unavailable");
       if (result.outcome === "unavailable") {
         expect(result.diagnostic).toMatch(/unrecognized shape|refused rather than guessed/i);
@@ -168,7 +184,7 @@ describe("parseContributionStatus", () => {
   });
 
   it("bounds oversized projected strings instead of trusting the source", () => {
-    const result = parseContributionStatus(JSON.stringify({ ...OK_BODY, lane: "L".repeat(5000) }), 200, READ_TOKEN);
+    const result = parseContributionStatus(JSON.stringify({ ...OK_BODY, lane: "L".repeat(5000) }), 200, READ_TOKEN, new URL(SURFACE));
     expect(result.outcome).toBe("ok");
     if (result.outcome === "ok") expect(result.status.lane.length).toBeLessThanOrEqual(1025);
   });
@@ -240,5 +256,86 @@ describe("fetchContributionStatus", () => {
     );
     const result = await fetchContributionStatus("run-1", "ns", okConfig);
     expect(result).toMatchObject({ outcome: "unavailable", httpStatus: 200, timeout: false });
+  });
+
+  // #1690: the read URL keeps the configured surface's userinfo, and a runtime
+  // may echo it in a fetch error; the credential-bearing prefix must not survive.
+  it("scrubs a credential-bearing surface URL echoed in a fetch failure", async () => {
+    const credConfig = {
+      ...okConfig,
+      statusBase: new URL("https://user:secretpw@courier.internal:8443/v1/contributions"),
+      credentialSurface: new URL("https://user:secretpw@courier.internal:8443/v1/contributions?token=***"),
+    };
+    const echoed =
+      "Failed to fetch https://user:secretpw@courier.internal:8443/v1/contributions/courier-3f2a?namespace=team-alpha";
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError(echoed)));
+    const result = await fetchContributionStatus("courier-3f2a", "team-alpha", credConfig);
+    expect(result).toMatchObject({ outcome: "unavailable", timeout: false });
+    if (result.outcome === "unavailable") {
+      expect(result.diagnostic).not.toContain("secretpw");
+      expect(result.diagnostic).not.toContain("supersecret");
+      expect(result.diagnostic).not.toContain("user:secretpw@");
+      expect(result.diagnostic).toContain("[scrubbed-endpoint]");
+    }
+  });
+
+  // The scrub anchor is the FULL configured surface, so a query credential
+  // configured for the POST surface is scrubbed from an echo even though the
+  // read never sends it — the guarantee does not depend on the read's URL
+  // construction dropping the query.
+  it("scrubs a configured query credential echoed behind a read-URL parameter", async () => {
+    const queryConfig = {
+      ...okConfig,
+      statusBase: new URL(SURFACE),
+      credentialSurface: new URL(`${SURFACE}?auth=querysecret`),
+    };
+    const echoed = "Failed to fetch https://courier.internal/v1/contributions/run-1?namespace=ns&auth=querysecret";
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError(echoed)));
+    const result = await fetchContributionStatus("run-1", "ns", queryConfig);
+    expect(result).toMatchObject({ outcome: "unavailable" });
+    if (result.outcome === "unavailable") {
+      expect(result.diagnostic).not.toContain("querysecret");
+      expect(result.diagnostic).toContain("[scrubbed-endpoint]");
+    }
+  });
+
+  // A derived-URL echo can recompose the query through `searchParams`, turning
+  // `%20` into `+`; the scrubber must know that serialization too.
+  it("scrubs a URLSearchParams-recomposed query credential echoed in a fetch failure", async () => {
+    const queryConfig = {
+      ...okConfig,
+      statusBase: new URL(SURFACE),
+      credentialSurface: new URL(`${SURFACE}?auth=demo%20secret`),
+    };
+    const echoed = new URL(`${SURFACE}/run-1?auth=demo%20secret`);
+    echoed.searchParams.set("namespace", "ns");
+    expect(echoed.search).toBe("?auth=demo+secret&namespace=ns");
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError(`Failed to fetch ${echoed.href}`)));
+    const result = await fetchContributionStatus("run-1", "ns", queryConfig);
+    expect(result).toMatchObject({ outcome: "unavailable" });
+    if (result.outcome === "unavailable") {
+      expect(result.diagnostic).not.toContain("demo+secret");
+      expect(result.diagnostic).not.toContain("demo%20secret");
+      expect(result.diagnostic).toContain("[scrubbed-endpoint]");
+    }
+  });
+
+  // Raw-configuration echoes can keep host spellings (case, default port) that
+  // the URL parser normalized away; the `@`-anchored userinfo form still scrubs.
+  it("scrubs userinfo echoed with host casing or a default port the parser normalized away", async () => {
+    const credConfig = {
+      ...okConfig,
+      statusBase: new URL("https://user:secretpw@courier.internal/v1/contributions"),
+      credentialSurface: new URL("https://user:secretpw@COURIER.internal:443/v1/contributions"),
+    };
+    const echoed =
+      "Failed to fetch https://user:secretpw@COURIER.internal:443/v1/contributions/run-1?namespace=ns";
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError(echoed)));
+    const result = await fetchContributionStatus("run-1", "ns", credConfig);
+    expect(result).toMatchObject({ outcome: "unavailable" });
+    if (result.outcome === "unavailable") {
+      expect(result.diagnostic).not.toContain("secretpw");
+      expect(result.diagnostic).toContain("[scrubbed-endpoint]");
+    }
   });
 });
