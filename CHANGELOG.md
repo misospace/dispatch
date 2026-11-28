@@ -1,5 +1,90 @@
 # Changelog
 
+## [0.5.77](https://github.com/misospace/dispatch/compare/v0.5.76...v0.5.77) (2026-11-28)
+
+
+### Features
+
+* **deps:** update dependency @testing-library/jest-dom (7.0.1 → 8.0.0) ([#1663](https://github.com/misospace/dispatch/issues/1663)) ([e5bbfa7](https://github.com/misospace/dispatch/commit/e5bbfa7502807861b83cf03711e46b7fd82cd0cc))
+* **deps:** update dependency eslint (10.14.0 → 10.15.0) ([#1632](https://github.com/misospace/dispatch/issues/1632)) ([4620f4d](https://github.com/misospace/dispatch/commit/4620f4dc77f444d2572c7702a434b86bfa8ed2be))
+* **deps:** update dependency eslint (10.15.0 → 10.16.0) ([#1726](https://github.com/misospace/dispatch/issues/1726)) ([b2c6ee1](https://github.com/misospace/dispatch/commit/b2c6ee1e39d4a74354f6a2aeb9e0d9283c60107c))
+* **deps:** update dependency lucide-react (1.72.0 → 1.73.0) ([#1633](https://github.com/misospace/dispatch/issues/1633)) ([3489ff7](https://github.com/misospace/dispatch/commit/3489ff7d55949232d6d3d5bb2928afd1f1280bd1))
+* **deps:** update dependency lucide-react (1.73.0 → 1.74.0) ([#1650](https://github.com/misospace/dispatch/issues/1650)) ([b2c7244](https://github.com/misospace/dispatch/commit/b2c7244f95523bca64a71e814805fab0c2073376))
+* **deps:** update dependency lucide-react (1.74.0 → 1.75.0) ([#1658](https://github.com/misospace/dispatch/issues/1658)) ([55b292d](https://github.com/misospace/dispatch/commit/55b292d48037c539c5535acd3017827a734094c6))
+* **deps:** update dependency lucide-react (1.75.0 → 1.76.0) ([#1664](https://github.com/misospace/dispatch/issues/1664)) ([a158db8](https://github.com/misospace/dispatch/commit/a158db84f5f3063af50eaadd39c728fdb3b69d25))
+* **deps:** update dependency lucide-react (1.76.0 → 1.77.0) ([#1669](https://github.com/misospace/dispatch/issues/1669)) ([73321f8](https://github.com/misospace/dispatch/commit/73321f84f3b4ea8d266861ed0448475c79faa436))
+* **deps:** update dependency lucide-react (1.77.0 → 1.78.0) ([#1692](https://github.com/misospace/dispatch/issues/1692)) ([4d0a2de](https://github.com/misospace/dispatch/commit/4d0a2dea6104d58c89d663b7e03a96de7152d927))
+* **deps:** update dependency lucide-react (1.78.0 → 1.79.0) ([#1700](https://github.com/misospace/dispatch/issues/1700)) ([964b866](https://github.com/misospace/dispatch/commit/964b866a1ec5ff530bbdf242224f62703359b6a3))
+* **deps:** update dependency lucide-react (1.79.0 → 1.80.0) ([#1704](https://github.com/misospace/dispatch/issues/1704)) ([dd925a3](https://github.com/misospace/dispatch/commit/dd925a3c7aa5fa9e34d0910ce1801e3c241d727f))
+* **deps:** update dependency lucide-react (1.80.0 → 1.81.0) ([#1712](https://github.com/misospace/dispatch/issues/1712)) ([55eea7a](https://github.com/misospace/dispatch/commit/55eea7a955f6b91e4aa67076c68fedb107bbf722))
+* **deps:** update dependency lucide-react (1.81.0 → 1.82.0) ([#1720](https://github.com/misospace/dispatch/issues/1720)) ([6a01cfb](https://github.com/misospace/dispatch/commit/6a01cfbe2457b24df8f78aeb0cf7aa98c5444b72))
+* **deps:** update dependency lucide-react (1.82.0 → 1.83.0) ([#1729](https://github.com/misospace/dispatch/issues/1729)) ([7d9a58d](https://github.com/misospace/dispatch/commit/7d9a58d556657554dbe6628bd75fd9b9025dc75d))
+* **external-work:** add contribution interface ([#1688](https://github.com/misospace/dispatch/issues/1688)) ([434723e](https://github.com/misospace/dispatch/commit/434723e9acb205f4d59d04137dc5f3c5f533b4b7))
+* **external-work:** track Courier lifecycle via the read-only status API ([#1538](https://github.com/misospace/dispatch/issues/1538)) ([#1685](https://github.com/misospace/dispatch/issues/1685)) ([6c1742b](https://github.com/misospace/dispatch/commit/6c1742bc30045a24d8b6a228645974ea8c45f209))
+* **groomer:** pin one LiteLLM session across a grooming run ([#1699](https://github.com/misospace/dispatch/issues/1699)) ([b7f371b](https://github.com/misospace/dispatch/commit/b7f371b1077e66cb2432c835373e9128dbf12eab))
+* **pr-fix:** /dispatch-fix PR comment command — per-PR operator handoff of human-authored PRs ([#1622](https://github.com/misospace/dispatch/issues/1622)) ([#1634](https://github.com/misospace/dispatch/issues/1634)) ([81ff10f](https://github.com/misospace/dispatch/commit/81ff10fe4bbe533caca70a2f7e318037b1119245))
+* **pr-fix:** re-verify agent-label claimants and add operator clear/transfer ([#1695](https://github.com/misospace/dispatch/issues/1695)) ([#1696](https://github.com/misospace/dispatch/issues/1696)) ([d70a2c0](https://github.com/misospace/dispatch/commit/d70a2c0330949d35716526deef919e4661e1d862))
+* **rebase:** negotiate the model-assisted rebase capability ([#1674](https://github.com/misospace/dispatch/issues/1674)) ([#1681](https://github.com/misospace/dispatch/issues/1681)) ([b3bfdc9](https://github.com/misospace/dispatch/commit/b3bfdc94c7bce6f4d1768755505facb45be4172e))
+* scope automatic PR follow-up for shared automation identities ([#1665](https://github.com/misospace/dispatch/issues/1665)) ([#1683](https://github.com/misospace/dispatch/issues/1683)) ([b545a60](https://github.com/misospace/dispatch/commit/b545a60da6a2b6482f3e5096fd306599d1ce7cdc))
+
+
+### Bug Fixes
+
+* **courier-admission:** settle response-body read failures as uncertain delivery ([#1627](https://github.com/misospace/dispatch/issues/1627)) ([#1629](https://github.com/misospace/dispatch/issues/1629)) ([45f6e7c](https://github.com/misospace/dispatch/commit/45f6e7ce4e144f1f1ffbc44b1860a84f9c2e5629))
+* **deps:** floor effect at 3.22.1 to clear the npm audit gate; enforce lint --max-warnings=0 ([#1672](https://github.com/misospace/dispatch/issues/1672)) ([7805b1f](https://github.com/misospace/dispatch/commit/7805b1f87d4a884f47c5bda7bc72a7fc4a22768f))
+* **deps:** refresh the lockfile past minimatch GHSA-g3hv-75wg-m249 and pin the advisory ranges ([#1684](https://github.com/misospace/dispatch/issues/1684)) ([3a7e909](https://github.com/misospace/dispatch/commit/3a7e909240a7973dfda4e02f253057fa33e584d5))
+* **deps:** scope the effect override to @prisma/config and cap Renovate at 3.x ([#1686](https://github.com/misospace/dispatch/issues/1686)) ([48df22f](https://github.com/misospace/dispatch/commit/48df22f1aeed46d970fcd3508c4f287804633fcb))
+* **deps:** update dependency @testing-library/user-event (14.6.10 → 14.6.12) ([#1643](https://github.com/misospace/dispatch/issues/1643)) ([5b893aa](https://github.com/misospace/dispatch/commit/5b893aa4e1fa6e0ca131cb879e000a024722e048))
+* **deps:** update dependency @testing-library/user-event (14.6.12 → 14.6.13) ([#1662](https://github.com/misospace/dispatch/issues/1662)) ([c26a787](https://github.com/misospace/dispatch/commit/c26a7877d0a6450a22877260f5bb1ac00a09c86b))
+* **deps:** update dependency @testing-library/user-event (14.6.9 → 14.6.10) ([#1619](https://github.com/misospace/dispatch/issues/1619)) ([8b28369](https://github.com/misospace/dispatch/commit/8b2836961b465ce57521ff5a5d1aeebe196ea8ec))
+* **deps:** update dependency @types/node (26.6.10 → 26.6.11) ([#1711](https://github.com/misospace/dispatch/issues/1711)) ([092f19f](https://github.com/misospace/dispatch/commit/092f19fab9dbdc2108c57e8cdd795e62537bd41b))
+* **deps:** update dependency @types/node (26.6.6 → 26.6.7) ([#1703](https://github.com/misospace/dispatch/issues/1703)) ([a37a3d9](https://github.com/misospace/dispatch/commit/a37a3d932feae6fefd3bbcf6fca237d087fd5be1))
+* **deps:** update dependency @types/node (26.6.7 → 26.6.10) ([#1705](https://github.com/misospace/dispatch/issues/1705)) ([6c4bfeb](https://github.com/misospace/dispatch/commit/6c4bfeb456fc39bd794cc7be9c71d913f78cf02a))
+* **deps:** update dependency @types/react (19.3.0 → 19.3.1) ([#1702](https://github.com/misospace/dispatch/issues/1702)) ([fb0383b](https://github.com/misospace/dispatch/commit/fb0383b83b10328af54e8984228f07ab56d67acb))
+* **deps:** update dependency @types/react (19.3.1 → 19.3.2) ([#1706](https://github.com/misospace/dispatch/issues/1706)) ([d7228ee](https://github.com/misospace/dispatch/commit/d7228ee9012e38ddfbbb30cc1903093d98ebe947))
+* **deps:** update dependency @types/react (19.3.2 → 19.3.3) ([#1708](https://github.com/misospace/dispatch/issues/1708)) ([edaefff](https://github.com/misospace/dispatch/commit/edaefff3c0173906057edf9158d9f376d5e78b5f))
+* **deps:** update dependency astro (7.4.11 → 7.4.12) ([#1631](https://github.com/misospace/dispatch/issues/1631)) ([cd3e1af](https://github.com/misospace/dispatch/commit/cd3e1afd9bf6cf2eabd486742bff70dd0bde58de))
+* **deps:** update dependency astro (7.4.12 → 7.4.13) ([#1661](https://github.com/misospace/dispatch/issues/1661)) ([72d663a](https://github.com/misospace/dispatch/commit/72d663a9b08f769d8aeb83fe39301b37f4f5806c))
+* **deps:** update dependency jsdom (31.0.0 → 31.0.1) ([#1626](https://github.com/misospace/dispatch/issues/1626)) ([ece7e2b](https://github.com/misospace/dispatch/commit/ece7e2b629f58993fa068b762c1243aaadfdbd78))
+* **deps:** update dependency tailwind-merge (3.7.0 → 3.7.1) ([#1666](https://github.com/misospace/dispatch/issues/1666)) ([1af494d](https://github.com/misospace/dispatch/commit/1af494d2b89955f1f758a660a4c72aa6c2af43db))
+* **deps:** update vitest monorepo (5.1.0 → 5.1.1) ([#1659](https://github.com/misospace/dispatch/issues/1659)) ([a45b2cb](https://github.com/misospace/dispatch/commit/a45b2cbfcb8d7fd15ed40481502c8e49640a657e))
+* **deps:** update vitest monorepo (5.1.1 → 5.1.2) ([#1707](https://github.com/misospace/dispatch/issues/1707)) ([b84535a](https://github.com/misospace/dispatch/commit/b84535ac7be08104c153255ab2d0c9491f16067a))
+* **external-contributions:** keep a live final attempt in_flight ([#1628](https://github.com/misospace/dispatch/issues/1628)) ([#1630](https://github.com/misospace/dispatch/issues/1630)) ([86a56c7](https://github.com/misospace/dispatch/commit/86a56c7c2fe43246d62e24c097d77f889f94d36d))
+* **pr-fix-queue:** prove deleted PR absence past listing read bound ([#1648](https://github.com/misospace/dispatch/issues/1648)) ([#1649](https://github.com/misospace/dispatch/issues/1649)) ([6261f1e](https://github.com/misospace/dispatch/commit/6261f1ef90ccd1b6a957f01727441581f81eb8bc))
+* **pr-fix-queue:** queue-wide head-repository eligibility ([#1638](https://github.com/misospace/dispatch/issues/1638)) ([#1640](https://github.com/misospace/dispatch/issues/1640)) ([38090c1](https://github.com/misospace/dispatch/commit/38090c1caac800c39f9beb4c1810332cb48583c7))
+* **pr-fix-queue:** reap queue rows whose PR was deleted — per-PR existence probe ([#1641](https://github.com/misospace/dispatch/issues/1641)) ([#1642](https://github.com/misospace/dispatch/issues/1642)) ([0b1c786](https://github.com/misospace/dispatch/commit/0b1c786f5ade9f6c6f3fa1c20e75b6b9843a9ab8))
+* **pr-fix-queue:** run the deleted-PR reap with no tracked repositories ([#1651](https://github.com/misospace/dispatch/issues/1651)) ([#1652](https://github.com/misospace/dispatch/issues/1652)) ([d4d5c88](https://github.com/misospace/dispatch/commit/d4d5c88ed8b2f2e034f815c3fd88b4a26df483d5))
+* **pr-fix:** keep an older CHANGES_REQUESTED standing when a re-review is dismissed ([#1636](https://github.com/misospace/dispatch/issues/1636)) ([#1647](https://github.com/misospace/dispatch/issues/1647)) ([2933b61](https://github.com/misospace/dispatch/commit/2933b61c96ab4536ff8b394ef1101c26c1b2501c))
+* **pr-fix:** ship the original claimant inline on followup-pr hand-outs ([#1582](https://github.com/misospace/dispatch/issues/1582)) ([#1679](https://github.com/misospace/dispatch/issues/1679)) ([a86967a](https://github.com/misospace/dispatch/commit/a86967a8528e82a4831d98e8a3a2e42f06ea746f))
+* **pr-followup:** verify the PR head repo against the base repo before queueing fix work ([#1637](https://github.com/misospace/dispatch/issues/1637)) ([#1639](https://github.com/misospace/dispatch/issues/1639)) ([fffb64d](https://github.com/misospace/dispatch/commit/fffb64dadfbfefc8a181046a7708fc9fd78f638c))
+* **rebase:** persist one semantic-conflict episode and bounded REBASE-to-fix transfer ([#1675](https://github.com/misospace/dispatch/issues/1675)) ([#1682](https://github.com/misospace/dispatch/issues/1682)) ([ccf8f58](https://github.com/misospace/dispatch/commit/ccf8f58b97fe11ab4e8da0aac8509e78ae1cb4b9))
+* **site-audit:** time-boxed exception for the picomatch advisory GHSA-fc5q-39xc-vjpf ([#1654](https://github.com/misospace/dispatch/issues/1654)) ([308f58f](https://github.com/misospace/dispatch/commit/308f58f9153d312b245187254bc53e8a8ca5ce5e))
+* **sync:** reconcile cached agent labels against GitHub so stale labels stop poisoning claimants ([#1625](https://github.com/misospace/dispatch/issues/1625)) ([548b540](https://github.com/misospace/dispatch/commit/548b54065a45337bf6251e02e1cb88a4f6fbf7b5))
+* **webhooks:** key verified-delivery rate limits on the HMAC-covered body ([#1698](https://github.com/misospace/dispatch/issues/1698)) ([#1710](https://github.com/misospace/dispatch/issues/1710)) ([36b93e5](https://github.com/misospace/dispatch/commit/36b93e5b3c2a848759efe96fe56ad1004fcd08a8))
+
+
+### Chores
+
+* add LiteLLM review session affinity ([#1678](https://github.com/misospace/dispatch/issues/1678)) ([4bdf9bf](https://github.com/misospace/dispatch/commit/4bdf9bf55a1f5ba1836811e6cad6a27135ce9255))
+* adopt AGPL-3.0-only ([#1717](https://github.com/misospace/dispatch/issues/1717)) ([d2cfffc](https://github.com/misospace/dispatch/commit/d2cfffc866e063b17554a6f81816096fdaaf1a54))
+* **deps:** lock file maintenance ([#1645](https://github.com/misospace/dispatch/issues/1645)) ([3c4efaf](https://github.com/misospace/dispatch/commit/3c4efaf00b30850d63207d2720d7259fc3c65711))
+* **deps:** lock file maintenance ([#1693](https://github.com/misospace/dispatch/issues/1693)) ([3353836](https://github.com/misospace/dispatch/commit/33538360794f751ed771e88087b8c6bcfca7ff8d))
+
+
+### Documentation
+
+* codify Dispatch/Courier repository independence ([#1709](https://github.com/misospace/dispatch/issues/1709)) ([933accb](https://github.com/misospace/dispatch/commit/933accb9bc36abb8e9a3bb5c2f7989ef238e1b81))
+* require concise source comments ([#1714](https://github.com/misospace/dispatch/issues/1714)) ([cc59fe5](https://github.com/misospace/dispatch/commit/cc59fe5a2c662d144fa28887cf49fe07da1681d7))
+
+
+### Refactors
+
+* **automation:** compose repo release health once for all three readers ([#1719](https://github.com/misospace/dispatch/issues/1719)) ([ac692a6](https://github.com/misospace/dispatch/commit/ac692a66aef10449ce8641eb3856866895731a38))
+* consolidate duplicated shaping helpers into their owning modules ([#1646](https://github.com/misospace/dispatch/issues/1646)) ([1ad9e30](https://github.com/misospace/dispatch/commit/1ad9e30abc34109a734adcd57cbdcd9320f264a9))
+* consolidate excluded-label where composition into applyExcludedLabelExclusion ([#1624](https://github.com/misospace/dispatch/issues/1624)) ([a42889d](https://github.com/misospace/dispatch/commit/a42889d0a5b4a84c351b5e41508923966b162ff2))
+* share identical errorName/errorMessage helpers between courier modules ([#1697](https://github.com/misospace/dispatch/issues/1697)) ([48604ca](https://github.com/misospace/dispatch/commit/48604ca68f106ce04abf04600b344a95fb0fb922))
+* share the duplicated JSON helpers from src/lib/json.ts ([#1668](https://github.com/misospace/dispatch/issues/1668)) ([788d01b](https://github.com/misospace/dispatch/commit/788d01b2d4056d61fb0194207443c8962ec8bb80))
+
 ## [0.5.76](https://github.com/misospace/dispatch/compare/v0.5.75...v0.5.76) (2026-11-12)
 
 
