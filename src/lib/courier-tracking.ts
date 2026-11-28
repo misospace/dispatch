@@ -98,6 +98,11 @@ export function getCourierTrackingConfig(): CourierTrackingConfig {
   // run segment cannot produce `//run` (and never guess a different prefix —
   // the `/v1` prefix is the contract version).
   statusBase.pathname = statusBase.pathname.replace(/\/+$/, "");
+  // A read rebuilds the query from the stored run identity and never sends the
+  // configured one, so drop it here: a query credential configured for the POST
+  // surface stays out of the read path and out of the scrubbed surface entirely.
+  statusBase.search = "";
+  statusBase.hash = "";
 
   return { ok: true, statusBase, token, timeoutMs: courierAdmissionTimeoutMs() };
 }

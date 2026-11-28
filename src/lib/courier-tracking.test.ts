@@ -83,6 +83,17 @@ describe("getCourierTrackingConfig", () => {
     expect(getCourierTrackingConfig()).toMatchObject({ ok: false });
   });
 
+  it("drops a configured query and hash so no query credential rides the read path", () => {
+    setEnv({ DISPATCH_COURIER_ADMISSION_URL: `${SURFACE}?auth=querysecret#frag` });
+    const config = getCourierTrackingConfig();
+    expect(config.ok).toBe(true);
+    if (config.ok) {
+      expect(config.statusBase.toString()).toBe(SURFACE);
+      expect(config.statusBase.search).toBe("");
+      expect(config.statusBase.hash).toBe("");
+    }
+  });
+
   it("resolves a valid configuration and normalizes trailing slashes on the surface", () => {
     setEnv({ DISPATCH_COURIER_ADMISSION_URL: `${SURFACE}///` });
     const config = getCourierTrackingConfig();

@@ -168,6 +168,31 @@ describe("scrubEndpoint", () => {
     expect(scrubEndpoint("failed for user:p@ss@courier.internal", endpoint)).not.toContain("p@ss");
   });
 
+  it("scrubs a configured query pair carried behind another query parameter", () => {
+    // A derived read URL rewrites the query, so an echo can join the
+    // configured pair behind it with an `&` delimiter, where only the pair form matches.
+    const secret = "supersecret";
+    const endpoint = new URL(`https://courier.internal/v1/contributions?auth=${secret}`);
+    const scrubbed = scrubEndpoint(
+      `request to https://courier.internal/v1/contributions/run-9?namespace=prod&auth=${secret} failed`,
+      endpoint,
+    );
+    expect(scrubbed).not.toContain(secret);
+    expect(scrubbed).toContain("[scrubbed-endpoint]");
+  });
+
+  it("scrubs configured pairs in either delimiter and their raw (decoded) spelling", () => {
+    const raw = "p" + encodeURIComponent("@") + "ss"; // operator-typed vs URL-normalized spelling
+    const endpoint = new URL(`https://courier.internal/v1/contributions?auth=${raw}&debug=on`);
+    expect(scrubEndpoint(`echo ?namespace=prod&auth=${raw} done`, endpoint)).not.toContain(raw);
+    expect(scrubEndpoint("echo &auth=p@ss done", endpoint)).not.toContain("p@ss");
+    expect(scrubEndpoint("echo ?debug=on done", endpoint)).not.toContain("debug=on");
+    // An unrelated same-named pair is not the configured credential.
+    expect(scrubEndpoint("see https://other.internal/x?auth=unrelated", endpoint)).toBe(
+      "see https://other.internal/x?auth=unrelated",
+    );
+  });
+
   it("leaves unrelated text untouched, is idempotent, and no-ops on empty", () => {
     const endpoint = new URL("https://courier.internal/v1/contributions");
     const plain = "courier admission rejected with HTTP 422: lane unknown";

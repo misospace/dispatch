@@ -192,8 +192,11 @@ function tryDecodeComponent(value: string): string {
  * that names only the host carries no credential. Forms are removed longest-first
  * so a whole-URL echo is gone before its parts. Both the normalized (`URL.href`)
  * and the operator-typed (decoded userinfo) spellings are covered, since a
- * runtime may echo the raw configuration string. Idempotent: every form holds a
- * `:`, `@`, or `?`, and the `[scrubbed-endpoint]` placeholder holds none.
+ * runtime may echo the raw configuration string. The query is scrubbed whole
+ * AND pair-by-pair, because a derived-URL echo can carry a configured pair
+ * behind another parameter (`?namespace=…&token=…`), where only the delimiter-
+ * prefixed pair form matches. Idempotent: every form holds a `:`, `@`, `?`, or
+ * `&`, and the `[scrubbed-endpoint]` placeholder holds none.
  */
 export function scrubEndpoint(text: string, endpoint: URL): string {
   if (!text) return text;
@@ -225,9 +228,24 @@ export function scrubEndpoint(text: string, endpoint: URL): string {
     add(`//${rawAuthority}`);
   }
   add(endpoint.origin);
-  // Query is scrubbed WITH its leading `?` only: a scheme-less/`?`-less token
-  // would be a bare substring with no structural anchor to bound it.
-  if (endpoint.search) add(endpoint.search);
+  // Query forms keep a `?`/`&` anchor: a scheme-less/`?`-less token would be a
+  // bare substring with no structural bound. A valueless pair is not scrubbed
+  // as a pair — a bare flag is too short to anchor without mangling unrelated
+  // text — and stays covered only by the contiguous whole-query form.
+  if (endpoint.search) {
+    add(endpoint.search);
+    for (const pair of endpoint.search.slice(1).split("&")) {
+      const separator = pair.indexOf("=");
+      if (separator < 1 || separator === pair.length - 1) continue;
+      add(`?${pair}`);
+      add(`&${pair}`);
+      const decodedPair = tryDecodeComponent(pair);
+      if (decodedPair !== pair) {
+        add(`?${decodedPair}`);
+        add(`&${decodedPair}`);
+      }
+    }
+  }
   let scrubbed = text;
   for (const form of forms.sort((a, b) => b.length - a.length)) {
     scrubbed = scrubbed.split(form).join(SCRUBBED_ENDPOINT);

@@ -30,7 +30,11 @@ itself.
   configure the endpoint with a username, password, or token-like query string,
   and some runtimes echo the whole request URL in a fetch error. So `redactSecret`
   also removes the endpoint's origin, userinfo, and query (`scrubEndpoint`) from
-  any diagnostic.
+  any diagnostic. Query removal covers the configured query whole and each
+  configured `name=value` pair with a `?`/`&` delimiter, so a joined echo
+  (`?namespace=…&token=…`) cannot retain the query credential. Lifecycle reads
+  drop the configured query when resolving the status surface, so a read URL
+  never carries it.
 - **No client-selected destination.** The endpoint comes from
   `DISPATCH_COURIER_ADMISSION_URL`; the fetch runs with `redirect: "error"` so a
   redirect can never carry the credential to another URL. The namespace must be
