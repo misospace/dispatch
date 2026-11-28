@@ -581,13 +581,16 @@ export async function POST(request: Request) {
           // override a maintainer, and a close held for one pass is retried
           // by the next (waiting costs freshness, never correctness).
           let closeSkippedReason = result.closeSkippedReason ?? null;
+          // Stable note: the raw error is logged, never embedded, so a
+          // flapping fault with varying messages cannot defeat the
+          // annotation dedupe for the duration of an outage.
           if (
             !closeSkippedReason &&
             reopenEvidenceError &&
             mergedCloseAuthority.has(issue.number) &&
             result.actions.some((a) => a.type === "close_issue")
           ) {
-            closeSkippedReason = `reopen evidence unavailable (${reopenEvidenceError}); holding close for a later pass`;
+            closeSkippedReason = "reopen evidence unavailable; holding close for a later pass";
           }
           const actions = closeSkippedReason
             ? result.actions.filter((a) => a.type !== "close_issue")
