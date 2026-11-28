@@ -6,6 +6,7 @@ import { getSyncRepos } from "@/lib/config";
 import {
   extractFixingIssueNumbers,
   reconcileIssue,
+  loadReopenEvidence,
   classifyLaneByHeuristics,
   shouldReclassifyStaleBacklog,
   executeActions,
@@ -255,7 +256,8 @@ export async function recordLinkedMergeEvidence(input: {
  *
  * This endpoint replaces the grooming logic that previously lived in
  * Saffron's project_groom.py scripts. It:
- * 1. Detects merged PRs that fix issues → closes them on GitHub
+ * 1. Detects merged PRs that close issues → closes them on GitHub, unless a
+ *    recorded reopen observation postdates the merge (#1727)
  * 2. Detects open PRs and checks their health → applies labels via GitHub API
  * 3. Classifies lanes using heuristics when model calls are unavailable
  *
@@ -335,6 +337,7 @@ export async function POST(request: Request) {
     let totalMergedPrsFound = 0;
     let totalOpenPrsChecked = 0;
     let totalIssuesClosed = 0;
+    let totalClosesSkipped = 0;
     let totalLabelsChanged = 0;
     let totalLaneClassified = 0;
     const errors: string[] = [];
@@ -366,25 +369,24 @@ export async function POST(request: Request) {
         totalMergedPrsFound += mergedPrsMap.size;
         totalOpenPrsChecked += openPrsMap.size;
 
-        // Extract issue numbers from merged PRs: scan PR bodies for the
-        // "Fixes #NNN", "Closes #NNN", "Resolves #NNN" keywords workers write,
-        // then collect branch name patterns.
-        // `mergedFixingIssues` stays first-PR-wins because it drives the close
-        // decision. `mergedPrLinkEvidence` keeps *every* merged PR per issue
-        // with its link provenance (#1203): merge evidence records one event
-        // per linked PR. Branch-name evidence is collected independently of
-        // the close-decision map — a PR whose own number collides with an
-        // issue number already in that map still records its branch link.
-        // The branch claim still feeds the close decision, so the collision
-        // case widens the reconciler's close reach: the branch-linked issue
-        // number is closed by the same branch heuristic, under the same
-        // first-PR-wins-per-issue-number rule. Only explicit correlations
-        // qualify — a body Fixes/Closes/Resolves keyword or a branch-name
-        // pattern. PR titles are deliberately not consulted (#1203,
-        // review-required): a title-only match is neither close evidence nor
-        // link evidence, so a merged PR that only names an issue in its title
-        // neither closes it nor records a merge for it.
-        const mergedFixingIssues = new Map<number, typeof allPrs[number]>();
+        // Extract close authority and correlation evidence from merged PRs.
+        // They are deliberately separate (#1727):
+        // - `mergedCloseAuthority` holds only PRs whose *body* carries the
+        //   "Fixes/Closes/Resolves #NNN" keywords workers write, and it is
+        //   the sole input to the close decision. A branch name that matches
+        //   an issue number is correlation, not completion evidence, and no
+        //   longer feeds the close map.
+        // - `mergedPrLinkEvidence` keeps *every* merged PR per issue with its
+        //   link provenance (#1203): merge evidence records one event per
+        //   linked PR — body-keyword or branch-name — whether or not the
+        //   issue is closed, decoupled from any close.
+        // The authority map keeps the newest merge per issue: the #1727
+        // reopen check compares the issue's reopen observation against the
+        // merge, and it is the freshest keyword merge — not the first one the
+        // window happened to yield — that carries the current completion
+        // claim. PR titles are never consulted as evidence (#1203): a
+        // title-only match neither closes an issue nor records a merge for it.
+        const mergedCloseAuthority = new Map<number, typeof allPrs[number]>();
         const mergedPrLinkEvidence = new Map<number, PrMergeObservation[]>();
         const recordLinkEvidence = (num: number, pr: (typeof allPrs)[number], linkSource: string) => {
           const existing = mergedPrLinkEvidence.get(num);
@@ -401,29 +403,22 @@ export async function POST(request: Request) {
           else mergedPrLinkEvidence.set(num, [observation]);
         };
         for (const [, pr] of mergedPrsMap) {
-          // 1. Check PR body for keyword references (Fixes #, Closes #, Resolves #)
+          // 1. Body close keywords: the only close authority.
           for (const num of extractFixingIssueNumbers(pr.body ?? null)) {
-            if (!mergedFixingIssues.has(num)) {
-              mergedFixingIssues.set(num, pr);
+            const incumbent = mergedCloseAuthority.get(num);
+            if (!incumbent || (pr.merged_at ?? "") > (incumbent.merged_at ?? "")) {
+              mergedCloseAuthority.set(num, pr);
             }
             recordLinkEvidence(num, pr, "body-keyword");
           }
-          // 2. Branch name pattern — collected for every merged PR, not only
-          // for one whose own number is free in the close-decision map: the
-          // link evidence a branch name carries is independent of which PR
-          // the close decision picked for an issue number. The claim still
-          // feeds the close decision, so in the collision case the
-          // branch-linked issue is closed by the same branch heuristic.
+          // 2. Branch name pattern: correlation only (#1727). It records link
+          // evidence for the merged PR but never authorizes a close, even
+          // when the branch number collides with an issue in no other way.
           const branch = pr.head?.ref ?? "";
           const match = branch.match(/issue[-_/]?(\d+)/i);
           if (match) {
             const issueNum = parseInt(match[1], 10);
-            if (!isNaN(issueNum)) {
-              if (!mergedFixingIssues.has(issueNum)) {
-                mergedFixingIssues.set(issueNum, pr);
-              }
-              recordLinkEvidence(issueNum, pr, "branch-name");
-            }
+            if (!isNaN(issueNum)) recordLinkEvidence(issueNum, pr, "branch-name");
           }
         }
 
@@ -466,6 +461,37 @@ export async function POST(request: Request) {
         });
         const existingIssueByNumber = new Map(existingIssues.map((i) => [i.number, i]));
 
+        // #1727: load the reopen evidence for the issues the close authority
+        // names before any close decision. Two observations prove a merge's
+        // close was overridden: a sync-recorded `issue_reopened` lifecycle
+        // event, and the cache row's own `closedAt` when sync has not seen
+        // the reopen yet (GitHub shows the issue open again while the cached
+        // close lingers — a reopen resets GitHub's `closed_at` to null, so
+        // the cache is the observation until sync catches up).
+        const closeAuthorityIssueRows = new Map<number, (typeof existingIssues)[number]>();
+        for (const issueNum of mergedCloseAuthority.keys()) {
+          const row = existingIssueByNumber.get(issueNum);
+          if (row) closeAuthorityIssueRows.set(issueNum, row);
+        }
+        let reopenEvidence = new Map<number, Date>();
+        if (closeAuthorityIssueRows.size > 0) {
+          const idsByNumber = new Map<number, string>();
+          for (const [issueNum, row] of closeAuthorityIssueRows) idsByNumber.set(issueNum, row.id);
+          try {
+            reopenEvidence = await loadReopenEvidence(prisma, idsByNumber);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            console.warn(
+              `${repo.fullName}: reopen evidence lookup failed (${message}); closes fall back to merge evidence alone`,
+            );
+          }
+          for (const [issueNum, row] of closeAuthorityIssueRows) {
+            if (row.closedAt && (!reopenEvidence.has(issueNum) || row.closedAt > reopenEvidence.get(issueNum)!)) {
+              reopenEvidence.set(issueNum, row.closedAt);
+            }
+          }
+        }
+
         // Reconcile each issue
         for (const issue of issues) {
           if (issue.state !== "open") continue;
@@ -483,10 +509,31 @@ export async function POST(request: Request) {
               labels: currentLabels,
               state: issue.state,
             },
-            mergedFixingIssues,
+            mergedCloseAuthority,
             openPrToIssue,
             linkedPrHealthByIssue,
+            reopenEvidence,
           );
+
+          // #1727: a withheld close is recorded (audit + response count) and
+          // otherwise left alone — no GitHub write, no label churn. The
+          // merge itself still earns its `pr_merged` evidence below:
+          // correlation recording stays decoupled from the close.
+          if (result.closeSkippedReason) {
+            totalClosesSkipped++;
+            await prisma.auditLog.create({
+              data: {
+                actor: "reconciler",
+                action: "reconcile_close_skipped",
+                repoFullName: repo.fullName,
+                issueNumber: issue.number,
+                beforeLabels: currentLabels,
+                afterLabels: currentLabels,
+                success: true,
+                notes: result.closeSkippedReason,
+              },
+            });
+          }
 
           // Execute actions against GitHub
           if (result.actions.length > 0) {
@@ -528,7 +575,7 @@ export async function POST(request: Request) {
                 issueNumber: exec.action.issueNumber,
                 existingIssue,
                 mergedPr:
-                  mergedFixingIssues.get(exec.action.issueNumber) ??
+                  mergedCloseAuthority.get(exec.action.issueNumber) ??
                   openPrToIssue.get(exec.action.issueNumber) ??
                   null,
                 mergedPrs: mergedPrLinkEvidence.get(exec.action.issueNumber) ?? null,
@@ -700,6 +747,7 @@ export async function POST(request: Request) {
       mergedPrsFound: totalMergedPrsFound,
       openPrsChecked: totalOpenPrsChecked,
       issuesClosed: totalIssuesClosed,
+      closesSkipped: totalClosesSkipped,
       labelsChanged: totalLabelsChanged,
       lanesClassified: totalLaneClassified,
       prFixQueueStaleChecked: totalPrFixStaleChecked,

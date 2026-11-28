@@ -119,7 +119,9 @@ observer — reconcile, and the backfill — so the same physical merge observed
 twice lands on one row. The reconciler records one `pr_merged` per *linked*
 merged PR (#1203), each with its `linkSource`. Link evidence comes only from
 an explicit correlation — a body Fixes/Closes/Resolves keyword or a
-branch-name pattern. PR titles are never consulted, for links or for the
+branch-name pattern. Correlation is not completion: only the body keyword
+closes an issue (#1727). A branch-name match records the merge link and
+never drives a close. PR titles are never consulted, for links or for the
 close decision: a merged PR that only names an issue in its title neither
 closes it nor records a merge for it. When a caller supplies no evidence
 list at all, the PR that actually drove a recorded close is still noted,
@@ -128,6 +130,19 @@ the observed action rather than a text guess. The dedupe stamp is
 canonicalized so a `Date` and GitHub's second-precision string form of the
 same merge produce the same key, keeping reconcile, sync, and backfill on
 one row per physical merge.
+
+A merge is completion evidence for the close it caused, not a standing
+license to close (#1727). Before closing, the reconciler checks for a
+reopen recorded after the merge: the newest `issue_reopened` lifecycle
+event, or the cached issue row's `closedAt` when sync has not yet observed
+the reopen (GitHub nulls `closed_at` on reopen, so the cache holds the
+observation until sync catches up). A reopen that postdates the close-
+authority merge withholds the close: no GitHub write happens, the pass
+records a `reconcile_close_skipped` audit row, and the response counts it
+in `closesSkipped`. The merge evidence still records — correlation
+recording stays decoupled from closing. The close authority per issue is
+the newest body-keyword merge, so an older merge cannot make a legitimate
+newer fix look like a re-close.
 
 Merge recording is decoupled from the reconcile action loop: a linked merge
 records whether the issue is open or closed and whether the close action

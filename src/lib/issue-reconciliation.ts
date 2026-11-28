@@ -202,6 +202,57 @@ export interface IssueReconciliationResult {
   hasOpenPr: boolean;
   openPrNeedsWork: boolean;
   isClosedByMergedPr: boolean;
+  /**
+   * Why a close was withheld (#1727): the merge stayed correlated to the
+   * issue, but a recorded reopen/close observation postdates it, so closing
+   * would override a maintainer. The caller logs it; it never writes.
+   */
+  closeSkippedReason?: string | null;
+}
+
+// ─── Reopen Evidence (#1727) ─────────────────────────────────────────────────
+
+/**
+ * Client shape for reading reopen observations. Structurally satisfied by
+ * Prisma, the same way `LifecycleEventClient` is.
+ */
+type ReopenEvidenceClient = {
+  issueLifecycleEvent: {
+    findMany(args: {
+      where: { issueId: { in: string[] }; kind: string };
+      select: { issueId: true; occurredAt: true };
+    }): Promise<Array<{ issueId: string; occurredAt: Date }>>;
+  };
+};
+
+/**
+ * Latest authoritative reopen observation per issue, from the sync-recorded
+ * `issue_reopened` lifecycle stream (#1727). Sync writes one when it sees the
+ * state move closed → open, so the event outlives the cache row's `closedAt`
+ * (the sync upsert nulls it on reopen) and is the durable evidence that a
+ * maintainer reopened an issue the reconciler closed on a merge.
+ */
+export async function loadReopenEvidence(
+  client: ReopenEvidenceClient,
+  issueIdsByNumber: Map<number, string>,
+): Promise<Map<number, Date>> {
+  const latest = new Map<number, Date>();
+  if (issueIdsByNumber.size === 0) return latest;
+
+  const numberByIssueId = new Map<string, number>();
+  for (const [number, issueId] of issueIdsByNumber) numberByIssueId.set(issueId, number);
+
+  const events = await client.issueLifecycleEvent.findMany({
+    where: { issueId: { in: [...issueIdsByNumber.values()] }, kind: "issue_reopened" },
+    select: { issueId: true, occurredAt: true },
+  });
+  for (const event of events) {
+    const number = numberByIssueId.get(event.issueId);
+    if (number === undefined) continue;
+    const prev = latest.get(number);
+    if (!prev || event.occurredAt > prev) latest.set(number, event.occurredAt);
+  }
+  return latest;
 }
 
 /**
@@ -221,25 +272,53 @@ export interface ReconciliationResult {
 
 /**
  * Reconcile a single issue against PR state.
- * 
+ *
  * Checks:
- * 1. Has a merged PR that fixes this issue? → close it
+ * 1. Has a merged PR that closes this issue? → close it, unless a recorded
+ *    reopen/close observation postdates the merge (#1727): a merged PR is
+ *    completion evidence for the close it caused, never a standing license to
+ *    re-close an issue a maintainer reopened.
  * 2. Does an open PR exist for this issue? → check health, update lane
+ *
+ * `mergedPrs` carries only close-authority PRs (body Fixes/Closes/Resolves
+ * keywords — correlation by branch name alone never reaches this function as
+ * close evidence). `reopenEvidenceByIssue` is the latest authoritative
+ * reopen-or-recorded-close observation per issue number; when it postdates
+ * the authority PR's merge, the close is withheld and reported in
+ * `closeSkippedReason` without any other action for that issue.
  */
 export function reconcileIssue(
   issue: { number: number; title: string; body: string | null; labels: string[]; state: string },
   mergedPrs: Map<number, GithubPR>,
   openPrs: Map<number, GithubPR>,
   openPrHealth: Map<number, LinkedPrHealth | null> = new Map(),
+  reopenEvidenceByIssue: Map<number, Date> = new Map(),
 ): IssueReconciliationResult {
   const actions: ReconciliationAction[] = [];
   let hasOpenPr = false;
   let openPrNeedsWork = false;
   let isClosedByMergedPr = false;
 
-  // Check for merged fixing PRs
+  // Check for merged closing PRs
   if (issue.state === "open" && mergedPrs.has(issue.number)) {
     const mergedPr = mergedPrs.get(issue.number)!;
+    const reopenedAt = reopenEvidenceByIssue.get(issue.number) ?? null;
+    // Fail closed without a merge time: with no comparable timestamp, a
+    // reopen observation cannot be proven to predate the merge.
+    const mergedAtMs = mergedPr.merged_at ? Date.parse(mergedPr.merged_at) : NaN;
+    if (reopenedAt && (Number.isNaN(mergedAtMs) || reopenedAt.getTime() > mergedAtMs)) {
+      return {
+        issueNumber: issue.number,
+        repoFullName: "",
+        actions: [],
+        hasOpenPr: false,
+        openPrNeedsWork: false,
+        isClosedByMergedPr: false,
+        closeSkippedReason:
+          `reopened after merged PR #${mergedPr.number} ` +
+          `(reopen recorded ${reopenedAt.toISOString()}, merge ${Number.isNaN(mergedAtMs) ? "unknown" : new Date(mergedAtMs).toISOString()})`,
+      };
+    }
     actions.push({
       type: "close_issue",
       issueNumber: issue.number,
