@@ -123,9 +123,15 @@ export async function fetchReopenAfter(
     }
     const events: Array<{ event?: string; created_at?: string }> = await response.json();
     for (const event of events) {
-      if (event.event !== "reopened" || !event.created_at) continue;
-      const at = new Date(event.created_at);
-      if (Number.isNaN(at.getTime()) || at.getTime() <= since.getTime()) continue;
+      if (event.event !== "reopened") continue;
+      const at = event.created_at ? new Date(event.created_at) : null;
+      // A reopen with no usable timestamp cannot be placed after the merge,
+      // but silently skipping it would refute a real reopen. Unreadable data
+      // is an incomplete read: throw, and the caller keeps the withhold.
+      if (!at || Number.isNaN(at.getTime())) {
+        throw new Error(`GitHub timeline for ${repoFullName}#${issueNumber} carries a reopen without a usable created_at`);
+      }
+      if (at.getTime() <= since.getTime()) continue;
       if (!latest || at > latest) latest = at;
     }
     url = getNextLink(response);

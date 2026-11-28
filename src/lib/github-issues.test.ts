@@ -416,12 +416,20 @@ describe("fetchReopenAfter", () => {
 
   it("returns null when the read holds no reopened activity after `since`", async () => {
     fetchWithRetry.mockResolvedValue(okTimeline([
+      // A reopen at exactly `since` is not after the merge.
       { event: "reopened", created_at: "2026-10-02T08:00:00Z" },
       { event: "labeled", created_at: "2026-10-04T00:00:00Z" },
-      { event: "reopened" },
     ]));
 
     await expect(fetchReopenAfter("acme/app", 42, since)).resolves.toBeNull();
+  });
+
+  it("throws when a reopened activity carries no usable created_at", async () => {
+    // Skipping it would refute a real reopen; unreadable data is an
+    // incomplete read, and the caller fails closed.
+    fetchWithRetry.mockResolvedValue(okTimeline([{ event: "reopened" }]));
+
+    await expect(fetchReopenAfter("acme/app", 42, since)).rejects.toThrow(/without a usable created_at/);
   });
 
   it("follows rel=next pages until the end", async () => {

@@ -637,7 +637,9 @@ export async function POST(request: Request) {
               if (live.state !== "open") {
                 closeSkippedReason = "issue already closed upstream; no close needed";
               }
-            } catch {
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              console.warn(`${repo.fullName}: live issue recheck before close failed (${message}); close is held`);
               closeSkippedReason = "live issue recheck failed; holding close for a later pass";
             }
           }

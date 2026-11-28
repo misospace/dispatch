@@ -1439,6 +1439,32 @@ describe("POST — close authority and reopen gate (#1727)", () => {
     expect(skipAudit?.notes).not.toContain("2026-10-05");
   });
 
+  it("holds the close without a timeline call when the merge time is unparseable", async () => {
+    // Nothing to compare against, so no confirmation can be asked for: the
+    // event evidence wins fail-closed and the close stays held.
+    mockBodyKeywordMerge({ merged_at: "not-a-date" });
+    githubMocks.fetchIssues.mockResolvedValue([
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: ["status/in-review"] },
+    ]);
+    mockIssueRows([{ id: "issue-42", number: 42 }]);
+    prismaMocks.lifecycleRows.push({
+      kind: "issue_reopened",
+      source: "sync",
+      issueId: "issue-42",
+      issueNumber: 42,
+      dedupeKey: "sync|org/repo|42|issue_reopened|2026-10-05",
+      occurredAt: new Date("2026-10-05T00:00:00Z"),
+    });
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.closesSkipped).toBe(1);
+    expect(githubMocks.fetchReopenAfter).not.toHaveBeenCalled();
+    const skipAudit = prismaMocks.auditRows.find((row) => row.action === "reconcile_close_skipped");
+    expect(skipAudit?.notes).toContain("merge unknown");
+  });
+
   it("holds the close when the reopen confirmation timeline is unreadable", async () => {
     // Fail closed: a timeline that cannot be read cannot prove the reopen
     // predates the merge, so the upper bound stands and the close waits.
