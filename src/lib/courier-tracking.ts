@@ -15,9 +15,10 @@
  * handed read-only authority. When no read token is configured, tracking is
  * UNAVAILABLE and submission is untouched — a missing capability is named,
  * never guessed. The token is never logged, stored, or returned; every
- * diagnostic passes through `redactSecret` first, which also scrubs the
- * configured surface URL's origin/userinfo/query — the read URL keeps that URL's
- * userinfo, and a runtime may echo the whole thing in a fetch error string.
+ * diagnostic passes through `redactSecret` first, bound to the FULL configured
+ * surface (`credentialSurface`, query included) so the scrubber covers even a
+ * query credential configured for the POST surface, independently of what the
+ * read happens to send. The read itself derives from a query-less `statusBase`.
  *
  * Endpoint boundary: the status URL is derived from the operator-configured
  * `DISPATCH_COURIER_ADMISSION_URL` (the same `/v1/contributions` surface) plus
@@ -40,8 +41,15 @@ import { courierAdmissionTimeoutMs, errorName, errorMessage, redactSecret } from
 export type CourierTrackingConfig =
   | {
       ok: true;
-      /** The configured `/v1/contributions` surface; the run segment is appended per read. */
+      /** The configured `/v1/contributions` surface, query/hash dropped; the run segment is appended per read. */
       statusBase: URL;
+      /**
+       * The FULL configured surface (query/hash as typed), scrub-only: it
+       * anchors `scrubEndpoint` for every diagnostic so a query credential
+       * configured for the POST surface is a scrub form even though the read
+       * never sends it. Never used to build a request.
+       */
+      credentialSurface: URL;
       /** Server-side READ-ONLY credential; only ever enters an Authorization header. */
       token: string;
       timeoutMs: number;
@@ -98,13 +106,15 @@ export function getCourierTrackingConfig(): CourierTrackingConfig {
   // run segment cannot produce `//run` (and never guess a different prefix —
   // the `/v1` prefix is the contract version).
   statusBase.pathname = statusBase.pathname.replace(/\/+$/, "");
-  // A read rebuilds the query from the stored run identity and never sends the
-  // configured one, so drop it here: a query credential configured for the POST
-  // surface stays out of the read path and out of the scrubbed surface entirely.
+  // Keep the full configured surface (query included) as the SCRUB anchor, then
+  // drop the query/hash from the construction base: a read rebuilds the query
+  // from the stored run identity and never sends the configured one, and the
+  // scrub coverage never depends on that construction behavior.
+  const credentialSurface = new URL(statusBase);
   statusBase.search = "";
   statusBase.hash = "";
 
-  return { ok: true, statusBase, token, timeoutMs: courierAdmissionTimeoutMs() };
+  return { ok: true, statusBase, credentialSurface, token, timeoutMs: courierAdmissionTimeoutMs() };
 }
 
 /**
@@ -202,7 +212,7 @@ function parseDateOrNull(value: unknown): Date | null {
  * partial guess). Unknown EXTRA fields are ignored (the allowlist is the
  * frontend's protection, per Courier #819).
  */
-export function parseContributionStatus(bodyText: string, httpStatus: number, token: string, endpoint?: URL): TrackingReadResult {
+export function parseContributionStatus(bodyText: string, httpStatus: number, token: string, endpoint: URL): TrackingReadResult {
   let parsed: unknown;
   try {
     parsed = JSON.parse(bodyText);
@@ -270,7 +280,7 @@ export function parseContributionStatus(bodyText: string, httpStatus: number, to
   };
 }
 
-function incompatibleShape(httpStatus: number, token: string, detail: string, endpoint?: URL): TrackingReadResult {
+function incompatibleShape(httpStatus: number, token: string, detail: string, endpoint: URL): TrackingReadResult {
   return {
     outcome: "unavailable",
     httpStatus,
@@ -315,10 +325,10 @@ export async function fetchContributionStatus(
   namespace: string,
   config: Extract<CourierTrackingConfig, { ok: true }>,
 ): Promise<TrackingReadResult> {
-  // Bound every retained/returned diagnostic to this read credential + surface:
-  // strip the READ token AND the credential-bearing status URL (its userinfo
-  // survives into the derived request) that a runtime may echo in a fetch error.
-  const scrub = (text: string) => redactSecret(text, config.token, config.statusBase);
+  // Bound every retained/returned diagnostic to this read credential + the FULL
+  // configured surface: strip the READ token AND every credential-bearing form
+  // (userinfo, origin, configured query pairs) that a runtime may echo.
+  const scrub = (text: string) => redactSecret(text, config.token, config.credentialSurface);
   if (!isAddressableRunName(run)) {
     return {
       outcome: "refused",
@@ -386,7 +396,7 @@ export async function fetchContributionStatus(
     };
   }
   if (response.status === 200) {
-    return parseContributionStatus(bodyText, response.status, config.token, config.statusBase);
+    return parseContributionStatus(bodyText, response.status, config.token, config.credentialSurface);
   }
   if (response.status >= 400 && response.status < 500) {
     return {

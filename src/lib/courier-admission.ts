@@ -254,16 +254,17 @@ export function scrubEndpoint(text: string, endpoint: URL): string {
 }
 
 /**
- * Bound a diagnostic, strip any occurrence of `secret`, and — when the
- * configured endpoint is supplied — scrub its origin/userinfo/query. Applied to
- * every string this module (and the submission/tracking routes) may store or
- * log, so neither the credential nor the credential-bearing URL can leak into
- * the ledger, the audit log, or a response. Scrub runs before the length bound
- * so a truncated tail can never split a URL fragment past a removed component.
+ * Bound a diagnostic, strip any occurrence of `secret`, and scrub the
+ * configured endpoint's origin/userinfo/query. Applied to every string this
+ * module (and the submission/tracking routes) may store or log, so neither the
+ * credential nor the credential-bearing URL can leak into the ledger, the audit
+ * log, or a response. `endpoint` is REQUIRED: every credential-path diagnostic
+ * is bound to its surface, so a future call site cannot silently omit the URL
+ * scrub. Scrub runs before the length bound so a truncated tail can never split
+ * a URL fragment past a removed component.
  */
-export function redactSecret(text: string, secret: string, endpoint?: URL): string {
-  let redacted = text;
-  if (endpoint) redacted = scrubEndpoint(redacted, endpoint);
+export function redactSecret(text: string, secret: string, endpoint: URL): string {
+  let redacted = scrubEndpoint(text, endpoint);
   if (secret) redacted = redacted.split(secret).join("[redacted]");
   if (redacted.length > MAX_DIAGNOSTIC_LENGTH) {
     redacted = `${redacted.slice(0, MAX_DIAGNOSTIC_LENGTH)}…[truncated]`;

@@ -327,7 +327,7 @@ export async function refreshExternalContributionTracking(
         trackingError: redactSecret(
           `courier status identity mismatch on ${mismatched}; the observation was refused and nothing was recorded`,
           config.token,
-          config.statusBase,
+          config.credentialSurface,
         ),
       });
       if (!applied) return supersededOutcome(client, row.id);
@@ -379,7 +379,7 @@ export async function refreshExternalContributionTracking(
           ? `courier no longer reports this run (reaped or lost); the recorded ${current.trackingState} evidence is kept — a 404 is never completion`
           : `${result.diagnostic}; recorded as expired, not completion — re-ingestion would require a new request identity`,
         config.token,
-        config.statusBase,
+        config.credentialSurface,
       ),
     });
     if (!applied) return supersededOutcome(client, row.id);
@@ -388,7 +388,7 @@ export async function refreshExternalContributionTracking(
 
   if (result.outcome === "refused") {
     const applied = await settle(client, row.id, now, {
-      trackingError: redactSecret(result.diagnostic, config.token, config.statusBase),
+      trackingError: redactSecret(result.diagnostic, config.token, config.credentialSurface),
       ...(current.trackingState === null ? { trackingState: "unavailable" as TrackingState } : {}),
     });
     if (!applied) return supersededOutcome(client, row.id);
@@ -396,7 +396,7 @@ export async function refreshExternalContributionTracking(
   }
 
   const applied = await settle(client, row.id, now, {
-    trackingError: redactSecret(result.diagnostic, config.token, config.statusBase),
+    trackingError: redactSecret(result.diagnostic, config.token, config.credentialSurface),
     ...(current.trackingState === null ? { trackingState: "unavailable" as TrackingState } : {}),
   });
   if (!applied) return supersededOutcome(client, row.id);

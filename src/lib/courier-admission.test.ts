@@ -127,12 +127,13 @@ describe("buildAdmissionPayload", () => {
 
 describe("redactSecret", () => {
   it("removes every occurrence of the credential and bounds length", () => {
+    const surface = new URL("https://courier.internal/v1/contributions");
     const leaky = `boom at https://x Bearer ${TOKEN} then ${TOKEN} again`;
-    const redacted = redactSecret(leaky, TOKEN);
+    const redacted = redactSecret(leaky, TOKEN, surface);
     expect(redacted).not.toContain(TOKEN);
     expect(redacted).toContain("[redacted]");
     expect(redacted.length).toBeLessThanOrEqual(500 + "[truncated]…".length);
-    expect(redactSecret("x".repeat(900), "s")).toMatch(/\[truncated\]$/);
+    expect(redactSecret("x".repeat(900), "s", surface)).toMatch(/\[truncated\]$/);
   });
 });
 

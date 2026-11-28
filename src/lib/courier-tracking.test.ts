@@ -53,6 +53,7 @@ function httpResponse(status: number, body: string, headers: Record<string, stri
 const okConfig = {
   ok: true as const,
   statusBase: new URL(SURFACE),
+  credentialSurface: new URL(SURFACE),
   token: READ_TOKEN,
   timeoutMs: 30_000,
 };
@@ -91,6 +92,10 @@ describe("getCourierTrackingConfig", () => {
       expect(config.statusBase.toString()).toBe(SURFACE);
       expect(config.statusBase.search).toBe("");
       expect(config.statusBase.hash).toBe("");
+      // The scrub anchor keeps the configured query: the pair is a scrub form
+      // even though the read never sends it.
+      expect(config.credentialSurface.search).toBe("?auth=querysecret");
+      expect(config.credentialSurface.hash).toBe("#frag");
     }
   });
 
@@ -149,7 +154,7 @@ describe("parseContributionStatus", () => {
       // EXTRA fields are ignored — the allowlist is the frontend's protection.
       unexpected: { huge: "payload" },
     });
-    const result = parseContributionStatus(body, 200, READ_TOKEN);
+    const result = parseContributionStatus(body, 200, READ_TOKEN, new URL(SURFACE));
     expect(result.outcome).toBe("ok");
     if (result.outcome === "ok") {
       expect(result.status.phase).toBe("Verifying");
@@ -170,7 +175,7 @@ describe("parseContributionStatus", () => {
       JSON.stringify({ ...OK_BODY, observedAt: "nonsense" }),
       JSON.stringify({ ...OK_BODY, publication: "pr-url" }),
     ]) {
-      const result = parseContributionStatus(mutation, 200, READ_TOKEN);
+      const result = parseContributionStatus(mutation, 200, READ_TOKEN, new URL(SURFACE));
       expect(result.outcome).toBe("unavailable");
       if (result.outcome === "unavailable") {
         expect(result.diagnostic).toMatch(/unrecognized shape|refused rather than guessed/i);
@@ -179,7 +184,7 @@ describe("parseContributionStatus", () => {
   });
 
   it("bounds oversized projected strings instead of trusting the source", () => {
-    const result = parseContributionStatus(JSON.stringify({ ...OK_BODY, lane: "L".repeat(5000) }), 200, READ_TOKEN);
+    const result = parseContributionStatus(JSON.stringify({ ...OK_BODY, lane: "L".repeat(5000) }), 200, READ_TOKEN, new URL(SURFACE));
     expect(result.outcome).toBe("ok");
     if (result.outcome === "ok") expect(result.status.lane.length).toBeLessThanOrEqual(1025);
   });
@@ -258,7 +263,8 @@ describe("fetchContributionStatus", () => {
   it("scrubs a credential-bearing surface URL echoed in a fetch failure", async () => {
     const credConfig = {
       ...okConfig,
-      statusBase: new URL("https://user:secretpw@courier.internal:8443/v1/contributions?token=***"),
+      statusBase: new URL("https://user:secretpw@courier.internal:8443/v1/contributions"),
+      credentialSurface: new URL("https://user:secretpw@courier.internal:8443/v1/contributions?token=***"),
     };
     const echoed =
       "Failed to fetch https://user:secretpw@courier.internal:8443/v1/contributions/courier-3f2a?namespace=team-alpha";
@@ -269,6 +275,26 @@ describe("fetchContributionStatus", () => {
       expect(result.diagnostic).not.toContain("secretpw");
       expect(result.diagnostic).not.toContain("supersecret");
       expect(result.diagnostic).not.toContain("user:secretpw@");
+      expect(result.diagnostic).toContain("[scrubbed-endpoint]");
+    }
+  });
+
+  // The scrub anchor is the FULL configured surface, so a query credential
+  // configured for the POST surface is scrubbed from an echo even though the
+  // read never sends it — the guarantee does not depend on the read's URL
+  // construction dropping the query.
+  it("scrubs a configured query credential echoed behind a read-URL parameter", async () => {
+    const queryConfig = {
+      ...okConfig,
+      statusBase: new URL(SURFACE),
+      credentialSurface: new URL(`${SURFACE}?auth=querysecret`),
+    };
+    const echoed = "Failed to fetch https://courier.internal/v1/contributions/run-1?namespace=ns&auth=querysecret";
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError(echoed)));
+    const result = await fetchContributionStatus("run-1", "ns", queryConfig);
+    expect(result).toMatchObject({ outcome: "unavailable" });
+    if (result.outcome === "unavailable") {
+      expect(result.diagnostic).not.toContain("querysecret");
       expect(result.diagnostic).toContain("[scrubbed-endpoint]");
     }
   });
