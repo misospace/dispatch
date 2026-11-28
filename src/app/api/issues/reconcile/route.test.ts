@@ -1562,6 +1562,7 @@ describe("POST — close authority and reopen gate (#1727)", () => {
     );
     const skipAudit = prismaMocks.auditRows.find((row) => row.action === "reconcile_close_skipped");
     expect(skipAudit?.notes).toContain("2026-10-04T12:00:00.000Z");
+    expect(skipAudit?.issueId).toBeNull();
   });
 
   it("closes a close candidate with no cached row when the timeline holds no post-merge reopen", async () => {
@@ -1625,8 +1626,10 @@ describe("POST — close authority and reopen gate (#1727)", () => {
     const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
     expect(res.status).toBe(200);
     const body = await res.json();
+    expect(body.issuesClosed).toBe(0);
     expect(body.closesSkipped).toBe(1);
     expect(githubMocks.fetchReopenAfter).not.toHaveBeenCalled();
+    expect(reconciliationMocks.executeActions).not.toHaveBeenCalled();
     const skipAudit = prismaMocks.auditRows.find((row) => row.action === "reconcile_close_skipped");
     expect(skipAudit?.notes).toContain("reopen evidence unavailable");
   });

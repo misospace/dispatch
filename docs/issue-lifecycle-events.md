@@ -154,8 +154,8 @@ candidate with no cached issue row at all (never synced, or pruned after its
 close and reopened since) has no local signal either way, so it gets that
 same bounded timeline confirmation before the close, and an unreadable read
 holds its close too — a missing cache row is never treated as "no reopen
-happened." With that confirmation, the contract holds: a reopen that predates the merge does
-not suppress, and one that postdates it withholds the close for that
+happened." With that confirmation, the contract holds: a reopen that
+predates the merge does not suppress, and one that postdates it withholds the close for that
 issue — no close is written, the pass records a `reconcile_close_skipped`
 audit row (keyed to the cached `issueId` when one exists, so it rides the
 #1363 composite index), and the response counts it in `closesSkipped`.
@@ -168,8 +168,10 @@ deliberately reopened issue sat in `in-review` forever: claimed-looking, so the
 queue skipped it, with nothing left to advance it. A withhold resting on no
 evidence at all — the lifecycle-stream read itself failed — writes no label,
 because there an override cannot be told apart from a legitimate fix. A failed
-timeline *confirmation* is not that case: the sync event stays as reopen
-evidence, so it is the gate case above and its status handling still runs. The
+timeline *confirmation* is not that case: with a cached row the sync event
+stays as reopen evidence, so it is the gate case above and its status handling
+still runs; for a candidate with no cached row it *is* the no-evidence case —
+its close is held and no label is written. The
 linked-PR health snapshot persists either way. Identical skip annotations are
 suppressed until the shared #1363 re-emit window elapses, so a
 deliberately-reopened issue does not earn a row every pass. The merge
