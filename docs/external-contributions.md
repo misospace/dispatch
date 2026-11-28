@@ -30,7 +30,7 @@ itself.
   configure the endpoint with a username, password, or token-like query string,
   and some runtimes echo the whole request URL in a fetch error. So `redactSecret`
   also removes the endpoint's origin, userinfo, and query (`scrubEndpoint`) from
-  any diagnostic.   Query removal covers the configured query whole and each
+  any diagnostic. Query removal covers the configured query whole and each
   configured `name=value` pair with a `?`/`&` delimiter, so a joined echo
   (`?namespace=…&token=…`) cannot retain the query credential. The `endpoint`
   argument to `redactSecret` is REQUIRED, so no diagnostic path can silently
