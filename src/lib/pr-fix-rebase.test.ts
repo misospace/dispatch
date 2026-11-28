@@ -5,6 +5,7 @@ import {
   readRebaseSemanticConflict,
   rebaseModelAssistFeedback,
   rebaseModelTransport,
+  semanticConflictFromRefusal,
 } from "./pr-fix-rebase";
 
 describe("rebaseWorkItem (#1327)", () => {
@@ -121,5 +122,69 @@ describe("rebaseModelTransport (#1674)", () => {
       version: 1,
       semanticConflict: null,
     });
+  });
+});
+
+describe("semanticConflictFromRefusal (#1676)", () => {
+  it("maps full refusal evidence onto the bounded transport context", () => {
+    const context = semanticConflictFromRefusal({
+      baseRef: "main",
+      conflictingFiles: ["package-lock.json", "src/lib/a.ts"],
+      explanation: "Both sides edited the same retry loop.",
+    });
+    expect(context).toEqual({
+      base: "main",
+      files: ["package-lock.json", "src/lib/a.ts"],
+      reason: "Both sides edited the same retry loop.",
+    });
+  });
+
+  it("truncates an over-long reason to the read-side bound", () => {
+    const context = semanticConflictFromRefusal({
+      baseRef: "main",
+      conflictingFiles: ["src/a.ts"],
+      explanation: "r".repeat(600),
+    });
+    expect(context?.reason).toHaveLength(512);
+  });
+
+  it("returns null when the refusal reports nothing usable", () => {
+    expect(
+      semanticConflictFromRefusal({ baseRef: null, conflictingFiles: [], explanation: null }),
+    ).toBeNull();
+  });
+
+  it("maps files-only evidence to { files }", () => {
+    expect(
+      semanticConflictFromRefusal({ baseRef: null, conflictingFiles: ["src/a.ts"], explanation: null }),
+    ).toEqual({ files: ["src/a.ts"] });
+  });
+
+  it("tolerates a missing or non-array files list", () => {
+    expect(
+      semanticConflictFromRefusal({
+        baseRef: "main",
+        conflictingFiles: undefined as unknown as string[],
+        explanation: null,
+      }),
+    ).toEqual({ base: "main" });
+    expect(
+      semanticConflictFromRefusal({
+        baseRef: null,
+        conflictingFiles: "src/a.ts" as unknown as string[],
+        explanation: null,
+      }),
+    ).toBeNull();
+  });
+
+  it("caps more than the bound's worth of files", () => {
+    const many = Array.from({ length: 50 }, (_, i) => `src/p${i}.ts`);
+    const context = semanticConflictFromRefusal({
+      baseRef: null,
+      conflictingFiles: many,
+      explanation: null,
+    });
+    expect(context?.files).toHaveLength(32);
+    expect(context?.files?.[31]).toBe("src/p31.ts");
   });
 });

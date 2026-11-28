@@ -1,14 +1,20 @@
 import { fetchPullRequestHeadSha } from "../github-prs";
 import { normalizePrFixType } from "@/types";
 import { sanitizeForStorage } from "../groomer/sanitize";
-import { isMechanicalRebaseInstruction } from "../pr-fix-rebase";
+import {
+  isMechanicalRebaseInstruction,
+  rebaseEpisodeIdentity,
+  scopedRebaseSemanticConflict,
+  semanticConflictFromRefusal,
+} from "../pr-fix-rebase";
+import { REBASE_MODEL_EXECUTOR_CAPABILITY } from "../rebase-intake";
 import { resolveIngestionClaimant } from "../pr-fix-ownership";
 import { type PrFixQueueClient } from "./client";
 import { uniqueAppend } from "./shared";
-import { linkedIssueEscalationClassified, preserveEscalationLane, releaseLaneFromParentClass } from "./escalation-lane";
+import { linkedIssueEscalationClassified, linkedIssueEscalationClassifiedForModelPhase, preserveEscalationLane, releaseLaneFromParentClass, storedEscalatedParentClass, type LinkedIssueEscalationClassification } from "./escalation-lane";
 import { maxPrFixStagnation } from "./external-wait";
 import { findHandoutReceipt, freshAttemptGeneration } from "./handout";
-import { rebaseExecutorAgentNames, rebaseExecutorClaimantExclusion } from "./lane-admission";
+import { rebaseExecutorAgentNames, rebaseExecutorClaimantExclusion, rebaseModelWorkerPoolDeclared } from "./lane-admission";
 
 /**
  * #1675: durable semantic-conflict episode accounting and the bounded
@@ -68,6 +74,30 @@ import { rebaseExecutorAgentNames, rebaseExecutorClaimantExclusion } from "./lan
  *    state, recoverable through the standard #1569 operator paths with zero
  *    attempt burn) in the same pinned CAS write; a failed authoritative
  *    read declines the whole transfer to the ordinary safe hold.
+ * 8. PHASES (#1676) — an accepted episode has two repair stages ahead of any
+ *    human, and a deterministic refusal alone never skips the first:
+ *      a. MODEL REPAIR — when the deployment declares a model-rebase worker
+ *         (`DISPATCH_REBASE_MODEL_AGENTS`) AND the linked parent verifies
+ *         NOT_ESCALATED, the FIRST refusal settles the mechanical receipt and
+ *         persists the bounded context on the row (`semanticConflict` + the
+ *         episode id) as a fresh REBASE attempt. The row is now MODEL-REQUIRED,
+ *         so only a poll granted `rebase-model-executor:1` inside the
+ *         model-worker pool can pick it up (#1674's hand-out gates) and it
+ *         receives the model wall plus this context.
+ *      b. ORDINARY FIX-PR FALLBACK — a refusal that arrives while the CURRENT
+ *         episode already carries the persisted context proves a
+ *         model-authorized attempt ran and could not resolve it (the mechanical
+ *         refusal is not that proof), so it transfers to one ordinary fix
+ *         attempt under the existing attempt budgets. A deployment with no
+ *         model worker declared, or a parent the model path may not touch
+ *         (ESCALATED, or UNKNOWN fail-closed), takes this fallback on the FIRST
+ *         refusal — the pre-#1676 shape — and the exclusive lane survives it,
+ *         so a deterministic failure never becomes a frontier bypass.
+ *    Both markers are episode-scoped: the persisted context counts only while it
+ *    matches the row's current head knowledge (`scopedRebaseSemanticConflict`),
+ *    and the model-phase write clears `rebaseEpisodeTransferred` because the
+ *    episode it names has NOT transferred. A NEW episode (new head) therefore
+ *    re-decides instead of inheriting the old phase or a stale context.
  *
  * Failure classification: ONLY an explicit, well-formed, in-bounds
  * `kind: "nonmechanical_conflict"` refusal on a verifiable, exclusively-owned,
@@ -184,30 +214,40 @@ export function isTransferEligibleRefusal(refusal: RebaseRefusalContext | null |
 }
 
 /**
- * The stable conflict-episode identity: a pure function of the AUTHORITATIVE
- * PR/base/head/ref state Dispatch itself holds. `branch` is the head ref,
- * `headSha` the conflicting head. Null branches/heads fold to a literal
- * "unknown" segment so a partially-observed episode still derives ONE
- * deterministic identity, and both sides of the comparison (the transfer
- * writer and the enqueue-side gate) fold the same way. Poll timestamps and
- * worker text are deliberately absent: a resync ten seconds later and a
- * restart tomorrow derive the SAME identity for the SAME conflict, and a new
- * push (new head) derives a DIFFERENT one.
+ * The episode identity lives with the conflict-context helpers (#1327/#1676) so
+ * the writer, the enqueue-side no-bounce gate, and the dispatch-side context
+ * scoping all derive it from one implementation.
  */
-export function rebaseEpisodeIdentity(
-  repo: string,
-  pr: number,
-  branch: string | null | undefined,
-  headSha: string | null | undefined,
-): string {
-  const ref = (branch ?? "").trim() || "unknown";
-  const head = (headSha ?? "").trim() || "unknown";
-  return `rebase-episode:${repo}#${pr}:${ref}:${head}`;
+export { rebaseEpisodeIdentity } from "../pr-fix-rebase";
+
+/**
+ * The parent classification the MODEL-repair phase may accept (#1676). The same
+ * folding the #1674 hand-out gate uses — a row already stored ESCALATED is
+ * frontier by its own authority — and only a positive NOT_ESCALATED answers.
+ * This is the WITHHOLD side of the decision: ESCALATED and UNKNOWN route the
+ * episode to the ordinary fallback (which enforces lane exclusivity at its own
+ * hand-out and never demotes the exclusive lane); the authoritative locked read
+ * stays at issuance, where the model wall is actually shipped.
+ *
+ * It uses the STRICT read, so an absent parent row is UNKNOWN and the phase
+ * declines: the marker this write commits is durable, and the locked issuance
+ * read that releases it already treats absence as UNKNOWN. Committing the phase
+ * on the lenient read would strand the row between two deferrals.
+ */
+async function modelRepairParentClass(
+  client: Pick<PrFixQueueClient, "issue">,
+  row: { repo: string; issue: number | null; lane: unknown },
+): Promise<LinkedIssueEscalationClassification> {
+  return storedEscalatedParentClass(row.lane) ?? linkedIssueEscalationClassifiedForModelPhase(client, row.repo, row.issue);
 }
 
 /** How the transfer attempt ended; the caller decides the ordinary fallback. */
 export type RebaseTransferResult =
   | { action: "transferred"; item: Record<string, unknown>; reason: string }
+  // #1676: the episode was accepted onto the MODEL-repair phase — the exact
+  // mechanical receipt is settled, the bounded context is persisted, and the
+  // row stays a fresh REBASE attempt only a model-authorized poll may take.
+  | { action: "model_repair"; item: Record<string, unknown>; reason: string }
   | { action: "parked"; item: Record<string, unknown>; reason: string }
   // The report must NOT mutate the row (a concurrent writer owns it, or the
   // exact CAS lost a race) — a plain skip, not a settlement.
@@ -366,6 +406,24 @@ export async function transferRebaseEpisodeToFix(
         reason: `transfer refused: the PR remote head (${remote || "unknown"}) no longer matches the rebase attempt baseline (${expected || "unknown"}); a changed remote head must stop, never silently transfer`,
       };
     }
+    // #1676 phase routing. The persisted context, scoped to THIS episode, is the
+    // only proof that a model-authorized attempt already ran: a deterministic
+    // refusal never sets it, so the first accepted refusal of an episode goes to
+    // the model phase whenever the deployment declares a model-rebase worker and
+    // the parent is not frontier-classified. Every other combination (no pool
+    // declared, ESCALATED, UNKNOWN, or a refusal whose episode already carries
+    // the context) lands on the ordinary fix-pr path below.
+    const modelPhasePending = scopedRebaseSemanticConflict(row) !== null;
+    const transportContext = semanticConflictFromRefusal({
+      baseRef: input.refusal.baseRef,
+      conflictingFiles: input.refusal.conflictingFiles,
+      explanation: input.refusal.explanation,
+    });
+    const modelRepair =
+      !modelPhasePending &&
+      transportContext !== null &&
+      rebaseModelWorkerPoolDeclared() &&
+      (await modelRepairParentClass(client, row)) === "NOT_ESCALATED";
     // Ownership transition invariant (#1615/#1569, #1675 review): the
     // transferred row is now an ORDINARY fix attempt, and the #1615 gate
     // deterministically refuses a rebase-executor pool member as the claimant
@@ -392,7 +450,13 @@ export async function transferRebaseEpisodeToFix(
       data: Record<string, unknown>;
       note: string;
     } | null = null;
-    if (priorClaimant !== "" && rebaseExecutorAgentNames().has(priorClaimant.toLowerCase())) {
+    // A model-phase row stays REBASE, so a rebase-executor claimant is legal on
+    // it (#1615 excludes that pool from NON-REBASE claimant evidence only).
+    if (
+      !modelRepair &&
+      priorClaimant !== "" &&
+      rebaseExecutorAgentNames().has(priorClaimant.toLowerCase())
+    ) {
       const resolution = await resolveIngestionClaimant(
         client,
         row.repo,
@@ -466,9 +530,14 @@ export async function transferRebaseEpisodeToFix(
     // never a fresh attempt and never a budget reset.
     const nextStagnation = (row.stagnationCount ?? 0) + 1;
     const capped = nextStagnation >= maxPrFixStagnation();
+    const filesReported = input.refusal.conflictingFiles.length
+      ? input.refusal.conflictingFiles.join(", ")
+      : "none reported";
     const historyNote = capped
-      ? `Agent reported a non-mechanical (semantic) conflict from the mechanical rebase attempt; the consecutive-stagnation budget is exhausted at ${nextStagnation} (PR_FIX_MAX_STAGNATION=${maxPrFixStagnation()}), so the REBASE→fix transfer is declined and the row parks instead (#1675, #1543). Receipt settled: ${owned}. Episode: ${episodeId}.`
-      : `Agent reported a non-mechanical (semantic) conflict from the mechanical rebase attempt; the exact rebase receipt/generation (${input.generation}) is settled and ONE ordinary fix attempt is authorized with the bounded refusal evidence (#1675). Episode: ${episodeId}. Conflicting files: ${input.refusal.conflictingFiles.length ? input.refusal.conflictingFiles.join(", ") : "none reported"}.${claimantTransition?.note ?? ""}`;
+      ? `Agent reported a non-mechanical (semantic) conflict from the mechanical rebase attempt; the consecutive-stagnation budget is exhausted at ${nextStagnation} (PR_FIX_MAX_STAGNATION=${maxPrFixStagnation()}), so the REBASE hand-off is declined and the row parks instead (#1675, #1676, #1543). Receipt settled: ${owned}. Episode: ${episodeId}.`
+      : modelRepair
+        ? `Agent reported a non-mechanical (semantic) conflict from the mechanical rebase attempt; the exact rebase receipt/generation (${input.generation}) is settled and the bounded conflict context is persisted, so the episode is now MODEL-REQUIRED and offered only to a poll granted ${REBASE_MODEL_EXECUTOR_CAPABILITY}:1 whose agent is in DISPATCH_REBASE_MODEL_AGENTS (#1676). Episode: ${episodeId}. Conflicting files: ${filesReported}.`
+        : `Agent reported a non-mechanical (semantic) conflict from the mechanical rebase attempt; the exact rebase receipt/generation (${input.generation}) is settled and ONE ordinary fix attempt is authorized with the bounded refusal evidence (#1675). ${modelPhasePending ? "The authorized model-assisted rebase attempt also refused this episode (or the model phase is no longer reachable), so the ordinary fix-pr fallback applies (#1676)." : "No model-rebase worker is authorized for this episode on this deployment, so it goes directly to the ordinary fix-pr fallback (#1676)."} Episode: ${episodeId}. Conflicting files: ${filesReported}.${claimantTransition?.note ?? ""}`;
     const cappedData: Record<string, unknown> = {
       status: "PARKED",
       // #1503: a bounded-exhaustion park never demotes the exclusive lane.
@@ -506,10 +575,64 @@ export async function transferRebaseEpisodeToFix(
       };
     }
 
+    // #1676 MODEL-REPAIR phase: settle the exact mechanical receipt, persist the
+    // bounded context, and keep the row on the REBASE lane so the #1674 gates
+    // offer it only to a model-authorized poll. `rebaseEpisodeTransferred` is
+    // cleared with the id it names: this episode awaits the model phase, it is
+    // not transferred, and a stale flag would make the dedup gate above swallow
+    // the model worker's own refusal (and strand its live receipt on the row).
+    if (modelRepair) {
+      const { count } = await client.prFixQueueItem.updateMany({
+        where: casWhere,
+        data: {
+          status: "QUEUED",
+          type: "REBASE",
+          // The same lane rule the transfer release applies: never demote an
+          // exclusive lane, and an explicit human hold resets as it does there.
+          lane: preserveEscalationLane(row.lane),
+          semanticConflict: transportContext,
+          rebaseEpisodeId: episodeId,
+          rebaseEpisodeTransferred: false,
+          rebaseEpisodeTransferredAt: null,
+          rebaseEpisodeGeneration: input.generation,
+          ...freshAttemptGeneration(),
+          // #1543: the consumed mechanical attempt made no progress, so it
+          // counts; the model attempt that follows is bounded by the same cap.
+          stagnationCount: nextStagnation,
+          outcome: null,
+          decisionDetail: null,
+          // The fresh attempt's baseline is the verified, unchanged remote head.
+          attemptHeadSha: remoteHead,
+          // `headSha` rides the same verified value: the dispatch-side context
+          // scoping keys on the freshest head knowledge, and the episode id this
+          // write stores was derived from exactly this head.
+          headSha: remoteHead,
+          postDispatchEvidenceKeys: [],
+          agentHandouts: [],
+          externalWaitBy: null,
+          handoutAcks: [],
+          handoutAckTimes: [],
+          handoutReceipts: [],
+        },
+      });
+      if (count !== 1) {
+        continue;
+      }
+      const modelRow = await client.prFixQueueItem.findUnique({ where: { id: row.id } });
+      await client.prFixHistory.create({
+        data: { itemId: row.id, action: "rebase_model_repair", status: "QUEUED", note: historyNote },
+      });
+      return {
+        action: "model_repair",
+        item: (modelRow ?? row) as Record<string, unknown>,
+        reason: `rebase episode ${episodeId} accepted for model-assisted repair: rebase attempt generation ${input.generation} settled, the bounded conflict context is persisted, and the row is held for a model-authorized REBASE poll at generation ${input.generation + 1} (#1676)`,
+      };
+    }
+
     // The transfer write: settle the exact receipt (the arrays are pinned and
     // cleared), release the consumed rebase hand-out, and open the ONE
     // authorized ordinary fix attempt — plus the episode record — atomically.
-    const feedbackLines = buildTransferFeedback(input.refusal, episodeId);
+    const feedbackLines = buildTransferFeedback(input.refusal, episodeId, modelPhasePending);
     // The mechanical-only instruction wall (#1327) is the REBASE lane's worker
     // contract, not evidence: a transferred row is an ordinary model-assisted
     // repair attempt (#1675), and carrying the wall would hand its worker
@@ -601,9 +724,11 @@ export async function transferRebaseEpisodeToFix(
  * refusal evidence. Bounded like every other feedback entry (uniqueAppend
  * caps the list; each line is bounded here).
  */
-function buildTransferFeedback(refusal: RebaseRefusalContext, episodeId: string): string[] {
+function buildTransferFeedback(refusal: RebaseRefusalContext, episodeId: string, modelAttempted: boolean): string[] {
   const lines = [
-    `The mechanical rebase lane refused this conflict as NON-MECHANICAL and this is the single authorized repair attempt for conflict episode ${episodeId} (#1675).`,
+    modelAttempted
+      ? `The authorized model-assisted rebase attempt refused this conflict episode ${episodeId}; this is the single authorized ordinary repair attempt for it (#1676, #1675).`
+      : `The mechanical rebase lane refused this conflict as NON-MECHANICAL and this is the single authorized repair attempt for conflict episode ${episodeId} (#1675).`,
     `Bounded refusal evidence — conflicting files: ${
       refusal.conflictingFiles.length ? refusal.conflictingFiles.join(", ") : "none reported"
     }.`,

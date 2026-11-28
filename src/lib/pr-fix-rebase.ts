@@ -65,10 +65,10 @@ export function rebaseWorkItem(stateLabel: string): {
  * ref the rebase stopped on, the conflicted paths that are not mechanically
  * resolvable, and a bounded reason.
  *
- * Dispatch does not detect conflicts itself. The context rides the queue
- * item when one is persisted on it (the durable episode accounting is the
- * sibling issue); until a producer exists every row reads as `null` and the
- * transport block ships with `semanticConflict: null`.
+ * Dispatch does not detect conflicts itself. The mechanical executor's accepted
+ * refusal is the producer (#1676): the episode writer persists this context on
+ * the row (`semanticConflict`), which is what marks the row MODEL-REQUIRED. A
+ * row without one reads as `null` and ships `semanticConflict: null`.
  */
 export interface RebaseSemanticConflictContext {
   /** The base ref the mechanical rebase stopped on. */
@@ -133,6 +133,89 @@ export function readRebaseSemanticConflict(row: unknown): RebaseSemanticConflict
  */
 export function isRebaseModelRequired(row: { semanticConflict?: RebaseSemanticConflictContext | null }): boolean {
   return row.semanticConflict != null;
+}
+
+/**
+ * The stable conflict-episode identity: a pure function of the AUTHORITATIVE
+ * PR/base/head/ref state Dispatch itself holds. `branch` is the head ref,
+ * `headSha` the conflicting head. Null branches/heads fold to a literal
+ * "unknown" segment so a partially-observed episode still derives ONE
+ * deterministic identity, and every side of the comparison (the episode writer,
+ * the enqueue-side no-bounce gate, and the dispatch-side context scoping below)
+ * folds the same way. Poll timestamps and worker text are deliberately absent:
+ * a resync ten seconds later and a restart tomorrow derive the SAME identity
+ * for the SAME conflict, and a new push (new head) derives a DIFFERENT one.
+ */
+export function rebaseEpisodeIdentity(
+  repo: string,
+  pr: number,
+  branch: string | null | undefined,
+  headSha: string | null | undefined,
+): string {
+  const ref = (branch ?? "").trim() || "unknown";
+  const head = (headSha ?? "").trim() || "unknown";
+  return `rebase-episode:${repo}#${pr}:${ref}:${head}`;
+}
+
+/**
+ * The persisted context ONLY while it still describes the row's current
+ * conflict (#1676). The episode writer persists the context together with the
+ * `rebaseEpisodeId` it derived from the head it verified, so a context whose id
+ * no longer matches the row's freshest head knowledge belongs to a superseded
+ * conflict (a new push is a new episode) and must neither mark the row
+ * model-required nor be transported as current evidence. Without that scoping a
+ * later mechanical conflict would inherit the previous episode's
+ * model-required gate and starve the concurrency-1 rebase lane, or ship a stale
+ * file list to the model worker. `headSha` leads because ingestion refreshes it
+ * on every observation; `attemptHeadSha` is the fallback the episode writer
+ * itself verified against.
+ */
+export function scopedRebaseSemanticConflict(row: {
+  repo?: string | null;
+  pr?: number | null;
+  branch?: string | null;
+  headSha?: string | null;
+  attemptHeadSha?: string | null;
+  rebaseEpisodeId?: string | null;
+  semanticConflict?: unknown;
+}): RebaseSemanticConflictContext | null {
+  const context = readRebaseSemanticConflict(row);
+  if (context === null) return null;
+  if (typeof row.repo !== "string" || typeof row.pr !== "number") return null;
+  const episodeId = rebaseEpisodeIdentity(
+    row.repo,
+    row.pr,
+    row.branch ?? null,
+    row.headSha ?? row.attemptHeadSha ?? null,
+  );
+  return row.rebaseEpisodeId === episodeId ? context : null;
+}
+
+/**
+ * The bounded refusal evidence the mechanical executor reports (#1675), narrowed
+ * to what the model transport needs.
+ */
+export type RebaseRefusalEvidence = {
+  baseRef: string | null;
+  conflictingFiles: string[];
+  explanation: string | null;
+};
+
+/**
+ * Map the mechanical executor's refusal evidence onto the transport context
+ * (#1676). Anchored here so the persisted context can never exceed the bounds
+ * `readRebaseSemanticConflict` re-applies on the read side: a refusal that
+ * reports nothing usable yields `null`, which keeps the row an ordinary
+ * mechanical item rather than a model-required row no context accompanies.
+ */
+export function semanticConflictFromRefusal(evidence: RebaseRefusalEvidence): RebaseSemanticConflictContext | null {
+  return readRebaseSemanticConflict({
+    semanticConflict: {
+      base: evidence.baseRef ?? undefined,
+      files: evidence.conflictingFiles,
+      reason: evidence.explanation ?? undefined,
+    },
+  });
 }
 
 /**

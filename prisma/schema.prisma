@@ -460,6 +460,18 @@ model PrFixQueueItem {
   rebaseEpisodeTransferred   Boolean   @default(false)
   rebaseEpisodeTransferredAt DateTime?
   rebaseEpisodeGeneration    Int?
+  // #1676: the accepted episode's bounded semantic-conflict context, persisted
+  // from the mechanical executor's structured refusal. Presence marks the row
+  // MODEL-REQUIRED (the #1674 hand-out gates), and — written together with the
+  // `rebaseEpisodeId` it describes — it is the episode's MODEL-PHASE marker: a
+  // later refusal whose episode still matches proves a model-authorized attempt
+  // already ran (a deterministic refusal alone proves nothing) and settles onto
+  // the bounded ordinary fix-pr fallback. A NEW episode re-decides. Context is
+  // transport evidence, never authorization. Written only by the single episode
+  // writer in pr-fix-queue/rebase-transfer.ts and read defensively
+  // (`scopedRebaseSemanticConflict`), which treats a context left from a
+  // superseded head as none.
+  semanticConflict           Json?
   author                   String?
   // #1569: ORIGINAL CLAIMANT of the PR-fix work — the agent/owner identity
   // that owned the work when the row was ingested. Distinct boundaries:

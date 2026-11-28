@@ -10,7 +10,7 @@ import {
 } from "@/lib/agent-task";
 import { isBacklogLane, prFixLaneForRequest } from "@/lib/lane-config";
 import { fetchAgentQueueData } from "@/lib/agent-queue-fetch";
-import { agentAlreadyHanded, agentHandoutToken, backfillPrFixClaimant, createLinkedPrFixItem, enforcePrFixHandoutLaneExclusivity, evaluatePrFixHandoutOwnership, handoutReceipt, hasInFlightRebaseHandout, isHeadRepoOfBaseRepo, isRebaseLaneAgent, isRebaseModelLaneAgent, linkedIssueEscalationClassified, linkedIssueEscalationClassifiedLocked, newHandoutToken, normalizeQueueRepo, prFixOwnershipMode, withHandoutLaneExclusivityFence, withRebaseLaneAdmission, type LinkedIssueEscalationClassification, type PrFixQueueClient } from "@/lib/pr-fix-queue";
+import { agentAlreadyHanded, agentHandoutToken, backfillPrFixClaimant, createLinkedPrFixItem, enforcePrFixHandoutLaneExclusivity, evaluatePrFixHandoutOwnership, handoutReceipt, hasInFlightRebaseHandout, isHeadRepoOfBaseRepo, isRebaseLaneAgent, isRebaseModelLaneAgent, linkedIssueEscalationClassified, linkedIssueEscalationClassifiedLocked, newHandoutToken, normalizeQueueRepo, prFixOwnershipMode, storedEscalatedParentClass, withHandoutLaneExclusivityFence, withRebaseLaneAdmission, type LinkedIssueEscalationClassification, type PrFixQueueClient } from "@/lib/pr-fix-queue";
 import { prFixOwnershipEvidence } from "@/lib/pr-fix-ownership";
 import { fetchPullRequestLabels, fetchPullRequestHeadSha, fetchPullRequestHeadRepo } from "@/lib/github";
 import { NEEDS_HUMAN_LABEL } from "@/lib/pr-fix-surfacing";
@@ -98,8 +98,7 @@ async function rebaseModelParentClass(
   client: Pick<PrFixQueueClient, "issue">,
   candidate: Pick<PrFixCandidate, "repo" | "pr" | "issue" | "lane">,
 ): Promise<LinkedIssueEscalationClassification> {
-  if (candidate.lane === "ESCALATED") return "ESCALATED";
-  return linkedIssueEscalationClassified(client, candidate.repo, candidate.issue);
+  return storedEscalatedParentClass(candidate.lane) ?? linkedIssueEscalationClassified(client, candidate.repo, candidate.issue);
 }
 
 /**
@@ -113,8 +112,7 @@ async function rebaseModelParentClassLocked(
   client: Pick<PrFixQueueClient, "issue">,
   candidate: Pick<PrFixCandidate, "repo" | "pr" | "issue" | "lane">,
 ): Promise<LinkedIssueEscalationClassification> {
-  if (candidate.lane === "ESCALATED") return "ESCALATED";
-  return linkedIssueEscalationClassifiedLocked(client, candidate.repo, candidate.issue);
+  return storedEscalatedParentClass(candidate.lane) ?? linkedIssueEscalationClassifiedLocked(client, candidate.repo, candidate.issue);
 }
 
 /**

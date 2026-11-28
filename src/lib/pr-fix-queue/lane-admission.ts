@@ -81,6 +81,25 @@ export function isRebaseModelLaneAgent(agentName: string): boolean {
 }
 
 /**
+ * Whether THIS deployment declares a model-rebase worker at all (#1676). The
+ * episode router uses it to decide between the model-repair phase and the
+ * bounded ordinary fix-pr fallback: an unset or empty
+ * `DISPATCH_REBASE_MODEL_AGENTS` is a deterministic-only deployment, so an
+ * accepted semantic episode goes straight to the ordinary fallback and the
+ * rebase lane keeps its pre-#1676 shape. Callers must test this BEFORE reading
+ * the parent classification, so a deterministic-only deployment pays no extra
+ * read. This is a deployment-level question (is any worker named?), never a
+ * per-agent authorization — the per-agent check stays `isRebaseModelLaneAgent`
+ * plus the negotiation at hand-out.
+ */
+export function rebaseModelWorkerPoolDeclared(
+  raw: string | undefined = process.env.DISPATCH_REBASE_MODEL_AGENTS,
+): boolean {
+  const pool = parseRebaseModelAgentPool(raw);
+  return pool === null || pool.size > 0;
+}
+
+/**
  * #1615: the operator-declared rebase-executor pool as a plain lowercase
  * name set, for CLAIMANT classification (distinct from lane eligibility).
  * A rebase executor is a mechanical-rebase worker by contract (#1327), so
